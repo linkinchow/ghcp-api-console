@@ -62,6 +62,13 @@ test('still merges sibling text into a normal tool result', () => {
   }]);
 });
 
+test('keeps model selection for the live catalog resolver', () => {
+  for (const model of ['claude-opus-4.8', 'claude-opus-4-8', 'claude-opus-5-2']) {
+    const prepared = preprocessClaudeCodeMessagesBody({ model, messages: [] });
+    assert.equal(prepared.model, model);
+  }
+});
+
 test('classifies an optimized generated continuation as agent initiated', () => {
   const prepared = prepareClaudeCodeMessagesRequest(request(), {
     model: 'claude-opus-4.7',

@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   forwardCopilotRequest,
   listModels,
+  resolveCopilotModel,
   validateCopilotOauthToken,
 } from './copilotClient.js';
 import { config } from '../config.js';
@@ -74,6 +75,71 @@ test('cache bypass does not fall back to a stale models snapshot', async () => {
       /List models failed with HTTP 500/,
     );
   } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('resolves canonical and dotted IDs against each identity live catalog', async () => {
+  const originalFetch = globalThis.fetch;
+  const copilot = {
+    identity: `model-alias-${Date.now()}`,
+    accessToken: 'test-token',
+    api: 'https://api.githubcopilot.com',
+  };
+  globalThis.fetch = async () => jsonResponse({
+    data: [
+      { id: 'claude-opus-5.2', capabilities: { endpoints: ['/v1/messages', '/chat/completions'] } },
+      { id: 'gpt-5.6-sol', capabilities: { endpoints: ['/responses'] } },
+    ],
+  });
+
+  try {
+    const canonical = await resolveCopilotModel(copilot, '/v1/messages', 'claude-opus-5-2');
+    assert.equal(canonical.canonicalId, 'claude-opus-5-2');
+    assert.equal(canonical.upstreamId, 'claude-opus-5.2');
+
+    const dotted = await resolveCopilotModel(copilot, '/chat/completions', 'claude-opus-5.2');
+    assert.equal(dotted.canonicalId, 'claude-opus-5-2');
+    assert.equal(dotted.upstreamId, 'claude-opus-5.2');
+
+    await assert.rejects(
+      resolveCopilotModel(copilot, '/responses', 'claude-opus-5-2'),
+      /not available on \/responses/,
+    );
+    await assert.rejects(
+      resolveCopilotModel(copilot, '/v1/messages', 'claude-opus-5-3'),
+      /Unknown Copilot model/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('does not use a stale snapshot when the refreshed catalog has canonical collisions', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalNow = Date.now;
+  const copilot = {
+    identity: `collision-${Date.now()}`,
+    accessToken: 'test-token',
+    api: 'https://api.githubcopilot.com',
+  };
+  let collide = false;
+  globalThis.fetch = async () => jsonResponse({
+    data: collide
+      ? [{ id: 'claude-opus-5.2' }, { id: 'claude-opus-5-2' }]
+      : [{ id: 'claude-opus-5.2' }],
+  });
+
+  try {
+    await listModels(copilot);
+    collide = true;
+    Date.now = () => originalNow() + 61 * 60 * 1000;
+    await assert.rejects(
+      resolveCopilotModel(copilot, '/v1/messages', 'claude-opus-5-2'),
+      /Multiple Copilot model IDs map to canonical ID/,
+    );
+  } finally {
+    Date.now = originalNow;
     globalThis.fetch = originalFetch;
   }
 });

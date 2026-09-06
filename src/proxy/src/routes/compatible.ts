@@ -14,13 +14,13 @@ import {
 } from '../diagnostics/errorDiagnostics.js';
 import { copilotAuthManager, CopilotAuthNotReadyError } from '../copilot/copilotAuthManager.js';
 import {
-  assertModelSupportsPath,
-  CopilotApiError,
-  CopilotModelPathError,
   executePreparedCopilotRequest,
   listModels,
   modelSupportsPath,
   prepareCopilotRequest,
+  resolveCopilotModel,
+  CopilotApiError,
+  CopilotModelPathError,
   type CopilotApiPath,
   type ForwardCopilotRequestOptions,
   type ModelInfo,
@@ -35,6 +35,7 @@ import {
 } from './claudeCodeCompat.js';
 import { resolveClaudeCodeOptimized } from './claudeCodeMode.js';
 import { resolveRequestIntent } from './requestIntent.js';
+import { toCanonicalRequestedModelId, withCanonicalModelIds } from '../copilot/modelIds.js';
 
 export const compatibleRouter = Router();
 const requestStatsLogger = new Logger('request-stats');
@@ -59,7 +60,9 @@ compatibleRouter.get('/v1/models', async (req, res) => {
     const useCache = req.get('x-cache')?.trim().toLowerCase() !== 'false';
     const diagnostics = createErrorDiagnosticContext(req, identity, '/v1/models');
     const models = await listModels(copilot, { useCache, diagnostics });
-    const visibleModels = claudeCodeOptimized ? models.filter((m) => modelSupportsPath(m, '/v1/messages')) : models;
+    const visibleModels = withCanonicalModelIds(
+      claudeCodeOptimized ? models.filter((m) => modelSupportsPath(m, '/v1/messages')) : models,
+    );
     await recordRequestStat({ identity, path: '/v1/models', success: true });
     if (claudeCodeOptimized) {
       const data = visibleModels.map(toClaudeCodeModel);
@@ -129,21 +132,25 @@ async function handleForward(req: Request, res: Response, path: CopilotApiPath):
     return;
   }
   const requestedModel = typeof body.model === 'string' ? body.model : undefined;
+  const canonicalRequestedModel = requestedModel ? toCanonicalRequestedModelId(requestedModel) : undefined;
   try {
     if (!requestedModel) throw new CopilotModelPathError('Request body must include a string "model".');
     const prepared = prepareForward(req, path, body, claudeCodeOptimized);
     if (prepared.preflightError) {
-      await recordRequestStat({ identity, path, model: requestedModel, success: false, failureReason: prepared.preflightError.message });
+      await recordRequestStat({ identity, path, model: canonicalRequestedModel, success: false, failureReason: prepared.preflightError.message });
       sendAnthropicError(res, prepared.preflightError.status, prepared.preflightError.type, prepared.preflightError.message);
       return;
     }
-    const model = typeof prepared.body.model === 'string' ? prepared.body.model : requestedModel;
-    const diagnostics = createErrorDiagnosticContext(req, identity, path, model);
-    const upstream = await forwardAuthenticated(identity, path, prepared.body, model, diagnostics, prepared.forwardOptions);
-    await pipeAndRecord(upstream.response, upstream.request, res, { identity, path, model }, diagnostics, prepared.pipeOptions);
+    const preparedModel = typeof prepared.body.model === 'string' ? prepared.body.model : requestedModel;
+    const diagnostics = createErrorDiagnosticContext(req, identity, path, canonicalRequestedModel);
+    const upstream = await forwardAuthenticated(identity, path, prepared.body, preparedModel, diagnostics, prepared.forwardOptions);
+    await pipeAndRecord(upstream.response, upstream.request, res, { identity, path, model: upstream.canonicalModel }, diagnostics, {
+      ...prepared.pipeOptions,
+      canonicalModel: upstream.canonicalModel,
+    });
   } catch (err) {
     if (!(err instanceof HandledUpstreamStreamError)) {
-      await recordRequestStat({ identity, path, model: requestedModel, success: false, failureReason: errorMessage(err) });
+      await recordRequestStat({ identity, path, model: canonicalRequestedModel, success: false, failureReason: errorMessage(err) });
     }
     const responseError = err instanceof HandledUpstreamStreamError ? err.cause : err;
     if (!res.headersSent) sendCompatibleError(req, res, responseError);
@@ -161,28 +168,32 @@ async function handleCountTokens(req: Request, res: Response, claudeCodeOptimize
     return;
   }
   const requestedModel = typeof body.model === 'string' ? body.model : undefined;
+  const canonicalRequestedModel = requestedModel ? toCanonicalRequestedModelId(requestedModel) : undefined;
   try {
     if (!requestedModel) throw new CopilotModelPathError('Request body must include a string "model".');
     const prepared = prepareForward(req, path, body, claudeCodeOptimized);
     if (prepared.preflightError) {
-      await recordRequestStat({ identity, path, model: requestedModel, success: false, failureReason: prepared.preflightError.message });
+      await recordRequestStat({ identity, path, model: canonicalRequestedModel, success: false, failureReason: prepared.preflightError.message });
       sendAnthropicError(res, prepared.preflightError.status, prepared.preflightError.type, prepared.preflightError.message);
       return;
     }
-    const model = typeof prepared.body.model === 'string' ? prepared.body.model : requestedModel;
-    const diagnostics = createErrorDiagnosticContext(req, identity, path, model);
-    const upstream = await forwardAuthenticated(identity, path, prepared.body, model, diagnostics, prepared.forwardOptions);
+    const preparedModel = typeof prepared.body.model === 'string' ? prepared.body.model : requestedModel;
+    const diagnostics = createErrorDiagnosticContext(req, identity, path, canonicalRequestedModel);
+    const upstream = await forwardAuthenticated(identity, path, prepared.body, preparedModel, diagnostics, prepared.forwardOptions);
     if (isTokenCountFallbackStatus(upstream.response.status)) {
       await recordTokenCountFallbackFailure(upstream.response, upstream.request, diagnostics);
-      const inputTokens = estimateInputTokens(prepared.body);
-      await recordRequestStat({ identity, path, model, success: true, inputTokens });
+      const inputTokens = estimateInputTokens(upstream.body);
+      await recordRequestStat({ identity, path, model: upstream.canonicalModel, success: true, inputTokens });
       res.json({ input_tokens: inputTokens });
       return;
     }
-    await pipeAndRecord(upstream.response, upstream.request, res, { identity, path, model }, diagnostics, prepared.pipeOptions);
+    await pipeAndRecord(upstream.response, upstream.request, res, { identity, path, model: upstream.canonicalModel }, diagnostics, {
+      ...prepared.pipeOptions,
+      canonicalModel: upstream.canonicalModel,
+    });
   } catch (err) {
     if (!(err instanceof HandledUpstreamStreamError)) {
-      await recordRequestStat({ identity, path, model: requestedModel, success: false, failureReason: errorMessage(err) });
+      await recordRequestStat({ identity, path, model: canonicalRequestedModel, success: false, failureReason: errorMessage(err) });
     }
     const responseError = err instanceof HandledUpstreamStreamError ? err.cause : err;
     if (!res.headersSent) sendCompatibleError(req, res, responseError);
@@ -240,18 +251,21 @@ async function forwardAuthenticated(
   identity: string,
   path: CopilotApiPath,
   body: Record<string, unknown>,
-  model: string,
+  requestedModel: string,
   diagnostics: ErrorDiagnosticContext,
   options?: ForwardCopilotRequestOptions,
-): Promise<{ response: globalThis.Response; request: PreparedCopilotRequest }> {
+): Promise<{ response: globalThis.Response; request: PreparedCopilotRequest; body: Record<string, unknown>; canonicalModel: string }> {
   const copilot = await copilotAuthManager.getAuth(identity);
+  let resolved;
   try {
-    await assertModelSupportsPath(copilot, path, model, diagnostics);
+    resolved = await resolveCopilotModel(copilot, path, requestedModel, diagnostics);
   } catch (err) {
     await invalidateUnauthorizedAuth(identity, copilot.accessToken, err);
     throw err;
   }
-  const request = prepareCopilotRequest(copilot, path, body, options);
+  diagnostics.model = resolved.canonicalId;
+  const upstreamBody = { ...body, model: resolved.upstreamId };
+  const request = prepareCopilotRequest(copilot, path, upstreamBody, options);
   let response: globalThis.Response;
   try {
     response = await executePreparedCopilotRequest(request);
@@ -262,7 +276,7 @@ async function forwardAuthenticated(
   if (response.status === 401) {
     await copilotAuthManager.invalidate(identity, copilot.accessToken);
   }
-  return { response, request };
+  return { response, request, body: upstreamBody, canonicalModel: resolved.canonicalId };
 }
 
 export async function pipeAndRecord(
@@ -300,7 +314,7 @@ export async function pipeAndRecord(
       await recordRequestStat({ ...stat, success: false, failureReason: `HTTP ${upstream.status}` });
       return;
     }
-    res.send(body.buffer);
+    res.send(canonicalizeJsonResponse(body.buffer, options.canonicalModel));
     const usage = parseUsage(text);
     await recordRequestStat({
       ...stat,
@@ -328,19 +342,18 @@ export async function pipeAndRecord(
     if (result.done || !result.value) break;
     capture.add(result.value);
     if (filterCopilotDone) {
-      sseBuffer = forwardSseEvents(sseBuffer + decoder.decode(result.value, { stream: true }), res, usage);
+      sseBuffer = forwardSseEvents(sseBuffer + decoder.decode(result.value, { stream: true }), res, usage, options.canonicalModel);
     } else {
-      sseBuffer = collectSseUsage(sseBuffer + decoder.decode(result.value, { stream: true }), usage);
-      res.write(result.value);
+      sseBuffer = forwardSseEvents(sseBuffer + decoder.decode(result.value, { stream: true }), res, usage, options.canonicalModel, false);
     }
   }
   const remaining = decoder.decode();
   if (filterCopilotDone) {
-    if (remaining) sseBuffer = forwardSseEvents(sseBuffer + remaining, res, usage);
-    flushSseRemainder(sseBuffer, res, usage);
+    if (remaining) sseBuffer = forwardSseEvents(sseBuffer + remaining, res, usage, options.canonicalModel);
+    flushSseRemainder(sseBuffer, res, usage, options.canonicalModel, true);
   } else {
-    if (remaining) sseBuffer = collectSseUsage(sseBuffer + remaining, usage);
-    collectSseEventUsage(sseBuffer, usage);
+    if (remaining) sseBuffer = forwardSseEvents(sseBuffer + remaining, res, usage, options.canonicalModel, false);
+    flushSseRemainder(sseBuffer, res, usage, options.canonicalModel, false);
   }
   const capturedBody = capture.result(true);
   if (!upstream.ok) await recordHttpFailure(diagnostics, upstreamRequest, upstream, capturedBody);
@@ -356,6 +369,7 @@ export async function pipeAndRecord(
 interface PipeOptions {
   claudeCodeOptimized?: boolean;
   requestBody?: Record<string, unknown>;
+  canonicalModel?: string;
 }
 
 interface BufferedResponseBody {
@@ -451,22 +465,87 @@ function collectSseUsage(buffer: string, usage: UsageStats): string {
   }
 }
 
-function forwardSseEvents(buffer: string, res: Response, usage: UsageStats): string {
+function forwardSseEvents(
+  buffer: string,
+  res: Response,
+  usage: UsageStats,
+  canonicalModel?: string,
+  filterDone = true,
+): string {
   let remaining = buffer;
   for (;;) {
     const boundary = nextSseEventBoundary(remaining);
     if (!boundary) return remaining;
     const eventText = remaining.slice(0, boundary.eventEnd);
     collectSseEventUsage(eventText, usage);
-    if (!isCopilotDoneEvent(eventText)) res.write(remaining.slice(0, boundary.nextEventStart));
+    if (!filterDone || !isCopilotDoneEvent(eventText)) {
+      const delimiter = remaining.slice(boundary.eventEnd, boundary.nextEventStart);
+      res.write(`${canonicalizeSseEvent(eventText, canonicalModel)}${delimiter}`);
+    }
     remaining = remaining.slice(boundary.nextEventStart);
   }
 }
 
-function flushSseRemainder(buffer: string, res: Response, usage: UsageStats): void {
+function flushSseRemainder(
+  buffer: string,
+  res: Response,
+  usage: UsageStats,
+  canonicalModel?: string,
+  filterDone = true,
+): void {
   if (!buffer) return;
   collectSseEventUsage(buffer, usage);
-  if (!isCopilotDoneEvent(buffer)) res.write(buffer);
+  if (!filterDone || !isCopilotDoneEvent(buffer)) res.write(canonicalizeSseEvent(buffer, canonicalModel));
+}
+
+function canonicalizeJsonResponse(buffer: Buffer, canonicalModel?: string): Buffer {
+  if (!canonicalModel) return buffer;
+  try {
+    const value = JSON.parse(buffer.toString('utf8')) as unknown;
+    if (!setResponseModel(value, canonicalModel)) return buffer;
+    return Buffer.from(JSON.stringify(value));
+  } catch {
+    return buffer;
+  }
+}
+
+function canonicalizeSseEvent(eventText: string, canonicalModel?: string): string {
+  if (!canonicalModel) return eventText;
+  const data = sseData(eventText);
+  if (!data || data === '[DONE]') return eventText;
+  try {
+    const value = JSON.parse(data) as unknown;
+    if (!setResponseModel(value, canonicalModel)) return eventText;
+    const serialized = JSON.stringify(value);
+    let replaced = false;
+    return eventText.split(/\r?\n/).map((line) => {
+      if (replaced || !line.startsWith('data:')) return line;
+      replaced = true;
+      return `data: ${serialized}`;
+    }).filter((line) => !replaced || !line.startsWith('data:') || line === `data: ${serialized}`).join('\n');
+  } catch {
+    return eventText;
+  }
+}
+
+function setResponseModel(value: unknown, canonicalModel: string): boolean {
+  const object = recordField(value);
+  if (!object) return false;
+  if (typeof object.model === 'string' && object.model !== canonicalModel) {
+    object.model = canonicalModel;
+    return true;
+  }
+  const message = recordField(object.message);
+  if (typeof message?.model === 'string' && message.model !== canonicalModel) {
+    message.model = canonicalModel;
+    return true;
+  }
+  const response = recordField(object.response);
+  if (typeof response?.model === 'string' && response.model !== canonicalModel) {
+    response.model = canonicalModel;
+    return true;
+  }
+  return false;
 }
 
 function nextSseEventBoundary(buffer: string): { eventEnd: number; nextEventStart: number } | undefined {

@@ -1,7 +1,6 @@
 import type { Request } from 'express';
 import {
   getAnthropicModelProfile,
-  normalizeAnthropicModelId,
   type AnthropicModelProfile,
 } from './anthropicModelProfiles.js';
 import { AUTOMATIC_CONTINUE_PROMPT, resolveRequestIntent } from './requestIntent.js';
@@ -78,7 +77,6 @@ export function prepareClaudeCodeMessagesRequest(
 
 export function preprocessClaudeCodeMessagesBody(body: Record<string, unknown>): Record<string, unknown> {
   const prepared = cloneJson(body) as Record<string, unknown>;
-  normalizeModel(prepared);
   const profile = getAnthropicModelProfile(stringField(prepared.model) ?? '');
 
   stripCacheControlScope(prepared);
@@ -109,14 +107,6 @@ export function shouldTranslateWebSearchError(status: number, bodyText: string, 
 
 export function webSearchUnsupportedMessage(requestBody: Record<string, unknown> | undefined): string {
   return webSearchUnsupportedMessageForTool(firstWebSearchToolType(requestBody) ?? 'web_search');
-}
-
-export { normalizeAnthropicModelId };
-
-function normalizeModel(body: Record<string, unknown>): void {
-  const model = stringField(body.model);
-  if (!model) return;
-  body.model = normalizeAnthropicModelId(model);
 }
 
 function anthropicBetaHeader(

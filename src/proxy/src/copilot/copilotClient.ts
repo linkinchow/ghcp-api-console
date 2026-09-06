@@ -10,6 +10,13 @@ import {
   type PreparedUpstreamRequest,
 } from '../diagnostics/errorDiagnostics.js';
 import { Logger } from '../logger.js';
+import {
+  buildModelIdIndex,
+  ModelIdCollisionError,
+  resolveModelId,
+  toCanonicalModelId,
+  type ModelIdResolution,
+} from './modelIds.js';
 import type { CopilotAuthContext } from './copilotAuth.js';
 
 export const COPILOT_API_PATHS = ['/chat/completions', '/v1/messages', '/responses'] as const;
@@ -19,6 +26,7 @@ type ModelsCacheKey = string;
 
 interface ModelsSnapshot {
   models: ModelInfo[];
+  modelIndex: Map<string, ModelIdResolution<ModelInfo>>;
   pathMap: Map<string, CopilotApiPath[]>;
   fetchedAt: number;
   expiresAt: number;
@@ -143,24 +151,30 @@ export function executePreparedCopilotRequest(request: PreparedCopilotRequest): 
   });
 }
 
-export async function assertModelSupportsPath(
+export interface ResolvedCopilotModel extends ModelIdResolution<ModelInfo> {
+  supportedPaths: CopilotApiPath[];
+}
+
+export async function resolveCopilotModel(
   copilot: CopilotAuthContext,
   path: CopilotApiPath,
-  model: string,
+  requestedId: string,
   diagnostics?: ErrorDiagnosticContext,
-): Promise<void> {
+): Promise<ResolvedCopilotModel> {
   const capabilityPath = modelCapabilityPath(path);
   let snapshot = await getModelsSnapshot(copilot, { diagnostics });
-  let supportedPaths = snapshot.pathMap.get(model);
-  if (supportedPaths?.includes(capabilityPath)) return;
+  let resolution = resolveModelId(snapshot.modelIndex, requestedId);
+  let supportedPaths = resolution ? snapshot.pathMap.get(resolution.upstreamId) : undefined;
+  if (resolution && supportedPaths?.includes(capabilityPath)) return { ...resolution, supportedPaths };
 
   if (Date.now() - snapshot.fetchedAt > MODELS_CACHE_NEGATIVE_RECHECK_MS) {
     snapshot = await getModelsSnapshot(copilot, { forceRefresh: true, allowStaleOnError: false, diagnostics });
-    supportedPaths = snapshot.pathMap.get(model);
-    if (supportedPaths?.includes(capabilityPath)) return;
+    resolution = resolveModelId(snapshot.modelIndex, requestedId);
+    supportedPaths = resolution ? snapshot.pathMap.get(resolution.upstreamId) : undefined;
+    if (resolution && supportedPaths?.includes(capabilityPath)) return { ...resolution, supportedPaths };
   }
 
-  throw modelPathError(model, path, supportedPaths);
+  throw modelPathError(toCanonicalModelId(requestedId), path, supportedPaths);
 }
 
 export function modelSupportsPath(model: ModelInfo, path: CopilotApiPath): boolean {
@@ -180,6 +194,7 @@ async function getModelsSnapshot(
   try {
     return await refreshModelsSnapshot(cacheKey, copilot, entry, options.diagnostics);
   } catch (err) {
+    if (err instanceof ModelIdCollisionError) throw err;
     if (err instanceof CopilotApiError && (err.status === 401 || err.status === 403)) throw err;
     if (options.allowStaleOnError !== false && snapshot && now - snapshot.fetchedAt <= MODELS_CACHE_STALE_MAX_AGE_MS) {
       modelsCacheLogger.warn('refresh-failed-stale', 'Using stale Copilot models cache after refresh failed', {
@@ -214,6 +229,7 @@ function refreshModelsSnapshot(
       const now = Date.now();
       const snapshot: ModelsSnapshot = {
         models,
+        modelIndex: buildModelIdIndex(models),
         pathMap: buildPathMap(models),
         fetchedAt: now,
         expiresAt: now + MODELS_CACHE_TTL_MS,
