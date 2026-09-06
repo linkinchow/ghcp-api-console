@@ -263,7 +263,7 @@ curl http://localhost:3000/v1/messages \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
-    "model": "claude-sonnet-4.6",
+    "model": "claude-sonnet-4-6",
     "max_tokens": 256,
     "messages": [
       {
@@ -281,7 +281,7 @@ curl http://localhost:3000/v1/messages/count_tokens \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
-    "model": "claude-sonnet-4.6",
+    "model": "claude-sonnet-4-6",
     "messages": [
       {
         "role": "user",
@@ -304,7 +304,7 @@ curl http://localhost:3000/responses \
   }'
 ```
 
-`model` 需要替换为支持目标 API path 的模型。默认 `CLAUDE_CODE_OPTIMIZED=true` 时，`GET /v1/models` 面向 Claude Code 只返回支持 `/v1/messages` 的模型，并保持 Copilot 原始模型名，例如 `claude-opus-4.8`；如果某次请求需要完整 Copilot/OpenAI 风格模型列表，传 `X-Claude-Code-Optimized: false`。`/responses` 示例中的 `gpt-5-mini` 需要替换为账号可用且支持 `/responses` 的 Copilot 模型。如果你在 `.env` 里改了 `IDENTITY_HEADER`，示例里的 `X-User-Identity` 也要同步替换。
+`model` 必须来自 `GET /v1/models`。Proxy 以当前账号的 Copilot `/models` 为实时权威目录：Claude 模型对外使用 Anthropic 标准连字符 ID（例如上游 `claude-opus-4.8` 对外为 `claude-opus-4-8`），其他模型 ID 原样保留。三个 POST 入口同时接受标准 ID 和旧点号 ID，并在发给 Copilot 前统一解析为上游真实 ID；因此该兼容不依赖 `X-Claude-Code-Optimized`。未来 Copilot 若返回 `claude-opus-5.1`、`5.2` 等型号，会由实时目录动态生成 `claude-opus-5-1`、`5-2`，无需维护静态型号表。默认 `CLAUDE_CODE_OPTIMIZED=true` 时，`GET /v1/models` 面向 Claude Code 只返回支持 `/v1/messages` 的模型；如需完整 Copilot/OpenAI 风格模型列表，传 `X-Claude-Code-Optimized: false`。`/responses` 示例中的 `gpt-5-mini` 需要替换为账号可用且支持 `/responses` 的 Copilot 模型。如果你在 `.env` 里改了 `IDENTITY_HEADER`，示例里的 `X-User-Identity` 也要同步替换。
 
 Claude Code 可以通过 settings 文件接入本地 proxy，例如 `~/.claude/settings.json` ：
 
