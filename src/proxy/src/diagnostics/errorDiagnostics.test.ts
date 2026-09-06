@@ -297,7 +297,9 @@ test('persists JSON, SSE, plain-text, and bodyless upstream HTTP failures', asyn
     const listed = await errorDiagnosticsStore.list(1, 10);
     assert.equal(listed.total, 4);
     assert.deepEqual(new Set(listed.items.map((item) => item.status)), new Set([400, 429, 502, 503]));
-    assert.equal((await listRequestStats(identity, 10)).filter((stat) => !stat.success).length, 4);
+    const stats = (await listRequestStats(identity, 10)).filter((stat) => !stat.success);
+    assert.equal(stats.length, config.requestStatsPerAccountLimit);
+    assert.deepEqual(stats.map((stat) => stat.failureReason), ['HTTP 503', 'HTTP 502']);
   });
 });
 
