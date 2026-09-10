@@ -43,6 +43,8 @@ export interface ImportCopilotOauthTokenRow {
 export interface ProxyRequestStatDto {
   id: string;
   identity: string;
+  callerId?: string;
+  leaseId?: string;
   ghLogin?: string;
   requestedAt: string;
   path: '/chat/completions' | '/v1/messages' | '/v1/messages/count_tokens' | '/responses' | '/v1/models';
@@ -169,6 +171,16 @@ export interface EnsureSsoUserResponse {
   created: boolean;
 }
 
+export interface SsoUserLoginCredentialsRequest {
+  expectedCreatedAt: string;
+  expectedEmail: string;
+}
+
+export interface SsoUserLoginCredentialsResponse {
+  user: SsoUserDto;
+  passwordForLogin: string;
+}
+
 export interface SsoUserCapacityDto {
   current: number;
   limit: number | null;
@@ -221,6 +233,8 @@ export interface SsoUserBatchRequest {
   ssoUsers: string[];
   enterpriseRole?: 'user' | 'enterprise_owner';
   assignCopilotSeat?: boolean;
+  /** For sync_emu only: fail on existing provisioning or SCIM conflict, never adopt or update. */
+  createOnly?: boolean;
 }
 
 export interface SsoUserBatchRow {

@@ -1,0 +1,16 @@
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const here = fileURLToPath(new URL('.', import.meta.url));
+if (existsSync(join(here, 'local-run.json'))) throw new Error('Existing test configuration found; use it rather than overwriting its certificate paths');
+const directory = mkdtempSync(join(tmpdir(), 'ghcp-pool-docker-'));
+const certs = join(directory, 'certs');
+mkdirSync(certs);
+const result = spawnSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', join(certs, 'idp-key.pem'), '-out', join(certs, 'idp-cert.pem'), '-days', '2', '-subj', '/CN=local-pool-smoke.test'], { stdio: 'inherit', shell: false });
+if (result.status !== 0) throw new Error('Test certificate generation failed');
+const envFile = join(directory, 'smoke.env');
+writeFileSync(envFile, `POOL_SMOKE_CERT_DIR=${certs.replaceAll('\\', '/')}\n`);
+writeFileSync(join(here, 'local-run.json'), JSON.stringify({ directory, envFile, compose: join(here, 'compose.yaml'), project: 'ghcp-user-pool-smoke' }, null, 2));
+console.log('Disposable local certificate and Compose configuration prepared; no tenant files were read.');

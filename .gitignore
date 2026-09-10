@@ -30,3 +30,10 @@ curl.http
 
 !docs/codebase-overview.md
 !docs/repo-map.md
+!docs/user-pool-*.md
+**/__pycache__/
+**/*.pyc
+.local-sso/
+.claude/
+/tests/docker-user-pool/local-run.json
+/tests/docker-user-pool/local-*.json

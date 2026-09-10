@@ -12,6 +12,9 @@ import { compatibleRouter } from './routes/compatible.js';
 import { resolveClaudeCodeOptimized } from './routes/claudeCodeMode.js';
 import { adminApiRouter } from './routes/adminApi.js';
 import { internalApiRouter } from './routes/internalApi.js';
+import { userPoolApiRouter } from './routes/userPoolApi.js';
+import { assertUserPoolOwner, routeUserPool, startUserPool, stopUserPool } from './userPool/runtime.js';
+import { readPoolConfig } from './userPool/config.js';
 
 const requestLogger = new Logger('request');
 
@@ -26,6 +29,7 @@ export function buildApp(): express.Express {
   app.get('/readyz', async (_req, res) => {
     try {
       await pingStorage();
+      assertUserPoolOwner();
       res.json({ status: 'ok', service: 'proxy', storage: config.storageDriver });
     } catch (err) {
       requestLogger.error('readiness-failed', 'Proxy storage readiness check failed', {
@@ -34,9 +38,9 @@ export function buildApp(): express.Express {
       res.status(503).json({ status: 'unavailable', service: 'proxy' });
     }
   });
-  app.use('/api', requireInternalToken, adminApiRouter);
+  app.use('/api', requireInternalToken, adminApiRouter, userPoolApiRouter);
   app.use('/internal', requireInternalToken, internalApiRouter);
-  app.use(requireApiKey, requireIdentityHeader, compatibleRouter);
+  app.use(requireApiKey, requireIdentityHeader, routeUserPool, compatibleRouter);
   app.use((req, res) => {
     const claudeCodeOptimized = resolveClaudeCodeOptimized(req);
     if (!claudeCodeOptimized.ok) {
@@ -89,7 +93,8 @@ function redactRawHeaders(rawHeaders: string[]): string[] {
 
 function shouldRedactHeader(name: string): boolean {
   const normalized = name.toLowerCase();
-  return shouldRedact(normalized) || normalized === 'x-api-key' || normalized === 'api-key' || normalized === 'apikey';
+  return shouldRedact(normalized) || normalized === config.identityHeader.toLowerCase()
+    || normalized === 'x-api-key' || normalized === 'api-key' || normalized === 'apikey';
 }
 
 function supportedPathsMessage(claudeCodeOptimized: boolean): string {
@@ -109,8 +114,13 @@ function sendInvalidRequestError(req: Request, res: Response, message: string): 
 export async function startServer(): Promise<Server> {
   let server: Server;
   try {
+    const poolOptions = readPoolConfig(process.env);
+    if (poolOptions.enabled && (config.storageDriver !== 'sqlite' || !config.apiKey || !config.internalApiToken)) {
+      throw new Error('User pool requires single-instance SQLite and authenticated Proxy/internal APIs');
+    }
     await initializeStorage();
     await pruneAllRequestStats();
+    await startUserPool();
     server = await new Promise<Server>((resolve, reject) => {
       const listening = buildApp().listen(config.port, () => {
         console.log(`[proxy] listening on http://localhost:${config.port}`);
@@ -120,6 +130,7 @@ export async function startServer(): Promise<Server> {
     });
   } catch (err) {
     try {
+      await stopUserPool();
       await closeStorage();
     } catch (closeError) {
       throw new AggregateError([err, closeError], 'Proxy startup and storage cleanup both failed.');
@@ -133,7 +144,7 @@ export async function startServer(): Promise<Server> {
     forceCloseTimer.unref();
     server.close((serverError) => {
       clearTimeout(forceCloseTimer);
-      void closeStorage()
+      void stopUserPool().then(() => closeStorage())
         .catch((storageError: unknown) => {
           console.error('[proxy] failed to close storage', storageError);
           process.exitCode = 1;

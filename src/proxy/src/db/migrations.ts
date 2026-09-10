@@ -34,6 +34,8 @@ export function runMigrations(db: Database.Database): void {
   `);
   addColumnIfMissing(db, 'proxy_request_stats', 'cache_input_tokens', 'INTEGER');
   addColumnIfMissing(db, 'proxy_request_stats', 'cache_write_tokens', 'INTEGER');
+  addColumnIfMissing(db, 'proxy_request_stats', 'caller_id', 'TEXT');
+  addColumnIfMissing(db, 'proxy_request_stats', 'lease_id', 'TEXT');
   copyLegacyCacheReadTokens(db);
   db.exec(`
     CREATE TABLE IF NOT EXISTS proxy_identity_initializations (

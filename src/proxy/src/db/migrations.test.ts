@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import { runMigrations } from './migrations.js';
+import { UserPoolStore } from '../userPool/store.js';
+import { readPoolConfig } from '../userPool/config.js';
 
 test('rebuilds legacy accounts without carrying old tokens and is idempotent', () => {
   const db = new Database(':memory:');
@@ -72,6 +74,7 @@ test('rebuilds legacy accounts without carrying old tokens and is idempotent', (
     },
   );
   assert.equal((db.prepare('SELECT COUNT(*) AS count FROM proxy_request_stats').get() as { count: number }).count, 1);
+  assert.deepEqual(db.prepare('SELECT caller_id, lease_id FROM proxy_request_stats').get(), { caller_id: null, lease_id: null });
 
   db.prepare(`
     UPDATE proxy_accounts
@@ -84,4 +87,32 @@ test('rebuilds legacy accounts without carrying old tokens and is idempotent', (
     { copilot_oauth_token: 'new-oauth-token', copilot_oauth_status: 'valid' },
   );
   db.close();
+});
+
+test('existing OAuth accounts preserve credentials and duplicate identity aliases without implicit pool enrollment', () => {
+  const db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
+  try {
+    db.exec(`
+      CREATE TABLE proxy_accounts (
+        identity TEXT PRIMARY KEY, sso_user TEXT NOT NULL, gh_login TEXT,
+        copilot_oauth_token TEXT, copilot_oauth_status TEXT NOT NULL,
+        copilot_oauth_updated_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      INSERT INTO proxy_accounts VALUES
+        ('legacy.user','legacy.user','legacy-user_test','existing-oauth-token','valid','2026-08-01','2026-07-01','2026-08-01'),
+        ('legacy.user@example.test','legacy.user','legacy-user_test','existing-oauth-token','valid','2026-08-02','2026-07-02','2026-08-02');
+    `);
+    const before = db.prepare('SELECT * FROM proxy_accounts ORDER BY identity').all();
+    runMigrations(db);
+    runMigrations(db);
+    const after = db.prepare('SELECT identity,sso_user,gh_login,copilot_oauth_token,copilot_oauth_status,copilot_oauth_updated_at,created_at,updated_at FROM proxy_accounts ORDER BY identity').all();
+    assert.deepEqual(after, before);
+    assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE name='user_pool_accounts'").get(), undefined);
+    const pool = new UserPoolStore(db, readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease',
+      POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test', POOL_WARMUP_MODEL: 'test-model', READY_IDLE_TARGET: '0' }));
+    assert.equal(pool.counts().total, 0);
+    assert.equal(pool.reserve(), undefined);
+    assert.deepEqual(db.prepare('SELECT identity,sso_user,gh_login,copilot_oauth_token,copilot_oauth_status,copilot_oauth_updated_at,created_at,updated_at FROM proxy_accounts ORDER BY identity').all(), before);
+  } finally { db.close(); }
 });

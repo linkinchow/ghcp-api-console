@@ -25,6 +25,10 @@ test('continues deleting an SSO user when the GitHub user has no Copilot seat', 
     if (url.startsWith('https://scim.test/')) {
       return jsonResponse(200, { Resources: [] });
     }
+    if (url === 'https://proxy.test/internal/accounts/by-sso-user/alice/pool-membership' && method === 'GET') {
+      assert.equal(new Headers(init?.headers).get('X-Internal-Token'), 'test-internal-token');
+      return jsonResponse(200, { managed: false });
+    }
     if (url.startsWith('https://proxy.test/')) {
       return jsonResponse(200, {
         ssoUser: 'alice',
@@ -60,7 +64,7 @@ test('continues deleting an SSO user when the GitHub user has no Copilot seat', 
     assert.equal(result.rows[0]?.status, 'success');
     assert.match(result.rows[0]?.warning ?? '', /has no Copilot seat/);
     assert.equal(getUser('alice'), undefined);
-    assert.deepEqual(requests.map(({ method }) => method), ['DELETE', 'GET', 'DELETE']);
+    assert.deepEqual(requests.map(({ method }) => method), ['GET', 'DELETE', 'GET', 'DELETE']);
   } finally {
     globalThis.fetch = originalFetch;
   }

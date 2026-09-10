@@ -19,6 +19,10 @@ export function runMigrations(db: Database.Database): void {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS sso_pool_managed_users (
+      sso_user TEXT PRIMARY KEY REFERENCES sso_users(sso_user) ON DELETE RESTRICT
+    );
+
     CREATE TABLE IF NOT EXISTS sso_runtime_settings (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       max_sso_users INTEGER,

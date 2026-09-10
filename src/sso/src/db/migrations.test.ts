@@ -3,6 +3,35 @@ import test from 'node:test';
 import Database from 'better-sqlite3';
 import { runMigrations } from './migrations.js';
 
+test('existing SSO passwords identities seat metadata and runtime settings survive upgrade', () => {
+  const db = new Database(':memory:');
+  try {
+    runMigrations(db);
+    db.prepare(`INSERT INTO sso_users
+      (sso_user,password_hash,salt,email,role,gh_login,gh_scim_id,emu_status,copilot_seat_status,
+       copilot_seat_last_operation,copilot_seat_last_error,copilot_seat_updated_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run('legacy.user','test-existing-hash','test-existing-salt','legacy@example.test','user',
+        'legacy-user_test','test-scim-id','active','assigned','assign',null,'2026-08-01','2026-07-01','2026-08-01');
+    db.prepare("UPDATE sso_runtime_settings SET user_prefix='existing', email_domain='existing.example.test', bulk_sync_concurrency=2, max_sso_users=50, version=7").run();
+    const user = db.prepare('SELECT * FROM sso_users').get();
+    const settings = db.prepare('SELECT * FROM sso_runtime_settings').get();
+    // Model an upgrade from a database that predates pool ownership metadata.
+    db.exec('DROP TABLE sso_pool_managed_users');
+    runMigrations(db);
+    runMigrations(db);
+    assert.deepEqual(db.prepare('SELECT * FROM sso_pool_managed_users').all(), []);
+    db.pragma('foreign_keys = ON');
+    assert.throws(() => db.prepare('INSERT INTO sso_pool_managed_users VALUES (?)').run('missing'), /FOREIGN KEY/);
+    db.prepare('INSERT INTO sso_pool_managed_users VALUES (?)').run('legacy.user');
+    runMigrations(db);
+    assert.deepEqual(db.prepare('SELECT * FROM sso_pool_managed_users').all(), [{ sso_user: 'legacy.user' }]);
+    assert.throws(() => db.prepare('DELETE FROM sso_users WHERE sso_user = ?').run('legacy.user'), /FOREIGN KEY/);
+    assert.deepEqual(db.prepare('SELECT * FROM sso_users').get(), user);
+    assert.deepEqual(db.prepare('SELECT * FROM sso_runtime_settings').get(), settings);
+  } finally { db.close(); }
+});
+
 test('adds Copilot seat status to existing EMU import plan rows', () => {
   const db = new Database(':memory:');
   try {

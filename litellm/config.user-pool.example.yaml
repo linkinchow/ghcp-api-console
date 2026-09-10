@@ -1,0 +1,30 @@
+# Merge into an EXISTING, authenticated LiteLLM gateway configuration.
+# Not a standalone gateway: configure DB-backed virtual keys and a master key
+# separately. Never distribute the shared GHCP_PROXY_API_KEY to end users.
+# Mount user_pool_hook.py beside this config; see docs/user-pool-litellm.md.
+model_list:
+  - model_name: claude-opus-5
+    litellm_params:
+      # Standard provider/model ID preserves protocol adaptation and built-in pricing.
+      # Verify availability and the price entry in the exact chosen gateway image.
+      model: anthropic/claude-opus-5
+      # Use http://proxy:3000. Anthropic adds /v1/messages itself.
+      api_base: os.environ/GHCP_POOL_API_BASE
+      api_key: os.environ/GHCP_PROXY_API_KEY
+      max_retries: 0
+
+litellm_settings:
+  callbacks:
+    # Keep this last among callbacks that modify outbound headers or URLs.
+    - user_pool_hook.proxy_handler_instance
+  set_verbose: false
+  cache: false
+  turn_off_message_logging: true
+
+# Dedicated minimal example: no automatic retry/fallback on throttling. Do not
+# replace other providers' router settings when merging into a shared gateway.
+router_settings:
+  num_retries: 0
+  fallbacks: []
+  context_window_fallbacks: []
+  content_policy_fallbacks: []

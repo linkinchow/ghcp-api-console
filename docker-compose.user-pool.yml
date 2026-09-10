@@ -1,0 +1,23 @@
+# Explicit opt-in only. Read docs/user-pool-implementation.md before starting.
+# Requires Docker Compose >= 2.24.4 for !override.
+services:
+  sso:
+    environment:
+      SSO_DEFAULT_USER_PASSWORD: ${SSO_DEFAULT_USER_PASSWORD:?set a strong pool SSO password of at least 16 characters}
+  proxy:
+    environment:
+      ACCOUNT_ROUTING_MODE: caller-lease
+      STORAGE_DRIVER: sqlite
+      IDENTITY_HEADER: X-User-Identity
+      IDENTITY_HEADER_REQUIRED: "true"
+      POOL_ACCOUNT_EMAIL_DOMAIN: ${POOL_ACCOUNT_EMAIL_DOMAIN:?set a permitted managed-account email domain}
+      POOL_WARMUP_MODEL: ${POOL_WARMUP_MODEL:?set a model available to the managed accounts}
+      # Do not retain raw upstream/request credentials in error diagnostics.
+      PROXY_ERROR_DIAGNOSTICS_ENABLED: "false"
+      PROXY_ERROR_DIAGNOSTICS_REDACT: "true"
+    # Host access is local only; the trusted gateway can use the Compose network.
+    # Do not attach untrusted containers to this network or publish Proxy publicly.
+    ports: !override
+      - "127.0.0.1:${PROXY_PORT:-3000}:3000"
+    deploy:
+      replicas: 1

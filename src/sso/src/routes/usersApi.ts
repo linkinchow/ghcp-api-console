@@ -1,8 +1,10 @@
 import { Router } from 'express';
 import { apiError, errorFields, loggerFor } from '@ghcp/shared';
-import { getUser, listUsers, SsoUserLimitReachedError, toDto } from '../db/usersRepo.js';
+import { getUser, listUsers, PoolMemberManagedError, SsoUserLimitReachedError, toDto } from '../db/usersRepo.js';
+import { PoolMembershipUnavailableError } from '../clients/proxyClient.js';
 import type { ScimEnterpriseRole } from '../scim/scimClient.js';
-import type { ImportEmuUserStatus, SsoUserBatchOperation } from '@ghcp/shared';
+import type { ImportEmuUserStatus, SsoUserBatchOperation, SsoUserLoginCredentialsResponse } from '@ghcp/shared';
+import { knownDefaultPasswordForUser, PoolPasswordPolicyError } from '../users/passwordPolicy.js';
 import {
   applyEmuImportPlan,
   assignCopilotSeatForSsoUser,
@@ -56,8 +58,12 @@ usersApiRouter.get('/users/capacity', (_req, res) => {
 });
 
 usersApiRouter.post('/users', (req, res) => {
+  if (req.body?.poolManaged !== undefined && typeof req.body.poolManaged !== 'boolean') {
+    res.status(400).json(apiError('invalid_pool_managed', 'poolManaged must be a boolean when provided.'));
+    return;
+  }
   try {
-    res.status(201).json(createSsoUser(req.body as { ssoUser: string; password?: string; email?: string; role?: 'user' | 'admin' }));
+    res.status(201).json(createSsoUser(req.body as Parameters<typeof createSsoUser>[0]));
   } catch (err) {
     sendCreateUserError(res, err, 'create_user_failed');
   }
@@ -73,7 +79,7 @@ usersApiRouter.post('/users/import', (req, res) => {
 });
 
 usersApiRouter.post('/users/batch', async (req, res) => {
-  const body = req.body as { operation?: unknown; ssoUsers?: unknown; enterpriseRole?: unknown; assignCopilotSeat?: unknown };
+  const body = req.body as { operation?: unknown; ssoUsers?: unknown; enterpriseRole?: unknown; assignCopilotSeat?: unknown; createOnly?: unknown };
   if (typeof body.operation !== 'string' || !SSO_USER_BATCH_OPERATIONS.has(body.operation)) {
     res.status(400).json(apiError('invalid_operation', 'operation must be one of sync_emu, suspend_emu, delete_emu, delete_sso, assign_copilot, remove_copilot.'));
     return;
@@ -94,19 +100,26 @@ usersApiRouter.post('/users/batch', async (req, res) => {
     res.status(400).json(apiError('invalid_assign_copilot_seat', 'assignCopilotSeat must be a boolean when provided.'));
     return;
   }
+  if (body.createOnly !== undefined && (typeof body.createOnly !== 'boolean' || body.operation !== 'sync_emu')) {
+    res.status(400).json(apiError('invalid_create_only', 'createOnly must be a boolean and is only supported for sync_emu.'));
+    return;
+  }
   const operation = body.operation as SsoUserBatchOperation;
   const enterpriseRole = body.enterpriseRole as ScimEnterpriseRole | undefined;
   const assignCopilotSeat = body.assignCopilotSeat as boolean | undefined;
+  const createOnly = body.createOnly as boolean | undefined;
   await sendAsync(res, 'batch-users', {
     operation,
     total: body.ssoUsers.length,
     enterpriseRole,
     assignCopilotSeat,
+    createOnly,
   }, () => runSsoUserBatch({
     operation,
     ssoUsers: body.ssoUsers as string[],
     enterpriseRole,
     assignCopilotSeat,
+    createOnly,
   }));
 });
 
@@ -173,13 +186,49 @@ usersApiRouter.get('/users/:ssoUser', (req, res) => {
   res.json(toDto(user));
 });
 
-usersApiRouter.patch('/users/:ssoUser', (req, res) => {
-  const user = patchSsoUser(req.params.ssoUser, req.body as { password?: string; email?: string; role?: 'user' | 'admin' });
+// Mounted behind requireInternalToken in server.ts. This deliberately never ensures,
+// creates or changes a user/password: ownership is checked on the same read snapshot.
+usersApiRouter.post('/users/:ssoUser/login-credentials', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const { expectedCreatedAt, expectedEmail } = (req.body ?? {}) as { expectedCreatedAt?: unknown; expectedEmail?: unknown };
+  if (typeof expectedCreatedAt !== 'string' || !expectedCreatedAt.trim() || !Number.isFinite(Date.parse(expectedCreatedAt))
+    || typeof expectedEmail !== 'string' || !expectedEmail.trim()) {
+    res.status(400).json(apiError('invalid_ownership', 'expectedCreatedAt and expectedEmail are required; expectedCreatedAt must be a timestamp.'));
+    return;
+  }
+  const user = getUser(req.params.ssoUser);
   if (!user) {
     res.status(404).json(apiError('user_not_found', 'SSO user was not found.'));
     return;
   }
-  res.json(user);
+  if (user.ssoUser !== req.params.ssoUser || user.createdAt !== expectedCreatedAt || user.email !== expectedEmail
+    || user.role !== 'user' || user.emuStatus === 'suspended' || user.emuStatus === 'deleted') {
+    res.status(409).json(apiError('user_ownership_mismatch', 'SSO user no longer matches the expected ownership or is not eligible for login.'));
+    return;
+  }
+  const passwordForLogin = knownDefaultPasswordForUser(user);
+  if (passwordForLogin === undefined) {
+    res.status(409).json(apiError('login_credentials_unavailable', 'The existing SSO user password is not available for automatic login.'));
+    return;
+  }
+  res.json({ user: toDto(user), passwordForLogin } satisfies SsoUserLoginCredentialsResponse);
+});
+
+usersApiRouter.patch('/users/:ssoUser', (req, res, next) => {
+  try {
+    const user = patchSsoUser(req.params.ssoUser, req.body as { password?: string; email?: string; role?: 'user' | 'admin' });
+    if (!user) {
+      res.status(404).json(apiError('user_not_found', 'SSO user was not found.'));
+      return;
+    }
+    res.json(user);
+  } catch (err) {
+    if (err instanceof PoolMemberManagedError) {
+      res.status(409).json(apiError(err.code, err.message));
+      return;
+    }
+    next(err);
+  }
 });
 
 usersApiRouter.post('/users/:ssoUser/copilot-seat', async (req, res) => {
@@ -203,6 +252,10 @@ async function sendAsync(res: import('express').Response, operation: string, fie
     res.status(successStatus).json(result);
   } catch (err) {
     logger.error(`${operation}-failed`, 'SSO user operation failed', { ...fields, ...errorFields(err) });
+    if (err instanceof PoolMemberManagedError || err instanceof PoolMembershipUnavailableError) {
+      res.status(err instanceof PoolMemberManagedError ? 409 : 503).json(apiError(err.code, err.message));
+      return;
+    }
     res.status(400).json(apiError('operation_failed', (err as Error).message));
   }
 }
@@ -220,6 +273,10 @@ function numberQuery(value: unknown): number | undefined {
 
 function sendCreateUserError(res: import('express').Response, err: unknown, fallbackCode: string): void {
   logger.error(fallbackCode, 'Create SSO user failed', { ...errorFields(err) });
+  if (err instanceof PoolPasswordPolicyError) {
+    res.status(400).json(apiError(err.code, err.message));
+    return;
+  }
   if (err instanceof SsoUserLimitReachedError) {
     res.status(409).json(apiError('sso_user_limit_reached', err.message, {
       current: err.current,

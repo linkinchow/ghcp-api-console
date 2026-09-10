@@ -43,7 +43,7 @@
     "cookie-session": "^2.1.0",
     "dotenv": "^16.4.7",
     "express": "^5.2.1",
-    "multer": "^2.1.1",
+    "multer": "2.3.0",
     "mysql2": "^3.24.2",
     "playwright": "^1.60.0",
     "playwright-extra": "^4.3.6",

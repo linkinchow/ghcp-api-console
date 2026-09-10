@@ -1,0 +1,24 @@
+import assert from 'node:assert/strict';
+const base = 'http://127.0.0.1:17301';
+const headers = { 'X-Internal-Token': 'local-pool-internal-test-only', 'Content-Type': 'application/json' };
+const identity = 'local-saml-smoke';
+const response = await fetch(`${base}/api/users/${identity}`, { headers });
+if (response.status === 404) {
+  const created = await fetch(`${base}/api/users`, { method: 'POST', headers, body: JSON.stringify({ ssoUser: identity, email: `${identity}@example.test`, role: 'user', password: 'local-saml-test-only' }) });
+  assert.equal(created.status, 201);
+} else assert.equal(response.status, 200);
+const start = await fetch(`${base}/sso?RelayState=local-smoke`, { redirect: 'manual' });
+assert.equal(start.status, 302);
+const cookie = start.headers.getSetCookie().map((item) => item.split(';')[0]).join('; ');
+const login = await fetch(`${base}/login`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: cookie }, body: new URLSearchParams({ username: identity, password: 'local-saml-test-only' }) });
+assert.equal(login.status, 200);
+const html = await login.text();
+const encoded = /name="SAMLResponse" value="([^"]+)"/.exec(html)?.[1];
+assert.ok(encoded, 'SAML form missing');
+const xml = Buffer.from(encoded, 'base64').toString('utf8');
+assert.match(xml, /SignatureValue/);
+assert.match(xml, /local-saml-smoke/);
+assert.match(xml, /http:\/\/mock:8002\/saml\/acs/);
+assert.match(html, /name="RelayState" value="local-smoke"/);
+console.log('PASS production SSO container login generates a signed SAML form with correct subject, local ACS and RelayState');
+console.log('SP signature acceptance and GitHub device OAuth are not exercised.');

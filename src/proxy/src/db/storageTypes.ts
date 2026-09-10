@@ -49,6 +49,8 @@ export interface DeleteAccountsBySsoUserResult {
 
 export interface RecordRequestStatInput {
   identity: string;
+  callerId?: string;
+  leaseId?: string;
   ghLogin?: string;
   path: ProxyRequestStatDto['path'];
   model?: string;

@@ -16,9 +16,12 @@ import {
   type EmuImportPlanRowRecord,
 } from '../db/emuImportPlansRepo.js';
 import { appendUserEvent } from '../db/eventLog.js';
-import { deleteProxyAccountsBySsoUser } from '../clients/proxyClient.js';
+import { deleteProxyAccountsBySsoUser, isProxyPoolManagedSsoUser } from '../clients/proxyClient.js';
 import { getSsoRuntimeSettings } from '../db/runtimeSettingsRepo.js';
 import {
+  assertNotLocallyPoolManaged,
+  isPoolManagedSsoUser,
+  PoolMemberManagedError,
   createUser,
   countUsers,
   deleteUser,
@@ -36,7 +39,7 @@ import {
 import { deleteProvisionedUser, findScimUserByUsername, listScimUsers, suspendUser, syncUser, type ScimEnterpriseRole, type ScimUserResource } from '../scim/scimClient.js';
 import { normalizeHandle } from '../scim/handle.js';
 import { parseBulkImportText } from './bulkImport.js';
-import { knownDefaultPasswordForUser, resolveInitialPassword } from './passwordPolicy.js';
+import { knownDefaultPasswordForUser, resolveInitialPassword, resolvePoolManagedPassword } from './passwordPolicy.js';
 
 const logger = loggerFor('sso', 'users');
 
@@ -93,11 +96,15 @@ export function getSsoUserCapacity(): SsoUserCapacityDto {
   };
 }
 
-export function createSsoUser(input: { ssoUser: string; password?: string; email?: string; role?: 'user' | 'admin' }): SsoUserDto {
+export function createSsoUser(input: { ssoUser: string; password?: string; email?: string; role?: 'user' | 'admin'; poolManaged?: boolean }): SsoUserDto {
   const ssoUser = sanitizeSsoUser(input.ssoUser);
   if (!ssoUser) throw new Error('ssoUser is required');
   if (getUser(ssoUser)) throw new Error(`SSO user "${ssoUser}" already exists.`);
-  const password = resolveInitialPassword(ssoUser, input.password);
+  if (input.poolManaged !== undefined && typeof input.poolManaged !== 'boolean') throw new Error('poolManaged must be a boolean.');
+  if (input.poolManaged && input.role !== undefined && input.role !== 'user') throw new Error('Pool users must have the user role.');
+  const password = input.poolManaged
+    ? resolvePoolManagedPassword(ssoUser, input.password)
+    : resolveInitialPassword(ssoUser, input.password);
   const settings = getSsoRuntimeSettings();
   const { passwordHash, salt } = hashPassword(password);
   const user = createUser({
@@ -106,6 +113,7 @@ export function createSsoUser(input: { ssoUser: string; password?: string; email
     salt,
     email: input.email || `${ssoUser}@${settings.emailDomain}`,
     role: input.role ?? 'user',
+    poolManaged: input.poolManaged,
   });
   appendUserEvent('create', user);
   logger.info('create-user', 'Created SSO user', { ssoUser: user.ssoUser, email: user.email, role: user.role });
@@ -113,6 +121,7 @@ export function createSsoUser(input: { ssoUser: string; password?: string; email
 }
 
 export function patchSsoUser(ssoUser: string, input: { password?: string; email?: string; role?: 'user' | 'admin' }): SsoUserDto | undefined {
+  assertNotLocallyPoolManaged(ssoUser);
   const patch: Parameters<typeof updateUser>[1] = {};
   if (input.email !== undefined) patch.email = input.email;
   if (input.role !== undefined) patch.role = input.role;
@@ -129,6 +138,7 @@ export function patchSsoUser(ssoUser: string, input: { password?: string; email?
 export async function deleteSsoUser(ssoUser: string): Promise<{ deleted: boolean; warning?: string }> {
   const user = getUser(ssoUser);
   if (!user) return { deleted: false };
+  await assertDestructiveOperationAllowed(user);
   logger.info('delete-user-start', 'Deleting SSO user', { ssoUser });
   const seatRemoval = await removeCopilotSeatForUser(user);
   await deleteProvisionedUser(user);
@@ -140,15 +150,18 @@ export async function deleteSsoUser(ssoUser: string): Promise<{ deleted: boolean
   return { deleted, warning: seatRemoval.warning };
 }
 
-export async function syncSsoUser(ssoUser: string, enterpriseRole?: ScimEnterpriseRole, shouldAssignCopilotSeat = false): Promise<SsoUserDto> {
+export async function syncSsoUser(ssoUser: string, enterpriseRole?: ScimEnterpriseRole, shouldAssignCopilotSeat = false, createOnly = false): Promise<SsoUserDto> {
   const user = requireUser(ssoUser);
   const resolvedEnterpriseRole = enterpriseRole ?? enterpriseRoleForSsoUser(user);
+  if (isPoolManagedSsoUser(user.ssoUser) && (!createOnly || resolvedEnterpriseRole !== 'user')) {
+    throw new PoolMemberManagedError();
+  }
   logger.info('sync-emu-start', 'Syncing SSO user to GH login', {
     ssoUser,
     enterpriseRole: resolvedEnterpriseRole,
     assignCopilotSeat: shouldAssignCopilotSeat,
   });
-  const provisioned = await syncUser(user, resolvedEnterpriseRole);
+  const provisioned = await syncUser(user, resolvedEnterpriseRole, createOnly);
   const updated = updateEmu(ssoUser, {
     ghLogin: provisioned.ghLogin,
     ghScimId: provisioned.scimId,
@@ -165,6 +178,7 @@ export async function syncSsoUser(ssoUser: string, enterpriseRole?: ScimEnterpri
 
 export async function suspendSsoUser(ssoUser: string): Promise<SsoUserDto> {
   const user = requireUser(ssoUser);
+  await assertDestructiveOperationAllowed(user);
   if (!user.ghScimId) throw new Error(`SSO user "${ssoUser}" is not synced to a GH login.`);
   logger.info('suspend-emu-start', 'Suspending GH login', { ssoUser, ghScimId: user.ghScimId });
   await suspendUser(user.ghScimId);
@@ -175,6 +189,7 @@ export async function suspendSsoUser(ssoUser: string): Promise<SsoUserDto> {
 
 export async function deleteEmuUser(ssoUser: string): Promise<SsoUserOperationOutcome> {
   const user = requireUser(ssoUser);
+  await assertDestructiveOperationAllowed(user);
   logger.info('delete-emu-start', 'Deleting provisioned GH login', { ssoUser, ghScimId: user.ghScimId });
   const seatRemoval = await removeCopilotSeatForUser(user);
   await deleteProvisionedUser(user);
@@ -192,6 +207,7 @@ export async function assignCopilotSeatForSsoUser(ssoUser: string): Promise<SsoU
 
 export async function removeCopilotSeatForSsoUser(ssoUser: string): Promise<SsoUserOperationOutcome> {
   const user = requireUser(ssoUser);
+  await assertDestructiveOperationAllowed(user);
   const result = await removeCopilotSeatForUser(user);
   if (!result.warning) {
     logger.info('remove-copilot-seat', 'Removed GitHub Copilot seat', { ssoUser, ghLogin: result.user.ghLogin });
@@ -327,6 +343,14 @@ export function importUsers(csvText: string): BatchResult<{ line: number; ssoUse
   };
 }
 
+async function assertDestructiveOperationAllowed(user: SsoUserRecord): Promise<void> {
+  // New pool users are protected even while provisioning, before Proxy membership exists.
+  assertNotLocallyPoolManaged(user.ssoUser);
+  // Legacy pool users have no local marker. All destructive direct operations must
+  // verify membership before touching seats, SCIM, Proxy accounts, or local state.
+  if (await isProxyPoolManagedSsoUser(user.ssoUser)) throw new PoolMemberManagedError();
+}
+
 function requireUser(ssoUser: string): SsoUserRecord {
   const user = getUser(ssoUser);
   if (!user) throw new Error(`SSO user "${ssoUser}" was not found.`);
@@ -336,7 +360,7 @@ function requireUser(ssoUser: string): SsoUserRecord {
 async function runSsoUserBatchRow(ssoUser: string, input: SsoUserBatchRequest): Promise<SsoUserOperationOutcome> {
   switch (input.operation) {
     case 'sync_emu':
-      return { user: await syncSsoUser(ssoUser, input.enterpriseRole, input.assignCopilotSeat === true) };
+      return { user: await syncSsoUser(ssoUser, input.enterpriseRole, input.assignCopilotSeat === true, input.createOnly === true) };
     case 'assign_copilot':
       return { user: await assignCopilotSeatForSsoUser(ssoUser) };
     case 'remove_copilot':

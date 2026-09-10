@@ -1,0 +1,15 @@
+services:
+  bridge:
+    ports: !override
+      - "127.0.0.1:17600:17300"
+      - "127.0.0.1:17601:17301"
+      - "127.0.0.1:17602:17302"
+      - "127.0.0.1:17603:17303"
+      - "127.0.0.1:17604:17304"
+  proxy:
+    environment:
+      POOL_MAX_ACCOUNTS: "2"
+      PREWARM_CONCURRENCY: "5"
+  mock:
+    environment:
+      POOL_MOCK_STAGE_DELAY_MS: "150"

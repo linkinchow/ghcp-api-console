@@ -1,0 +1,16 @@
+services:
+  proxy:
+    image: ghcp-pool-release-proxy:check
+  sso:
+    image: ghcp-pool-release-sso:check
+  login:
+    image: ghcp-pool-release-login:check
+  console:
+    image: ghcp-pool-release-console:check
+  bridge:
+    ports: !override
+      - "127.0.0.1:17800:17300"
+      - "127.0.0.1:17801:17301"
+      - "127.0.0.1:17802:17302"
+      - "127.0.0.1:17803:17303"
+      - "127.0.0.1:17804:17304"

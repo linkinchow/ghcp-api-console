@@ -9,6 +9,9 @@
 
 > 管理员的配置手册: ([guidance/guidance.md](./guidance/guidance.md))
 > 网络配置的说明: ([guidance/network-deployment.md](./guidance/network-deployment.md))
+> 可选独占用户账号池（默认关闭）: [设计](./docs/user-pool-design.md) · [实现与配置](./docs/user-pool-implementation.md) · **[现有Docker客户升级手册](./docs/user-pool-upgrade-guide.md)** · [LiteLLM Hash Hook](./docs/user-pool-litellm.md) · [页面操作说明](./docs/user-pool-console-guide.md) · [发布检查](./docs/user-pool-release-checklist.md)
+>
+> **存量升级注意**：新版本默认仍为 `direct`。旧SSO/Proxy账号和席位不会自动加入User Pool；启用pool后入口要求 `sha256:<key hash>`，旧用户名/邮箱header不兼容。保留数据和切换路由必须分阶段验证，不能将账号池cap当作企业总席位上限。
 
 ## 背景
 
@@ -30,7 +33,7 @@
 - 支持验证后批量导入 OpenCode Copilot OAuth token，也支持后台控制台查看账号、请求统计、上游错误诊断、登录任务、AI Credits 和 Copilot seat 状态。
 - 在 Proxy 层包含 Claude Code / Anthropic Messages 相关兼容优化。
 
-整体调用链：
+整体调用链（默认direct模式；caller-lease模式改由预热成员和排他租约路由）：
 
 ```text
 Client
@@ -124,7 +127,7 @@ cp .env.example .env
 | `ENTERPRISE_SLUG` / `ENTERPRISE_SHORTCODE` | GitHub Enterprise 标识和 EMU login 后缀。 |
 | `SCIM_BASE_URL` / `SCIM_TOKEN` | GitHub Enterprise SCIM API 地址和 token。 |
 | `GITHUB_COPILOT_SEAT_PAT` | 管理 Copilot seat / AI Credits 的 GitHub PAT。 |
-| `SSO_DEFAULT_USER_PASSWORD` | 新建 SSO 用户的默认密码；为空时使用用户名。该值不会进入运行时设置数据库。 |
+| `SSO_DEFAULT_USER_PASSWORD` | 新建SSO用户默认密码。direct旧行为为空时使用用户名；**poolManaged新成员强制要求至少16字符且不等于用户名，禁止空值回退**。不改变已有用户密码哈希。 |
 
 根目录 `.env` 也包含 proxy 的公共 API 和 OpenCode 认证/header 配置。Docker Compose 默认使用 `CLAUDE_CODE_OPTIMIZED=true` 启动 proxy，作为 Claude Code / Anthropic Messages 兼容优化和 `/v1/messages/count_tokens` 的默认模式；单个请求可用 `X-Claude-Code-Optimized: true|false` 覆盖，无需重启服务。
 
@@ -155,7 +158,7 @@ cp .env.example .env
 
 各服务完整环境变量表见 [`src/proxy/README.md`](./src/proxy/README.md)、[`src/sso/README.md`](./src/sso/README.md)、[`src/login/README.md`](./src/login/README.md) 和 [`src/console/README.md`](./src/console/README.md)。升级后请在 Console **Settings** 页面确认 SSO/Login 的持久化设置值。
 
-> **升级提示**：首次用新版本打开旧 `proxy.sqlite` 时会保留 identity、SSO/GH login 映射和请求统计，但会不可逆清除旧 VS Code/GitHub token 与短期 Copilot token。升级前先备份数据库，升级后在 Console 逐账号重新授权，或导入通过 OpenCode OAuth client 获取的新 token。
+> **升级提示**：如果旧 `proxy.sqlite` 仍为 `gh_token` / 短期 `copilot_token`结构，首次启动会保留identity/SSO/GH关联，但清除旧凭据并要求重新授权；若已具备当前OAuth三列，则保留已有OAuth token而不重建账号表。迁移后启动还会按 `REQUEST_STATS_PER_ACCOUNT_LIMIT` 裁剪统计（默认2），因此必须先备份、核对schema和保留量，并在副本演练。详见[存量升级手册](./docs/user-pool-upgrade-guide.md)。
 
 已有 Proxy SQLite 数据迁移到 MySQL 时，使用 [`upgrade/sqlite-to-mysql`](./upgrade/sqlite-to-mysql/README.md) 的显式迁移工具；Proxy 启动不会自动跨数据库搬迁数据。
 

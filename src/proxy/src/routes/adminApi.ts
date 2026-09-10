@@ -13,6 +13,7 @@ import { ErrorDiagnosticsDisabledError } from '../diagnostics/errorDiagnosticsSt
 import { copilotAuthManager } from '../copilot/copilotAuthManager.js';
 import { clearModelsCache } from '../copilot/copilotClient.js';
 import { Logger } from '../logger.js';
+import { getUserPool } from '../userPool/runtime.js';
 
 export const adminApiRouter = Router();
 const logger = new Logger('admin-api');
@@ -80,6 +81,10 @@ adminApiRouter.delete('/accounts/:identity', async (req, res) => {
 });
 
 adminApiRouter.post('/accounts/copilot-oauth-token/import', async (req, res) => {
+  if (await getUserPool()) {
+    res.status(409).json(apiError('pool_member_managed', 'OAuth token imports are disabled in caller-lease mode. Use pool-managed authorization.'));
+    return;
+  }
   const body = req.body as ImportCopilotOauthTokensRequest;
   if (typeof body.csvText !== 'string' || !body.csvText.trim()) {
     res.status(400).json(apiError('invalid_import', 'csvText is required.'));
@@ -106,6 +111,10 @@ adminApiRouter.get('/request-stats', async (req, res) => {
 
 adminApiRouter.post('/accounts/:identity/copilot-oauth/reauthorize', async (req, res) => {
   try {
+    if ((await getUserPool())?.inventory(req.params.identity)) {
+      res.status(409).json(apiError('pool_member_managed', 'Use User pool recovery controls for this account; an independent Login task cannot be started.'));
+      return;
+    }
     const body = req.body as { ssoPassword?: unknown; ssoType?: unknown };
     logger.info('reauthorize-copilot-start', 'Manual Copilot OAuth reauthorization requested', { identity: req.params.identity, ssoType: body.ssoType });
     await copilotAuthManager.triggerOauthRefresh(req.params.identity, {

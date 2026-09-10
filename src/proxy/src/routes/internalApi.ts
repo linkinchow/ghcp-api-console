@@ -3,6 +3,7 @@ import { apiError } from '@ghcp/shared';
 import { clearModelsCache } from '../copilot/copilotClient.js';
 import { deleteAccountsBySsoUser, failCopilotOauthAuthorization, getAccount, saveCopilotOauthToken, toAccountDto } from '../db/accountsRepo.js';
 import { Logger } from '../logger.js';
+import { getUserPool } from '../userPool/runtime.js';
 
 export const internalApiRouter = Router();
 const logger = new Logger('internal-api');
@@ -38,6 +39,21 @@ internalApiRouter.put('/accounts/:identity/copilot-oauth-token', async (req, res
     copilotOauthStatus: account.copilotOauthStatus,
   });
   res.json(toAccountDto(account));
+});
+
+internalApiRouter.get('/accounts/:identity/login-task-protection', async (req, res) => {
+  const member = (await getUserPool())?.inventory(req.params.identity);
+  const taskId = typeof req.query.taskId === 'string' ? req.query.taskId : undefined;
+  const attempt = typeof req.query.oauthAttemptId === 'string' ? req.query.oauthAttemptId : undefined;
+  const referenced = Boolean(member && !['warmup', 'ready'].includes(member.stage)
+    && ((taskId && member.task_id === taskId) || (attempt && member.oauth_attempt_id === attempt)));
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ managed: Boolean(member), referenced });
+});
+
+internalApiRouter.get('/accounts/by-sso-user/:ssoUser/pool-membership', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ managed: (await getUserPool())?.managesSsoUser(req.params.ssoUser) ?? false });
 });
 
 internalApiRouter.delete('/accounts/by-sso-user/:ssoUser', async (req, res) => {

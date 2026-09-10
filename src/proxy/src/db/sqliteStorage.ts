@@ -12,6 +12,8 @@ import {
   type ProxyRequestStatDto,
 } from '@ghcp/shared';
 import { runMigrations } from './migrations.js';
+import { UserPoolStore } from '../userPool/store.js';
+import type { PoolConfig } from '../userPool/config.js';
 import type {
   AccountListQuery,
   CreateAccountInput,
@@ -37,6 +39,8 @@ interface AccountRow {
 interface StatRow {
   id: string;
   identity: string;
+  caller_id?: string;
+  lease_id?: string;
   gh_login?: string;
   requested_at: string;
   path: ProxyRequestStatDto['path'];
@@ -52,6 +56,11 @@ interface StatRow {
 
 export class SqliteStorage implements ProxyStorage {
   private db?: Database.Database;
+  private poolStore?: UserPoolStore;
+
+  userPool(options: PoolConfig): UserPoolStore {
+    return this.poolStore ??= new UserPoolStore(this.database(), options);
+  }
 
   constructor(
     private readonly path: string,
@@ -64,6 +73,7 @@ export class SqliteStorage implements ProxyStorage {
     const db = new BetterSqlite3(this.path);
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
+    db.pragma('busy_timeout = 5000');
     runMigrations(db);
     this.db = db;
   }
@@ -75,6 +85,7 @@ export class SqliteStorage implements ProxyStorage {
   async close(): Promise<void> {
     this.db?.close();
     this.db = undefined;
+    this.poolStore = undefined;
   }
 
   async listAccounts(query: AccountListQuery = {}): Promise<PageResponse<ProxyAccountRecord>> {
@@ -279,8 +290,8 @@ export class SqliteStorage implements ProxyStorage {
       .prepare(`
         INSERT INTO proxy_request_stats (
           id, identity, gh_login, requested_at, path, model, success, failure_reason,
-          input_tokens, output_tokens, cache_tokens, cache_input_tokens, cache_write_tokens
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          input_tokens, output_tokens, cache_tokens, cache_input_tokens, cache_write_tokens, caller_id, lease_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         newRequestId(),
@@ -296,6 +307,8 @@ export class SqliteStorage implements ProxyStorage {
         input.cacheTokens,
         input.cacheInputTokens,
         input.cacheWriteTokens,
+        input.callerId,
+        input.leaseId,
       );
     this.pruneStats(input.identity);
   }
@@ -372,6 +385,8 @@ function mapStatRow(row: StatRow): ProxyRequestStatDto {
   return {
     id: row.id,
     identity: row.identity,
+    callerId: row.caller_id ?? undefined,
+    leaseId: row.lease_id ?? undefined,
     ghLogin: row.gh_login,
     requestedAt: row.requested_at,
     path: row.path,

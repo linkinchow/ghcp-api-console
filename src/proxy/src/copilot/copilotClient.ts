@@ -54,6 +54,7 @@ export interface ForwardCopilotRequestOptions {
 export interface ListModelsOptions {
   useCache?: boolean;
   diagnostics?: ErrorDiagnosticContext;
+  signal?: AbortSignal;
 }
 
 export interface PreparedCopilotRequest extends PreparedUpstreamRequest {
@@ -64,6 +65,7 @@ export class CopilotApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly retryAfter?: string,
   ) {
     super(message);
     this.name = 'CopilotApiError';
@@ -91,21 +93,30 @@ export async function listModels(copilot: CopilotAuthContext, options: ListModel
     forceRefresh: !useCache,
     allowStaleOnError: useCache,
     diagnostics: options.diagnostics,
+    signal: options.signal,
   });
   return snapshot.models;
 }
 
-async function fetchModels(copilot: CopilotAuthContext, diagnostics?: ErrorDiagnosticContext): Promise<ModelInfo[]> {
+async function fetchModels(copilot: CopilotAuthContext, diagnostics?: ErrorDiagnosticContext, signal?: AbortSignal): Promise<ModelInfo[]> {
   const request: PreparedCopilotRequest = Object.freeze({
     url: copilotUrl(copilot, '/models'),
     method: 'GET',
     headers: Object.freeze(modelHeaders(copilot)),
   });
-  const res = await executeWithDiagnostics(request, diagnostics);
-  const body = await readWithDiagnostics(request, res, diagnostics);
+  const res = await executeWithDiagnostics(request, diagnostics, signal);
+  let body: { buffer: Buffer; capture: CapturedResponseBody };
+  try {
+    body = await readWithDiagnostics(request, res, diagnostics);
+  } catch (error) {
+    if ([401, 403, 429].includes(res.status)) {
+      throw new CopilotApiError(`List models failed with HTTP ${res.status}.`, res.status, res.headers.get('retry-after') ?? undefined);
+    }
+    throw error;
+  }
   if (!res.ok) {
     if (diagnostics) await recordHttpFailure(diagnostics, request, res, body.capture);
-    throw new CopilotApiError(`List models failed with HTTP ${res.status}.`, res.status);
+    throw new CopilotApiError(`List models failed with HTTP ${res.status}.`, res.status, res.headers.get('retry-after') ?? undefined);
   }
   const data = JSON.parse(body.buffer.toString('utf8')) as { data?: ModelInfo[] };
   if (!Array.isArray(data.data)) throw new CopilotApiError('List models returned an invalid response.', 502);
@@ -143,11 +154,12 @@ export function prepareCopilotRequest(
   });
 }
 
-export function executePreparedCopilotRequest(request: PreparedCopilotRequest): Promise<Response> {
+export function executePreparedCopilotRequest(request: PreparedCopilotRequest, signal?: AbortSignal): Promise<Response> {
   return fetch(request.url, {
     method: request.method,
     headers: request.headers,
     body: request.body,
+    signal,
   });
 }
 
@@ -160,15 +172,16 @@ export async function resolveCopilotModel(
   path: CopilotApiPath,
   requestedId: string,
   diagnostics?: ErrorDiagnosticContext,
+  signal?: AbortSignal,
 ): Promise<ResolvedCopilotModel> {
   const capabilityPath = modelCapabilityPath(path);
-  let snapshot = await getModelsSnapshot(copilot, { diagnostics });
+  let snapshot = await getModelsSnapshot(copilot, { diagnostics, signal });
   let resolution = resolveModelId(snapshot.modelIndex, requestedId);
   let supportedPaths = resolution ? snapshot.pathMap.get(resolution.upstreamId) : undefined;
   if (resolution && supportedPaths?.includes(capabilityPath)) return { ...resolution, supportedPaths };
 
   if (Date.now() - snapshot.fetchedAt > MODELS_CACHE_NEGATIVE_RECHECK_MS) {
-    snapshot = await getModelsSnapshot(copilot, { forceRefresh: true, allowStaleOnError: false, diagnostics });
+    snapshot = await getModelsSnapshot(copilot, { forceRefresh: true, allowStaleOnError: false, diagnostics, signal });
     resolution = resolveModelId(snapshot.modelIndex, requestedId);
     supportedPaths = resolution ? snapshot.pathMap.get(resolution.upstreamId) : undefined;
     if (resolution && supportedPaths?.includes(capabilityPath)) return { ...resolution, supportedPaths };
@@ -183,8 +196,9 @@ export function modelSupportsPath(model: ModelInfo, path: CopilotApiPath): boole
 
 async function getModelsSnapshot(
   copilot: CopilotAuthContext,
-  options: { forceRefresh?: boolean; allowStaleOnError?: boolean; diagnostics?: ErrorDiagnosticContext } = {},
+  options: { forceRefresh?: boolean; allowStaleOnError?: boolean; diagnostics?: ErrorDiagnosticContext; signal?: AbortSignal } = {},
 ): Promise<ModelsSnapshot> {
+  options.signal?.throwIfAborted();
   const cacheKey = modelsCacheKey(copilot);
   const entry = modelsCacheEntry(cacheKey);
   const now = Date.now();
@@ -192,10 +206,11 @@ async function getModelsSnapshot(
   if (!options.forceRefresh && snapshot && snapshot.expiresAt > now) return snapshot;
 
   try {
-    return await refreshModelsSnapshot(cacheKey, copilot, entry, options.diagnostics);
+    return await refreshModelsSnapshot(cacheKey, copilot, entry, options.diagnostics, options.signal);
   } catch (err) {
+    options.signal?.throwIfAborted();
     if (err instanceof ModelIdCollisionError) throw err;
-    if (err instanceof CopilotApiError && (err.status === 401 || err.status === 403)) throw err;
+    if (err instanceof CopilotApiError && [401, 403, 429].includes(err.status)) throw err;
     if (options.allowStaleOnError !== false && snapshot && now - snapshot.fetchedAt <= MODELS_CACHE_STALE_MAX_AGE_MS) {
       modelsCacheLogger.warn('refresh-failed-stale', 'Using stale Copilot models cache after refresh failed', {
         cacheKey,
@@ -221,10 +236,12 @@ function refreshModelsSnapshot(
   copilot: CopilotAuthContext,
   entry: ModelsCacheEntry,
   diagnostics?: ErrorDiagnosticContext,
+  signal?: AbortSignal,
 ): Promise<ModelsSnapshot> {
-  if (entry.refreshPromise) return entry.refreshPromise;
+  // Request-scoped cancellation must not abort another caller's catalog refresh.
+  if (!signal && entry.refreshPromise) return entry.refreshPromise;
 
-  const promise = fetchModels(copilot, diagnostics)
+  const promise = fetchModels(copilot, diagnostics, signal)
     .then((models) => {
       const now = Date.now();
       const snapshot: ModelsSnapshot = {
@@ -246,7 +263,7 @@ function refreshModelsSnapshot(
       if (entry.refreshPromise === promise) entry.refreshPromise = undefined;
     });
 
-  entry.refreshPromise = promise;
+  if (!signal) entry.refreshPromise = promise;
   return promise;
 }
 
@@ -277,9 +294,10 @@ function errorMessage(err: unknown): string {
 async function executeWithDiagnostics(
   request: PreparedCopilotRequest,
   diagnostics: ErrorDiagnosticContext | undefined,
+  signal?: AbortSignal,
 ): Promise<Response> {
   try {
-    return await executePreparedCopilotRequest(request);
+    return await executePreparedCopilotRequest(request, signal);
   } catch (err) {
     if (diagnostics) await recordFetchFailure(diagnostics, request, err);
     throw err;

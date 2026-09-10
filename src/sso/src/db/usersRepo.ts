@@ -43,6 +43,24 @@ export class SsoUserLimitReachedError extends Error {
   }
 }
 
+export class PoolMemberManagedError extends Error {
+  readonly code = 'pool_member_managed';
+
+  constructor() {
+    super('pool_member_managed: Manage this user through the user pool.');
+    this.name = 'PoolMemberManagedError';
+  }
+}
+
+// Kept separate from user records/DTOs: this is local ownership metadata only.
+export function isPoolManagedSsoUser(ssoUser: string): boolean {
+  return Boolean(getDb().prepare('SELECT 1 FROM sso_pool_managed_users WHERE lower(sso_user) = lower(?)').get(ssoUser));
+}
+
+export function assertNotLocallyPoolManaged(ssoUser: string): void {
+  if (isPoolManagedSsoUser(ssoUser)) throw new PoolMemberManagedError();
+}
+
 export function listUsers(query: UserListQuery = {}): PageResponse<SsoUserDto> {
   const page = Math.max(1, Math.trunc(query.page ?? 1));
   const pageSize = Math.max(1, Math.min(Math.trunc(query.pageSize ?? 25), 100));
@@ -84,6 +102,7 @@ export function createUser(input: {
   salt: string;
   email: string;
   role?: 'user' | 'admin';
+  poolManaged?: boolean;
 }): SsoUserRecord {
   const db = getDb();
   return db.transaction(() => {
@@ -98,6 +117,9 @@ export function createUser(input: {
         VALUES (?, ?, ?, ?, ?, 'not_synced', ?, ?)
       `)
       .run(input.ssoUser, input.passwordHash, input.salt, input.email, input.role ?? 'user', now, now);
+    if (input.poolManaged === true) {
+      db.prepare('INSERT INTO sso_pool_managed_users (sso_user) VALUES (?)').run(input.ssoUser);
+    }
     const created = getUser(input.ssoUser);
     if (!created) throw new Error(`Failed to read newly created SSO user "${input.ssoUser}".`);
     return created;
@@ -107,6 +129,7 @@ export function createUser(input: {
 export function updateUser(ssoUser: string, patch: Partial<Pick<SsoUserRecord, 'email' | 'role' | 'passwordHash' | 'salt'>>): SsoUserRecord | undefined {
   const current = getUser(ssoUser);
   if (!current) return undefined;
+  assertNotLocallyPoolManaged(current.ssoUser);
   getDb()
     .prepare(`
       UPDATE sso_users
@@ -175,6 +198,7 @@ export function updateCopilotSeatFromGitHub(ssoUser: string, status: 'assigned' 
 }
 
 export function deleteUser(ssoUser: string): boolean {
+  assertNotLocallyPoolManaged(ssoUser);
   const result = getDb().prepare('DELETE FROM sso_users WHERE lower(sso_user) = lower(?)').run(ssoUser);
   return result.changes > 0;
 }

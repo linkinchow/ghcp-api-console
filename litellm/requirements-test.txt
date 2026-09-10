@@ -1,0 +1,2 @@
+# API contract test baseline, not an instruction to upgrade an existing gateway.
+litellm[proxy]==1.99.1

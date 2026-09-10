@@ -27,12 +27,13 @@ import { Input } from './components/ui/input.js';
 import { Textarea } from './components/ui/textarea.js';
 import { Tooltip } from './components/ui/tooltip.js';
 import { formatDate, formatNumber, statusTone, tokenTotal } from './lib/format.js';
+import { UserPoolPage } from './pages/UserPoolPage.js';
 
 interface SetupState {
   initialized: boolean;
 }
 
-type Page = 'dashboard' | 'users' | 'budgets' | 'stats' | 'accounts' | 'tasks' | 'settings' | 'error-diagnostics' | 'diagnostics';
+type Page = 'dashboard' | 'users' | 'budgets' | 'stats' | 'accounts' | 'user-pool' | 'tasks' | 'settings' | 'error-diagnostics' | 'diagnostics';
 type Notify = (message: string, tone?: 'success' | 'warning' | 'error') => void;
 const EMU_IMPORT_ROW_PAGE_SIZE = 100;
 const EMU_IMPORT_ROW_STATUSES: (ImportEmuUserStatus | '')[] = ['', 'pending_create', 'pending_update', 'created', 'updated', 'skipped', 'conflict', 'failed'];
@@ -44,6 +45,7 @@ const pages: { id: Page; label: string; description: string }[] = [
   { id: 'budgets', label: 'AI Credits Usage', description: 'Review enterprise AI Credits consumption and Copilot seat cost.' },
   { id: 'stats', label: 'Request Stats', description: 'Review request failures and input/output/cache token usage.' },
   { id: 'accounts', label: 'Proxy Accounts', description: 'Inspect identity mappings and refresh GitHub or Copilot tokens.' },
+  { id: 'user-pool', label: 'User pool', description: 'Manage idle capacity, exclusive caller leases, and account recovery.' },
   { id: 'tasks', label: 'Login Tasks', description: 'Monitor automatic login and GitHub-token refresh tasks.' },
   { id: 'settings', label: 'Settings', description: 'Change the Console password and update runtime service settings.' },
   { id: 'error-diagnostics', label: 'Error Diagnostics', description: 'Inspect complete Copilot upstream failure snapshots.' },
@@ -175,6 +177,7 @@ function AdminApp(props: { onLogout: () => void }) {
           {page === 'budgets' ? <AiCreditsUsagePage notify={notify} /> : null}
           {page === 'stats' ? <RequestStatsPage /> : null}
           {page === 'accounts' ? <ProxyAccountsPage notify={notify} /> : null}
+          {page === 'user-pool' ? <UserPoolPage notify={notify} /> : null}
           {page === 'tasks' ? <LoginTasksPage notify={notify} /> : null}
           {page === 'settings' ? <SettingsPage notify={notify} /> : null}
           {page === 'error-diagnostics' ? <ErrorDiagnosticsPage notify={notify} /> : null}

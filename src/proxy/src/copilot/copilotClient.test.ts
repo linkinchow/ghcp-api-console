@@ -144,6 +144,18 @@ test('does not use a stale snapshot when the refreshed catalog has canonical col
   }
 });
 
+test('model refresh 429 is not hidden by stale-cache fallback', async () => {
+  const originalFetch = globalThis.fetch, originalNow = Date.now;
+  const copilot = { identity: 'rate-limited-cache-test', accessToken: 'test-token', api: 'https://api.githubcopilot.com' };
+  try {
+    globalThis.fetch = async () => jsonResponse({ data: [{ id: 'claude-test' }] });
+    await listModels(copilot);
+    Date.now = () => originalNow() + 61 * 60 * 1000;
+    globalThis.fetch = async () => new Response('limited', { status: 429, headers: { 'Retry-After': '45' } });
+    await assert.rejects(listModels(copilot), (error: any) => error.status === 429 && error.retryAfter === '45');
+  } finally { globalThis.fetch = originalFetch; Date.now = originalNow; }
+});
+
 function jsonResponse(value: unknown): Response {
   return new Response(JSON.stringify(value), {
     status: 200,

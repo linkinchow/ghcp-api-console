@@ -1,4 +1,5 @@
 import { TextDecoder } from 'node:util';
+import { once } from 'node:events';
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import { apiError } from '@ghcp/shared';
 import { recordRequestStat as persistRequestStat } from '../db/requestStatsRepo.js';
@@ -36,6 +37,12 @@ import {
 import { resolveClaudeCodeOptimized } from './claudeCodeMode.js';
 import { resolveRequestIntent } from './requestIntent.js';
 import { toCanonicalRequestedModelId, withCanonicalModelIds } from '../copilot/modelIds.js';
+import { poolRequest, statIdentity, withPoolOperation, type PoolRequest } from '../userPool/runtime.js';
+import { UserPoolError } from '../userPool/config.js';
+import { isSuccessfulJson, StreamCompletion } from '../userPool/responseCompletion.js';
+import { getAccount } from '../db/accountsRepo.js';
+import { config } from '../config.js';
+import type { CopilotAuthContext } from '../copilot/copilotAuth.js';
 
 export const compatibleRouter = Router();
 const requestStatsLogger = new Logger('request-stats');
@@ -48,22 +55,26 @@ interface UsageStats {
   cacheWriteTokens?: number;
 }
 
-compatibleRouter.get('/v1/models', async (req, res) => {
+compatibleRouter.get('/v1/models', async (req, res) => withPoolOperation(res, () => handleModels(req, res)));
+
+async function handleModels(req: Request, res: Response): Promise<void> {
   const identity = requireIdentity(req, res);
   if (!identity) return;
   const claudeCodeOptimized = requireClaudeCodeOptimized(req, res);
   if (claudeCodeOptimized === undefined) return;
   let accessToken: string | undefined;
   try {
-    const copilot = await copilotAuthManager.getAuth(identity);
+    const context = poolRequest(res);
+    const copilot = await requestAuth(identity, context);
     accessToken = copilot.accessToken;
     const useCache = req.get('x-cache')?.trim().toLowerCase() !== 'false';
     const diagnostics = createErrorDiagnosticContext(req, identity, '/v1/models');
-    const models = await listModels(copilot, { useCache, diagnostics });
+    const models = await listModels(copilot, { useCache, diagnostics, signal: context?.controller.signal });
+    context?.controller.signal.throwIfAborted();
     const visibleModels = withCanonicalModelIds(
       claudeCodeOptimized ? models.filter((m) => modelSupportsPath(m, '/v1/messages')) : models,
     );
-    await recordRequestStat({ identity, path: '/v1/models', success: true });
+    await recordRequestStat({ ...statIdentity(res, identity), path: '/v1/models', success: true });
     if (claudeCodeOptimized) {
       const data = visibleModels.map(toClaudeCodeModel);
       res.json({
@@ -76,18 +87,19 @@ compatibleRouter.get('/v1/models', async (req, res) => {
     }
     res.json({ object: 'list', data: visibleModels.map((m) => ({ object: 'model', owned_by: 'github-copilot', ...m })) });
   } catch (err) {
-    await invalidateUnauthorizedAuth(identity, accessToken, err);
-    await recordRequestStat({ identity, path: '/v1/models', success: false, failureReason: errorMessage(err) });
-    sendCompatibleError(req, res, err);
+    await handlePoolFailure(poolRequest(res), accessToken, err);
+    if (!poolRequest(res)) await invalidateUnauthorizedAuth(identity, accessToken, err);
+    await recordRequestStat({ ...statIdentity(res, identity), path: '/v1/models', success: false, failureReason: errorMessage(err) });
+    if (!res.headersSent && !res.destroyed) sendCompatibleError(req, res, err);
   }
-});
+}
 
 compatibleRouter.post('/chat/completions', async (req, res) => {
-  await handleForward(req, res, '/chat/completions');
+  await withPoolOperation(res, () => handleForward(req, res, '/chat/completions'));
 });
 
 compatibleRouter.post('/responses', async (req, res) => {
-  await handleForward(req, res, '/responses');
+  await withPoolOperation(res, () => handleForward(req, res, '/responses'));
 });
 
 compatibleRouter.post('/v1/messages/count_tokens', async (req, res) => {
@@ -97,11 +109,11 @@ compatibleRouter.post('/v1/messages/count_tokens', async (req, res) => {
     sendUnsupportedCompatiblePath(req, res, claudeCodeOptimized);
     return;
   }
-  await handleCountTokens(req, res, claudeCodeOptimized);
+  await withPoolOperation(res, () => handleCountTokens(req, res, claudeCodeOptimized));
 });
 
 compatibleRouter.post('/v1/messages', async (req, res) => {
-  await handleForward(req, res, '/v1/messages');
+  await withPoolOperation(res, () => handleForward(req, res, '/v1/messages'));
 });
 
 compatibleRouter.use('/v1/files', handleFilesApiUnsupported);
@@ -137,23 +149,23 @@ async function handleForward(req: Request, res: Response, path: CopilotApiPath):
     if (!requestedModel) throw new CopilotModelPathError('Request body must include a string "model".');
     const prepared = prepareForward(req, path, body, claudeCodeOptimized);
     if (prepared.preflightError) {
-      await recordRequestStat({ identity, path, model: canonicalRequestedModel, success: false, failureReason: prepared.preflightError.message });
+      await recordRequestStat({ ...statIdentity(res, identity), path, model: canonicalRequestedModel, success: false, failureReason: prepared.preflightError.message });
       sendAnthropicError(res, prepared.preflightError.status, prepared.preflightError.type, prepared.preflightError.message);
       return;
     }
     const preparedModel = typeof prepared.body.model === 'string' ? prepared.body.model : requestedModel;
     const diagnostics = createErrorDiagnosticContext(req, identity, path, canonicalRequestedModel);
-    const upstream = await forwardAuthenticated(identity, path, prepared.body, preparedModel, diagnostics, prepared.forwardOptions);
-    await pipeAndRecord(upstream.response, upstream.request, res, { identity, path, model: upstream.canonicalModel }, diagnostics, {
+    const upstream = await forwardAuthenticated(identity, path, prepared.body, preparedModel, diagnostics, prepared.forwardOptions, poolRequest(res));
+    await pipeAndRecord(upstream.response, upstream.request, res, { ...statIdentity(res, identity), path, model: upstream.canonicalModel }, diagnostics, {
       ...prepared.pipeOptions,
       canonicalModel: upstream.canonicalModel,
     });
   } catch (err) {
     if (!(err instanceof HandledUpstreamStreamError)) {
-      await recordRequestStat({ identity, path, model: canonicalRequestedModel, success: false, failureReason: errorMessage(err) });
+      await recordRequestStat({ ...statIdentity(res, identity), path, model: canonicalRequestedModel, success: false, failureReason: errorMessage(err) });
     }
     const responseError = err instanceof HandledUpstreamStreamError ? err.cause : err;
-    if (!res.headersSent) sendCompatibleError(req, res, responseError);
+    if (!res.headersSent && !res.destroyed) sendCompatibleError(req, res, responseError);
     else if (!res.writableEnded) res.end();
   }
 }
@@ -173,30 +185,30 @@ async function handleCountTokens(req: Request, res: Response, claudeCodeOptimize
     if (!requestedModel) throw new CopilotModelPathError('Request body must include a string "model".');
     const prepared = prepareForward(req, path, body, claudeCodeOptimized);
     if (prepared.preflightError) {
-      await recordRequestStat({ identity, path, model: canonicalRequestedModel, success: false, failureReason: prepared.preflightError.message });
+      await recordRequestStat({ ...statIdentity(res, identity), path, model: canonicalRequestedModel, success: false, failureReason: prepared.preflightError.message });
       sendAnthropicError(res, prepared.preflightError.status, prepared.preflightError.type, prepared.preflightError.message);
       return;
     }
     const preparedModel = typeof prepared.body.model === 'string' ? prepared.body.model : requestedModel;
     const diagnostics = createErrorDiagnosticContext(req, identity, path, canonicalRequestedModel);
-    const upstream = await forwardAuthenticated(identity, path, prepared.body, preparedModel, diagnostics, prepared.forwardOptions);
+    const upstream = await forwardAuthenticated(identity, path, prepared.body, preparedModel, diagnostics, prepared.forwardOptions, poolRequest(res));
     if (isTokenCountFallbackStatus(upstream.response.status)) {
       await recordTokenCountFallbackFailure(upstream.response, upstream.request, diagnostics);
       const inputTokens = estimateInputTokens(upstream.body);
-      await recordRequestStat({ identity, path, model: upstream.canonicalModel, success: true, inputTokens });
+      await recordRequestStat({ ...statIdentity(res, identity), path, model: upstream.canonicalModel, success: true, inputTokens });
       res.json({ input_tokens: inputTokens });
       return;
     }
-    await pipeAndRecord(upstream.response, upstream.request, res, { identity, path, model: upstream.canonicalModel }, diagnostics, {
+    await pipeAndRecord(upstream.response, upstream.request, res, { ...statIdentity(res, identity), path, model: upstream.canonicalModel }, diagnostics, {
       ...prepared.pipeOptions,
       canonicalModel: upstream.canonicalModel,
     });
   } catch (err) {
     if (!(err instanceof HandledUpstreamStreamError)) {
-      await recordRequestStat({ identity, path, model: canonicalRequestedModel, success: false, failureReason: errorMessage(err) });
+      await recordRequestStat({ ...statIdentity(res, identity), path, model: canonicalRequestedModel, success: false, failureReason: errorMessage(err) });
     }
     const responseError = err instanceof HandledUpstreamStreamError ? err.cause : err;
-    if (!res.headersSent) sendCompatibleError(req, res, responseError);
+    if (!res.headersSent && !res.destroyed) sendCompatibleError(req, res, responseError);
     else if (!res.writableEnded) res.end();
   }
 }
@@ -254,13 +266,17 @@ async function forwardAuthenticated(
   requestedModel: string,
   diagnostics: ErrorDiagnosticContext,
   options?: ForwardCopilotRequestOptions,
+  context?: PoolRequest,
 ): Promise<{ response: globalThis.Response; request: PreparedCopilotRequest; body: Record<string, unknown>; canonicalModel: string }> {
-  const copilot = await copilotAuthManager.getAuth(identity);
+  const copilot = await requestAuth(identity, context);
   let resolved;
   try {
-    resolved = await resolveCopilotModel(copilot, path, requestedModel, diagnostics);
+    resolved = await resolveCopilotModel(copilot, path, requestedModel, diagnostics, context?.controller.signal);
+    context?.controller.signal.throwIfAborted();
+    if (context && !context.store.heartbeat(context.held)) throw new UserPoolError(503, 'member_unavailable');
   } catch (err) {
-    await invalidateUnauthorizedAuth(identity, copilot.accessToken, err);
+    await handlePoolFailure(context, copilot.accessToken, err);
+    if (!context) await invalidateUnauthorizedAuth(identity, copilot.accessToken, err);
     throw err;
   }
   diagnostics.model = resolved.canonicalId;
@@ -268,15 +284,45 @@ async function forwardAuthenticated(
   const request = prepareCopilotRequest(copilot, path, upstreamBody, options);
   let response: globalThis.Response;
   try {
-    response = await executePreparedCopilotRequest(request);
+    response = await executePreparedCopilotRequest(request, context?.controller.signal);
   } catch (err) {
     await recordFetchFailure(diagnostics, request, err);
     throw err;
   }
   if (response.status === 401) {
-    await copilotAuthManager.invalidate(identity, copilot.accessToken);
+    if (context) context.store.recoverUnauthorized(context.held, copilot.accessToken);
+    else await copilotAuthManager.invalidate(identity, copilot.accessToken);
+  } else if (response.status === 429 && context) {
+    context.store.cool(identity, retryAfterSeconds(response.headers.get('retry-after'), context.options.retryAfterSeconds), context.held);
   }
   return { response, request, body: upstreamBody, canonicalModel: resolved.canonicalId };
+}
+
+async function requestAuth(identity: string, context?: PoolRequest): Promise<CopilotAuthContext> {
+  if (!context) return copilotAuthManager.getAuth(identity);
+  context.controller.signal.throwIfAborted();
+  if (!context.store.heartbeat(context.held)) throw new UserPoolError(503, 'member_unavailable');
+  const account = await getAccount(identity);
+  if (!account?.copilotOauthToken || account.copilotOauthStatus !== 'valid' || !context.store.heartbeat(context.held)) {
+    throw new UserPoolError(503, 'member_unavailable');
+  }
+  return { identity, accessToken: account.copilotOauthToken, api: config.copilotApiBaseUrl };
+}
+
+async function handlePoolFailure(context: PoolRequest | undefined, token: string | undefined, error: unknown): Promise<void> {
+  if (!context || !(error instanceof CopilotApiError)) return;
+  if (error.status === 401 && token) {
+    context.store.recoverUnauthorized(context.held, token);
+  } else if (error.status === 429) {
+    context.store.cool(context.held.member_identity, retryAfterSeconds(error.retryAfter ?? null, context.options.retryAfterSeconds), context.held);
+  }
+}
+
+function retryAfterSeconds(value: string | null, fallback: number): number {
+  if (!value) return fallback;
+  const seconds = /^\d+(?:\.\d+)?$/.test(value.trim())
+    ? Number(value) : (Date.parse(value) - Date.now()) / 1000;
+  return Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds) : fallback;
 }
 
 export async function pipeAndRecord(
@@ -287,13 +333,17 @@ export async function pipeAndRecord(
   diagnostics: ErrorDiagnosticContext,
   options: PipeOptions = {},
 ): Promise<void> {
+  const context = poolRequest(res);
+  context?.controller.signal.throwIfAborted();
   res.status(upstream.status);
   const contentType = upstream.headers.get('content-type') ?? 'application/json';
   res.setHeader('content-type', contentType);
+  const retryAfter = upstream.headers.get('retry-after');
+  if (retryAfter) res.setHeader('Retry-After', retryAfter);
   if (!upstream.body) {
     if (!upstream.ok) await recordHttpFailure(diagnostics, upstreamRequest, upstream);
     res.end();
-    await recordRequestStat({ ...stat, success: upstream.ok, failureReason: upstream.ok ? undefined : `HTTP ${upstream.status}` });
+    await recordRequestStat({ ...stat, success: upstream.ok && !context, failureReason: upstream.ok ? (context ? 'empty_upstream_body' : undefined) : `HTTP ${upstream.status}` });
     return;
   }
   const shouldBuffer = contentType.includes('application/json')
@@ -314,17 +364,21 @@ export async function pipeAndRecord(
       await recordRequestStat({ ...stat, success: false, failureReason: `HTTP ${upstream.status}` });
       return;
     }
+    context?.controller.signal.throwIfAborted();
+    const success = upstream.ok && (!context || isSuccessfulJson(text));
+    if (context) res.locals.poolSuccess = success;
     res.send(canonicalizeJsonResponse(body.buffer, options.canonicalModel));
     const usage = parseUsage(text);
     await recordRequestStat({
       ...stat,
-      success: upstream.ok,
-      failureReason: upstream.ok ? undefined : `HTTP ${upstream.status}`,
+      success,
+      failureReason: success ? undefined : upstream.ok ? 'invalid_upstream_body' : `HTTP ${upstream.status}`,
       ...usageStatFields(usage),
     });
     return;
   }
   const reader = upstream.body.getReader();
+  const completion = context ? new StreamCompletion(stat.path) : undefined;
   const usage: UsageStats = {};
   const capture = new DiagnosticBodyCapture();
   const decoder = new TextDecoder();
@@ -340,12 +394,19 @@ export async function pipeAndRecord(
       throw new HandledUpstreamStreamError(err);
     }
     if (result.done || !result.value) break;
+    context?.controller.signal.throwIfAborted();
+    completion?.add(result.value);
     capture.add(result.value);
     if (filterCopilotDone) {
       sseBuffer = forwardSseEvents(sseBuffer + decoder.decode(result.value, { stream: true }), res, usage, options.canonicalModel);
     } else {
       sseBuffer = forwardSseEvents(sseBuffer + decoder.decode(result.value, { stream: true }), res, usage, options.canonicalModel, false);
     }
+    if (context && sseBuffer.length > 4 * 1024 * 1024) {
+      context.controller.abort(new Error('Upstream SSE event exceeds size limit'));
+      throw new Error('Upstream SSE event exceeds size limit');
+    }
+    if (context && res.writableNeedDrain) await once(res, 'drain', { signal: context.controller.signal });
   }
   const remaining = decoder.decode();
   if (filterCopilotDone) {
@@ -357,11 +418,14 @@ export async function pipeAndRecord(
   }
   const capturedBody = capture.result(true);
   if (!upstream.ok) await recordHttpFailure(diagnostics, upstreamRequest, upstream, capturedBody);
+  context?.controller.signal.throwIfAborted();
+  const success = upstream.ok && (!completion || completion.finish());
+  if (context) res.locals.poolSuccess = success;
   res.end();
   await recordRequestStat({
     ...stat,
-    success: upstream.ok,
-    failureReason: upstream.ok ? undefined : `HTTP ${upstream.status}`,
+    success,
+    failureReason: success ? undefined : upstream.ok ? 'incomplete_or_failed_stream' : `HTTP ${upstream.status}`,
     ...usageStatFields(usage),
   });
 }
@@ -718,11 +782,19 @@ function requireClaudeCodeOptimized(req: Request, res: Response): boolean | unde
 }
 
 function sendCompatibleError(req: Request, res: Response, err: unknown): void {
+  if (err instanceof UserPoolError) {
+    if (err.retryAfter) res.setHeader('Retry-After', err.retryAfter);
+    res.status(err.status).json({ type: 'error', error: {
+      type: err.status === 429 ? 'rate_limit_error' : 'api_error', code: err.code, message: err.message,
+    } });
+    return;
+  }
   if (err instanceof CopilotAuthNotReadyError) {
     res.status(err.status).json(apiError(err.code, err.message, err.details));
     return;
   }
   const status = proxyErrorStatus(err);
+  if (err instanceof CopilotApiError && err.retryAfter) res.setHeader('Retry-After', err.retryAfter);
   sendOpenAiLikeError(req, res, status, errorMessage(err), proxyErrorType(err));
 }
 
@@ -766,7 +838,7 @@ function toClaudeCodeModel(model: ModelInfo): Record<string, unknown> {
 
 function proxyErrorStatus(err: unknown): number {
   if (err instanceof CopilotModelPathError) return err.status;
-  if (err instanceof CopilotApiError && (err.status === 401 || err.status === 403)) return err.status;
+  if (err instanceof CopilotApiError && [401, 403, 429].includes(err.status)) return err.status;
   return 502;
 }
 

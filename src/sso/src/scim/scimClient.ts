@@ -36,7 +36,10 @@ export interface ProvisionResult {
 
 const logger = loggerFor('sso', 'scim');
 
-export async function syncUser(user: SsoUserRecord, enterpriseRole: ScimEnterpriseRole = 'user'): Promise<ProvisionResult> {
+export async function syncUser(user: SsoUserRecord, enterpriseRole: ScimEnterpriseRole = 'user', createOnly = false): Promise<ProvisionResult> {
+  if (createOnly && (user.ghScimId || user.ghLogin || user.emuStatus !== 'not_synced')) {
+    throw new Error(`SCIM create-only refused: SSO user ${user.ssoUser} already has provisioning data.`);
+  }
   if (user.ghScimId) {
     logger.info('sync-existing', 'Updating existing SCIM user', { ssoUser: user.ssoUser, scimId: user.ghScimId, enterpriseRole });
     const updated = await replaceUser(user.ghScimId, user, enterpriseRole);
@@ -45,6 +48,7 @@ export async function syncUser(user: SsoUserRecord, enterpriseRole: ScimEnterpri
   logger.info('sync-create', 'Creating SCIM user', { ssoUser: user.ssoUser, enterpriseRole });
   const created = await createUser(user, enterpriseRole);
   if (created) return resultFromScimUser(created);
+  if (createOnly) throw new Error(`SCIM create-only conflict: user ${user.ssoUser} already exists; no lookup or update was attempted.`);
   logger.info('sync-conflict-lookup', 'SCIM user already exists, looking up by SSO user', { ssoUser: user.ssoUser });
   const existing = await findScimUserByUsername(user.ssoUser);
   if (!existing?.id) throw new Error(`SCIM user ${user.ssoUser} already exists but could not be found`);

@@ -1,0 +1,148 @@
+name: ghcp-user-pool-smoke
+x-auth: &auth
+  INTERNAL_API_TOKEN: local-pool-internal-test-only
+x-health: &health
+  interval: 2s
+  timeout: 3s
+  retries: 30
+services:
+  bridge:
+    image: node:22-bookworm-slim
+    command: ["node", "/fixtures/bridge.mjs"]
+    volumes: ["./bridge.mjs:/fixtures/bridge.mjs:ro"]
+    ports: ["127.0.0.1:17300:17300", "127.0.0.1:17301:17301", "127.0.0.1:17302:17302", "127.0.0.1:17303:17303", "127.0.0.1:17304:17304"]
+    networks: [default, preview]
+    depends_on:
+      console: {condition: service_healthy}
+  mock:
+    image: node:22-bookworm-slim
+    command: ["node", "/fixtures/mock-services.mjs"]
+    environment:
+      <<: *auth
+      PORT: "8002"
+      SCIM_TOKEN: local-pool-scim-test-only
+      SEAT_PAT: local-pool-seat-test-only
+      PROXY_BASE_URL: http://proxy:3000
+    volumes:
+      - ./mock-services.mjs:/fixtures/mock-services.mjs:ro
+    ports: ["127.0.0.1:17302:8002"]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8002/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  sso:
+    image: ghcp-pool-smoke-sso:local
+    working_dir: /app/src/sso
+    command: ["node", "dist/index.js"]
+    environment:
+      <<: *auth
+      PORT: "7001"
+      DB_PATH: /data/sso.sqlite
+      BASE_URL: http://sso:7001
+      PROXY_BASE_URL: http://proxy:3000
+      SESSION_SECRET: local-pool-session-test-only
+      SSO_DEFAULT_USER_PASSWORD: local-pool-sso-test-only
+      SSO_USER_EVENTS_LOG: /data/sso-user-events.log
+      ENTERPRISE_SLUG: local-test
+      ENTERPRISE_SHORTCODE: test
+      GITHUB_API_BASE_URL: http://mock:8002
+      GITHUB_COPILOT_SEAT_PAT: local-pool-seat-test-only
+      SCIM_BASE_URL: http://mock:8002/scim/v2/enterprises/local-test
+      SCIM_TOKEN: local-pool-scim-test-only
+      SP_ENTITY_ID: http://mock:8002/saml
+      SP_ACS_URL: http://mock:8002/saml/acs
+      CERT_DIR: /certs
+    ports: ["127.0.0.1:17301:7001"]
+    volumes:
+      - sso-data:/data
+      - ${POOL_SMOKE_CERT_DIR:?provide disposable signing certificate directory}:/certs:ro
+    depends_on:
+      mock: {condition: service_healthy}
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7001/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  login:
+    image: ghcp-pool-smoke-login:local
+    working_dir: /app/src/login
+    command: ["node", "dist/index.js"]
+    environment:
+      <<: *auth
+      PORT: "7003"
+      DB_PATH: /data/login.sqlite
+      PROXY_BASE_URL: http://proxy:3000
+      LOG_DIR: /logs/login
+      SSO_URL: http://sso:7001/login
+      SSO_PROVIDER: custom
+      AUTH_HEADLESS: "true"
+      GITHUB_OAUTH_CLIENT_ID: local-test-unused
+    ports: ["127.0.0.1:17303:7003"]
+    volumes:
+      - login-data:/data
+      - login-logs:/logs
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7003/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  proxy:
+    image: ghcp-pool-smoke-proxy:local
+    working_dir: /app/src/proxy
+    command: ["node", "dist/index.js"]
+    environment:
+      <<: *auth
+      PORT: "3000"
+      STORAGE_DRIVER: sqlite
+      DB_PATH: /data/proxy.sqlite
+      API_KEY: local-pool-proxy-test-only
+      ACCOUNT_ROUTING_MODE: caller-lease
+      POOL_ACCOUNT_EMAIL_DOMAIN: pool.example.test
+      POOL_WARMUP_MODEL: claude-opus-5-2
+      READY_IDLE_TARGET: "0"
+      POOL_MAX_ACCOUNTS: "6"
+      CALLER_LEASE_TTL_SECONDS: "60"
+      PROVISIONAL_LEASE_TTL_SECONDS: "15"
+      PREWARM_POLL_SECONDS: "1"
+      POOL_REQUEST_TIMEOUT_SECONDS: "10"
+      POOL_EXHAUSTED_RETRY_AFTER_SECONDS: "2"
+      SSO_BASE_URL: http://sso:7001
+      LOGIN_BASE_URL: http://mock:8002
+      COPILOT_API_BASE_URL: http://mock:8002
+      REQUEST_STATS_PER_ACCOUNT_LIMIT: "100"
+      PROXY_ERROR_DIAGNOSTICS_ENABLED: "false"
+      PROXY_ERROR_DIAGNOSTICS_REDACT: "true"
+      LOG_LEVEL: info
+    ports: ["127.0.0.1:17300:3000"]
+    volumes: ["proxy-data:/data"]
+    depends_on:
+      sso: {condition: service_healthy}
+      mock: {condition: service_healthy}
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  console:
+    image: ghcp-pool-smoke-console:local
+    working_dir: /app/src/console
+    command: ["node", "dist/server/index.js"]
+    environment:
+      <<: *auth
+      PORT: "7004"
+      ADMINS_FILE: /data/admins.json
+      SESSION_SECRET: local-pool-session-test-only
+      PROXY_BASE_URL: http://proxy:3000
+      SSO_BASE_URL: http://sso:7001
+      LOGIN_BASE_URL: http://login:7003
+    ports: ["127.0.0.1:17304:7004"]
+    volumes: ["console-data:/data"]
+    depends_on:
+      proxy: {condition: service_healthy}
+      login: {condition: service_healthy}
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7004/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+networks:
+  default:
+    internal: true
+  preview: {}
+volumes:
+  proxy-data:
+  sso-data:
+  login-data:
+  login-logs:
+  console-data:

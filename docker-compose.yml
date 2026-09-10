@@ -9,6 +9,8 @@ services:
     build:
       context: .
       dockerfile: src/sso/Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
     image: ghcp-sso:local
     environment:
       PORT: "7001"
@@ -42,6 +44,8 @@ services:
     build:
       context: .
       dockerfile: src/login/Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
     image: ghcp-login:local
     environment:
       PORT: "7003"
@@ -71,6 +75,8 @@ services:
     build:
       context: .
       dockerfile: src/proxy/Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
     image: ghcp-proxy:local
     restart: "on-failure:5"
     environment:
@@ -87,6 +93,17 @@ services:
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?set INTERNAL_API_TOKEN}
       IDENTITY_HEADER: ${IDENTITY_HEADER:-X-User-Identity}
       IDENTITY_HEADER_REQUIRED: "${IDENTITY_HEADER_REQUIRED:-true}"
+      ACCOUNT_ROUTING_MODE: ${ACCOUNT_ROUTING_MODE:-direct}
+      POOL_ACCOUNT_EMAIL_DOMAIN: "${POOL_ACCOUNT_EMAIL_DOMAIN:-}"
+      POOL_WARMUP_MODEL: "${POOL_WARMUP_MODEL:-}"
+      READY_IDLE_TARGET: "${READY_IDLE_TARGET:-10}"
+      POOL_MAX_ACCOUNTS: "${POOL_MAX_ACCOUNTS:-100}"
+      CALLER_LEASE_TTL_SECONDS: "${CALLER_LEASE_TTL_SECONDS:-172800}"
+      PROVISIONAL_LEASE_TTL_SECONDS: "${PROVISIONAL_LEASE_TTL_SECONDS:-300}"
+      PREWARM_POLL_SECONDS: "${PREWARM_POLL_SECONDS:-5}"
+      PREWARM_CONCURRENCY: "${PREWARM_CONCURRENCY:-5}"
+      POOL_EXHAUSTED_RETRY_AFTER_SECONDS: "${POOL_EXHAUSTED_RETRY_AFTER_SECONDS:-30}"
+      POOL_REQUEST_TIMEOUT_SECONDS: "${POOL_REQUEST_TIMEOUT_SECONDS:-120}"
       CLAUDE_CODE_OPTIMIZED: "${CLAUDE_CODE_OPTIMIZED:-true}"
       SSO_BASE_URL: http://sso:7001
       LOGIN_BASE_URL: http://login:7003
@@ -120,6 +137,8 @@ services:
     build:
       context: .
       dockerfile: src/console/Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
     image: ghcp-console:local
     environment:
       PORT: "7004"

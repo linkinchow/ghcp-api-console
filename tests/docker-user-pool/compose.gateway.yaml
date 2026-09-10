@@ -1,0 +1,53 @@
+services:
+  bridge:
+    ports: !override
+      - "127.0.0.1:17500:17300"
+      - "127.0.0.1:17501:17301"
+      - "127.0.0.1:17502:17302"
+      - "127.0.0.1:17503:17303"
+      - "127.0.0.1:17504:17304"
+      - "127.0.0.1:17505:17305"
+    environment:
+      POOL_SMOKE_GATEWAY: "true"
+  mock:
+    environment:
+      POOL_MOCK_MODEL: claude-opus-5
+      POOL_MOCK_STAGE_DELAY_MS: "150"
+  proxy:
+    environment:
+      POOL_WARMUP_MODEL: claude-opus-5
+      POOL_MAX_ACCOUNTS: "20"
+      PREWARM_CONCURRENCY: "5"
+      CALLER_LEASE_TTL_SECONDS: "600"
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: pooltest
+      POSTGRES_PASSWORD: local-gateway-db-test-only
+      POSTGRES_DB: litellm
+    volumes: ["gateway-db:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pooltest -d litellm"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.99.1
+    environment:
+      DATABASE_URL: postgresql://pooltest:local-gateway-db-test-only@postgres:5432/litellm
+      LITELLM_MASTER_KEY: sk-local-gateway-master-test-only
+      LITELLM_SALT_KEY: local-gateway-salt-test-only
+      GHCP_POOL_API_BASES: http://proxy:3000
+      GHCP_PROXY_API_KEY: local-pool-proxy-test-only
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+      LITELLM_TELEMETRY: "False"
+      PYTHONPATH: /fixtures
+    volumes:
+      - ./gateway-config.yaml:/fixtures/config.yaml:ro
+      - ../../litellm/user_pool_hook.py:/fixtures/user_pool_hook.py:ro
+    command: ["--config", "/fixtures/config.yaml", "--port", "4000", "--num_workers", "1"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      proxy: {condition: service_healthy}
+volumes:
+  gateway-db:

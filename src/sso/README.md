@@ -60,12 +60,22 @@ SSO 数据库只保存 scrypt 密码哈希和 salt，不能还原用户的明文
 
 ### 与 proxy 的边界
 
-SSO 只在两处与 proxy 发生代码级关系：
+SSO 与 proxy 的代码级关系：
 
 1. 内部服务可调用 `POST /api/users/ensure` 获取或创建 `ssoUser`。
 2. `delete_sso` 删除时调用 `DELETE {PROXY_BASE_URL}/internal/accounts/by-sso-user/:ssoUser`，并携带同一个 `X-Internal-Token`。
+3. `delete_sso`、`delete_emu`、`suspend_emu`、`remove_copilot`（含单独 seat DELETE API）在任何 seat、SCIM、proxy 删除或本地修改之前，先检查本地 pool 标记；未标记用户必须调用只读 `GET {PROXY_BASE_URL}/internal/accounts/by-sso-user/:ssoUser/pool-membership`，使用同一个 `X-Internal-Token`，要求成功 JSON 响应 `{ "managed": boolean }`。`managed=true` 返回安全错误 `pool_member_managed`。此查询覆盖旧版本创建但尚无本地标记的 pool 用户；它不会自动收编或修改用户。
 
-当前未提供：SSO 侧没有主动同步 proxy 中已存在账号的 `ghLogin`，也没有读取 proxy 状态的 API。
+**可用性约束**：上述破坏性操作对未标记的普通用户也必须做 proxy 预检；proxy 不可用、超时、404 或响应格式不正确时，以 `pool_membership_unavailable` 拒绝操作，绝不先删除 seat 再依赖 proxy 外键拦截。单独 seat API 分别返回 409 / 503；batch 保持现有 200 响应并在失败行 `detail` 中返回安全错误代码。上线前先部署 proxy 查询接口。
+
+#### Pool 管理用户
+
+- 内部 `POST /api/users` 可选 `poolManaged: true`。创建前要求环境配置 `SSO_DEFAULT_USER_PASSWORD` 去除首尾空白后至少 16 字符，且不能等于用户名（忽略大小写）；只使用该配置密码，不接受不同的自定义密码，角色必须为 `user`。未配置/弱密码返回 `400 pool_password_policy`，不会创建用户或标记。省略该标志或传 `false` 保持普通创建的原有密码策略。
+- 用户与 `sso_pool_managed_users(sso_user PRIMARY KEY REFERENCES sso_users(sso_user) ON DELETE RESTRICT)` 标记在同一 SQLite 事务内创建。migration 不标记或修改旧用户。标记不进入普通用户 DTO，普通创建/查询也不返回密码或 token。
+- 本地标记在 proxy 无连接或 provisioning 尚未创建 pool membership 时仍生效。对已标记用户，密码/email/role PATCH、CSV 密码更新、EMU 反向导入的本地身份更新也会拒绝，避免破坏 worker 的身份所有权。标记不能通过普通 PATCH 移除。
+- **有意限定**：本地 PATCH/CSV 更新只检查本地标记，不对所有普通编辑增加跨服务依赖。因此无标记的历史 pool 用户仍需单独核对并回填本地所有权标记，才能保护其本地编辑；其破坏性操作已由只读 proxy 预检保护。该预检不是跨服务事务，不能代替 proxy 侧自身的成员删除保护。
+
+当前未提供：SSO 侧没有主动同步 proxy 中已存在账号的 `ghLogin`。
 
 ## 3. 启动方式
 

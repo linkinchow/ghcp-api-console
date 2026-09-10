@@ -1,4 +1,7 @@
 .git
+.local-sso
+.claude
+certs
 .gitignore
 .dockerignore
 
@@ -8,6 +11,8 @@ node_modules
 
 .env
 **/.env
+**/.env*
+**/*.env*
 **/*.sqlite
 **/*.sqlite-*
 **/data

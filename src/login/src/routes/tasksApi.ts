@@ -1,6 +1,7 @@
-import { Router } from 'express';
+import { Router, type Response } from 'express';
 import { apiError, type CreateLoginTaskRequest, type LoginTaskStatus } from '@ghcp/shared';
-import { deleteTask, getTask, listTasks, listTasksPage } from '../db/tasksRepo.js';
+import { deleteTask, getTask, listTasks, listTasksPage, type LoginTaskRecord } from '../db/tasksRepo.js';
+import { getPoolTaskProtection } from '../clients/proxyClient.js';
 import { loginQueue } from '../tasks/queue.js';
 
 export const tasksApiRouter = Router();
@@ -52,7 +53,10 @@ tasksApiRouter.post('/tasks/:id/cancel', (req, res) => {
   res.json(task);
 });
 
-tasksApiRouter.delete('/tasks/:id', (req, res) => {
+tasksApiRouter.delete('/tasks/:id', async (req, res) => {
+  const task = getTask(req.params.id);
+  if (task && task.status !== 'pending' && task.status !== 'running'
+    && !await allowPoolTaskMutation(task, 'delete', res)) return;
   const result = deleteTask(req.params.id);
   if (result === 'not_found') {
     res.status(404).json(apiError('task_not_found', 'Login task was not found.'));
@@ -65,7 +69,7 @@ tasksApiRouter.delete('/tasks/:id', (req, res) => {
   res.status(204).end();
 });
 
-tasksApiRouter.post('/tasks/:id/retry', (req, res) => {
+tasksApiRouter.post('/tasks/:id/retry', async (req, res) => {
   const task = getTask(req.params.id);
   if (!task) {
     res.status(404).json(apiError('task_not_found', 'Login task was not found.'));
@@ -83,8 +87,23 @@ tasksApiRouter.post('/tasks/:id/retry', (req, res) => {
     res.status(400).json(apiError('invalid_login_task', parsed.error));
     return;
   }
+  if (!await allowPoolTaskMutation(task, 'retry', res)) return;
   res.status(202).json(loginQueue.retry(task, parsed.value));
 });
+
+async function allowPoolTaskMutation(task: LoginTaskRecord, operation: 'delete' | 'retry', res: Response): Promise<boolean> {
+  try {
+    const protection = await getPoolTaskProtection(task.identity, task.id, task.oauthAttemptId);
+    if (operation === 'delete' ? protection.referenced : protection.managed) {
+      res.status(409).json(apiError('pool_task_managed', 'Use User pool recovery controls; this Login task is managed by the pool.'));
+      return false;
+    }
+    return true;
+  } catch {
+    res.status(503).json(apiError('pool_membership_unavailable', 'Cannot verify pool task ownership; no task was changed.'));
+    return false;
+  }
+}
 
 type ParseResult = { ok: true; value: CreateLoginTaskRequest } | { ok: false; error: string };
 
