@@ -5,7 +5,7 @@ import { SqliteStorage } from '../db/sqliteStorage.js';
 import { Logger } from '../logger.js';
 import { normalizeCaller, readPoolConfig, UserPoolError, type PoolConfig } from './config.js';
 import { realProvisioner } from './provisioner.js';
-import { PrewarmWorker } from './worker.js';
+import { PrewarmWorker, type PrewarmWorkerSnapshot } from './worker.js';
 import type { HeldLease } from './store.js';
 import type { PoolStore } from './storage.js';
 import { boundedAdmission } from './admission.js';
@@ -54,6 +54,12 @@ export async function stopUserPool(): Promise<void> {
   worker = undefined;
   store = undefined;
   options = undefined;
+}
+
+/** No initialization or storage access. Undefined means no worker in THIS process,
+ * not that the cluster has no scheduler, nor that routing/storage is unhealthy. */
+export function getLocalUserPoolSchedulerSnapshot(): PrewarmWorkerSnapshot | undefined {
+  return worker?.snapshot();
 }
 
 export function assertUserPoolOwner(): void {

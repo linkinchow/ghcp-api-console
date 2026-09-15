@@ -1,7 +1,8 @@
 import { Router, type Request, type Response } from 'express';
 import { requireInternalToken } from '../auth/internalAuth.js';
-import { getUserPool, wakePool } from '../userPool/runtime.js';
-import { UserPoolError } from '../userPool/config.js';
+import { getLocalUserPoolSchedulerSnapshot, getUserPool, wakePool } from '../userPool/runtime.js';
+import { readPoolConfig, UserPoolError } from '../userPool/config.js';
+import type { PrewarmWorkerSnapshot } from '../userPool/worker.js';
 import { NAME_CAPACITY } from '../userPool/names.js';
 import type { PoolSettings } from '../userPool/store.js';
 import { poolPageSql, type PoolList, type PoolPageQuery } from '../userPool/paging.js';
@@ -12,6 +13,8 @@ type AdminStore = Pick<PoolStore, 'settings' | 'counts' | 'accounts' | 'leases' 
 interface Dependencies {
   getStore: () => Promise<AdminStore | undefined>;
   wake: () => void | Promise<void>;
+  isPoolEnabled: () => boolean;
+  localScheduler: () => PrewarmWorkerSnapshot | undefined;
 }
 
 const LIST_LIMITS = { accounts: 1000, leases: 1000, events: 200 } as const;
@@ -57,7 +60,12 @@ const ERROR_MESSAGES: Record<string, string> = {
 
 /** The router also authenticates itself so an alternate mount cannot expose pool administration. */
 export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}): Router {
-  const { getStore, wake } = { getStore: getUserPool, wake: wakePool, ...dependencies };
+  const { getStore, wake, isPoolEnabled, localScheduler } = {
+    getStore: getUserPool, wake: wakePool,
+    isPoolEnabled: () => readPoolConfig(process.env).enabled,
+    localScheduler: getLocalUserPoolSchedulerSnapshot,
+    ...dependencies,
+  };
   const router = Router();
   router.use('/user-pool', requireInternalToken, (_req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
@@ -94,6 +102,16 @@ export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}
       listLimits: LIST_LIMITS,
     });
   }));
+
+  // Local diagnostics must remain readable without initializing or querying storage.
+  router.get('/user-pool/diagnostics/local', (req, res) => {
+    try {
+      if (Object.keys(req.query).length) throw new UserPoolError(400, 'invalid_request');
+      if (!isPoolEnabled()) throw new UserPoolError(409, 'pool_mode_disabled');
+      res.json({ enabled: true, poolId: 'default', observedAt: Date.now(), scope: 'local_process',
+        localScheduler: schedulerDto(localScheduler()) });
+    } catch (error) { sendError(res, error); }
+  });
 
   router.get('/user-pool/summary', handle(async (_req, res, store) => {
     res.json({ enabled: true, poolId: 'default', observedAt: Date.now(),
@@ -186,6 +204,25 @@ export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}
 }
 
 export const userPoolApiRouter = createUserPoolApiRouter();
+
+function schedulerDto(snapshot: PrewarmWorkerSnapshot | undefined) {
+  if (!snapshot) return null;
+  const loss = snapshot.lastOwnershipLoss;
+  return {
+    scope: 'local_process', state: enumValue(snapshot.state, ['owner', 'standby', 'stopped']),
+    observedAtUnixMs: timestamp(snapshot.observedAtUnixMs),
+    localTenureAgeMs: snapshot.localTenureAgeMs === null ? null : number(snapshot.localTenureAgeMs),
+    lastSuccessfulRenewalAtUnixMs: timestamp(snapshot.lastSuccessfulRenewalAtUnixMs),
+    lastSuccessfulRenewalAgeMs: snapshot.lastSuccessfulRenewalAgeMs === null ? null : number(snapshot.lastSuccessfulRenewalAgeMs),
+    claimAttempts: number(snapshot.claimAttempts), ownershipAcquisitions: number(snapshot.ownershipAcquisitions),
+    ownershipLosses: number(snapshot.ownershipLosses),
+    lastOwnershipLoss: loss ? {
+      reason: enumValue(loss.reason, ['local_tenure_expired', 'renewal_rejected', 'storage_unavailable', 'storage_operation_failed']),
+      atUnixMs: timestamp(loss.atUnixMs),
+      ...(loss.storageFailure === 'deadline' || loss.storageFailure === 'connection' ? { storageFailure: loss.storageFailure } : {}),
+    } : null,
+  };
+}
 
 function readSettingsPatch(body: unknown): { expectedVersion: number; changes: Partial<PoolSettings> } {
   const invalid = () => new UserPoolError(400, 'invalid_pool_settings');

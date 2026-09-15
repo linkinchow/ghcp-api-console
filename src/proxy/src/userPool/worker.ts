@@ -11,6 +11,7 @@ import {
   type ProvisionInventory,
 } from './provisioner.js';
 import type { Awaitable, PoolStore } from './storage.js';
+import { MysqlConnectionError, MysqlDeadlineError } from './mysqlDeadline.js';
 
 /** Every remote operation is awaited; writes check the supplied fence in their transaction. */
 export interface PrewarmStore extends Pick<PoolStore,
@@ -30,7 +31,35 @@ export interface PrewarmStore extends Pick<PoolStore,
 const HEARTBEAT_MS = 5000;
 const OWNER_TTL_MS = 30000;
 interface Tenure { id: string; renewedAt: number }
-export interface PrewarmWorkerOptions { multiReplica?: boolean }
+export interface PrewarmWorkerOptions {
+  multiReplica?: boolean;
+  /** Diagnostic timestamps only; never used for tenure/lease decisions or SQL. */
+  wallClockNow?: () => number;
+}
+export type OwnershipLossReason = 'local_tenure_expired' | 'renewal_rejected'
+  | 'storage_unavailable' | 'storage_operation_failed';
+export interface OwnershipLoss {
+  readonly reason: OwnershipLossReason;
+  readonly storageFailure?: 'deadline' | 'connection';
+}
+export interface PrewarmWorkerSnapshot {
+  /** This worker instance in this process only; never cluster health or routing readiness. */
+  readonly scope: 'local_process';
+  /** owner means locally unexpired, NOT verified database ownership. Before start: standby. */
+  readonly state: 'owner' | 'standby' | 'stopped';
+  readonly observedAtUnixMs: number;
+  /** Request-start age of the current tenure's last claim/renewal; may exceed the TTL. */
+  readonly localTenureAgeMs: number | null;
+  /** Accepted renewal response time, not the lease deadline (a claim is not a renewal). */
+  readonly lastSuccessfulRenewalAtUnixMs: number | null;
+  readonly lastSuccessfulRenewalAgeMs: number | null;
+  /** Cumulative since construction. Renewals, including SQLite's fallback, are not claims. */
+  readonly claimAttempts: number;
+  readonly ownershipAcquisitions: number;
+  /** Recorded loss transitions only; an observational read never records a loss. */
+  readonly ownershipLosses: number;
+  readonly lastOwnershipLoss: (OwnershipLoss & { readonly atUnixMs: number }) | null;
+}
 
 export class PrewarmWorker {
   private tenure?: Tenure;
@@ -48,6 +77,12 @@ export class PrewarmWorker {
   private wake?: ReturnType<typeof setImmediate>;
   private started = false;
   private stopped = false;
+  private claimAttempts = 0;
+  private ownershipAcquisitions = 0;
+  private ownershipLosses = 0;
+  private lastSuccessfulRenewal?: { atUnixMs: number; atMonotonicMs: number };
+  private lastOwnershipLoss?: OwnershipLoss & { atUnixMs: number };
+  private readonly wallClockNow: () => number;
   private readonly logger = new Logger('user-pool');
 
   constructor(
@@ -61,6 +96,7 @@ export class PrewarmWorker {
     if (!Number.isFinite(pollMs) || pollMs <= 0) throw new Error('Invalid prewarm poll interval');
     if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 20) throw new Error('Invalid prewarm concurrency');
     if (options.multiReplica && !store.renewOwner) throw new Error('Multi-replica pool requires fenced owner renewal');
+    this.wallClockNow = options.wallClockNow ?? Date.now;
   }
 
   async start(): Promise<void> {
@@ -81,6 +117,26 @@ export class PrewarmWorker {
       void this.tick();
     })().finally(() => { this.starting = undefined; });
     return this.starting;
+  }
+
+  /** Pure local observation: no SQL, election, expiry transition, abort or logging.
+   * A locally expired tenure is shown as standby until normal execution fences it;
+   * loss counters/timestamps only change when that transition actually happens. */
+  snapshot(): PrewarmWorkerSnapshot {
+    const now = this.monotonicNow();
+    const localTenureAgeMs = this.tenure ? Math.max(0, now - this.tenure.renewedAt) : null;
+    return {
+      scope: 'local_process',
+      state: this.stopped ? 'stopped' : localTenureAgeMs !== null && localTenureAgeMs < OWNER_TTL_MS ? 'owner' : 'standby',
+      observedAtUnixMs: this.wallClockNow(),
+      localTenureAgeMs,
+      lastSuccessfulRenewalAtUnixMs: this.lastSuccessfulRenewal?.atUnixMs ?? null,
+      lastSuccessfulRenewalAgeMs: this.lastSuccessfulRenewal ? Math.max(0, now - this.lastSuccessfulRenewal.atMonotonicMs) : null,
+      claimAttempts: this.claimAttempts,
+      ownershipAcquisitions: this.ownershipAcquisitions,
+      ownershipLosses: this.ownershipLosses,
+      lastOwnershipLoss: this.lastOwnershipLoss ? { ...this.lastOwnershipLoss } : null,
+    };
   }
 
   /** Local scheduler status only. Routing readiness must check storage, not require ownership. */
@@ -235,7 +291,7 @@ export class PrewarmWorker {
     if (this.stopped || this.tenure !== tenure) return false;
     // A blocked event loop or delayed database response must not resurrect local execution.
     if (this.monotonicNow() - tenure.renewedAt >= OWNER_TTL_MS) {
-      this.loseOwnership(tenure);
+      this.loseOwnership(tenure, { reason: 'local_tenure_expired' });
       return false;
     }
     return true;
@@ -247,6 +303,7 @@ export class PrewarmWorker {
     if (this.ownership) return this.ownership;
     // Abort races drain the local steps first; their retained contexts stay fenced forever.
     if (this.active.size || this.reservationTask) return false;
+    this.claimAttempts++;
     const candidate: Tenure = { id: randomUUID(), renewedAt: this.monotonicNow() };
     this.ownership = (async () => {
       try {
@@ -260,6 +317,7 @@ export class PrewarmWorker {
           return false;
         }
         this.tenure = candidate;
+        this.ownershipAcquisitions++;
         return true;
       } catch {
         if (!this.options.multiReplica) this.stopped = true;
@@ -282,38 +340,48 @@ export class PrewarmWorker {
         // must have the DB predicate owner = ? AND owner_until > DB_NOW in renewOwner.
         const renewed = await (this.store.renewOwner
           ? this.store.renewOwner(tenure.id) : this.store.claimOwner(tenure.id));
-        if (!renewed || !this.isCurrentTenure(tenure)) {
-          this.loseOwnership(tenure);
+        if (!renewed) {
+          this.loseOwnership(tenure, { reason: 'renewal_rejected' });
           return false;
         }
+        if (!this.isCurrentTenure(tenure)) return false;
         // Use request start, not response time: network latency cannot extend our deadline.
         tenure.renewedAt = requestedAt;
+        this.lastSuccessfulRenewal = { atUnixMs: this.wallClockNow(), atMonotonicMs: this.monotonicNow() };
         return true;
-      } catch {
-        this.loseOwnership(tenure);
+      } catch (error) {
+        this.loseOwnership(tenure, ownershipStorageFailure(error));
         return false;
       }
     })().finally(() => { this.ownership = undefined; });
     return this.ownership;
   }
 
-  private loseOwnership(tenure: Tenure): void {
+  private loseOwnership(tenure: Tenure, loss: OwnershipLoss): void {
     if (this.tenure !== tenure) return;
     this.tenure = undefined;
+    this.ownershipLosses++;
+    this.lastOwnershipLoss = { ...loss, atUnixMs: this.wallClockNow() };
     if (!this.options.multiReplica) {
       this.stopped = true;
       this.clearTimers();
     }
     for (const { controller } of this.active.values()) controller.abort(new ProvisionFailure('provision_fenced'));
     this.reservationController?.abort(new ProvisionFailure('provision_fenced'));
-    this.logger.error('ownership-lost', this.options.multiReplica ? 'Pool worker is standby' : 'Pool worker stopped');
+    // One log per lost local tenure, never per failed standby poll. No error objects,
+    // messages, SQL operations, identities or owner UUIDs enter diagnostic fields.
+    this.logger.error('ownership-lost', this.options.multiReplica ? 'Pool worker is standby' : 'Pool worker stopped', {
+      scope: 'local_process', state: this.stopped ? 'stopped' : 'standby', ...this.lastOwnershipLoss,
+      lastSuccessfulRenewalAtUnixMs: this.lastSuccessfulRenewal?.atUnixMs ?? null,
+      claimAttempts: this.claimAttempts, ownershipAcquisitions: this.ownershipAcquisitions, ownershipLosses: this.ownershipLosses,
+    });
   }
 
   private async storageOperation<T>(tenure: Tenure, operation: () => Awaitable<T>): Promise<T> {
     try {
       return await operation();
-    } catch {
-      this.loseOwnership(tenure);
+    } catch (error) {
+      this.loseOwnership(tenure, ownershipStorageFailure(error));
       throw new ProvisionFailure('provision_fenced');
     }
   }
@@ -455,6 +523,14 @@ export class PrewarmWorker {
     })();
     return this.stopping;
   }
+}
+
+function ownershipStorageFailure(error: unknown): OwnershipLoss {
+  // Only trusted storage wrappers get an availability tag. Never echo an arbitrary
+  // code/name/message/cause (even an allowlist-looking code can be application data).
+  if (error instanceof MysqlDeadlineError) return { reason: 'storage_unavailable', storageFailure: 'deadline' };
+  if (error instanceof MysqlConnectionError) return { reason: 'storage_unavailable', storageFailure: 'connection' };
+  return { reason: 'storage_operation_failed' };
 }
 
 function failureCode(error: unknown): string {

@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": { "@ghcp/shared": ["../../src/packages/shared/src/index.ts"] }
+  },
+  "include": ["routes*.ts"]
+}
