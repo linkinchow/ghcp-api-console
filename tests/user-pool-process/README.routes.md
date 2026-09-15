@@ -1,4 +1,77 @@
-# Frozen-v4 process-level route qualification (two cases passed)
+# Process-level route qualification: frozen-v4 baseline and v5 follow-up
+
+## V5 follow-up (corrected parent run: 5 passed)
+
+The corrected suite passed against actual isolated MySQL: **5 pass / 0 fail / 0 skipped, 12.612 seconds**. All five child pairs exited and all five sibling databases were dropped. Corrected log SHA-256: `5b433f6955dea962cb6badb80f12624a53bcfcfb48481c0f9092cc03e41b3ce8`. Production source remained unchanged; the first failed run below is retained.
+
+First parent-reported engine result: **3 pass / 2 fail, 12.320 seconds**, with all five child pairs exited and random sibling databases dropped. The new all-catalog-cancel case passed in 2.307 seconds. Both 401-first cases reached the post-completion admission probe and failed because the fixture expected 503 but received 429. Production admission reclaims unverified ready inventory to `failed/warmup`, advances generation and expires the lease. With both old holds already drained, it deletes that lease, so no available ready member remains: the exact safe rejection is **429 `pool_exhausted`**, unlike the baseline's retained-live-hold **503 `member_unavailable`**. The test-only correction now asserts that exact code, failed/warmup state, `credential_not_verified`, generation +1, lease-expiration event/deletion, zero holds and no upstream traffic, retaining all pre-admission stale-200/401 fences. Correction checks locally: noEmit PASS; offline guards **4 pass**; v5 discovery **5 skipped / 0 engine passes**; whitespace and unchanged-production checks PASS. **The corrected five-case engine rerun subsequently passed as recorded above.**
+
+Production target: `356f8f5e33a21ccfe7cf8c5db07060ab1ac47846`. This test-only follow-up adds **three** scenarios, retains the original two baseline test bodies, and changes only the existing `routes.*` harness files and this README. No production, worker launcher, suspend/login-network/replicas suite, package scripts or deployment changes are required.
+
+### Selection and bounded coverage
+
+There was no route-specific frozen launcher: `routes.mysql.test.ts` was invoked directly. The existing `worker-run.mjs` is separately pinned to v4 and must **not** be used for this suite. The route test entrypoint now explicitly selects:
+
+- Missing `MYSQL_POOL_PROCESS_ROUTES_SUITE`, or `baseline`: exactly the two historical cases; no new v5 qualification claim.
+- `MYSQL_POOL_PROCESS_ROUTES_SUITE=v5`: exactly **five** cases (two baseline + three follow-ups). After the existing destructive-fixture gate and before loading the harness, a bounded read-only Git preflight requires `src/proxy` and `src/packages/shared` to match the production target and rejects untracked production files. This compares source content rather than HEAD, allowing test-only follow-up commits while refusing older/modified production. Unknown/empty suite selections hard-refuse.
+
+The added scenarios are:
+
+1. **Every catalog consumer cancels across two processes.** Four GET/HEAD consumers join two independent partial-body cache refreshes. Cancellation is staged with committed SQL-hold barriers: one local survivor keeps its stream alive; the last local consumer aborts that stream while the other PID remains alive; the last remote consumer then aborts its stream. Both mock responses must close prematurely without a body release and all catalog holds drain. Without any cache clear, a different caller makes two fresh refreshes, then hits both successful caches. No inference, lease creation or renewal is allowed. Fresh-only release uses an observed mock-call cursor; release of an old cancelled response still fails.
+2. **ABA, old 401 before old 200.** Requests are held on separate PIDs, and SQL proves both request IDs pin the original generation. Production credential writes rotate A → B → A. The old 401 completes and its exact hold drains while the old 200 stays blocked; SQL must retain valid replacement credentials, unchanged inventory/lease, and zero reauth/renewal events. Only then is 200 released. Neither admission, reclaim nor worker runs before **both** old completions, so those operations cannot mask the old-generation fence. Reverification uses the actual worker/provisioner with a held wire warmup; no admission before readiness, no inference replay, and a new active lease afterward.
+3. **A → B, old 401 before old 200.** Reuses the same bounded scheduling and exact-generation checks, but verifies the B token is used by replacement warmup and inference. This is one additional rotation variant, not an exhaustive matrix.
+
+The strict localhost/root/random-sibling-DB, environment isolation, child-exit, SQL watchdog, request/barrier and cleanup controls described below remain intact. The test-control allowlist additionally permits `rotate-ab`. The original 5-second production hold heartbeat is unchanged: both old completions must beat it; no parallel engine suites or debugger pauses at those barriers. Counts/timing in the historical v4 record below do not qualify these additions.
+
+### Commands and actual local test report
+
+Run from the checkout root with existing dependencies (no install needed). If dependencies resolve from an ancestor, use its installed TypeScript executable, as in the local check here.
+
+```sh
+node "$(node -p "require.resolve('typescript/bin/tsc')")" -p tests/user-pool-process/tsconfig.routes.json
+node --check tests/user-pool-process/routes.offline.test.mjs
+node --import tsx --test tests/user-pool-process/routes.offline.test.mjs
+
+env -u MYSQL_POOL_PROCESS_ROUTES_TEST -u MYSQL_POOL_TEST_DISPOSABLE -u MYSQL_TEST_URL \
+  -u MYSQL_POOL_PROCESS_ROUTES_SUITE \
+  node --import tsx --test --test-concurrency=1 tests/user-pool-process/routes.mysql.test.ts
+env -u MYSQL_POOL_PROCESS_ROUTES_TEST -u MYSQL_POOL_TEST_DISPOSABLE -u MYSQL_TEST_URL \
+  MYSQL_POOL_PROCESS_ROUTES_SUITE=v5 \
+  node --import tsx --test --test-concurrency=1 tests/user-pool-process/routes.mysql.test.ts
+
+node --import tsx --input-type=module -e "const s = await import('./tests/user-pool-process/routes.safety.ts'); await s.assertV5Production(); console.log('PASS: read-only production match to ' + s.v5ProductionRef)"
+git diff --check
+```
+
+Actual local results on Node `v24.14.0`, 2026-09-15:
+
+| Check | Actual result |
+| --- | --- |
+| Strict routes TypeScript noEmit | PASS, exit 0 |
+| Offline MJS syntax | PASS, exit 0 |
+| Offline URL/opt-in guards, suite selection, source-preflight stubs, side-effect sentinels | **4 pass / 0 fail / 0 skipped**, exit 0 |
+| Default/baseline discovery, engine opt-ins removed | **0 pass / 0 fail / 2 skipped**, exit 0 |
+| Explicit v5 discovery, engine opt-ins removed | **0 pass / 0 fail / 5 skipped**, exit 0 |
+| Actual read-only production match to `356f8f5` | PASS, exit 0 |
+| Diff whitespace | PASS, exit 0 |
+| V5 real MySQL route execution | **NOT EXECUTED locally; pending parent Azure-engine run** |
+
+The offline source-preflight tests stub Git to exercise matching, drift and untracked-source outcomes; the separate actual Git check above verifies this checkout. Entrypoint side-effect sentinels cover both suite selections and invalid selection, rejecting unsafe/missing configuration before Git/process spawn, listener/socket creation or fetch. Neither skip discovery nor offline passes count as MySQL/process acceptance. No cloud, Docker, MySQL fixture, commit or push was run for this preparation.
+
+### Parent-only v5 engine command (not executed here)
+
+Use the designated disposable engine on the Azure test host's **loopback**, with production source matching the target, this complete follow-up harness, and existing dependencies. The URL is only a credential/disposable-marker source; the named database is never selected or changed. Set the actual synthetic/disposable password through the authorized environment; do not put credentials in reports.
+
+```sh
+MYSQL_POOL_PROCESS_ROUTES_SUITE=v5 \
+MYSQL_POOL_PROCESS_ROUTES_TEST=1 MYSQL_POOL_TEST_DISPOSABLE=1 \
+MYSQL_TEST_URL='mysql://root:DISPOSABLE_PASSWORD@127.0.0.1:3306/ghcp_pool_test_optin' \
+node --import tsx --test --test-concurrency=1 tests/user-pool-process/routes.mysql.test.ts
+```
+
+Require the v5 production-match banner, **5 non-skipped passes / 0 failures**, distinct PID diagnostics and successful random-sibling drop evidence for all five cases, and exit 0. A baseline-only two-pass run does not cover this follow-up. Parent should serialize this with other disposable-engine suites and report full failing TAP/child-startup diagnostics; do not edit production fences to make a test pass. Remaining exclusions include count_tokens, exhaustive race/cancellation combinations, process death/failover, real upstreams, deployment and long-duration behavior.
+
+## Historical frozen-v4 qualification (two cases passed)
 
 Baseline: `2bc12b363e62923ca6c1db0185e42f9ed5c78bf9` (frozen v4).
 These eight harness files were copied unchanged from the prepared worktree before audit, then hardened only within this test directory. The earlier preparation/audit performed offline checks only; the parent subsequently ran both cases sequentially against disposable real MySQL on the frozen baseline. **Actual result: 2 pass / 0 fail / 0 skipped, 5.574 seconds**, with distinct child PID and successful random sibling database cleanup evidence. The frozen production modules and npm scripts were not changed. This is finite process-route qualification, not runtime acceptance of the later observability image.

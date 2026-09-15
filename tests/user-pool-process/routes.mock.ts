@@ -50,8 +50,11 @@ export async function mockServer() {
   server.requestTimeout = 30000; server.headersTimeout = 10000;
   server.listen(0, '127.0.0.1');
   await bounded(once(server, 'listening'), 'mock listen');
-  const release = (kind: string) => {
-    for (const call of calls.filter(call => call.kind === kind && !call.released)) {
+  const release = (kind: string, since = 0) => {
+    assert.ok(Number.isSafeInteger(since) && since >= 0 && since <= calls.length);
+    const selected = calls.slice(since).filter(call => call.kind === kind && !call.released);
+    assert.ok(selected.length > 0, `No pending upstream ${kind} at release barrier`);
+    for (const call of selected) {
       assert.equal(call.cancelled || call.res.destroyed, false, `Upstream ${kind} from PID ${call.pid} closed before its release barrier`);
       call.released = true;
       if (kind === 'catalog') call.res.end(`${JSON.stringify({ id: model, capabilities: { endpoints: ['/v1/messages'] } })}]}`);

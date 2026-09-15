@@ -103,7 +103,7 @@ export async function fixture(t: TestContext) {
   assert.notEqual(replicas[0].proxy, replicas[1].proxy);
   assert.notEqual(replicas[0].control, replicas[1].control);
   t.diagnostic(`Independent child PIDs ${replicas.map(replica => replica.pid).join(', ')}; shared ${database}`);
-  function control(index: number, command: 'state' | 'seed' | 'rotate-aba' | 'tick' | 'clear-cache') {
+  function control(index: number, command: 'state' | 'seed' | 'rotate-aba' | 'rotate-ab' | 'tick' | 'clear-cache') {
     live(); const controller = new AbortController(); controllers.push(controller);
     return track((async () => {
       const response = await fetch(`${replicas[index].control}/${command}`, {

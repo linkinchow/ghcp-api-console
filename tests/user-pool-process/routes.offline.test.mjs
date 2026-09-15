@@ -5,7 +5,7 @@ import http from 'node:http';
 import https from 'node:https';
 import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
-import { engineEnabled, loopbackOrigin, mysqlGate } from './routes.safety.ts';
+import { assertV5Production, engineEnabled, loopbackOrigin, mysqlGate, routesSuite, v5ProductionRef } from './routes.safety.ts';
 
 const valid = { MYSQL_POOL_PROCESS_ROUTES_TEST: '1', MYSQL_POOL_TEST_DISPOSABLE: '1',
   MYSQL_TEST_URL: 'mysql://root:synthetic@127.0.0.1:3306/ghcp_pool_test_optin' };
@@ -30,6 +30,37 @@ test('offline guard rejects absent opt-in and unsafe MySQL/control URLs', () => 
   for (const url of ['http://localhost:4321', 'http://127.0.0.1:4321/path', 'https://127.0.0.1:4321', 'http://127.0.0.1:4321?x=1', 'http://127.0.0.1']) assert.throws(() => loopbackOrigin(url));
 });
 
+test('offline suite selector preserves baseline and rejects unknown selections', () => {
+  assert.equal(routesSuite({}), 'baseline');
+  assert.equal(routesSuite({ MYSQL_POOL_PROCESS_ROUTES_SUITE: 'baseline' }), 'baseline');
+  assert.equal(routesSuite({ MYSQL_POOL_PROCESS_ROUTES_SUITE: 'v5' }), 'v5');
+  for (const value of ['', 'v4', 'all', 'V5']) assert.throws(() => routesSuite({ MYSQL_POOL_PROCESS_ROUTES_SUITE: value }), /REFUSED/);
+});
+
+test('offline v5 source preflight checks exact production content and rejects drift', async () => {
+  const saved = childProcess.execFileSync;
+  const calls = [];
+  let mode = 'match';
+  childProcess.execFileSync = (command, args, options) => {
+    calls.push(args);
+    assert.equal(command, 'git'); assert.equal(options.timeout, 5000);
+    assert.equal(options.encoding, 'utf8'); assert.equal(options.stdio, 'pipe');
+    if (args[0] === 'diff') {
+      assert.deepEqual(args, ['diff', '--exit-code', v5ProductionRef, '--', 'src/proxy', 'src/packages/shared']);
+      if (mode === 'drift') throw new Error('synthetic production mismatch');
+      return '';
+    }
+    assert.deepEqual(args, ['ls-files', '--others', '--exclude-standard', '--', 'src/proxy', 'src/packages/shared']);
+    return mode === 'untracked' ? 'src/proxy/src/untracked.ts\n' : '';
+  };
+  syncBuiltinESMExports();
+  try {
+    await assertV5Production(); assert.equal(calls.length, 2);
+    mode = 'drift'; await assert.rejects(assertV5Production(), /synthetic production mismatch/);
+    mode = 'untracked'; await assert.rejects(assertV5Production(), /untracked production/);
+  } finally { childProcess.execFileSync = saved; syncBuiltinESMExports(); }
+});
+
 test('offline entrypoints refuse before process spawn, HTTP listeners, sockets or fetch', async () => {
   let attempts = 0;
   const restored = [];
@@ -41,15 +72,20 @@ test('offline entrypoints refuse before process spawn, HTTP listeners, sockets o
     [globalThis, ['fetch']],
   ]) for (const key of keys) { restored.push([object, key, object[key]]); object[key] = deny; }
   syncBuiltinESMExports();
-  const names = ['MYSQL_POOL_PROCESS_ROUTES_TEST', 'MYSQL_POOL_TEST_DISPOSABLE', 'MYSQL_TEST_URL'];
+  const names = ['MYSQL_POOL_PROCESS_ROUTES_TEST', 'MYSQL_POOL_TEST_DISPOSABLE', 'MYSQL_TEST_URL', 'MYSQL_POOL_PROCESS_ROUTES_SUITE'];
   const saved = Object.fromEntries(names.map(name => [name, process.env[name]]));
   try {
     for (const name of names) delete process.env[name];
     await assert.rejects(import('./routes.child.ts?offline=absent'), /REFUSED/);
-    Object.assign(process.env, { MYSQL_POOL_PROCESS_ROUTES_TEST: '1' });
-    for (const file of ['routes.mysql.test.ts', 'routes.child.ts']) await assert.rejects(import(`./${file}?offline=missing-disposable`), /REFUSED/);
-    Object.assign(process.env, valid, { MYSQL_TEST_URL: 'mysql://root:x@192.0.2.1/ghcp_pool_test_x' });
-    for (const file of ['routes.mysql.test.ts', 'routes.child.ts']) await assert.rejects(import(`./${file}?offline=remote`), /loopback/);
+    for (const suite of ['baseline', 'v5']) {
+      for (const name of names) delete process.env[name];
+      Object.assign(process.env, { MYSQL_POOL_PROCESS_ROUTES_TEST: '1', MYSQL_POOL_PROCESS_ROUTES_SUITE: suite });
+      for (const file of ['routes.mysql.test.ts', 'routes.child.ts']) await assert.rejects(import(`./${file}?offline=${suite}-missing-disposable`), /REFUSED/);
+      Object.assign(process.env, valid, { MYSQL_TEST_URL: 'mysql://root:x@192.0.2.1/ghcp_pool_test_x' });
+      for (const file of ['routes.mysql.test.ts', 'routes.child.ts']) await assert.rejects(import(`./${file}?offline=${suite}-remote`), /loopback/);
+    }
+    Object.assign(process.env, valid, { MYSQL_POOL_PROCESS_ROUTES_SUITE: 'unknown' });
+    await assert.rejects(import('./routes.mysql.test.ts?offline=unknown-suite'), /REFUSED/);
     assert.equal(attempts, 0, 'Entrypoints must reject without even attempting a side effect');
   } finally {
     for (const [object, key, value] of restored) object[key] = value;

@@ -134,9 +134,9 @@ const control = createServer(async (req, res) => {
       assert.equal((await store.inventory(member))?.state, 'ready');
       assert.notEqual((await store.inventory(member))?.verified_at, null);
       result = { member };
-    } else if (req.method === 'POST' && path === '/rotate-aba') {
+    } else if (req.method === 'POST' && (path === '/rotate-aba' || path === '/rotate-ab')) {
       assert.ok(member && seeded);
-      for (const token of [tokenB, tokenA]) await accounts.importCopilotOauthToken({ identity: member, ssoUser: member,
+      for (const token of path === '/rotate-aba' ? [tokenB, tokenA] : [tokenB]) await accounts.importCopilotOauthToken({ identity: member, ssoUser: member,
         ghLogin: 'synthetic-gh-process', copilotOauthToken: token });
       result = { generation: (await store.inventory(member))!.generation };
     } else if (req.method === 'POST' && path === '/tick') {

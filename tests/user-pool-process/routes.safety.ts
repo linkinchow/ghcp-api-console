@@ -9,6 +9,29 @@ export const otherCaller = `sha256:${'b'.repeat(64)}`;
 export const model = 'gpt-process-routes';
 export const createdAt = '2026-01-01T00:00:00.000Z';
 export const deadlineMs = 8000;
+export const v5ProductionRef = '356f8f5e33a21ccfe7cf8c5db07060ab1ac47846';
+
+// This existing test entrypoint is also the suite selector; no v4 worker launcher
+// is involved. An absent selector preserves the two historical baseline cases.
+export function routesSuite(env: NodeJS.ProcessEnv): 'baseline' | 'v5' {
+  const suite = env.MYSQL_POOL_PROCESS_ROUTES_SUITE ?? 'baseline';
+  assert.ok(suite === 'baseline' || suite === 'v5', 'REFUSED: MYSQL_POOL_PROCESS_ROUTES_SUITE must be baseline or v5');
+  return suite;
+}
+
+// Called only after engineEnabled validates all destructive-fixture inputs.
+// Compare production content, not HEAD: test-only follow-up commits are allowed,
+// but older or locally modified production cannot be labelled a v5 run.
+export async function assertV5Production(): Promise<void> {
+  const { execFileSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const cwd = fileURLToPath(new URL('../../', import.meta.url));
+  const paths = ['src/proxy', 'src/packages/shared'];
+  const options = { cwd, timeout: 5000, encoding: 'utf8' as const, stdio: 'pipe' as const };
+  execFileSync('git', ['diff', '--exit-code', v5ProductionRef, '--', ...paths], options);
+  assert.equal(execFileSync('git', ['ls-files', '--others', '--exclude-standard', '--', ...paths], options).trim(), '',
+    'REFUSED: untracked production source is not qualified v5 content');
+}
 
 // Ordinary discovery without the dedicated opt-in skips. Once opted in, every
 // missing/unsafe destructive-fixture input is a hard refusal, never an engine pass.
