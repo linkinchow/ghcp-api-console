@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "timeoutMs": 3000,
+  "maxAgeMs": 15000,
+  "concurrency": 4,
+  "endpoints": [
+    {
+      "instance": "proxy-a",
+      "url": "https://proxy-a.example.invalid/api/user-pool/diagnostics/local",
+      "tokenEnv": "POOL_MONITOR_TOKEN_A"
+    },
+    {
+      "instance": "proxy-b",
+      "url": "https://proxy-b.example.invalid/api/user-pool/diagnostics/local",
+      "tokenEnv": "POOL_MONITOR_TOKEN_B"
+    }
+  ]
+}

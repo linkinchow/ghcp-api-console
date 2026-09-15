@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-09-15",
+  "scope": "Bounded offline operations adapter only; production files read-only",
+  "runtime": "Node.js v24.14.0 on Windows",
+  "runs": [
+    {
+      "command": "node --test ops/user-pool-monitor/monitor.test.mjs",
+      "stage": "Initial deterministic classifier and HTTP transport tests",
+      "exitCode": 0,
+      "tests": 28,
+      "passed": 28,
+      "failed": 0,
+      "skipped": 0,
+      "durationMs": 371.4446
+    },
+    {
+      "command": "node --check ops/user-pool-monitor/monitor.mjs",
+      "stage": "Sampler syntax validation",
+      "exitCode": 0
+    },
+    {
+      "command": "node --check ops/user-pool-monitor/monitor.test.mjs",
+      "stage": "Initial test file syntax validation, before adding two CLI tests",
+      "exitCode": 0
+    },
+    {
+      "command": "node --test ops/user-pool-monitor/monitor.test.mjs",
+      "stage": "Final deterministic suite including isolated child-process CLI checks",
+      "exitCode": 0,
+      "tests": 30,
+      "passed": 30,
+      "failed": 0,
+      "skipped": 0,
+      "durationMs": 424.6436
+    }
+  ],
+  "coverage": [
+    "Explicit endpoint/config allowlist, duplicate rejection, HTTPS and exact-loopback-only HTTP opt-in",
+    "Local owner/standby/stopped/null scope and payload freshness/clock-skew handling",
+    "DB-clock lease expiry boundary independent of sampler wall clock; zero deadline has no fabricated age",
+    "Unknown, stale, malformed, non-writer and SQL-unreachable observations never imply absent ownership",
+    "Local counter delta continuity requires fresh same-instance external process epoch; reset/gap is not a rate",
+    "Exact pool storage/member/SQLite-owner 503 versus exhaustion/cooling 429 classification",
+    "Authenticated GET, strict TLS, no-store, no redirect/retry/proxy, bounded body and total HTTP deadline",
+    "Output projection excludes credentials, raw fields, error messages, endpoints and environment key names",
+    "Missing credentials/debug tracing fail closed before any HTTP call",
+    "Bounded concurrency and batch-publication freshness revalidation",
+    "CLI safe JSON and exit 1 for invalid invocation; exit 2 for missing credentials and unknown DB"
+  ],
+  "executionBoundaries": {
+    "http": "Injected event emitters only; no sockets or DNS",
+    "timeouts": "Mocked timers; no wall-clock sleeps",
+    "cli": "Child processes use empty environment except optional SystemRoot; example credentials unavailable, hence no endpoint requests",
+    "sql": "SELECT template source-matched to production DB clock/fence; not executed",
+    "productionChanges": false,
+    "realEndpointsOrAccounts": false,
+    "azureDockerOrExternalServices": false,
+    "gitCommitOrPush": false,
+    "continuousLoad": false
+  },
+  "notes": [
+    "Initial and final test counts overlap and must not be summed.",
+    "One compound shell syntax/CLI command was rejected by the worktree command verifier before execution; syntax checks were then run as plain commands and CLI checks were added to and executed in the final suite.",
+    "Customer SQL collector wiring, actual per-instance routing, live alert delivery, readiness/drain, and LiteLLM effective fallback/request correlation remain customer integration acceptance, not executed tests.",
+    "No new soak or 24-hour campaign. Any further approved continuous load belongs to the coordinator's single maximum-30-minute campaign."
+  ]
+}

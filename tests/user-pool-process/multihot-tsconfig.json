@@ -1,0 +1,4 @@
+{
+  "extends": "./replicas-tsconfig.json",
+  "include": ["multihot-*.ts", "replicas-*.ts"]
+}

@@ -1,0 +1,203 @@
+# TEMPLATE ONLY. Not a kubectl/Rancher-ready release and not production approved.
+# Replace every REPLACE_* privately, review network/secrets/PVCs, and pass README gates.
+# No Namespace, Secret, MySQL, Ingress, PVC, SSO/Login/Console replacement is created here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-pool-proxy-config
+  namespace: REPLACE_CUSTOMER_NAMESPACE
+data:
+  PORT: "3000"
+  LOG_LEVEL: info
+  ACCOUNT_ROUTING_MODE: caller-lease
+  STORAGE_DRIVER: mysql
+  MYSQL_CONNECTION_LIMIT: "10"
+  MYSQL_SSL_MODE: verify-ca
+  MYSQL_SSL_CA_PATH: /run/mysql-ca/ca.pem
+  IDENTITY_HEADER: X-User-Identity
+  IDENTITY_HEADER_REQUIRED: "true"
+  POOL_ACCOUNT_EMAIL_DOMAIN: REPLACE_APPROVED_POOL_DOMAIN
+  POOL_WARMUP_MODEL: REPLACE_APPROVED_WARMUP_MODEL
+  # First-seed only, NOT a runtime pause. Existing DB settings take precedence.
+  READY_IDLE_TARGET: "0"
+  POOL_MAX_ACCOUNTS: "2"
+  CALLER_LEASE_TTL_SECONDS: "172800"
+  PROVISIONAL_LEASE_TTL_SECONDS: "300"
+  PREWARM_POLL_SECONDS: "5"
+  PREWARM_CONCURRENCY: "1"
+  POOL_LOGIN_MAX_PENDING: "5"
+  POOL_EXHAUSTED_RETRY_AFTER_SECONDS: "30"
+  POOL_REQUEST_TIMEOUT_SECONDS: "120"
+  # Preserve the customer-approved retention value; do not blindly use the default 2.
+  REQUEST_STATS_PER_ACCOUNT_LIMIT: REPLACE_APPROVED_STATS_RETENTION
+  PROXY_ERROR_DIAGNOSTICS_ENABLED: "false"
+  PROXY_ERROR_DIAGNOSTICS_REDACT: "true"
+  SSO_BASE_URL: REPLACE_EXISTING_INTERNAL_SSO_ROOT
+  LOGIN_BASE_URL: REPLACE_EXISTING_INTERNAL_LOGIN_ROOT
+  ENTERPRISE_SHORTCODE: REPLACE_EXISTING_ENTERPRISE_SHORTCODE
+  COPILOT_API_BASE_URL: REPLACE_APPROVED_COPILOT_API_ROOT
+  # This is checked by the init container, not a product env or DB pause setting.
+  # Leave BLOCKED until actual persisted paused=1, target=0 and safe external-task
+  # state are privately verified. Importer forces paused=1 but preserves source target.
+  CUSTOMER_PAUSED_DATABASE_APPROVED: BLOCKED
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-pool-companion-routing
+  namespace: REPLACE_CUSTOMER_NAMESPACE
+data:
+  # Apply this setting to the EXISTING single-instance SSO, Login and Console.
+  # Same namespace DNS; no /api suffix. Preserve every other env/secret/volume.
+  PROXY_BASE_URL: http://ghcp-pool-proxy:3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ghcp-pool-proxy
+  namespace: REPLACE_CUSTOMER_NAMESPACE
+spec:
+  type: ClusterIP
+  sessionAffinity: None
+  selector:
+    app.kubernetes.io/name: ghcp-pool-proxy
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ghcp-pool-proxy
+  namespace: REPLACE_CUSTOMER_NAMESPACE
+  annotations:
+    ghcp.delivery/status: template-not-production-approved
+    ghcp.delivery/source-commit: REPLACE_FULL_CUSTOMER_BUILD_COMMIT
+spec:
+  # Draft default is 3. Customer chooses after node/MySQL connection budgeting.
+  # 3/5 independent-process tests are NOT Rancher cross-node capacity/HA evidence.
+  replicas: 3
+  revisionHistoryLimit: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ghcp-pool-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ghcp-pool-proxy
+      annotations:
+        ghcp.delivery/source-commit: REPLACE_FULL_CUSTOMER_BUILD_COMMIT
+        ghcp.delivery/config-revision: REPLACE_REVIEWED_CONFIG_REVISION
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      # Spread is a draft placement preference, not guaranteed failure-domain HA.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ghcp-pool-proxy
+      # Customer supplies imagePullSecrets here if its own image distribution needs it.
+      initContainers:
+        - name: require-approved-paused-database
+          image: REPLACE_CUSTOMER_PROXY_IMAGE_REFERENCE
+          imagePullPolicy: IfNotPresent
+          command:
+            - node
+            - -e
+            - "if(process.env.CUSTOMER_PAUSED_DATABASE_APPROVED !== 'true'){console.error('BLOCKED: verify persisted paused=1, target=0 and external-task quiescence before startup');process.exit(1)}"
+          env:
+            - name: CUSTOMER_PAUSED_DATABASE_APPROVED
+              valueFrom:
+                configMapKeyRef:
+                  name: ghcp-pool-proxy-config
+                  key: CUSTOMER_PAUSED_DATABASE_APPROVED
+      containers:
+        - name: proxy
+          image: REPLACE_CUSTOMER_PROXY_IMAGE_REFERENCE
+          imagePullPolicy: IfNotPresent
+          # Existing Dockerfile uses npm as PID1; explicit node receives SIGTERM.
+          # Confirm compiled entry for the selected commit before deployment.
+          command: [node, src/proxy/dist/index.js]
+          ports:
+            - name: http
+              containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: ghcp-pool-proxy-config
+          env:
+            - name: MYSQL_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_EXISTING_PROXY_SECRET_NAME
+                  key: MYSQL_URL
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_EXISTING_PROXY_SECRET_NAME
+                  key: API_KEY
+            - name: INTERNAL_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_EXISTING_PROXY_SECRET_NAME
+                  key: INTERNAL_API_TOKEN
+            - name: PROXY_INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+          resources:
+            requests:
+              cpu: REPLACE_APPROVED_CPU_REQUEST
+              memory: REPLACE_APPROVED_MEMORY_REQUEST
+            limits:
+              cpu: REPLACE_APPROVED_CPU_LIMIT
+              memory: REPLACE_APPROVED_MEMORY_LIMIT
+          # /readyz checks storage and does not require MySQL local owner status.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            timeoutSeconds: 6
+            periodSeconds: 10
+            failureThreshold: 2
+            successThreshold: 1
+          # /healthz has no DB query. Do not replace with /readyz for liveness.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 6
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 30
+          lifecycle:
+            preStop:
+              exec:
+                # Bounded time for Service endpoint propagation, NOT a drain API.
+                command: [node, -e, "setTimeout(() => {}, 10000)"]
+          volumeMounts:
+            - name: mysql-ca
+              mountPath: /run/mysql-ca
+              readOnly: true
+      volumes:
+        - name: mysql-ca
+          configMap:
+            name: REPLACE_EXISTING_MYSQL_CA_CONFIGMAP
+            items:
+              - key: ca.pem
+                path: ca.pem
