@@ -141,7 +141,7 @@ function fixture(stage = 'new') {
       return warmResponse();
     },
   });
-  const advance = async () => { const patch = await adapter.step({ ...row }, context); context.checkpoint(patch); return patch; };
+  const advance = async () => { const patch = await adapter.step({ ...row }, context); await context.checkpoint(patch); return patch; };
   return {
     adapter, context, controller, advance, requests, checkpoints, tasks,
     row: () => row, user: () => user!, account: () => account,
@@ -457,6 +457,94 @@ test('step deadline aborts an external request and never records a successful ch
   } finally {
     clearTimeout(keepAlive);
   }
+});
+
+test('async context assertions and checkpoints finish before any external side effect', async () => {
+  const f = fixture('oauth-starting');
+  const asserted = f.context.assertCurrent.bind(f.context);
+  f.context.assertCurrent = async () => {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await asserted();
+  };
+  const checkpoint = f.context.checkpoint.bind(f.context);
+  f.context.checkpoint = async patch => {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    return checkpoint(patch);
+  };
+  await f.advance();
+  assert.equal(f.row().stage, 'oauth-wait');
+  assert.equal(f.tasks.length, 1, 'mock POST asserts the intent was already persisted');
+
+  const fenced = fixture();
+  fenced.context.assertCurrent = async () => {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    throw new ProvisionFailure('provision_fenced');
+  };
+  await rejectsCode(fenced.advance(), 'provision_fenced');
+  assert.equal(fenced.requests.length, 0);
+});
+
+test('async credential pin is awaited before warmup account and model work', async () => {
+  const f = fixture('warmup');
+  f.context.pinCredentials = async () => {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    throw new ProvisionFailure('provision_fenced');
+  };
+  await rejectsCode(f.advance(), 'provision_fenced');
+  assert.equal(f.modelRequest(), undefined);
+  assert.equal(f.warms(), 0);
+});
+
+test('atomic context handles link, authorization and both 401 invalidations without legacy mutations', async () => {
+  for (const stage of ['scim-synced', 'oauth-starting', 'warmup', 'warmup-catalog']) {
+    const f = fixture(stage === 'warmup-catalog' ? 'warmup' : stage);
+    const mutations: unknown[] = [];
+    f.context.claimLoginDispatch = async () => f.context.checkpoint({ stage: 'oauth-dispatch' });
+    f.context.mutateCredentials = async mutation => {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      mutations.push(mutation);
+      return true;
+    };
+    if (stage === 'warmup') f.warmResponse(() => json({}, 401));
+    if (stage === 'warmup-catalog') f.modelError(new CopilotApiError('synthetic unauthorized', 401));
+    if (stage.startsWith('warmup')) {
+      await rejectsCode(f.advance(), 'warmup_http_401');
+      assert.equal(f.row().stage, 'synced');
+      assert.deepEqual(mutations, [{ type: 'invalidate', expectedToken: 'test-oauth-token' }]);
+    } else {
+      await f.advance();
+      assert.deepEqual(mutations, [stage === 'scim-synced'
+        ? { type: 'link', ghLogin: 'alex001_emu' } : { type: 'begin', oauthAttemptId: 'oauth-attempt' }]);
+    }
+    assert.equal(f.begins(), 0);
+    assert.equal(f.invalidations(), 0);
+  }
+});
+
+test('rejected atomic mutation fences dispatch rather than falling back to a repository write', async () => {
+  const f = fixture('oauth-starting');
+  f.context.mutateCredentials = async () => false;
+  await rejectsCode(f.advance(), 'provision_fenced');
+  assert.equal(f.begins(), 0);
+  assert.equal(f.tasks.length, 0);
+  assert.equal(f.row().stage, 'oauth-starting');
+});
+
+test('production adapter requires atomic mutation context before any network access', async () => {
+  const f = fixture();
+  const production = realProvisioner({ now: async () => Date.now() }, options);
+  await rejectsCode(production.step(f.row(), f.context), 'provision_storage_incompatible');
+  assert.equal(f.checkpoints.length, 0);
+});
+
+test('task age validation uses awaited database time', async () => {
+  const f = fixture('oauth-wait');
+  f.patch({ task_id: 'task-1' });
+  const task = makeTask({ createdAt, status: 'running' });
+  const adapter = realProvisioner({ now: async () => Date.parse(createdAt) + 15 * 60 * 1000 }, options, {
+    fetch: async input => String(input).includes('/api/tasks/') ? json(task) : json(f.user()),
+  });
+  await rejectsCode(adapter.step(f.row(), f.context), 'oauth_task_stalled');
 });
 
 test('aborting a response body bounds stop and oversized responses are rejected', async () => {

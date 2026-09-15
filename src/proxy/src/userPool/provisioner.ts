@@ -20,7 +20,8 @@ import {
 import { getStorage } from '../db/connection.js';
 import type { CreateAccountInput, ProxyAccountRecord } from '../db/storageTypes.js';
 import type { PoolConfig } from './config.js';
-import type { Inventory, UserPoolStore } from './store.js';
+import type { Inventory } from './store.js';
+import type { Awaitable, PoolStore, WorkerCredentialMutation } from './storage.js';
 
 /** Separate aliases keep the adapter contract readable without duplicating the persisted schema. */
 export type ProvisionInventory = Inventory;
@@ -40,17 +41,25 @@ export class ProvisionFailure extends Error {
 
 export interface ProvisionContext {
   signal: AbortSignal;
-  assertCurrent(): void;
+  assertCurrent(): Awaitable<void>;
   /** Fence a warmup against credential writes, including ABA token replacement. */
-  pinCredentials(): void;
-  /** A successful conditional token invalidation increments the generation once. */
-  credentialsInvalidated?(): void;
-  checkpoint(patch: ProvisionPatch): ProvisionInventory;
+  pinCredentials(): Awaitable<void>;
+  /** Legacy injected test adapters only; production invalidation updates its pin atomically. */
+  credentialsInvalidated?(): Awaitable<void>;
+  /** The worker applies owner/attempt/stage/generation checks in the credential transaction. */
+  mutateCredentials?(mutation: WorkerCredentialMutation): Awaitable<boolean>;
+  claimLoginDispatch?(limit: number): Awaitable<ProvisionInventory | undefined>;
+  checkpoint(patch: ProvisionPatch): Awaitable<ProvisionInventory>;
 }
+
+export type LoginReservationContext = Pick<ProvisionContext, 'signal' | 'assertCurrent'>;
+export type LoginReservationOutcome = 'success' | 'failed';
 
 export interface ProvisionAdapter {
   readonly stepTimeoutMs?: number;
   step(row: ProvisionInventory, context: ProvisionContext): Promise<ProvisionPatch>;
+  /** Observe only: never retry, cancel, begin OAuth, warm up, or modify credentials. */
+  reconcileLoginReservation?(row: ProvisionInventory, context: LoginReservationContext): Promise<LoginReservationOutcome | undefined>;
 }
 
 interface ProvisionDependencies {
@@ -68,31 +77,53 @@ const LOGIN_TASK_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_TASK_PAGES = 10;
 
 export function realProvisioner(
-  store: Pick<UserPoolStore, 'now'>,
+  store: Pick<PoolStore, 'now'>,
   options: PoolConfig,
   dependencies: Partial<ProvisionDependencies> = {},
 ): ProvisionAdapter {
-  const deps: ProvisionDependencies = {
-    fetch: (...args) => fetch(...args),
-    // The caller has already initialized single-owner SQLite. Avoid the repository
-    // wrappers' initialization await between the hold/owner fence and a credential write.
-    getAccount: (identity) => getStorage().getAccount(identity),
-    createAccount: (input) => getStorage().createAccount(input),
-    beginAuthorization: (identity, attempt) => getStorage().beginCopilotOauthAuthorization(identity, attempt),
-    invalidateToken: (identity, token, status) => getStorage().invalidateCopilotOauthToken(identity, token, status),
+  const deps = {
+    fetch: (...args: Parameters<typeof fetch>) => fetch(...args),
+    // Reads may use either storage driver. Production writes use the atomic context.
+    getAccount: (identity: string) => getStorage().getAccount(identity),
     resolveModel: resolveCopilotModel,
     executeRequest: executePreparedCopilotRequest,
     ...dependencies,
   };
   const email = (row: ProvisionInventory) => `${row.identity}@${options.accountDomain}`;
 
+  async function mutate(row: ProvisionInventory, context: ProvisionContext, mutation: WorkerCredentialMutation): Promise<boolean> {
+    await context.assertCurrent();
+    if (context.mutateCredentials) {
+      if (!await context.mutateCredentials(mutation)) throw new ProvisionFailure('provision_fenced');
+      return true;
+    }
+    // Only explicitly injected test dependencies may use the old non-atomic fixture API.
+    // Missing mutation support must never silently fall through to a real repository write.
+    if (mutation.type === 'link' && dependencies.createAccount) {
+      await dependencies.createAccount({ identity: row.identity, ssoUser: row.identity, ghLogin: mutation.ghLogin });
+      return true;
+    }
+    if (mutation.type === 'begin' && dependencies.beginAuthorization) {
+      if (!await dependencies.beginAuthorization(row.identity, mutation.oauthAttemptId)) {
+        throw new ProvisionFailure('proxy_identity_changed', true);
+      }
+      return true;
+    }
+    if (mutation.type === 'invalidate' && dependencies.invalidateToken) {
+      const invalidated = await dependencies.invalidateToken(row.identity, mutation.expectedToken, 'expired');
+      if (invalidated) await context.credentialsInvalidated?.();
+      return invalidated;
+    }
+    throw new ProvisionFailure('provision_storage_incompatible', true);
+  }
+
   async function request<T>(
-    context: ProvisionContext,
+    context: LoginReservationContext,
     service: 'sso' | 'login',
     path: string,
     body?: unknown,
   ): Promise<T> {
-    context.assertCurrent();
+    await context.assertCurrent();
     const baseUrl = service === 'sso' ? config.ssoBaseUrl : config.loginBaseUrl;
     const response = await deps.fetch(`${baseUrl.replace(/\/+$/, '')}${path}`, {
       method: body === undefined ? 'GET' : 'POST',
@@ -105,12 +136,16 @@ export function realProvisioner(
       signal: context.signal,
       redirect: 'error',
     });
-    context.assertCurrent();
-    if (!response.ok) {
+    try {
+      await context.assertCurrent();
+      if (!response.ok) throw new ProvisionFailure(`${service}_http_${response.status}`);
+      const body = await readJson(response, context.signal);
+      await context.assertCurrent();
+      return body as T;
+    } catch (error) {
       void response.body?.cancel().catch(() => {});
-      throw new ProvisionFailure(`${service}_http_${response.status}`);
+      throw error;
     }
-    return await readJson(response, context.signal) as T;
   }
 
   function checkUser(row: ProvisionInventory, user: SsoUserDto, creating = false): SsoUserDto {
@@ -134,10 +169,10 @@ export function realProvisioner(
     }
   }
 
-  async function accountFor(row: ProvisionInventory, context: ProvisionContext, user?: SsoUserDto): Promise<ProxyAccountRecord> {
-    context.assertCurrent();
+  async function accountFor(row: ProvisionInventory, context: LoginReservationContext, user?: SsoUserDto): Promise<ProxyAccountRecord> {
+    await context.assertCurrent();
     const account = await deps.getAccount(row.identity);
-    context.assertCurrent();
+    await context.assertCurrent();
     if (!account || account.identity !== row.identity || account.ssoUser !== row.identity
       || user && account.ghLogin && account.ghLogin !== user.ghLogin) {
       throw new ProvisionFailure('proxy_identity_changed', true);
@@ -154,7 +189,7 @@ export function realProvisioner(
     return task;
   }
 
-  async function findTask(row: ProvisionInventory, context: ProvisionContext, ghLogin: string): Promise<LoginTaskDto | undefined> {
+  async function findTask(row: ProvisionInventory, context: LoginReservationContext, ghLogin: string): Promise<LoginTaskDto | undefined> {
     let found: LoginTaskDto | undefined;
     for (let page = 1; page <= MAX_TASK_PAGES; page++) {
       const result = await request<PageResponse<LoginTaskDto>>(context, 'login',
@@ -174,7 +209,7 @@ export function realProvisioner(
   }
 
   async function step(row: ProvisionInventory, context: ProvisionContext): Promise<ProvisionPatch> {
-    context.assertCurrent();
+    await context.assertCurrent();
     if (row.stage === 'new') {
       try {
         await request(context, 'sso', `/api/users/${encodeURIComponent(row.identity)}`);
@@ -184,7 +219,7 @@ export function realProvisioner(
       }
       // POST /users has no idempotency key. A crash from this point requires manual
       // reconciliation, even if a later GET happens to find the expected name/email.
-      row = context.checkpoint({ stage: 'sso-creating', sso_created_at: null });
+      row = await context.checkpoint({ stage: 'sso-creating', sso_created_at: null });
       try {
         const user = checkUser(row, await request<SsoUserDto>(context, 'sso', '/api/users', {
           ssoUser: row.identity, email: email(row), role: 'user', poolManaged: true,
@@ -202,7 +237,7 @@ export function realProvisioner(
       if (existing.emuStatus === 'active' && existing.ghLogin && existing.ghScimId) return { stage: 'scim-synced' };
       // Never replay a timed-out side effect while the SSO service may still be doing it.
       if (row.stage === 'scim-syncing') throw new ProvisionFailure('scim_sync_unconfirmed');
-      row = context.checkpoint({ stage: 'scim-syncing' });
+      row = await context.checkpoint({ stage: 'scim-syncing' });
       const result = await request<{ rows: { ssoUser: string; status: string; user?: SsoUserDto }[] }>(
         context, 'sso', '/api/users/batch', {
           operation: 'sync_emu', ssoUsers: [row.identity], assignCopilotSeat: false, createOnly: true,
@@ -221,15 +256,15 @@ export function realProvisioner(
       if (user.emuStatus !== 'active' || !user.ghLogin || !user.ghScimId) throw new ProvisionFailure('scim_not_ready');
       if (user.copilotSeatStatus !== 'assigned') {
         if (row.stage === 'seat-assigning') throw new ProvisionFailure('seat_assignment_unconfirmed');
-        row = context.checkpoint({ stage: 'seat-assigning' });
+        row = await context.checkpoint({ stage: 'seat-assigning' });
         user = checkUser(row, await request<SsoUserDto>(context, 'sso',
           `/api/users/${encodeURIComponent(row.identity)}/copilot-seat`, {}));
       }
       checkEntitlement(user);
       await accountFor(row, context, user);
-      context.assertCurrent();
-      await deps.createAccount({ identity: row.identity, ssoUser: row.identity, ghLogin: user.ghLogin });
-      context.assertCurrent();
+      await context.assertCurrent();
+      await mutate(row, context, { type: 'link', ghLogin: user.ghLogin! });
+      await context.assertCurrent();
       return { stage: 'synced' };
     }
 
@@ -253,14 +288,18 @@ export function realProvisioner(
       checkUser(row, credentials.user);
       if (!credentials.passwordForLogin) throw new ProvisionFailure('sso_password_unavailable', true);
       if (account.copilotOauthAttemptId !== row.oauth_attempt_id || account.copilotOauthStatus !== 'refreshing') {
-        context.assertCurrent();
-        if (!await deps.beginAuthorization(row.identity, row.oauth_attempt_id)) {
-          throw new ProvisionFailure('proxy_identity_changed', true);
-        }
+        await mutate(row, context, { type: 'begin', oauthAttemptId: row.oauth_attempt_id });
       }
       // Persist before POST, never after. Recovery only searches; the Login API does
       // not deduplicate POSTs carrying the same oauthAttemptId.
-      row = context.checkpoint({ stage: 'oauth-dispatch' });
+      if (context.claimLoginDispatch) {
+        const admitted = await context.claimLoginDispatch(options.loginMaxPending ?? 5);
+        if (!admitted) return {};
+        row = admitted;
+      } else {
+        if (context.mutateCredentials) throw new ProvisionFailure('provision_storage_incompatible', true);
+        row = await context.checkpoint({ stage: 'oauth-dispatch' });
+      }
       const task = checkTask(row, await request<LoginTaskDto>(context, 'login', '/api/tasks', {
         identity: row.identity, ssoUser: row.identity, ghLogin: user.ghLogin,
         ssoPassword: credentials.passwordForLogin, oauthAttemptId: row.oauth_attempt_id, ssoType: 'custom',
@@ -279,11 +318,12 @@ export function realProvisioner(
       // never convert an uncertain dispatch into a new OAuth attempt.
       if (!task) throw new ProvisionFailure('oauth_dispatch_unconfirmed');
       const createdAt = Date.parse(task.createdAt);
-      if (!Number.isFinite(createdAt) || createdAt > store.now() + 60000) throw new ProvisionFailure('oauth_task_invalid', true);
+      const now = await store.now();
+      if (!Number.isFinite(createdAt) || createdAt > now + 60000) throw new ProvisionFailure('oauth_task_invalid', true);
       if (row.stage === 'oauth-dispatch') return { stage: 'oauth-wait', task_id: task.id };
       if (task.status === 'cancelled') throw new ProvisionFailure('oauth_task_cancelled_unconfirmed', true);
       if (task.status === 'failed') {
-        context.checkpoint({ stage: 'synced', task_id: null, oauth_attempt_id: null });
+        await context.checkpoint({ stage: 'synced', task_id: null, oauth_attempt_id: null });
         throw new ProvisionFailure('oauth_login_failed');
       }
       if (task.status === 'success') {
@@ -293,7 +333,7 @@ export function realProvisioner(
         }
         return { stage: 'warmup' };
       }
-      if (store.now() - createdAt >= LOGIN_TASK_TIMEOUT_MS) {
+      if (now - createdAt >= LOGIN_TASK_TIMEOUT_MS) {
         // Login cancellation only marks its DB row, it does not stop Playwright. Do not
         // create a concurrent replacement for a stalled task or reset its stage.
         throw new ProvisionFailure('oauth_task_stalled', true);
@@ -305,10 +345,10 @@ export function realProvisioner(
     if (row.stage === 'warmup' || row.stage === 'ready') {
       const user = await knownUser(row, context);
       checkEntitlement(user);
-      context.pinCredentials();
+      await context.pinCredentials();
       const account = await accountFor(row, context, user);
       if (!account.copilotOauthToken || account.copilotOauthStatus !== 'valid') {
-        context.checkpoint({ stage: 'synced', task_id: null, oauth_attempt_id: null });
+        await context.checkpoint({ stage: 'synced', task_id: null, oauth_attempt_id: null });
         throw new ProvisionFailure('credential_not_valid');
       }
       const auth = { identity: account.identity, accessToken: account.copilotOauthToken, api: config.copilotApiBaseUrl };
@@ -321,15 +361,15 @@ export function realProvisioner(
           break;
         } catch (error) {
           if (error instanceof CopilotApiError && error.status === 401) {
-            context.checkpoint({ stage: 'synced', task_id: null, oauth_attempt_id: null });
-            if (await deps.invalidateToken(account.identity, account.copilotOauthToken, 'expired')) context.credentialsInvalidated?.();
+            await context.checkpoint({ stage: 'synced', task_id: null, oauth_attempt_id: null });
+            await mutate(row, context, { type: 'invalidate', expectedToken: account.copilotOauthToken });
             throw new ProvisionFailure('warmup_http_401');
           }
           if (!(error instanceof CopilotModelPathError)) throw error;
         }
       }
       if (!resolved) throw new ProvisionFailure('warmup_model_unavailable');
-      context.assertCurrent();
+      await context.assertCurrent();
       const prepared = prepareCopilotRequest(auth, path, {
         model: resolved.upstreamId, stream: false,
         ...(path === '/responses'
@@ -337,12 +377,17 @@ export function realProvisioner(
           : { messages: [{ role: 'user', content: 'Reply OK' }], max_tokens: 16 }),
       });
       const response = await deps.executeRequest(prepared, context.signal);
-      context.assertCurrent();
+      try {
+        await context.assertCurrent();
+      } catch (error) {
+        void response.body?.cancel().catch(() => {});
+        throw error;
+      }
       if (!response.ok) {
         void response.body?.cancel().catch(() => {});
         if (response.status === 401) {
-          context.checkpoint({ stage: 'synced', task_id: null, oauth_attempt_id: null });
-          if (await deps.invalidateToken(account.identity, account.copilotOauthToken, 'expired')) context.credentialsInvalidated?.();
+          await context.checkpoint({ stage: 'synced', task_id: null, oauth_attempt_id: null });
+          await mutate(row, context, { type: 'invalidate', expectedToken: account.copilotOauthToken });
         }
         throw new ProvisionFailure(`warmup_http_${response.status}`);
       }
@@ -353,24 +398,63 @@ export function realProvisioner(
         || latest.copilotOauthUpdatedAt !== account.copilotOauthUpdatedAt) {
         throw new ProvisionFailure('warmup_credential_changed');
       }
-      context.assertCurrent();
-      return { stage: 'ready', state: 'ready', last_error: null, verified_at: store.now(), attempts: 0, retry_at: 0 };
+      await context.assertCurrent();
+      return { stage: 'ready', state: 'ready', last_error: null, verified_at: await store.now(), attempts: 0, retry_at: 0 };
     }
     throw new ProvisionFailure('unknown_provision_stage', true);
   }
 
   return {
     stepTimeoutMs: options.requestTimeoutMs,
+    async reconcileLoginReservation(row, context) {
+      if (!isExhaustedLoginReservation(row) || !row.oauth_attempt_id) return undefined;
+      const signal = AbortSignal.any([context.signal, AbortSignal.timeout(options.requestTimeoutMs)]);
+      const observation: LoginReservationContext = {
+        signal,
+        assertCurrent: async () => { signal.throwIfAborted(); await context.assertCurrent(); signal.throwIfAborted(); },
+      };
+      // The persisted Proxy identity is sufficient for task ownership. Do not require
+      // another SSO/entitlement call: those outages may have exhausted the poll retries.
+      const account = await accountFor(row, observation);
+      if (!account.ghLogin) return undefined;
+      const task = row.task_id
+        ? checkTask(row, await request<LoginTaskDto>(observation, 'login', `/api/tasks/${encodeURIComponent(row.task_id)}`), account.ghLogin)
+        : await findTask(row, observation, account.ghLogin);
+      await observation.assertCurrent();
+      // cancelled is only a DB marker in Login, not proof that Playwright stopped.
+      // A successful task releases capacity, not the failed/disabled retry protection.
+      return task?.status === 'success' || task?.status === 'failed' ? task.status : undefined;
+    },
     async step(row, context) {
+      if (!context.mutateCredentials && Object.keys(dependencies).length === 0) {
+        throw new ProvisionFailure('provision_storage_incompatible', true);
+      }
       const signal = AbortSignal.any([context.signal, AbortSignal.timeout(options.requestTimeoutMs)]);
       return step(row, {
         ...context,
         signal,
-        assertCurrent: () => { signal.throwIfAborted(); context.assertCurrent(); },
-        checkpoint: (patch) => { signal.throwIfAborted(); return context.checkpoint(patch); },
+        assertCurrent: async () => { signal.throwIfAborted(); await context.assertCurrent(); signal.throwIfAborted(); },
+        pinCredentials: async () => { signal.throwIfAborted(); await context.pinCredentials(); signal.throwIfAborted(); },
+        mutateCredentials: context.mutateCredentials && (async (mutation) => {
+          signal.throwIfAborted();
+          const result = await context.mutateCredentials!(mutation);
+          signal.throwIfAborted();
+          return result;
+        }),
+        checkpoint: async (patch) => {
+          signal.throwIfAborted();
+          const saved = await context.checkpoint(patch);
+          signal.throwIfAborted();
+          return saved;
+        },
       });
     },
   };
+}
+
+export function isExhaustedLoginReservation(row: ProvisionInventory): boolean {
+  return (row.stage === 'oauth-dispatch' || row.stage === 'oauth-wait')
+    && (row.state === 'disabled' || row.state === 'failed' && row.attempts >= 3);
 }
 
 function validWarmupResponse(value: unknown, path: CopilotApiPath): boolean {

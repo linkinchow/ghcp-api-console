@@ -14,6 +14,9 @@ import {
   type ProxyRequestStatDto,
 } from '@ghcp/shared';
 import { runMysqlMigrations } from './mysqlMigrations.js';
+import { MysqlPoolStore } from '../userPool/mysqlStore.js';
+import type { PoolConfig } from '../userPool/config.js';
+import { leaseMysqlConnection, MysqlDeadline } from '../userPool/mysqlDeadline.js';
 import type {
   AccountListQuery,
   CreateAccountInput,
@@ -37,6 +40,8 @@ interface AccountRow extends RowDataPacket {
 }
 
 interface StatRow extends RowDataPacket {
+  caller_id: string | null;
+  lease_id: string | null;
   id: string;
   identity: string;
   gh_login: string | null;
@@ -53,6 +58,19 @@ interface StatRow extends RowDataPacket {
 }
 
 export class MysqlStorage implements ProxyStorage {
+  private poolStore?: Promise<MysqlPoolStore>;
+
+  userPool(options: PoolConfig): Promise<MysqlPoolStore> {
+    return this.poolStore ??= (async () => {
+      const store = new MysqlPoolStore(this.pool, options);
+      await store.initialize();
+      return store;
+    })().catch((error: unknown) => {
+      this.poolStore = undefined;
+      throw error;
+    });
+  }
+
   constructor(
     private readonly pool: Pool,
     private readonly requestStatsPerAccountLimit: number,
@@ -64,7 +82,7 @@ export class MysqlStorage implements ProxyStorage {
   }
 
   async ping(): Promise<void> {
-    await this.pool.query('SELECT 1');
+    await this.execute('SELECT 1');
   }
 
   async close(): Promise<void> {
@@ -81,11 +99,11 @@ export class MysqlStorage implements ProxyStorage {
     const args = q ? [`%${q}%`, `%${q}%`, `%${q}%`] : [];
     const sort = sortColumn(query.sort);
     const dir = query.dir === 'asc' ? 'ASC' : 'DESC';
-    const [countRows] = await this.pool.execute<Array<RowDataPacket & { count: number }>>(
+    const [countRows] = await this.execute<Array<RowDataPacket & { count: number }>>(
       `SELECT COUNT(*) AS count FROM proxy_accounts ${where}`,
       args,
     );
-    const [rows] = await this.pool.execute<AccountRow[]>(
+    const [rows] = await this.execute<AccountRow[]>(
       `SELECT * FROM proxy_accounts ${where} ORDER BY ${sort} ${dir} LIMIT ? OFFSET ?`,
       [...args, pageSize, (page - 1) * pageSize],
     );
@@ -93,7 +111,7 @@ export class MysqlStorage implements ProxyStorage {
   }
 
   async getAccount(identity: string): Promise<ProxyAccountRecord | undefined> {
-    const [rows] = await this.pool.execute<AccountRow[]>(
+    const [rows] = await this.execute<AccountRow[]>(
       'SELECT * FROM proxy_accounts WHERE identity = ?',
       [identity],
     );
@@ -155,7 +173,7 @@ export class MysqlStorage implements ProxyStorage {
 
   async createAccount(input: CreateAccountInput): Promise<ProxyAccountRecord> {
     const now = mysqlTimestamp(nowIso());
-    await this.pool.execute(`
+    await this.execute(`
       INSERT INTO proxy_accounts (
         identity, sso_user, gh_login, copilot_oauth_status, copilot_oauth_attempt_id, created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -177,7 +195,7 @@ export class MysqlStorage implements ProxyStorage {
 
   async importCopilotOauthToken(input: ImportCopilotOauthTokenInput): Promise<ProxyAccountRecord> {
     const now = mysqlTimestamp(nowIso());
-    await this.pool.execute(`
+    await this.execute(`
       INSERT INTO proxy_accounts (
         identity, sso_user, gh_login, copilot_oauth_token, copilot_oauth_status,
         copilot_oauth_updated_at, created_at, updated_at
@@ -209,7 +227,7 @@ export class MysqlStorage implements ProxyStorage {
     ghLogin?: string,
   ): Promise<ProxyAccountRecord | undefined> {
     const now = mysqlTimestamp(nowIso());
-    const [result] = await this.pool.execute<ResultSetHeader>(`
+    const [result] = await this.execute<ResultSetHeader>(`
       UPDATE proxy_accounts
       SET copilot_oauth_token = ?, gh_login = COALESCE(?, gh_login),
           copilot_oauth_status = 'valid', copilot_oauth_updated_at = ?,
@@ -220,14 +238,14 @@ export class MysqlStorage implements ProxyStorage {
   }
 
   async markCopilotOauthStatus(identity: string, status: CopilotOauthStatus): Promise<void> {
-    await this.pool.execute(
+    await this.execute(
       'UPDATE proxy_accounts SET copilot_oauth_status = ?, updated_at = ? WHERE identity = ?',
       [status, mysqlTimestamp(nowIso()), identity],
     );
   }
 
   async beginCopilotOauthAuthorization(identity: string, oauthAttemptId: string): Promise<boolean> {
-    const [result] = await this.pool.execute<ResultSetHeader>(`
+    const [result] = await this.execute<ResultSetHeader>(`
       UPDATE proxy_accounts
       SET copilot_oauth_status = 'refreshing', copilot_oauth_attempt_id = ?, updated_at = ?
       WHERE identity = ?
@@ -236,7 +254,7 @@ export class MysqlStorage implements ProxyStorage {
   }
 
   async failCopilotOauthAuthorization(identity: string, oauthAttemptId: string): Promise<boolean> {
-    const [result] = await this.pool.execute<ResultSetHeader>(`
+    const [result] = await this.execute<ResultSetHeader>(`
       UPDATE proxy_accounts
       SET copilot_oauth_status = 'failed', updated_at = ?
       WHERE identity = ? AND copilot_oauth_attempt_id = ?
@@ -250,7 +268,7 @@ export class MysqlStorage implements ProxyStorage {
     status: Extract<CopilotOauthStatus, 'expired' | 'failed'>,
   ): Promise<boolean> {
     const now = mysqlTimestamp(nowIso());
-    const [result] = await this.pool.execute<ResultSetHeader>(`
+    const [result] = await this.execute<ResultSetHeader>(`
       UPDATE proxy_accounts
       SET copilot_oauth_token = NULL, copilot_oauth_status = ?,
           copilot_oauth_updated_at = ?, copilot_oauth_attempt_id = NULL, updated_at = ?
@@ -264,13 +282,13 @@ export class MysqlStorage implements ProxyStorage {
     const leaseExpiresAt = mysqlTimestamp(new Date(Date.now() + leaseSeconds * 1000).toISOString());
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
-        const [inserted] = await this.pool.execute<ResultSetHeader>(`
+        const [inserted] = await this.execute<ResultSetHeader>(`
           INSERT IGNORE INTO proxy_identity_initializations (
             identity, claim_id, lease_expires_at, created_at, updated_at
           ) VALUES (?, ?, ?, ?, ?)
         `, [identity, claimId, leaseExpiresAt, now, now]);
         if (inserted.affectedRows === 1) return true;
-        const [updated] = await this.pool.execute<ResultSetHeader>(`
+        const [updated] = await this.execute<ResultSetHeader>(`
           UPDATE proxy_identity_initializations
           SET claim_id = ?, lease_expires_at = ?, updated_at = ?
           WHERE identity = ? AND lease_expires_at <= ?
@@ -285,7 +303,7 @@ export class MysqlStorage implements ProxyStorage {
   }
 
   async releaseIdentityInitialization(identity: string, claimId: string): Promise<boolean> {
-    const [result] = await this.pool.execute<ResultSetHeader>(
+    const [result] = await this.execute<ResultSetHeader>(
       'DELETE FROM proxy_identity_initializations WHERE identity = ? AND claim_id = ?',
       [identity, claimId],
     );
@@ -293,11 +311,11 @@ export class MysqlStorage implements ProxyStorage {
   }
 
   async recordRequestStat(input: RecordRequestStatInput): Promise<void> {
-    await this.pool.execute(`
+    await this.execute(`
       INSERT INTO proxy_request_stats (
         id, identity, gh_login, requested_at, path, model, success, failure_reason,
-        input_tokens, output_tokens, cache_tokens, cache_input_tokens, cache_write_tokens
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        input_tokens, output_tokens, cache_tokens, cache_input_tokens, cache_write_tokens, caller_id, lease_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
       newRequestId(),
       input.identity,
@@ -312,6 +330,8 @@ export class MysqlStorage implements ProxyStorage {
       input.cacheTokens ?? null,
       input.cacheInputTokens ?? null,
       input.cacheWriteTokens ?? null,
+      input.callerId ?? null,
+      input.leaseId ?? null,
     ]);
     await this.pruneStats(input.identity);
   }
@@ -319,11 +339,11 @@ export class MysqlStorage implements ProxyStorage {
   async listRequestStats(identity?: string, limit = 100): Promise<ProxyRequestStatDto[]> {
     const boundedLimit = Math.max(1, Math.min(limit, 1000));
     const [rows] = identity
-      ? await this.pool.execute<StatRow[]>(
+      ? await this.execute<StatRow[]>(
           'SELECT * FROM proxy_request_stats WHERE identity = ? ORDER BY requested_at DESC, id DESC LIMIT ?',
           [identity, boundedLimit],
         )
-      : await this.pool.execute<StatRow[]>(
+      : await this.execute<StatRow[]>(
           'SELECT * FROM proxy_request_stats ORDER BY requested_at DESC, id DESC LIMIT ?',
           [boundedLimit],
         );
@@ -331,7 +351,7 @@ export class MysqlStorage implements ProxyStorage {
   }
 
   async pruneAllRequestStats(): Promise<void> {
-    await this.pool.execute(`
+    await this.execute(`
       DELETE stats
       FROM proxy_request_stats AS stats
       JOIN (
@@ -351,7 +371,7 @@ export class MysqlStorage implements ProxyStorage {
   }
 
   private async pruneStats(identity: string): Promise<void> {
-    await this.pool.execute(`
+    await this.execute(`
       DELETE FROM proxy_request_stats
       WHERE identity = ?
         AND id NOT IN (
@@ -365,18 +385,31 @@ export class MysqlStorage implements ProxyStorage {
     `, [identity, identity, this.requestStatsPerAccountLimit]);
   }
 
+  private readonly execute: Pool['execute'] = (async (...args: unknown[]) => {
+    const lease = await leaseMysqlConnection(this.pool, new MysqlDeadline());
+    try { return await Reflect.apply(lease.connection.execute, lease.connection, args); }
+    finally { lease.release(); }
+  }) as Pool['execute'];
+
   private async transaction<T>(operation: (connection: PoolConnection) => Promise<T>): Promise<T> {
-    const connection = await this.pool.getConnection();
+    const lease = await leaseMysqlConnection(this.pool, new MysqlDeadline());
+    const { connection } = lease;
+    let committing = false;
     try {
       await connection.beginTransaction();
       const result = await operation(connection);
+      committing = true;
       await connection.commit();
       return result;
     } catch (err) {
-      await connection.rollback();
+      if (committing) lease.destroy();
+      else if (!lease.destroyed) {
+        try { await connection.rollback(); }
+        catch { lease.destroy(); }
+      }
       throw err;
     } finally {
-      connection.release();
+      lease.release();
     }
   }
 }
@@ -399,6 +432,8 @@ function mapStatRow(row: StatRow): ProxyRequestStatDto {
   return {
     id: row.id,
     identity: row.identity,
+    callerId: row.caller_id ?? undefined,
+    leaseId: row.lease_id ?? undefined,
     ghLogin: row.gh_login ?? undefined,
     requestedAt: mysqlTimestampToIso(row.requested_at)!,
     path: row.path,

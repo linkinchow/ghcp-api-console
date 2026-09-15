@@ -75,6 +75,20 @@ export interface UserPoolOverview {
 export type UserPoolAccountAction = 'disable' | 'resume' | 'retry';
 const BASE = '/api/console/proxy/user-pool';
 
+export function getUserPoolSummary(signal?: AbortSignal): Promise<UserPoolOverview> {
+  return api<UserPoolOverview>(`${BASE}/summary`, { signal, cache: 'no-store' });
+}
+export interface UserPoolPageResult {
+  items: Array<UserPoolAccount | UserPoolLease | UserPoolEvent>;
+  total: number;
+  page: number;
+  pageSize: number;
+}
+export function getUserPoolPage(kind: 'accounts' | 'leases' | 'events', page: number, pageSize: number,
+  q: string, state: string, signal?: AbortSignal): Promise<UserPoolPageResult> {
+  const query = new URLSearchParams({ page: String(page), pageSize: String(pageSize), q, state });
+  return api(`${BASE}/page/${kind}?${query}`, { signal, cache: 'no-store' });
+}
 export function getUserPoolOverview(signal?: AbortSignal): Promise<UserPoolOverview> {
   return api<UserPoolOverview>(BASE, { signal, cache: 'no-store' });
 }

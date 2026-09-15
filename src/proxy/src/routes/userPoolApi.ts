@@ -3,10 +3,12 @@ import { requireInternalToken } from '../auth/internalAuth.js';
 import { getUserPool, wakePool } from '../userPool/runtime.js';
 import { UserPoolError } from '../userPool/config.js';
 import { NAME_CAPACITY } from '../userPool/names.js';
-import type { PoolSettings, UserPoolStore } from '../userPool/store.js';
+import type { PoolSettings } from '../userPool/store.js';
+import { poolPageSql, type PoolList, type PoolPageQuery } from '../userPool/paging.js';
+import type { PoolStore } from '../userPool/storage.js';
 
-type AdminStore = Pick<UserPoolStore, 'settings' | 'counts' | 'accounts' | 'leases' | 'events'
-  | 'updateSettings' | 'inventory' | 'disable' | 'retry' | 'release' | 'hasHolds'>;
+type AdminStore = Pick<PoolStore, 'settings' | 'counts' | 'accounts' | 'leases' | 'events'
+  | 'updateSettings' | 'inventory' | 'disable' | 'retry' | 'release' | 'hasHolds'> & Partial<Pick<PoolStore, 'page'>>;
 interface Dependencies {
   getStore: () => Promise<AdminStore | undefined>;
   wake: () => void | Promise<void>;
@@ -74,43 +76,74 @@ export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}
       }
     };
 
-  router.get('/user-pool', handle((_req, res, store) => {
-    // counts() reclaims expired leases before the associated lists are read.
-    const counts = countsDto(store.counts());
-    const accounts = store.accounts().slice(0, LIST_LIMITS.accounts).map(accountDto);
+  router.get('/user-pool', handle(async (_req, res, store) => {
+    const counts = countsDto(await store.counts());
+    const accounts = (await store.accounts()).slice(0, LIST_LIMITS.accounts).map(accountDto);
+    const leases = (await store.leases()).slice(0, LIST_LIMITS.leases)
+      .map((lease) => leaseDto(lease, number(lease.active_requests) > 0));
     res.json({
       enabled: true,
       poolId: 'default',
       observedAt: Date.now(),
-      settings: settingsDto(store.settings()),
+      settings: settingsDto(await store.settings()),
       counts,
       accounts,
-      leases: store.leases().slice(0, LIST_LIMITS.leases).map((lease) => leaseDto(lease, store.hasHolds(lease.member_identity))),
-      events: store.events().slice(0, LIST_LIMITS.events).map(eventDto),
+      leases,
+      events: (await store.events()).slice(0, LIST_LIMITS.events).map(eventDto),
       limits: SETTINGS_LIMITS,
       listLimits: LIST_LIMITS,
     });
   }));
 
-  router.get('/user-pool/accounts', handle((_req, res, store) => {
-    const counts = countsDto(store.counts());
-    res.json({ items: store.accounts().slice(0, LIST_LIMITS.accounts).map(accountDto), total: counts.total, limit: LIST_LIMITS.accounts });
+  router.get('/user-pool/summary', handle(async (_req, res, store) => {
+    res.json({ enabled: true, poolId: 'default', observedAt: Date.now(),
+      settings: settingsDto(await store.settings()), counts: countsDto(await store.counts()),
+      limits: SETTINGS_LIMITS, listLimits: LIST_LIMITS, accounts: [], leases: [], events: [] });
   }));
-  router.get('/user-pool/leases', handle((_req, res, store) => {
-    const counts = countsDto(store.counts());
-    res.json({
-      items: store.leases().slice(0, LIST_LIMITS.leases).map((lease) => leaseDto(lease, store.hasHolds(lease.member_identity))),
-      total: counts.leased + counts.provisional,
-      limit: LIST_LIMITS.leases,
-    });
+  router.get('/user-pool/page/:kind', async (req, res) => {
+    try {
+      const kind = req.params.kind as PoolList;
+      if (!['accounts', 'leases', 'events'].includes(kind)
+        || Object.keys(req.query).some(key => !['page', 'pageSize', 'q', 'state'].includes(key))) {
+        throw new UserPoolError(400, 'invalid_request');
+      }
+      const integerQuery = (key: string, fallback: number) => {
+        const value = req.query[key];
+        if (value === undefined) return fallback;
+        if (typeof value !== 'string' || !/^\d+$/.test(value)) throw new UserPoolError(400, 'invalid_request');
+        return Number(value);
+      };
+      if (req.query.q !== undefined && typeof req.query.q !== 'string'
+        || req.query.state !== undefined && typeof req.query.state !== 'string') throw new UserPoolError(400, 'invalid_request');
+      const query: PoolPageQuery = { page: integerQuery('page', 1), pageSize: integerQuery('pageSize', 25),
+        q: req.query.q as string | undefined, state: req.query.state as string | undefined };
+      try { poolPageSql(kind, query, 0); } catch { throw new UserPoolError(400, 'invalid_request'); }
+      const store = await getStore();
+      if (!store) throw new UserPoolError(409, 'pool_mode_disabled');
+      if (!store.page) throw new UserPoolError(503, 'pool_operation_failed');
+      const result = await store.page(kind, query);
+      res.json({ ...result, items: result.items.map(row => kind === 'accounts' ? accountDto(row)
+        : kind === 'events' ? eventDto(row) : leaseDto(row, isRecord(row) && number(row.active_requests) > 0)) });
+    } catch (error) { sendError(res, error); }
+  });
+
+  router.get('/user-pool/accounts', handle(async (_req, res, store) => {
+    const counts = countsDto(await store.counts());
+    res.json({ items: (await store.accounts()).slice(0, LIST_LIMITS.accounts).map(accountDto), total: counts.total, limit: LIST_LIMITS.accounts });
   }));
-  router.get('/user-pool/events', handle((_req, res, store) => {
-    res.json({ items: store.events().slice(0, LIST_LIMITS.events).map(eventDto), limit: LIST_LIMITS.events });
+  router.get('/user-pool/leases', handle(async (_req, res, store) => {
+    const counts = countsDto(await store.counts());
+    const items = (await store.leases()).slice(0, LIST_LIMITS.leases)
+      .map((lease) => leaseDto(lease, number(lease.active_requests) > 0));
+    res.json({ items, total: counts.leased + counts.provisional, limit: LIST_LIMITS.leases });
+  }));
+  router.get('/user-pool/events', handle(async (_req, res, store) => {
+    res.json({ items: (await store.events()).slice(0, LIST_LIMITS.events).map(eventDto), limit: LIST_LIMITS.events });
   }));
 
   router.patch('/user-pool/settings', handle(async (req, res, store) => {
     const { expectedVersion, changes } = readSettingsPatch(req.body);
-    const settings = store.updateSettings(expectedVersion, changes);
+    const settings = await store.updateSettings(expectedVersion, changes);
     await wake();
     res.json(settingsDto(settings));
   }));
@@ -125,14 +158,14 @@ export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}
     const action = String(req.params.action);
     if (identity !== identity.trim() || !/^[a-zA-Z0-9][a-zA-Z0-9._@+-]{0,253}$/.test(identity)) throw new UserPoolError(400, 'invalid_member_identity');
     if (!['disable', 'resume', 'retry'].includes(action)) throw new UserPoolError(404, 'action_not_found');
-    const account = store.inventory(identity);
+    const account = await store.inventory(identity);
     if (!account) throw new UserPoolError(404, 'member_not_found');
     if (action === 'disable') {
-      store.disable(identity);
+      await store.disable(identity);
     } else {
       if (account.state !== (action === 'resume' ? 'disabled' : 'failed')) throw new UserPoolError(409, 'invalid_member_state');
       // Retry revalidates entitlement and credentials; a resumed account is not immediately ready.
-      store.retry(identity);
+      await store.retry(identity);
     }
     await wake();
     res.json({ accepted: true });
@@ -142,7 +175,7 @@ export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}
     if (Object.keys(req.body).some((key) => key !== 'confirm')) throw new UserPoolError(400, 'invalid_request');
     const id = String(req.params.id);
     if (id.length !== 36 || !UUID.test(id)) throw new UserPoolError(400, 'invalid_lease_id');
-    store.release(id);
+    await store.release(id);
     await wake();
     res.json({ released: true });
   }));

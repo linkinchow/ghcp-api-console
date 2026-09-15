@@ -13,7 +13,7 @@ import { resolveClaudeCodeOptimized } from './routes/claudeCodeMode.js';
 import { adminApiRouter } from './routes/adminApi.js';
 import { internalApiRouter } from './routes/internalApi.js';
 import { userPoolApiRouter } from './routes/userPoolApi.js';
-import { assertUserPoolOwner, routeUserPool, startUserPool, stopUserPool } from './userPool/runtime.js';
+import { assertUserPoolOwner, getUserPool, routeUserPool, startUserPool, stopUserPool } from './userPool/runtime.js';
 import { readPoolConfig } from './userPool/config.js';
 
 const requestLogger = new Logger('request');
@@ -115,10 +115,11 @@ export async function startServer(): Promise<Server> {
   let server: Server;
   try {
     const poolOptions = readPoolConfig(process.env);
-    if (poolOptions.enabled && (config.storageDriver !== 'sqlite' || !config.apiKey || !config.internalApiToken)) {
-      throw new Error('User pool requires single-instance SQLite and authenticated Proxy/internal APIs');
+    if (poolOptions.enabled && (!config.apiKey || !config.internalApiToken)) {
+      throw new Error('User pool requires authenticated Proxy/internal APIs');
     }
     await initializeStorage();
+    await getUserPool();
     await pruneAllRequestStats();
     await startUserPool();
     server = await new Promise<Server>((resolve, reject) => {

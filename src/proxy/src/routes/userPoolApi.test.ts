@@ -80,6 +80,21 @@ test('pool router authenticates every route, including alternate mounts and disa
   } finally { await f.close(); }
 });
 
+test('legacy lease lists use joined hold counts instead of per-row lookups', async () => {
+  const f = await fixture();
+  try {
+    f.ready();
+    const held = f.store.acquire(HASH);
+    f.store.hasHolds = () => { throw new Error('Unexpected per-lease query'); };
+    for (const path of ['', '/leases']) {
+      const result = await f.request(path);
+      assert.equal(result.status, 200);
+      assert.equal((path ? result.body.items : result.body.leases)[0].inUse, true);
+    }
+    assert.ok(held.request_id);
+  } finally { await f.close(); }
+});
+
 test('overview explicitly selects safe DTOs, validates caller hashes, and sanitizes event/error details', async () => {
   const f = await fixture();
   try {
@@ -206,6 +221,33 @@ test('async initialization, read, and wake failures use safe JSON error envelope
     assert.equal((await f.request('/reconcile', 'POST')).body.error.code, 'pool_operation_failed');
     f.store.counts = () => { throw new Error('database_password=secret'); };
     assert.equal((await f.request()).body.error.code, 'pool_operation_failed');
+  } finally { await f.close(); }
+});
+
+test('server paging validates parameters, authenticates and preserves DTO redaction', async () => {
+  const f = await fixture();
+  try {
+    const first = f.ready(), second = f.ready();
+    const held = f.store.acquire(HASH);
+    const summary = await f.request('/summary');
+    assert.equal(summary.status, 200);
+    assert.deepEqual(summary.body.accounts, []);
+    assert.equal(summary.body.counts.total, 2);
+    const page = await f.request('/page/accounts?page=2&pageSize=1');
+    assert.equal(page.body.total, 2);
+    assert.equal(page.body.items.length, 1);
+    assert.equal(page.body.items[0].identity, second);
+    assert.ok(!JSON.stringify(page.body).includes('gho-private-token'));
+    const leased = await f.request('/page/leases?pageSize=1');
+    assert.equal(leased.body.items[0].inUse, true);
+    assert.equal(leased.body.items[0].memberIdentity, first);
+    assert.equal((await f.request(`/page/accounts?q=${encodeURIComponent(second)}&state=ready_idle`)).body.total, 1);
+    assert.equal((await f.request('/page/accounts?q=%25')).body.total, 0);
+    for (const query of ['page=0', 'pageSize=101', 'page=1.5', 'state=unknown', 'extra=1', 'q=a&q=b']) {
+      assert.equal((await f.request(`/page/accounts?${query}`)).status, 400);
+    }
+    assert.equal((await f.request('/page/accounts', 'GET', undefined, null)).status, 401);
+    f.store.finish(held, false);
   } finally { await f.close(); }
 });
 

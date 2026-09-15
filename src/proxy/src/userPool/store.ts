@@ -3,6 +3,9 @@ import type Database from 'better-sqlite3';
 import type { PoolConfig } from './config.js';
 import { normalizeCaller, UserPoolError } from './config.js';
 import { accountName, NAME_CAPACITY } from './names.js';
+import { poolPageSql, type PoolList, type PoolPage, type PoolPageQuery } from './paging.js';
+import type { WorkerCredentialFence, WorkerCredentialMutation } from './storage.js';
+import { LOGIN_CAPACITY_SQL, PendingSelection } from './scheduling.js';
 
 export interface Inventory {
   identity: string;
@@ -52,7 +55,7 @@ export interface PoolSettings {
   paused: number;
 }
 
-export type InventoryFence = string | Pick<Inventory, 'attempt_id' | 'generation'>;
+export type InventoryFence = string | (Pick<Inventory, 'attempt_id' | 'generation'> & Partial<Pick<Inventory, 'stage'>>);
 
 interface HoldRow {
   request_id: string;
@@ -75,6 +78,8 @@ const INVENTORY_KEYS = [
 ];
 
 export class UserPoolStore {
+  private readonly pendingSelection = new PendingSelection();
+
   constructor(private readonly db: Database.Database, private readonly options: PoolConfig) {
     db.transaction(() => {
       db.exec(`
@@ -205,12 +210,73 @@ export class UserPoolStore {
     }).immediate();
   }
 
+  mutateWorkerCredential(identity: string, fence: WorkerCredentialFence, owner: string, mutation: WorkerCredentialMutation): boolean {
+    return this.db.transaction(() => {
+      const row = this.inventory(identity);
+      if (!row || row.state !== 'provisioning' || row.stage !== fence.stage
+        || !this.matchesFence(row, fence) || !this.matchesOwner(owner) || this.hasHolds(identity)) return false;
+      const timestamp = new Date(this.now()).toISOString();
+      if (mutation.type === 'link') {
+        return this.db.prepare(`UPDATE proxy_accounts SET gh_login = ?, updated_at = ?
+          WHERE identity = ? AND sso_user = ? AND (gh_login IS NULL OR gh_login = ?)`)
+          .run(mutation.ghLogin, timestamp, identity, identity, mutation.ghLogin).changes === 1;
+      }
+      if (mutation.type === 'begin') {
+        return this.db.prepare(`UPDATE proxy_accounts SET copilot_oauth_status = 'refreshing',
+          copilot_oauth_attempt_id = ?, updated_at = ? WHERE identity = ? AND sso_user = ?`)
+          .run(mutation.oauthAttemptId, timestamp, identity, identity).changes === 1;
+      }
+      return this.db.prepare(`UPDATE proxy_accounts SET copilot_oauth_token = NULL,
+        copilot_oauth_status = 'expired', copilot_oauth_attempt_id = NULL,
+        copilot_oauth_updated_at = ?, updated_at = ?
+        WHERE identity = ? AND copilot_oauth_token = ? AND copilot_oauth_status = 'valid'`)
+        .run(timestamp, timestamp, identity, mutation.expectedToken).changes === 1;
+    }).immediate();
+  }
+
+  claimLoginDispatch(identity: string, fence: WorkerCredentialFence, owner: string, limit: number): boolean {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new UserPoolError(400, 'invalid_login_limit');
+    return this.db.transaction(() => {
+      const row = this.inventory(identity);
+      if (!row || row.state !== 'provisioning' || row.stage !== 'oauth-starting' || !this.matchesFence(row, fence)
+        || !this.matchesOwner(owner) || this.hasHolds(identity)) return false;
+      const occupied = (this.db.prepare(`SELECT COUNT(*) n FROM user_pool_accounts
+        WHERE stage IN ('oauth-dispatch', 'oauth-wait')`).get() as { n: number }).n;
+      if (occupied >= limit) return false;
+      return this.update(identity, { stage: 'oauth-dispatch' }, fence, owner);
+    }).immediate();
+  }
+
+  listLoginReservations(): Inventory[] {
+    return this.db.prepare(`SELECT * FROM user_pool_accounts WHERE stage IN ('oauth-dispatch', 'oauth-wait')
+      AND (state = 'disabled' OR (state = 'failed' AND attempts >= 3)) ORDER BY ordinal LIMIT 100`).all() as Inventory[];
+  }
+
+  releaseLoginReservation(identity: string, fence: Inventory, owner: string, outcome: 'success' | 'failed'): boolean {
+    return this.db.transaction(() => {
+      const row = this.inventory(identity);
+      const keys: (keyof Inventory)[] = ['attempt_id', 'generation', 'stage', 'state', 'attempts', 'task_id', 'oauth_attempt_id', 'sso_created_at'];
+      if (!row || !['success', 'failed'].includes(outcome) || !['oauth-dispatch', 'oauth-wait'].includes(row.stage)
+        || !(row.state === 'disabled' || row.state === 'failed' && row.attempts >= 3)
+        || keys.some(key => (row[key] ?? null) !== (fence[key] ?? null))
+        || !this.matchesOwner(owner) || this.settings().paused || this.hasHolds(identity)) return false;
+      return this.db.prepare(`UPDATE user_pool_accounts SET stage=?, task_id=NULL, oauth_attempt_id=NULL,
+        generation=generation+1 WHERE identity=?`).run(outcome === 'success' ? 'warmup' : 'synced', identity).changes === 1;
+    }).immediate();
+  }
+
   claimOwner(owner: string): boolean {
     const now = this.now();
     return this.db.prepare(`
       UPDATE user_pool_settings SET owner = ?, owner_until = ?
       WHERE id = 1 AND (owner = ? OR owner_until <= ?)
     `).run(owner, now + 30000, owner, now).changes === 1;
+  }
+
+  renewOwner(owner: string): boolean {
+    const now = this.now();
+    return this.db.prepare(`UPDATE user_pool_settings SET owner_until = ?
+      WHERE id = 1 AND owner = ? AND owner_until > ?`).run(now + 30000, owner, now).changes === 1;
   }
 
   releaseOwner(owner: string): void {
@@ -225,6 +291,15 @@ export class UserPoolStore {
     this.db.prepare(`
       DELETE FROM user_pool_events WHERE id <= (SELECT COALESCE(MAX(id), 0) - 10000 FROM user_pool_events)
     `).run();
+  }
+
+  page(kind: PoolList, query: PoolPageQuery): PoolPage {
+    return this.db.transaction(() => {
+      const sql = poolPageSql(kind, query, this.now());
+      const total = (this.db.prepare(sql.countSql).get(...sql.values) as { total: number }).total;
+      const items = this.db.prepare(sql.itemsSql).all(...sql.values, query.pageSize, (query.page - 1) * query.pageSize);
+      return { items, total, page: query.page, pageSize: query.pageSize };
+    })();
   }
 
   events(): unknown[] {
@@ -242,8 +317,12 @@ export class UserPoolStore {
     `).all({ now: this.now() });
   }
 
-  leases(): Lease[] {
-    return this.db.prepare('SELECT * FROM user_pool_leases ORDER BY assigned_at DESC LIMIT 1000').all() as Lease[];
+  leases(): Array<Lease & { active_requests: number }> {
+    return this.db.prepare(`SELECT l.*,
+      (SELECT COUNT(*) FROM user_pool_holds h WHERE h.lease_id=l.lease_id AND h.expires_at>@now)
+      + (SELECT COUNT(*) FROM user_pool_catalog_holds h WHERE h.member_identity=l.member_identity AND h.expires_at>@now) AS active_requests
+      FROM user_pool_leases l ORDER BY assigned_at DESC, lease_id LIMIT 1000`)
+      .all({ now: this.now() }) as Array<Lease & { active_requests: number }>;
   }
 
   inventory(identity: string): Inventory | undefined {
@@ -323,8 +402,9 @@ export class UserPoolStore {
     }).immediate();
   }
 
-  acquire(caller: string): HeldLease {
+  acquire(caller: string, signal?: AbortSignal): HeldLease {
     normalizeCaller(caller);
+    signal?.throwIfAborted();
     return this.admit(() => {
       this.assertCallerNotCooling(caller);
       const now = this.now();
@@ -354,8 +434,9 @@ export class UserPoolStore {
   }
 
   /** Discovery pins one member only for the request and never creates/renews a caller lease. */
-  acquireCatalog(caller: string): HeldLease {
+  acquireCatalog(caller: string, signal?: AbortSignal): HeldLease {
     normalizeCaller(caller);
+    signal?.throwIfAborted();
     return this.admit(() => {
       this.assertCallerNotCooling(caller);
       const existing = this.db.prepare('SELECT * FROM user_pool_leases WHERE caller_id = ?')
@@ -642,7 +723,7 @@ export class UserPoolStore {
   }
 
   pending(excluded: readonly string[] = []): Inventory | undefined {
-    return this.db.transaction(() => {
+    const row = this.db.transaction(() => {
       this.reclaim();
       if (this.settings().paused) return undefined;
       const exclusion = excluded.length ? `AND p.identity NOT IN (${excluded.map(() => '?').join(',')})` : '';
@@ -654,15 +735,19 @@ export class UserPoolStore {
           AND NOT EXISTS (SELECT 1 FROM user_pool_holds h JOIN user_pool_leases l ON l.lease_id = h.lease_id
             WHERE l.member_identity = p.identity)
           AND NOT EXISTS (SELECT 1 FROM user_pool_catalog_holds h WHERE h.member_identity = p.identity)
-        ORDER BY retry_at, updated_at, ordinal LIMIT 1
-      `).get(this.now(), ...excluded) as Inventory | undefined;
+          AND ${LOGIN_CAPACITY_SQL}
+        ORDER BY ${this.pendingSelection.orderSql()} LIMIT 1
+      `).get(this.now(), ...excluded, this.options.loginMaxPending ?? 5) as Inventory | undefined;
     }).immediate();
+    if (row) this.pendingSelection.selected();
+    return row;
   }
 
   private matchesFence(row: Inventory, fence?: InventoryFence): boolean {
     if (fence === undefined) return true;
     if (typeof fence === 'string') return row.attempt_id === fence;
-    return row.attempt_id === fence.attempt_id && row.generation === fence.generation;
+    return row.attempt_id === fence.attempt_id && row.generation === fence.generation
+      && (fence.stage === undefined || row.stage === fence.stage);
   }
 
   private matchesOwner(owner?: string): boolean {
@@ -693,11 +778,11 @@ export class UserPoolStore {
     }).immediate();
   }
 
-  fail(identity: string, code: string, expected?: InventoryFence, owner?: string): void {
+  fail(identity: string, code: string, expected?: InventoryFence, owner?: string, terminal = false): void {
     this.db.transaction(() => {
       const row = this.inventory(identity);
       if (!row || row.state === 'disabled' || !this.matchesFence(row, expected) || !this.matchesOwner(owner)) return;
-      const attempts = row.attempts + 1;
+      const attempts = terminal ? Math.max(3, row.attempts + 1) : row.attempts + 1;
       this.update(identity, {
         state: 'failed', attempts, last_error: code,
         retry_at: this.now() + Math.min(300, 30 * 2 ** (attempts - 1)) * 1000,

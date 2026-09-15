@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(shutil.which("docker"), "Docker Compose is not available")
 class ComposeConfigTests(unittest.TestCase):
-    def render(self, *, pool=False, **overrides):
+    def render(self, *, pool=False, mysql_pool=False, **overrides):
         env = dict(os.environ)
         # Ignore live shell settings; use the public template and synthetic values.
         for line in (ROOT / ".env.example").read_text().splitlines():
@@ -22,6 +22,8 @@ class ComposeConfigTests(unittest.TestCase):
                    "-f", str(ROOT / "docker-compose.yml")]
         if pool:
             command.extend(["-f", str(ROOT / "docker-compose.user-pool.yml")])
+        if mysql_pool:
+            command.extend(["-f", str(ROOT / "docker-compose.user-pool-mysql.yml")])
         return subprocess.run(command + ["config", "--format", "json"], env=env,
                               capture_output=True, text=True, timeout=30)
 
@@ -52,6 +54,27 @@ class ComposeConfigTests(unittest.TestCase):
                             "PREWARM_POLL_SECONDS": "5", "POOL_EXHAUSTED_RETRY_AFTER_SECONDS": "30",
                             "POOL_REQUEST_TIMEOUT_SECONDS": "120"}.items():
             self.assertEqual(env[name], value)
+
+    def test_mysql_pool_uses_shared_database_without_shared_sqlite_or_host_port(self):
+        result = self.render(mysql_pool=True, POOL_ACCOUNT_EMAIL_DOMAIN="pool.example.test",
+                             POOL_WARMUP_MODEL="test-model", SSO_DEFAULT_USER_PASSWORD="local-test-password-only",
+                             MYSQL_URL="mysql://test:test@db.test/pool", PROXY_CLUSTER_BASE_URL="http://lb.test:8081")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        services = json.loads(result.stdout)["services"]
+        proxy = services["proxy"]
+        self.assertEqual(proxy["environment"]["STORAGE_DRIVER"], "mysql")
+        self.assertEqual(proxy["environment"]["ACCOUNT_ROUTING_MODE"], "caller-lease")
+        self.assertEqual(proxy["environment"]["POOL_LOGIN_MAX_PENDING"], "5")
+        self.assertEqual(proxy["deploy"]["replicas"], 2)
+        self.assertFalse(proxy.get("ports"))
+        self.assertFalse(proxy.get("volumes"))
+        for name in ["sso", "login", "console"]:
+            self.assertEqual(services[name]["environment"]["PROXY_BASE_URL"], "http://lb.test:8081")
+            self.assertTrue(services[name]["volumes"])
+
+    def test_mysql_pool_requires_database_and_internal_load_balancer(self):
+        self.assertNotEqual(self.render(mysql_pool=True, POOL_ACCOUNT_EMAIL_DOMAIN="pool.example.test",
+                                       POOL_WARMUP_MODEL="test-model", SSO_DEFAULT_USER_PASSWORD="local-test-password-only").returncode, 0)
 
     def test_pool_overlay_requires_explicit_sso_password(self):
         self.assertNotEqual(self.render(pool=True, POOL_ACCOUNT_EMAIL_DOMAIN="pool.example.com",

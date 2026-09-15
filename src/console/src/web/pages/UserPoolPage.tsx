@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { ConsoleApiError } from '../api/client.js';
 import {
-  getUserPoolOverview, reconcileUserPool, releaseUserPoolLease, updateUserPoolAccount, updateUserPoolSettings,
+  getUserPoolSummary, getUserPoolPage, reconcileUserPool, releaseUserPoolLease, updateUserPoolAccount, updateUserPoolSettings,
   type UserPoolAccount, type UserPoolAccountAction, type UserPoolEvent, type UserPoolLease,
   type UserPoolLimits, type UserPoolOverview, type UserPoolSettings,
 } from '../api/userPool.js';
@@ -32,18 +32,34 @@ export function UserPoolPage({ notify }: { notify: Notify }) {
   const [query, setQuery] = useState('');
   const [state, setState] = useState('');
   const [page, setPage] = useState(1);
+  const [listTotal, setListTotal] = useState(0);
   const [confirmation, setConfirmation] = useState<Confirmation>();
   const request = useRef<AbortController | undefined>(undefined);
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; request.current?.abort(); };
+  }, []);
 
   const load = useCallback(async (background = false) => {
+    // A mutation may finish after navigation away from this page.
+    if (!mounted.current) return;
     request.current?.abort();
     const controller = new AbortController();
     request.current = controller;
     if (!background) setLoading(true);
     try {
-      const next = await getUserPoolOverview(controller.signal);
+      const [next, list] = await Promise.all([
+        getUserPoolSummary(controller.signal),
+        getUserPoolPage(tab, page, PAGE_SIZE, query.trim(), state, controller.signal),
+      ]);
       if (controller.signal.aborted) return;
-      setData(next);
+      const last = Math.max(1, Math.ceil(list.total / PAGE_SIZE));
+      if (page > last) { setPage(last); return; }
+      setListTotal(list.total);
+      setData({ ...next, accounts: tab === 'accounts' ? list.items as UserPoolAccount[] : [],
+        leases: tab === 'leases' ? list.items as UserPoolLease[] : [],
+        events: tab === 'events' ? list.items as UserPoolEvent[] : [] });
       setDisabled(false);
       setError(undefined);
     } catch (err) {
@@ -59,7 +75,7 @@ export function UserPoolPage({ notify }: { notify: Notify }) {
     } finally {
       if (!controller.signal.aborted) setLoading(false);
     }
-  }, []);
+  }, [tab, page, query, state]);
 
   useEffect(() => {
     void load();
@@ -80,15 +96,19 @@ export function UserPoolPage({ notify }: { notify: Notify }) {
     setActionError(undefined);
     try {
       await action();
+      if (!mounted.current) return;
       setConfirmation(undefined);
       notify(success);
       await load();
     } catch (err) {
+      if (!mounted.current) return;
       setActionError(errorMessage(err));
       if (err instanceof ConsoleApiError && err.code === 'pool_mode_disabled') await load();
     } finally {
-      setLoading(false);
-      setBusy(undefined);
+      if (mounted.current) {
+        setLoading(false);
+        setBusy(undefined);
+      }
     }
   };
   const accountAction = (account: UserPoolAccount, action: UserPoolAccountAction) => {
@@ -96,16 +116,15 @@ export function UserPoolPage({ notify }: { notify: Notify }) {
       action === 'disable' ? `${account.identity} disabled. No new requests will use this account.` : `${account.identity} queued for revalidation.`);
   };
   const warnings = data ? poolWarnings(data.counts, data.settings) : [];
-  const search = query.trim().toLowerCase();
-  const accounts = data?.accounts.filter((account) => (!state || accountState(account) === state)
-    && `${account.identity} ${account.ghLogin ?? ''} ${account.callerKeyHash ?? ''}`.toLowerCase().includes(search)) ?? [];
-  const leases = data?.leases.filter((lease) => (!state || lease.phase === state)
-    && `${lease.memberIdentity} ${lease.callerKeyHash ?? ''} ${lease.leaseId}`.toLowerCase().includes(search)) ?? [];
-  const events = data?.events.filter((event) => `${event.action} ${event.identity ?? ''} ${event.callerKeyHash ?? ''} ${event.leaseId ?? ''} ${event.detail ?? ''}`.toLowerCase().includes(search)) ?? [];
-  const total = tab === 'accounts' ? accounts.length : tab === 'leases' ? leases.length : events.length;
-  const currentPage = Math.min(page, Math.max(1, Math.ceil(total / PAGE_SIZE)));
+  const accounts = data?.accounts ?? [];
+  const leases = data?.leases ?? [];
+  const events = data?.events ?? [];
+  const total = listTotal;
+  const currentPage = page;
   const start = (currentPage - 1) * PAGE_SIZE;
-  const controlsDisabled = Boolean(busy) || disabled || Boolean(error);
+  const controlsDisabled = Boolean(busy) || disabled || Boolean(error) || loading;
+  // Keep the mutation's refresh closure on the same tab/filter/page until it settles.
+  const listsDisabled = Boolean(busy);
 
   return (
     <div className="user-pool space-y-5">
@@ -174,23 +193,27 @@ export function UserPoolPage({ notify }: { notify: Notify }) {
           </section>
 
           <PoolSettingsEditor settings={data.settings} limits={data.limits} disabled={controlsDisabled} notify={notify}
-            onBusy={(saving) => setBusy(saving ? 'settings' : undefined)} onRefresh={() => load()} />
+            onBusy={(saving) => {
+              if (!mounted.current) return;
+              if (saving) request.current?.abort();
+              setBusy(saving ? 'settings' : undefined);
+            }} onRefresh={() => load()} />
 
           <Card className="min-w-0">
             <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
               <nav aria-label="User pool lists" className="flex flex-wrap gap-2">
                 {(['accounts', 'leases', 'events'] as const).map((value) => (
-                  <Button key={value} variant={tab === value ? 'primary' : 'secondary'} aria-pressed={tab === value}
+                  <Button key={value} variant={tab === value ? 'primary' : 'secondary'} aria-pressed={tab === value} disabled={listsDisabled}
                     onClick={() => { setTab(value); setState(''); setPage(1); }}>
                     {value === 'accounts' ? 'Accounts' : value === 'leases' ? 'Leases' : 'Recent events'}
                   </Button>
                 ))}
               </nav>
               <div className="flex flex-col gap-2 sm:flex-row">
-                <Input aria-label="Search pool records" className="w-full sm:w-80" value={query} placeholder="Account, caller key hash, or lease ID"
+                <Input aria-label="Search pool records" className="w-full sm:w-80" value={query} placeholder="Account, caller key hash, or lease ID" disabled={listsDisabled}
                   onChange={(event) => { setQuery(event.target.value); setPage(1); }} />
                 {tab !== 'events' ? (
-                  <select aria-label="Filter pool state" className={selectClass} value={state} onChange={(event) => { setState(event.target.value); setPage(1); }}>
+                  <select aria-label="Filter pool state" className={selectClass} value={state} disabled={listsDisabled} onChange={(event) => { setState(event.target.value); setPage(1); }}>
                     <option value="">All states</option>
                     {(tab === 'leases' ? ['active', 'provisional'] : Object.keys(stateLabels)).map((value) => <option key={value} value={value}>{stateLabels[value]}</option>)}
                   </select>
@@ -198,22 +221,19 @@ export function UserPoolPage({ notify }: { notify: Notify }) {
               </div>
             </div>
             <p className="my-3 text-xs text-slate-500">
-              {tab === 'accounts' ? `Showing the first ${data.accounts.length} of ${data.counts.total} accounts (limit ${data.listLimits.accounts}).`
-                : tab === 'leases' ? `Showing the latest ${data.leases.length} of ${data.counts.leased + data.counts.provisional} leases (limit ${data.listLimits.leases}).`
-                  : `Latest ${data.events.length} events (up to ${data.listLimits.events}); older events are not shown.`}
-              {' '}Search and filters apply to loaded records only.
+              {total.toLocaleString()} matching records. Search and filters run on the server across retained records.
             </p>
-            {tab === 'accounts' ? <AccountsTable accounts={accounts.slice(start, start + PAGE_SIZE)} disabled={controlsDisabled}
+            {tab === 'accounts' ? <AccountsTable accounts={accounts} disabled={controlsDisabled}
               onAction={(account, action) => action === 'disable' ? (setActionError(undefined), setConfirmation({ kind: 'disable', account })) : accountAction(account, action)} /> : null}
-            {tab === 'leases' ? <LeasesTable leases={leases.slice(start, start + PAGE_SIZE)} disabled={controlsDisabled}
+            {tab === 'leases' ? <LeasesTable leases={leases} disabled={controlsDisabled}
               onRelease={(lease) => { setActionError(undefined); setConfirmation({ kind: 'release', lease }); }} /> : null}
-            {tab === 'events' ? <EventsTable events={events.slice(start, start + PAGE_SIZE)} /> : null}
+            {tab === 'events' ? <EventsTable events={events} /> : null}
             <div className="mt-4 flex flex-wrap items-center justify-between gap-3 text-sm text-slate-600">
               <p>{total ? `${start + 1}–${Math.min(start + PAGE_SIZE, total)} of ${total} matching records` : 'No matching records'}</p>
               <div className="flex items-center gap-2">
-                <Button variant="secondary" disabled={currentPage === 1} onClick={() => setPage(currentPage - 1)}>Previous</Button>
+                <Button variant="secondary" disabled={listsDisabled || currentPage === 1} onClick={() => setPage(currentPage - 1)}>Previous</Button>
                 <span>Page {currentPage} / {Math.max(1, Math.ceil(total / PAGE_SIZE))}</span>
-                <Button variant="secondary" disabled={currentPage * PAGE_SIZE >= total} onClick={() => setPage(currentPage + 1)}>Next</Button>
+                <Button variant="secondary" disabled={listsDisabled || currentPage * PAGE_SIZE >= total} onClick={() => setPage(currentPage + 1)}>Next</Button>
               </div>
             </div>
           </Card>
@@ -236,6 +256,11 @@ function PoolSettingsEditor(props: {
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   useEffect(() => {
     if (!dirty) {
       setBase(props.settings);
@@ -254,18 +279,21 @@ function PoolSettingsEditor(props: {
     props.onBusy(true);
     try {
       const next = await updateUserPoolSettings(base.version, changes);
+      if (!mounted.current) return;
       setBase(next);
       setDraft(poolSettingsDraft(next));
       setDirty(false);
       props.notify('Pool settings saved. Changes apply to future provisioning and lease renewals.');
       await props.onRefresh();
     } catch (err) {
+      if (!mounted.current) return;
       if (err instanceof ConsoleApiError && err.code === 'settings_version_conflict') {
         await props.onRefresh();
+        if (!mounted.current) return;
         setError('Settings changed in another session. Your draft was not saved. Use “Reload latest settings” to discard it and review the current values.');
       } else setError(errorMessage(err));
     } finally {
-      setSaving(false);
+      if (mounted.current) setSaving(false);
       props.onBusy(false);
     }
   };

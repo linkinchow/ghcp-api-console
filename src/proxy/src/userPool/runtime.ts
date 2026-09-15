@@ -6,30 +6,34 @@ import { Logger } from '../logger.js';
 import { normalizeCaller, readPoolConfig, UserPoolError, type PoolConfig } from './config.js';
 import { realProvisioner } from './provisioner.js';
 import { PrewarmWorker } from './worker.js';
-import type { HeldLease, UserPoolStore } from './store.js';
+import type { HeldLease } from './store.js';
+import type { PoolStore } from './storage.js';
+import { boundedAdmission } from './admission.js';
+import { isMysqlStorageUnavailable } from './mysqlDeadline.js';
 
 export interface PoolRequest {
   held: HeldLease;
-  store: UserPoolStore;
+  store: PoolStore;
   options: PoolConfig;
   controller: AbortController;
   completed: boolean;
   operationActive: boolean;
-  finish?: (success: boolean) => void;
+  upstreamComplete?: boolean;
+  finish?: (success: boolean) => Promise<void>;
 }
 
-let store: UserPoolStore | undefined;
+let store: PoolStore | undefined;
 let worker: PrewarmWorker | undefined;
 let options: PoolConfig | undefined;
+let wakeTimer: ReturnType<typeof setTimeout> | undefined;
 const logger = new Logger('user-pool');
 
-export async function getUserPool(): Promise<UserPoolStore | undefined> {
+export async function getUserPool(): Promise<PoolStore | undefined> {
   options ??= readPoolConfig(process.env);
   if (!options.enabled) return undefined;
   await initializeStorage();
   const storage = getStorage();
-  if (!(storage instanceof SqliteStorage)) throw new Error('User pool requires SQLite');
-  store ??= storage.userPool(options);
+  store ??= await storage.userPool(options);
   return store;
 }
 
@@ -37,12 +41,15 @@ export async function startUserPool(): Promise<void> {
   const current = await getUserPool();
   if (current && !worker) {
     if (!config.apiKey || !config.internalApiToken) throw new Error('User pool requires Proxy API and internal service authentication');
-    worker = new PrewarmWorker(current, realProvisioner(current, options!), options!.pollMs, options!.prewarmConcurrency);
-    worker.start();
+    worker = new PrewarmWorker(current, realProvisioner(current, options!), options!.pollMs, options!.prewarmConcurrency, undefined,
+      { multiReplica: !(getStorage() instanceof SqliteStorage) });
+    await worker.start();
   }
 }
 
 export async function stopUserPool(): Promise<void> {
+  if (wakeTimer) clearTimeout(wakeTimer);
+  wakeTimer = undefined;
   await worker?.stop();
   worker = undefined;
   store = undefined;
@@ -50,11 +57,15 @@ export async function stopUserPool(): Promise<void> {
 }
 
 export function assertUserPoolOwner(): void {
-  if (worker && !worker.isActive()) throw new UserPoolError(503, 'pool_owner_unavailable');
+  if (worker && getStorage() instanceof SqliteStorage && !worker.isActive()) throw new UserPoolError(503, 'pool_owner_unavailable');
 }
 
 export function wakePool(): void {
-  void worker?.tick().catch(() => logger.error('wake-failed', 'Pool worker could not reconcile'));
+  if (!worker || wakeTimer) return;
+  const tick = () => { void worker?.tick().catch(() => logger.error('wake-failed', 'Pool worker could not reconcile')); };
+  if (getStorage() instanceof SqliteStorage) return tick();
+  wakeTimer = setTimeout(() => { wakeTimer = undefined; tick(); }, Math.min(options?.pollMs ?? 1000, 1000));
+  wakeTimer.unref();
 }
 
 export function poolRequest(res: Response): PoolRequest | undefined {
@@ -76,7 +87,7 @@ export async function withPoolOperation(res: Response, operation: () => Promise<
   } finally {
     if (context) {
       context.operationActive = false;
-      if (res.destroyed || res.writableFinished) context.finish?.(res.locals.poolSuccess === true && res.writableFinished);
+      if (res.destroyed || res.writableFinished) await context.finish?.(res.locals.poolSuccess === true && res.writableFinished);
     }
   }
 }
@@ -94,8 +105,28 @@ export const routeUserPool: RequestHandler = async (req, res, next) => {
     if (req.method === 'POST' && (!req.body || Array.isArray(req.body) || typeof req.body.model !== 'string' || !req.body.model.trim())) {
       throw new UserPoolError(400, 'invalid_model');
     }
-    const held = req.method === 'GET' || req.method === 'HEAD' || path === '/v1/messages/count_tokens'
-      ? current.acquireCatalog(caller) : current.acquire(caller);
+    const admittedAt = performance.now();
+    const admission = new AbortController();
+    const admissionTimeout = setTimeout(() => admission.abort(), options!.requestTimeoutMs);
+    admissionTimeout.unref();
+    const disconnect = () => admission.abort();
+    res.once('close', disconnect);
+    let held: HeldLease;
+    try {
+      held = await boundedAdmission(() => req.method === 'GET' || req.method === 'HEAD' || path === '/v1/messages/count_tokens'
+        ? current.acquireCatalog(caller, admission.signal) : current.acquire(caller, admission.signal), admission.signal,
+      async late => {
+        try { await current.finish(late, false); }
+        catch { logger.error('request-finish-failed', 'Late admission cleanup failed; its bounded hold will expire'); }
+      });
+    } finally {
+      clearTimeout(admissionTimeout);
+      res.off('close', disconnect);
+    }
+    if (res.destroyed || req.aborted) {
+      try { await current.finish(held, false); } catch { logger.error('request-finish-failed', 'Disconnected admission cleanup failed'); }
+      return;
+    }
     const context: PoolRequest = {
       held, store: current, options: options!, controller: new AbortController(), completed: false, operationActive: false,
     };
@@ -103,21 +134,28 @@ export const routeUserPool: RequestHandler = async (req, res, next) => {
     req.identity = held.member_identity;
     const canRenew = req.method === 'POST' && path !== '/v1/messages/count_tokens';
     let responseSucceeded = false;
-    const finish = (success: boolean) => {
+    let finishing: Promise<void> | undefined;
+    const finish = (success: boolean): Promise<void> => {
       responseSucceeded ||= success && canRenew && res.statusCode >= 200 && res.statusCode < 300;
-      if (context.completed || context.operationActive) return;
-      context.completed = true;
+      if (finishing) return finishing;
       clearTimeout(timeout);
       clearInterval(heartbeat);
       context.controller.abort();
-      try {
-        current.finish(context.held, responseSucceeded);
-        current.event('request_finished', context.held.member_identity, caller, context.held.lease_id, responseSucceeded ? 'success' : 'not_renewed');
-      } catch {
-        logger.error('request-finish-failed', 'Pool request cleanup failed; its bounded hold will expire');
-      } finally {
-        wakePool();
-      }
+      // A disconnected upstream may still be draining; unrelated post-response
+      // statistics must not hold up an already completed inference's renewal.
+      if (context.operationActive && !context.upstreamComplete) return Promise.resolve();
+      context.completed = true;
+      finishing = (async () => {
+        try {
+          await current.finish(context.held, responseSucceeded);
+          await current.event('request_finished', context.held.member_identity, caller, context.held.lease_id, responseSucceeded ? 'success' : 'not_renewed');
+        } catch {
+          logger.error('request-finish-failed', 'Pool request cleanup failed; its bounded hold will expire');
+        } finally {
+          wakePool();
+        }
+      })();
+      return finishing;
     };
     context.finish = finish;
     const timeout = setTimeout(() => {
@@ -127,26 +165,35 @@ export const routeUserPool: RequestHandler = async (req, res, next) => {
       } else if (!res.writableEnded) {
         res.destroy();
       }
-    }, Math.max(1, Math.min(options!.requestTimeoutMs, (held.deadline_at ?? current.now() + options!.requestTimeoutMs) - current.now())));
+    }, Math.max(1, options!.requestTimeoutMs - (performance.now() - admittedAt)));
+    let checking = false;
     const heartbeat = setInterval(() => {
-      try {
-        assertUserPoolOwner();
-        if (!current.heartbeat(context.held)) throw new Error('Pool request hold expired or was fenced');
-      } catch {
-        context.controller.abort(new Error('Pool hold could not be renewed'));
-        res.destroy();
-      }
+      if (checking || context.completed) return;
+      checking = true;
+      void (async () => {
+        try {
+          assertUserPoolOwner();
+          if (!await current.heartbeat(context.held)) throw new Error('Pool request hold expired or was fenced');
+        } catch {
+          if (!context.completed) {
+            context.controller.abort(new Error('Pool hold could not be verified'));
+            res.destroy();
+          }
+        } finally { checking = false; }
+      })();
     }, 5000);
     timeout.unref();
     heartbeat.unref();
-    res.once('finish', () => finish(res.locals.poolSuccess === true));
+    res.once('finish', () => { void finish(res.locals.poolSuccess === true); });
     res.once('close', () => {
       context.controller.abort();
-      finish(false);
+      void finish(false);
     });
     wakePool();
     next();
   } catch (error) {
+    if (res.destroyed || res.writableEnded) return;
+    if (isMysqlStorageUnavailable(error)) error = new UserPoolError(503, 'pool_storage_unavailable', 1);
     if (error instanceof UserPoolError) {
       if (error.retryAfter) res.setHeader('Retry-After', error.retryAfter);
       res.status(error.status).json({ type: 'error', error: {

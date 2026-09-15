@@ -44,7 +44,8 @@ function createMysqlStorage(): MysqlStorage {
     uri: config.mysqlUrl!,
     connectionLimit: config.mysqlConnectionLimit,
     waitForConnections: true,
-    queueLimit: 0,
+    // Bound even uncancelable, timed-out mysql2 acquisition callbacks.
+    queueLimit: 1024,
     timezone: 'Z',
     dateStrings: true,
     decimalNumbers: true,

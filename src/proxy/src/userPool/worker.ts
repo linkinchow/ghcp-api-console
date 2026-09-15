@@ -3,35 +3,51 @@ import { HttpApiError } from '@ghcp/shared';
 import { Logger } from '../logger.js';
 import {
   ProvisionFailure,
+  isExhaustedLoginReservation,
+  type LoginReservationContext,
+  type LoginReservationOutcome,
   type ProvisionAdapter,
   type ProvisionContext,
   type ProvisionInventory,
-  type ProvisionPatch,
 } from './provisioner.js';
-import type { InventoryFence, UserPoolStore } from './store.js';
+import type { Awaitable, PoolStore } from './storage.js';
 
-/** The optional owner fence is checked in the same transaction as each write. */
-export interface PrewarmStore extends Pick<UserPoolStore,
-  'now' | 'claimOwner' | 'releaseOwner' | 'reclaim' | 'settings' | 'pending' | 'reserveDeficit' | 'hasHolds' | 'event'> {
-  inventory(identity: string): ProvisionInventory | undefined;
-  update(identity: string, patch: ProvisionPatch, expected?: InventoryFence, owner?: string): boolean;
-  fail(identity: string, code: string, expected?: InventoryFence, owner?: string): void;
+/** Every remote operation is awaited; writes check the supplied fence in their transaction. */
+export interface PrewarmStore extends Pick<PoolStore,
+  'now' | 'claimOwner' | 'releaseOwner' | 'reclaim' | 'settings' | 'pending' | 'reserveDeficit' | 'hasHolds'
+  | 'event' | 'inventory' | 'update' | 'fail' | 'mutateWorkerCredential'> {
+  claimLoginDispatch?: PoolStore['claimLoginDispatch'];
+  /** At most 100 rows, ordered stably; only exhausted failed/disabled dispatch/wait rows. */
+  listLoginReservations?(): Awaitable<ProvisionInventory[]>;
+  /** Atomic owner/expiry, full row fence, unpaused and no-holds check. Preserve state,
+   * attempts and errors; move to warmup (success) / synced (failed), clear task/nonce,
+   * increment generation. Never change Proxy credentials or automatically retry. */
+  releaseLoginReservation?(identity: string, fence: ProvisionInventory, owner: string, outcome: LoginReservationOutcome): Awaitable<boolean>;
+  /** Unlike election, renewal must reject an already expired lease. Required for multiple replicas. */
+  renewOwner?(owner: string): Awaitable<boolean>;
 }
 
 const HEARTBEAT_MS = 5000;
 const OWNER_TTL_MS = 30000;
+interface Tenure { id: string; renewedAt: number }
+export interface PrewarmWorkerOptions { multiReplica?: boolean }
 
 export class PrewarmWorker {
-  private readonly owner = randomUUID();
+  private tenure?: Tenure;
   private timer?: ReturnType<typeof setInterval>;
   private heartbeat?: ReturnType<typeof setInterval>;
   private readonly active = new Map<string, { controller: AbortController; promise: Promise<void> }>();
+  private reservationController?: AbortController;
+  private reservationTask?: Promise<void>;
+  private lastReservationPoll = -Infinity;
+  private reservationOffset = 0;
   private scheduling?: Promise<Promise<void>[]>;
+  private ownership?: Promise<boolean>;
+  private starting?: Promise<void>;
+  private stopping?: Promise<void>;
   private wake?: ReturnType<typeof setImmediate>;
   private started = false;
   private stopped = false;
-  private ownsPool = false;
-  private renewedAt = 0;
   private readonly logger = new Logger('user-pool');
 
   constructor(
@@ -39,28 +55,40 @@ export class PrewarmWorker {
     private readonly adapter: ProvisionAdapter,
     private readonly pollMs: number,
     private readonly concurrency = 5,
+    private readonly monotonicNow: () => number = () => performance.now(),
+    private readonly options: PrewarmWorkerOptions = {},
   ) {
     if (!Number.isFinite(pollMs) || pollMs <= 0) throw new Error('Invalid prewarm poll interval');
     if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 20) throw new Error('Invalid prewarm concurrency');
+    if (options.multiReplica && !store.renewOwner) throw new Error('Multi-replica pool requires fenced owner renewal');
   }
 
-  start(): void {
+  async start(): Promise<void> {
     if (this.stopped) throw new Error('Pool worker has stopped');
-    if (this.timer) return;
-    if (!this.renewOwner()) throw new Error('Another Proxy owns the SQLite user pool');
-    this.started = true;
-    // Ownership must stay alive even when reconciliation is slower than its 30s lease.
-    this.heartbeat = setInterval(() => this.renewOwner(), HEARTBEAT_MS);
-    this.timer = setInterval(() => void this.tick(), this.pollMs);
-    this.heartbeat.unref();
-    this.timer.unref();
-    void this.tick();
+    if (this.starting) return this.starting;
+    if (this.started) return;
+    this.starting = (async () => {
+      if (!await this.ensureOwner() && !this.options.multiReplica) {
+        throw new Error('Another Proxy owns the SQLite user pool');
+      }
+      if (this.stopped) return;
+      this.started = true;
+      // Heartbeats also run for standby replicas, independently of reconciliation and HTTP.
+      this.heartbeat = setInterval(() => { void this.ensureOwner(); }, HEARTBEAT_MS);
+      this.timer = setInterval(() => { void this.tick(); }, this.pollMs);
+      this.heartbeat.unref();
+      this.timer.unref();
+      void this.tick();
+    })().finally(() => { this.starting = undefined; });
+    return this.starting;
   }
 
+  /** Local scheduler status only. Routing readiness must check storage, not require ownership. */
   isActive(): boolean {
-    return this.ownsPool && this.renewOwner();
+    return this.tenure !== undefined && this.isCurrentTenure(this.tenure);
   }
 
+  /** Await ordinary steps launched by this tick, not independent terminal observations. */
   async tick(): Promise<void> {
     if (this.stopped) return;
     if (!this.scheduling) {
@@ -75,6 +103,11 @@ export class PrewarmWorker {
     await Promise.all(launched);
   }
 
+  /** Drain the current bounded observation batch without scheduling another one. */
+  async waitForObservations(): Promise<void> {
+    await this.reservationTask;
+  }
+
   private requestTick(): void {
     if (!this.started || this.stopped || this.wake) return;
     this.wake = setImmediate(() => {
@@ -84,21 +117,33 @@ export class PrewarmWorker {
     this.wake.unref();
   }
 
-  private schedule(): Promise<void>[] {
-    if (this.stopped || !this.renewOwner()) return [];
-    this.store.reclaim();
-    if (this.store.settings().paused) return [];
-    this.store.reserveDeficit(this.owner);
+  private async schedule(): Promise<Promise<void>[]> {
+    if (!await this.ensureOwner()) return [];
+    const tenure = this.tenure;
+    if (!tenure || !this.isCurrentTenure(tenure)) return [];
+    const storage = <T>(operation: () => Awaitable<T>) => this.storageOperation(tenure, operation);
+    await storage(() => this.store.reclaim());
+    if (!this.isCurrentTenure(tenure)) return [];
+    if ((await storage(() => this.store.settings())).paused) {
+      this.reservationController?.abort(new ProvisionFailure('provision_fenced'));
+      return [];
+    }
+    if (!this.isCurrentTenure(tenure)) return [];
+    // Login GETs can take the full request deadline. They must not hold the ordinary
+    // scheduler single-flight or consume its provisioning concurrency slots.
+    this.observeLoginReservations(tenure);
+    await storage(() => this.store.reserveDeficit(tenure.id));
     const launched: Promise<void>[] = [];
     const excluded = [...this.active.keys()];
-    while (this.active.size < this.concurrency) {
-      const row = this.store.pending(excluded);
+    while (this.isCurrentTenure(tenure) && this.active.size < this.concurrency) {
+      const row = await storage(() => this.store.pending(excluded));
       if (!row || excluded.includes(row.identity)) break;
       excluded.push(row.identity);
-      if (this.store.hasHolds(row.identity)) continue;
+      if (await storage(() => this.store.hasHolds(row.identity))) continue;
+      if (!this.isCurrentTenure(tenure)) break;
       const controller = new AbortController();
-      // Register before entering the adapter, even if it completes synchronously.
-      const promise = Promise.resolve().then(() => this.advance(row, controller))
+      // Capture the tenure, never look up a replacement owner inside this step's callbacks.
+      const promise = Promise.resolve().then(() => this.advance(row, controller, tenure))
         .catch(() => this.logger.error('reconcile-failed', 'Pool account step failed; inspect storage health'))
         .finally(() => {
           this.active.delete(row.identity);
@@ -110,105 +155,274 @@ export class PrewarmWorker {
     return launched;
   }
 
-  private renewOwner(): boolean {
-    if (this.stopped) return false;
-    try {
-      // Do not revive an expired owner after a blocked event loop: outstanding work is stale.
-      if (this.ownsPool && performance.now() - this.renewedAt >= OWNER_TTL_MS) {
-        this.loseOwnership();
-        return false;
+  private observeLoginReservations(tenure: Tenure): void {
+    if (this.reservationTask || !this.isCurrentTenure(tenure)
+      || !this.store.listLoginReservations || !this.store.releaseLoginReservation || !this.adapter.reconcileLoginReservation) return;
+    const now = this.monotonicNow();
+    // Completion-triggered scheduler wakes must not hammer unresolved Login tasks.
+    if (now - this.lastReservationPoll < this.pollMs) return;
+    this.lastReservationPoll = now;
+    const controller = new AbortController();
+    this.reservationController = controller;
+    // Bound the whole batch, including selection and assertions, not just the HTTP.
+    const deadline = setTimeout(() => controller.abort(new ProvisionFailure('provision_timeout')),
+      this.adapter.stepTimeoutMs ?? 120000);
+    deadline.unref();
+    this.reservationTask = untilAborted(
+      Promise.resolve().then(() => this.reconcileLoginReservations(tenure, controller.signal)), controller.signal,
+    ).catch(() => {
+      // Storage failures already fence ownership. Timeouts/aborts retain reservations.
+    }).finally(() => {
+      clearTimeout(deadline);
+      controller.abort(new ProvisionFailure('provision_fenced'));
+      this.reservationController = undefined;
+      this.reservationTask = undefined;
+      this.requestTick();
+    });
+  }
+
+  private async reconcileLoginReservations(tenure: Tenure, batchSignal: AbortSignal): Promise<void> {
+    const storage = async <T>(operation: () => Awaitable<T>): Promise<T> => {
+      batchSignal.throwIfAborted();
+      if (!this.isCurrentTenure(tenure)) throw new ProvisionFailure('provision_fenced');
+      const result = await this.storageOperation(tenure, operation);
+      batchSignal.throwIfAborted();
+      return result;
+    };
+    const rows = (await storage(() => this.store.listLoginReservations!())).slice(0, 100);
+    if (!rows.length) { this.reservationOffset = 0; return; }
+    const offset = this.reservationOffset % rows.length;
+    const batch = [...rows.slice(offset), ...rows.slice(0, offset)].slice(0, 10);
+    this.reservationOffset = (offset + batch.length) % rows.length;
+    await Promise.all(batch.map(async row => {
+      if (!isExhaustedLoginReservation(row) || this.active.has(row.identity) || !this.isCurrentTenure(tenure)) return;
+      const controller = new AbortController();
+      const signal = AbortSignal.any([batchSignal, controller.signal]);
+      const context: LoginReservationContext = {
+        signal,
+        assertCurrent: async () => {
+          signal.throwIfAborted();
+          if (!await this.renewTenure(tenure)) throw new ProvisionFailure('provision_fenced');
+          const latest = await storage(() => this.store.inventory(row.identity));
+          const paused = (await storage(() => this.store.settings())).paused;
+          const held = await storage(() => this.store.hasHolds(row.identity));
+          signal.throwIfAborted();
+          if (!this.isCurrentTenure(tenure) || paused || held || !latest || !isExhaustedLoginReservation(latest)
+            || latest.state !== row.state || latest.attempts !== row.attempts || latest.generation !== row.generation
+            || latest.attempt_id !== row.attempt_id || latest.stage !== row.stage || latest.task_id !== row.task_id
+            || latest.oauth_attempt_id !== row.oauth_attempt_id || latest.sso_created_at !== row.sso_created_at) {
+            throw new ProvisionFailure('provision_fenced');
+          }
+        },
+      };
+      try {
+        await context.assertCurrent();
+        const outcome = await untilAborted(this.adapter.reconcileLoginReservation!(row, context), signal);
+        if (outcome !== 'success' && outcome !== 'failed') return;
+        await context.assertCurrent();
+        await storage(() => this.store.releaseLoginReservation!(row.identity, row, tenure.id, outcome));
+      } catch {
+        // Read errors, missing/ambiguous tasks and stale owners retain the reservation.
+        // They must never charge another provisioning attempt or reset operator state.
+      } finally {
+        // Fence retained callbacks as soon as this row finishes, not only the batch.
+        controller.abort(new ProvisionFailure('provision_fenced'));
       }
-      if (!this.store.claimOwner(this.owner)) {
-        this.loseOwnership();
-        return false;
-      }
-      this.ownsPool = true;
-      this.renewedAt = performance.now();
-      return true;
-    } catch {
-      this.loseOwnership();
+    }));
+  }
+
+  private isCurrentTenure(tenure: Tenure): boolean {
+    if (this.stopped || this.tenure !== tenure) return false;
+    // A blocked event loop or delayed database response must not resurrect local execution.
+    if (this.monotonicNow() - tenure.renewedAt >= OWNER_TTL_MS) {
+      this.loseOwnership(tenure);
       return false;
     }
+    return true;
   }
 
-  private loseOwnership(): void {
-    this.stopped = true;
-    this.clearTimers();
-    for (const { controller } of this.active.values()) controller.abort();
-    this.logger.error('ownership-lost', 'Pool worker stopped');
+  private async ensureOwner(): Promise<boolean> {
+    if (this.stopped) return false;
+    if (this.tenure) return this.renewTenure(this.tenure);
+    if (this.ownership) return this.ownership;
+    // Abort races drain the local steps first; their retained contexts stay fenced forever.
+    if (this.active.size || this.reservationTask) return false;
+    const candidate: Tenure = { id: randomUUID(), renewedAt: this.monotonicNow() };
+    this.ownership = (async () => {
+      try {
+        if (!await this.store.claimOwner(candidate.id)) {
+          if (!this.options.multiReplica) this.stopped = true;
+          return false;
+        }
+        if (this.stopped || this.monotonicNow() - candidate.renewedAt >= OWNER_TTL_MS) {
+          await this.store.releaseOwner(candidate.id);
+          if (!this.options.multiReplica) this.stopped = true;
+          return false;
+        }
+        this.tenure = candidate;
+        return true;
+      } catch {
+        if (!this.options.multiReplica) this.stopped = true;
+        return false;
+      }
+    })().finally(() => { this.ownership = undefined; });
+    return this.ownership;
   }
 
-  private async advance(row: ProvisionInventory, controller: AbortController): Promise<void> {
-    if (this.stopped || this.store.settings().paused || !this.renewOwner()) return;
-    let current = this.store.inventory(row.identity);
-    if (!current || current.attempt_id !== row.attempt_id || this.store.hasHolds(current.identity)) return;
+  private async renewTenure(tenure: Tenure): Promise<boolean> {
+    if (!this.isCurrentTenure(tenure)) return false;
+    if (this.ownership) {
+      await this.ownership;
+      return this.isCurrentTenure(tenure);
+    }
+    const requestedAt = this.monotonicNow();
+    this.ownership = (async () => {
+      try {
+        // Only legacy synchronous SQLite stores may use claim for renewal. Remote stores
+        // must have the DB predicate owner = ? AND owner_until > DB_NOW in renewOwner.
+        const renewed = await (this.store.renewOwner
+          ? this.store.renewOwner(tenure.id) : this.store.claimOwner(tenure.id));
+        if (!renewed || !this.isCurrentTenure(tenure)) {
+          this.loseOwnership(tenure);
+          return false;
+        }
+        // Use request start, not response time: network latency cannot extend our deadline.
+        tenure.renewedAt = requestedAt;
+        return true;
+      } catch {
+        this.loseOwnership(tenure);
+        return false;
+      }
+    })().finally(() => { this.ownership = undefined; });
+    return this.ownership;
+  }
+
+  private loseOwnership(tenure: Tenure): void {
+    if (this.tenure !== tenure) return;
+    this.tenure = undefined;
+    if (!this.options.multiReplica) {
+      this.stopped = true;
+      this.clearTimers();
+    }
+    for (const { controller } of this.active.values()) controller.abort(new ProvisionFailure('provision_fenced'));
+    this.reservationController?.abort(new ProvisionFailure('provision_fenced'));
+    this.logger.error('ownership-lost', this.options.multiReplica ? 'Pool worker is standby' : 'Pool worker stopped');
+  }
+
+  private async storageOperation<T>(tenure: Tenure, operation: () => Awaitable<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch {
+      this.loseOwnership(tenure);
+      throw new ProvisionFailure('provision_fenced');
+    }
+  }
+
+  private async advance(row: ProvisionInventory, controller: AbortController, tenure: Tenure): Promise<void> {
+    const storage = <T>(operation: () => Awaitable<T>) => this.storageOperation(tenure, operation);
+    if (!this.isCurrentTenure(tenure) || (await storage(() => this.store.settings())).paused) return;
+    let current = await storage(() => this.store.inventory(row.identity));
+    if (!current || current.attempt_id !== row.attempt_id || current.stage !== row.stage
+      || current.generation !== row.generation || await storage(() => this.store.hasHolds(row.identity))) return;
     const identity = current.identity;
     const attempt = current.attempt_id;
+    if (!this.isCurrentTenure(tenure)) return;
     if (current.state === 'failed') {
-      if (!this.store.update(identity, { state: 'provisioning' }, current, this.owner)) return;
-      current = this.store.inventory(identity)!;
+      const previous = current;
+      if (!await storage(() => this.store.update(identity, { state: 'provisioning' }, previous, tenure.id))) return;
+      current = await storage(() => this.store.inventory(identity));
+      if (!current || current.stage !== previous.stage || current.generation !== previous.generation + 1) return;
     }
-    if (current.state !== 'provisioning') return;
+    if (!current || current.state !== 'provisioning' || current.attempt_id !== attempt) return;
 
     let credentialGeneration: number | undefined;
     const deadline = setTimeout(() => controller.abort(new ProvisionFailure('provision_timeout')),
       this.adapter.stepTimeoutMs ?? 120000);
     deadline.unref();
-    const assertCurrent = () => {
-      controller.signal.throwIfAborted();
-      if (!this.renewOwner()) throw new ProvisionFailure('provision_fenced');
-      const latest = this.store.inventory(identity);
-      if (!latest || latest.state !== 'provisioning' || latest.attempt_id !== attempt
-        || latest.stage !== current!.stage || this.store.hasHolds(identity)
+    const readCurrent = async (checkSignal = true): Promise<ProvisionInventory> => {
+      if (checkSignal) controller.signal.throwIfAborted();
+      if (!await this.renewTenure(tenure)) throw new ProvisionFailure('provision_fenced');
+      const latest = await storage(() => this.store.inventory(identity));
+      const held = await storage(() => this.store.hasHolds(identity));
+      if (checkSignal) controller.signal.throwIfAborted();
+      if (!this.isCurrentTenure(tenure) || !latest || latest.state !== 'provisioning' || latest.attempt_id !== attempt
+        || latest.stage !== current!.stage || held
         || credentialGeneration !== undefined && latest.generation !== credentialGeneration) {
         throw new ProvisionFailure('provision_fenced');
       }
+      return latest;
     };
     const context: ProvisionContext = {
       signal: controller.signal,
-      assertCurrent,
-      pinCredentials: () => {
-        assertCurrent();
-        credentialGeneration = this.store.inventory(identity)!.generation;
-      },
-      credentialsInvalidated: () => {
+      assertCurrent: async () => { await readCurrent(); },
+      pinCredentials: async () => { credentialGeneration = (await readCurrent()).generation; },
+      credentialsInvalidated: async () => {
         if (credentialGeneration === undefined) throw new ProvisionFailure('provision_fenced');
         credentialGeneration++;
-        assertCurrent();
+        await readCurrent();
       },
-      checkpoint: (patch) => {
-        assertCurrent();
-        const fence = this.store.inventory(identity)!;
-        if (!this.store.update(identity, patch, fence, this.owner)) throw new ProvisionFailure('provision_fenced');
-        const saved = this.store.inventory(identity)!;
+      mutateCredentials: async (mutation) => {
+        const fence = await readCurrent();
+        if (mutation.type === 'invalidate' && credentialGeneration === undefined) throw new ProvisionFailure('provision_fenced');
+        if (!await storage(() => this.store.mutateWorkerCredential(identity, fence, tenure.id, mutation))) {
+          throw new ProvisionFailure('provision_fenced');
+        }
+        // Conditional invalidation changes exactly one generation. Never repin from a
+        // later read: a concurrent replacement (including ABA) belongs to a different warmup.
+        if (mutation.type === 'invalidate') credentialGeneration!++;
+        await readCurrent();
+        return true;
+      },
+      claimLoginDispatch: async (limit) => {
+        if (!this.store.claimLoginDispatch) throw new ProvisionFailure('provision_storage_incompatible', true);
+        const fence = await readCurrent();
+        const claimed = await storage(() => this.store.claimLoginDispatch!(identity, fence, tenure.id, limit));
+        if (!claimed) { await readCurrent(); return undefined; }
+        const saved = await storage(() => this.store.inventory(identity));
+        controller.signal.throwIfAborted();
+        if (!this.isCurrentTenure(tenure) || !saved || saved.attempt_id !== attempt
+          || saved.stage !== 'oauth-dispatch' || saved.generation !== fence.generation) throw new ProvisionFailure('provision_fenced');
+        current = saved;
+        return saved;
+      },
+      checkpoint: async (patch) => {
+        const fence = await readCurrent();
+        if (!await storage(() => this.store.update(identity, patch, fence, tenure.id))) throw new ProvisionFailure('provision_fenced');
+        const saved = await storage(() => this.store.inventory(identity));
+        controller.signal.throwIfAborted();
+        if (!this.isCurrentTenure(tenure) || !saved || saved.attempt_id !== attempt
+          || credentialGeneration !== undefined && saved.generation !== credentialGeneration) {
+          throw new ProvisionFailure('provision_fenced');
+        }
+        current = saved;
         // Fail closed if an old store silently ignores a required persisted field.
         if (Object.entries(patch).some(([key, value]) => saved[key as keyof ProvisionInventory] !== value)) {
           throw new ProvisionFailure('provision_storage_incompatible', true);
         }
-        current = saved;
         return saved;
       },
     };
     try {
-      assertCurrent();
+      await context.assertCurrent();
       const patch = await untilAborted(this.adapter.step(current, context), controller.signal);
       const progressed = Object.entries(patch).some(([key, value]) => current![key as keyof ProvisionInventory] !== value);
-      context.checkpoint({ ...patch, retry_at: patch.retry_at ?? this.store.now() + (progressed ? 0 : this.pollMs) });
-      if (patch.state === 'ready') this.store.event('account_ready', identity);
+      const now = await storage(() => this.store.now());
+      await context.checkpoint({ ...patch, retry_at: patch.retry_at ?? now + (progressed ? 0 : this.pollMs) });
+      if (patch.state === 'ready') await storage(() => this.store.event('account_ready', identity));
     } catch (error) {
-      // Disable, operator retry, shutdown, or another owner must fence both success and failure.
-      if (this.stopped || !this.renewOwner()) return;
-      const latest = this.store.inventory(identity);
-      if (!latest || latest.state !== 'provisioning' || latest.attempt_id !== attempt
-        || credentialGeneration !== undefined && latest.generation !== credentialGeneration
-        || this.store.hasHolds(identity) || error instanceof ProvisionFailure && error.code === 'provision_fenced') return;
+      // Never let a late callback elect a new owner or charge another attempt/generation.
+      if (!this.isCurrentTenure(tenure) || error instanceof ProvisionFailure && error.code === 'provision_fenced') return;
+      let latest: ProvisionInventory;
+      try { latest = await readCurrent(false); } catch { return; }
       const code = failureCode(error);
-      this.store.fail(identity, code, latest, this.owner);
-      if (error instanceof ProvisionFailure && error.terminal) {
-        this.store.update(identity, { attempts: 3 }, this.store.inventory(identity), this.owner);
-      }
+      // Terminal retry exhaustion belongs to the failure transaction. A Login callback
+      // may increment generation immediately afterwards; no second write may be needed.
+      await storage(() => this.store.fail(identity, code, latest, tenure.id,
+        error instanceof ProvisionFailure && error.terminal));
     } finally {
       clearTimeout(deadline);
+      // Retained callbacks must not outlive a successfully returned/failed adapter either.
+      controller.abort(new ProvisionFailure('provision_fenced'));
     }
   }
 
@@ -222,15 +436,24 @@ export class PrewarmWorker {
   }
 
   async stop(): Promise<void> {
+    if (this.stopping) return this.stopping;
     this.stopped = true;
     this.clearTimers();
+    const tenure = this.tenure;
+    this.tenure = undefined;
     for (const { controller } of this.active.values()) controller.abort();
-    // The abort race bounds shutdown even if an adapter fails to cooperate. Its context
-    // remains aborted, so late results and subsequent checkpoints cannot mutate inventory.
-    await this.scheduling;
-    await Promise.all([...this.active.values()].map(({ promise }) => promise));
-    if (this.ownsPool) this.store.releaseOwner(this.owner);
-    this.ownsPool = false;
+    this.reservationController?.abort();
+    this.stopping = (async () => {
+      // Pending elections clean up their own UUID. Awaiting them prevents shutdown from
+      // leaking an owner whose claim completed after stop began.
+      await this.ownership;
+      await this.starting;
+      await this.scheduling;
+      await this.waitForObservations();
+      await Promise.all([...this.active.values()].map(({ promise }) => promise));
+      if (tenure) await this.store.releaseOwner(tenure.id);
+    })();
+    return this.stopping;
   }
 }
 

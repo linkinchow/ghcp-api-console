@@ -1,0 +1,48 @@
+# Disposable qualification only. Every provider URL is on the internal fixture
+# network; the canonical pool base must exactly match GHCP_POOL_API_BASES.
+model_list:
+  - model_name: claude-opus-5-2
+    litellm_params:
+      model: anthropic/claude-opus-5-2
+      api_base: http://pool-lb:8080
+      api_key: os.environ/GHCP_PROXY_API_KEY
+      max_retries: 0
+    model_info:
+      id: mysql-pool-primary
+  - model_name: other-only
+    litellm_params:
+      model: anthropic/claude-opus-5-2
+      api_base: http://mock:8002/other
+      api_key: local-other-provider-test-only
+      max_retries: 0
+    model_info:
+      id: mysql-local-other
+  - model_name: fallback-probe
+    litellm_params:
+      model: anthropic/claude-opus-5-2
+      api_base: http://mock:8002/other
+      # The stability mock records this request and returns 503. It never routes
+      # to a real provider, nor to a second GHCP member for the failed primary.
+      api_key: mysql-fixture-deliberately-invalid-primary
+      max_retries: 0
+    model_info:
+      id: mysql-local-failing-primary
+litellm_settings:
+  callbacks:
+    - user_pool_hook.proxy_handler_instance
+  cache: false
+  telemetry: false
+  request_timeout: 30
+  num_retries: 0
+router_settings:
+  fallbacks:
+    - fallback-probe: [claude-opus-5-2]
+  num_retries: 0
+  allowed_fails: 1000
+  cooldown_time: 1
+  disable_cooldowns: true
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  background_health_checks: false
+  disable_spend_logs: true

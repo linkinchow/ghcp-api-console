@@ -63,7 +63,11 @@ export interface RecordRequestStatInput {
   cacheWriteTokens?: number;
 }
 
+import type { PoolConfig } from '../userPool/config.js';
+import type { Awaitable, PoolStore } from '../userPool/storage.js';
+
 export interface ProxyStorage {
+  userPool(options: PoolConfig): Awaitable<PoolStore>;
   initialize(): Promise<void>;
   ping(): Promise<void>;
   close(): Promise<void>;

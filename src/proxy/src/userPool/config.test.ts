@@ -46,8 +46,9 @@ test('direct mode ignores all pool-only settings and does not restrict storage',
   assert.equal(direct.enabled, false);
   assert.deepEqual(direct, readPoolConfig({ ACCOUNT_ROUTING_MODE: 'direct' }));
   assert.throws(() => readPoolConfig({ ACCOUNT_ROUTING_MODE: 'other' }), /ACCOUNT_ROUTING_MODE/);
-  for (const driver of ['mysql', 'postgres', 'SQLite']) {
-    assert.throws(() => readPoolConfig({ ...enabledEnv, STORAGE_DRIVER: driver }), /single-instance SQLite/);
+  assert.equal(readPoolConfig({ ...enabledEnv, STORAGE_DRIVER: 'mysql' }).enabled, true);
+  for (const driver of ['postgres', 'SQLite']) {
+    assert.throws(() => readPoolConfig({ ...enabledEnv, STORAGE_DRIVER: driver }), /requires SQLite or MySQL/);
   }
 });
 

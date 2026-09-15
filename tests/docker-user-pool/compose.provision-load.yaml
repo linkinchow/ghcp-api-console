@@ -1,0 +1,20 @@
+# Only for an EMPTY isolated fixture, never a deployment overlay.
+services:
+  proxy:
+    environment:
+      PREWARM_CONCURRENCY: "5"
+      POOL_LOGIN_MAX_PENDING: "5"
+  proxy2:
+    environment:
+      PREWARM_CONCURRENCY: "5"
+      POOL_LOGIN_MAX_PENDING: "5"
+  mock:
+    environment:
+      MYSQL_PROVISION_FIXTURE: "1"
+      POOL_MOCK_LOGIN_CONCURRENCY: "1"
+      POOL_MOCK_LOGIN_DELAY_MS: "50"
+    volumes:
+      - ./mock-login-queue.mjs:/fixtures/mock-login-queue.mjs:ro
+  bridge:
+    environment:
+      MYSQL_PROVISION_FIXTURE: "1"

@@ -11,6 +11,7 @@ export interface PoolConfig {
   provisionalSeconds: number;
   pollMs: number;
   prewarmConcurrency?: number;
+  loginMaxPending?: number;
   retryAfterSeconds: number;
   warmupModel: string;
   requestTimeoutMs: number;
@@ -29,14 +30,15 @@ export function readPoolConfig(env: NodeJS.ProcessEnv): PoolConfig {
     provisionalSeconds: 300,
     pollMs: 5000,
     prewarmConcurrency: 5,
+    loginMaxPending: 5,
     retryAfterSeconds: 30,
     warmupModel: '',
     requestTimeoutMs: 120000,
   };
   // In direct mode, even stale/invalid pool-only environment variables have no effect.
   if (!defaults.enabled) return defaults;
-  if ((env.STORAGE_DRIVER ?? 'sqlite') !== 'sqlite') {
-    throw new Error('Caller lease mode requires single-instance SQLite');
+  if (!['sqlite', 'mysql'].includes(env.STORAGE_DRIVER ?? 'sqlite')) {
+    throw new Error('Caller lease mode requires SQLite or MySQL');
   }
 
   const integer = (key: string, fallback: number, min: number, max: number): number => {
@@ -69,9 +71,20 @@ export function readPoolConfig(env: NodeJS.ProcessEnv): PoolConfig {
     provisionalSeconds: integer('PROVISIONAL_LEASE_TTL_SECONDS', defaults.provisionalSeconds, 10, 3600),
     pollMs: integer('PREWARM_POLL_SECONDS', defaults.pollMs / 1000, 1, 3600) * 1000,
     prewarmConcurrency: integer('PREWARM_CONCURRENCY', defaults.prewarmConcurrency!, 1, 20),
+    loginMaxPending: integer('POOL_LOGIN_MAX_PENDING', defaults.loginMaxPending!, 1, 100),
     retryAfterSeconds: integer('POOL_EXHAUSTED_RETRY_AFTER_SECONDS', defaults.retryAfterSeconds, 1, 3600),
     requestTimeoutMs: integer('POOL_REQUEST_TIMEOUT_SECONDS', defaults.requestTimeoutMs / 1000, 5, 600) * 1000,
   };
+}
+
+export function normalizePoolConfig(options: PoolConfig): PoolConfig {
+  const prewarmConcurrency = options.prewarmConcurrency === undefined ? 5 : options.prewarmConcurrency;
+  const loginMaxPending = options.loginMaxPending === undefined ? 5 : options.loginMaxPending;
+  if (!Number.isSafeInteger(prewarmConcurrency) || prewarmConcurrency < 1 || prewarmConcurrency > 20
+    || !Number.isSafeInteger(loginMaxPending) || loginMaxPending < 1 || loginMaxPending > 100) {
+    throw new Error('Invalid pool concurrency limits');
+  }
+  return { ...options, prewarmConcurrency, loginMaxPending };
 }
 
 export class UserPoolError extends Error {

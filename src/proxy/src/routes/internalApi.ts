@@ -42,7 +42,7 @@ internalApiRouter.put('/accounts/:identity/copilot-oauth-token', async (req, res
 });
 
 internalApiRouter.get('/accounts/:identity/login-task-protection', async (req, res) => {
-  const member = (await getUserPool())?.inventory(req.params.identity);
+  const member = await (await getUserPool())?.inventory(req.params.identity);
   const taskId = typeof req.query.taskId === 'string' ? req.query.taskId : undefined;
   const attempt = typeof req.query.oauthAttemptId === 'string' ? req.query.oauthAttemptId : undefined;
   const referenced = Boolean(member && !['warmup', 'ready'].includes(member.stage)
@@ -53,7 +53,7 @@ internalApiRouter.get('/accounts/:identity/login-task-protection', async (req, r
 
 internalApiRouter.get('/accounts/by-sso-user/:ssoUser/pool-membership', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
-  res.json({ managed: (await getUserPool())?.managesSsoUser(req.params.ssoUser) ?? false });
+  res.json({ managed: await (await getUserPool())?.managesSsoUser(req.params.ssoUser) ?? false });
 });
 
 internalApiRouter.delete('/accounts/by-sso-user/:ssoUser', async (req, res) => {

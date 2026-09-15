@@ -57,18 +57,27 @@ function fixture(target = 2) {
       const row = rows.get(identity);
       if (!row || row.state === 'disabled' || (typeof attempt === 'string' ? attempt !== row.attempt_id
         : attempt?.attempt_id !== row.attempt_id || attempt.generation !== row.generation) || owner !== expectedOwner) return false;
+      if (patch.state && ['failed', 'disabled', 'provisioning'].includes(patch.state) && patch.state !== row.state) row.generation++;
       Object.assign(row, patch, { updated_at: Date.now() });
       return true;
     },
-    fail: (identity, code, attempt, expectedOwner) => {
+    fail: (identity, code, attempt, expectedOwner, terminal = false) => {
       const row = rows.get(identity);
       if (!row || row.state === 'disabled' || (typeof attempt === 'string' ? attempt !== row.attempt_id
         : attempt?.attempt_id !== row.attempt_id || attempt.generation !== row.generation) || owner !== expectedOwner) return;
       failures.push(code);
+      row.generation++;
       row.state = 'failed';
-      row.attempts++;
+      row.attempts = terminal ? Math.max(3, row.attempts + 1) : row.attempts + 1;
       row.last_error = code;
       row.retry_at = Date.now() + 30000 * 2 ** (row.attempts - 1);
+    },
+    mutateWorkerCredential: (identity, fence, expectedOwner) => {
+      const row = rows.get(identity);
+      if (!row || owner !== expectedOwner || row.state !== 'provisioning' || holds.has(identity)
+        || fence.attempt_id !== row.attempt_id || fence.stage !== row.stage || fence.generation !== row.generation) return false;
+      row.generation++;
+      return true;
     },
     event: (action) => { events.push(action); },
   };
@@ -113,13 +122,12 @@ test('poll interval is not capped at five seconds; owner heartbeat is independen
   const f = fixture(1);
   let calls = 0;
   const worker = new PrewarmWorker(f.store, { async step() { calls++; return {}; } }, 60000);
-  worker.start();
+  await worker.start();
   await worker.tick();
   const claims = f.claims();
   const eligibilityClock = Date.now();
   f.store.now = () => eligibilityClock;
-  t.mock.timers.tick(55000);
-  await flush();
+  for (let i = 0; i < 11; i++) { t.mock.timers.tick(5000); await flush(); }
   assert.equal(calls, 1);
   assert.ok(f.claims() > claims + 5);
   f.rows.get('member-0')!.retry_at = 0;
@@ -129,12 +137,17 @@ test('poll interval is not capped at five seconds; owner heartbeat is independen
   await worker.stop();
 });
 
-test('readiness detects a lost worker owner before the next scheduled heartbeat', async () => {
+test('scheduler status is local only; the next reconciliation detects a lost owner', async () => {
   const f = fixture(0);
   const worker = new PrewarmWorker(f.store, { async step() { return {}; } }, 60000);
-  worker.start();
+  await worker.start();
+  await worker.tick();
+  const claims = f.claims();
   assert.equal(worker.isActive(), true);
   f.stealOwner();
+  assert.equal(worker.isActive(), true);
+  assert.equal(f.claims(), claims, 'status must never query SQL');
+  await worker.tick();
   assert.equal(worker.isActive(), false);
   await worker.stop();
   assert.equal(worker.isActive(), false);
@@ -145,10 +158,9 @@ test('ownership stays renewed during slow external work', async (t) => {
   const f = fixture(1);
   const external = deferred<{}>();
   const worker = new PrewarmWorker(f.store, { step: () => external.promise }, 60000);
-  worker.start();
+  await worker.start();
   const claims = f.claims();
-  t.mock.timers.tick(45000);
-  await flush();
+  for (let i = 0; i < 9; i++) { t.mock.timers.tick(5000); await flush(); }
   assert.ok(f.claims() > claims + 5);
   external.resolve({});
   await worker.tick();
@@ -171,7 +183,7 @@ test('stop aborts bounded work and ignores an uncooperative late result', async 
   await flush();
   assert.equal(f.rows.get('member-0')!.state, 'provisioning');
   assert.equal(f.failures.length, 0);
-  assert.throws(() => context.checkpoint({ state: 'ready' }));
+  await assert.rejects(async () => context.checkpoint({ state: 'ready' }));
 });
 
 test('shutdown immediately after a scheduled tick cannot reserve or dispatch work', async () => {
@@ -206,7 +218,7 @@ test('ownership loss aborts external work and fences late success/failure', asyn
   const external = deferred<{ state: string }>();
   let context!: ProvisionContext;
   const worker = new PrewarmWorker(f.store, { step: (_row, ctx) => { context = ctx; return external.promise; } }, 60000);
-  worker.start();
+  await worker.start();
   await flush();
   f.stealOwner();
   t.mock.timers.tick(5000);
@@ -254,8 +266,8 @@ test('disable during external work cannot be undone by a late success', async ()
 test('credential generation changes fence a successful warmup, including ABA token replacement', async () => {
   const f = fixture(1);
   const external = deferred<{ state: string; stage: string }>();
-  const worker = new PrewarmWorker(f.store, { step: (_row, context) => {
-    context.pinCredentials();
+  const worker = new PrewarmWorker(f.store, { async step(_row, context) {
+    await context.pinCredentials();
     return external.promise;
   } }, 60000);
   const running = worker.tick();
@@ -274,7 +286,7 @@ test('late warmup rejection cannot consume a replacement credential retry budget
   const f = fixture(1);
   const external = deferred<{}>();
   const worker = new PrewarmWorker(f.store, { async step(_row, context) {
-    context.pinCredentials();
+    await context.pinCredentials();
     await external.promise;
     throw new Error('old request failed');
   } }, 60000);
@@ -345,8 +357,8 @@ test('terminal ambiguity is quarantined immediately; paused pool has no side eff
 test('restart resumes the persisted checkpoint, not the previously selected stage', async () => {
   const f = fixture(1);
   const external = deferred<{}>();
-  const first = new PrewarmWorker(f.store, { step: (_row, context) => {
-    context.checkpoint({ stage: 'oauth-dispatch', oauth_attempt_id: 'oauth-nonce' });
+  const first = new PrewarmWorker(f.store, { async step(_row, context) {
+    await context.checkpoint({ stage: 'oauth-dispatch', oauth_attempt_id: 'oauth-nonce' });
     return external.promise;
   } }, 60000);
   void first.tick();
@@ -374,8 +386,8 @@ test('SQLite persists worker intents across recreation and excludes live holds d
   });
   const store = new UserPoolStore(db, options);
   const external = deferred<{}>();
-  const first = new PrewarmWorker(store, { step: (_row, context) => {
-    context.checkpoint({ stage: 'oauth-dispatch', oauth_attempt_id: 'persisted-oauth', sso_created_at: 'sso-creation-marker' });
+  const first = new PrewarmWorker(store, { async step(_row, context) {
+    await context.checkpoint({ stage: 'oauth-dispatch', oauth_attempt_id: 'persisted-oauth', sso_created_at: 'sso-creation-marker' });
     return external.promise;
   } }, 60000);
   void first.tick();
@@ -392,7 +404,7 @@ test('SQLite persists worker intents across recreation and excludes live holds d
     assert.equal(row.sso_created_at, 'sso-creation-marker');
     db.prepare("UPDATE proxy_accounts SET copilot_oauth_status = 'valid', copilot_oauth_token = 'test-token' WHERE identity = ?")
       .run(row.identity);
-    context.pinCredentials();
+    await context.pinCredentials();
     return { state: 'ready', stage: 'ready', verified_at: store.now() };
   } }, 60000);
   await second.tick();
@@ -422,7 +434,7 @@ test('an incompatible store cannot silently discard an intent checkpoint and dis
   };
   let dispatched = false;
   const worker = new PrewarmWorker(f.store, { async step(_row, context) {
-    context.checkpoint({ stage: 'oauth-dispatch', oauth_attempt_id: 'must-persist' });
+    await context.checkpoint({ stage: 'oauth-dispatch', oauth_attempt_id: 'must-persist' });
     dispatched = true;
     return {};
   } }, 60000);

@@ -10,7 +10,8 @@ import { listRequestStats } from '../db/requestStatsRepo.js';
 import { clearModelsCache } from '../copilot/copilotClient.js';
 import { buildApp } from '../server.js';
 import { getUserPool, stopUserPool } from '../userPool/runtime.js';
-import type { UserPoolStore } from '../userPool/store.js';
+import { UserPoolStore } from '../userPool/store.js';
+import { MysqlDeadlineError } from '../userPool/mysqlDeadline.js';
 
 const originalFetch = globalThis.fetch;
 const originalConfig = { ...config };
@@ -34,7 +35,9 @@ beforeEach(async () => {
   config.dbPath = ':memory:';
   config.requestStatsPerAccountLimit = 100;
   config.claudeCodeOptimized = true;
-  store = (await getUserPool())!;
+  const pool = await getUserPool();
+  assert.ok(pool instanceof UserPoolStore);
+  store = pool;
   now = store.now();
   store.now = () => now;
   members = [];
@@ -97,6 +100,31 @@ async function waitForHoldsToDrain(): Promise<void> {
   }
   assert.ok(members.every((identity) => !store.hasHolds(identity)));
 }
+
+test('storage deadline during admission returns a bounded safe 503 without forwarding', async () => {
+  const acquire = store.acquire;
+  try {
+    store.acquire = () => { throw new MysqlDeadlineError('query'); };
+    const response = await request();
+    assert.equal(response.status, 503);
+    assert.equal(response.headers.get('retry-after'), '1');
+    const body = await response.json() as { error: { code: string } };
+    assert.equal(body.error.code, 'pool_storage_unavailable');
+    assert.equal(upstreamCalls.length, 0);
+  } finally { store.acquire = acquire; }
+});
+
+test('storage deadline during credential checks uses the same safe 503 envelope', async () => {
+  const heartbeat = store.heartbeat;
+  try {
+    store.heartbeat = () => { throw new MysqlDeadlineError('query'); };
+    const response = await request();
+    assert.equal(response.status, 503);
+    assert.equal((await response.json() as { error: { code: string } }).error.code, 'pool_storage_unavailable');
+    assert.equal(upstreamCalls.length, 0);
+  } finally { store.heartbeat = heartbeat; }
+  await waitForHoldsToDrain();
+});
 
 test('Login task protection keeps dispatch and waiting evidence until consumed', async () => {
   const saved = config.internalApiToken;

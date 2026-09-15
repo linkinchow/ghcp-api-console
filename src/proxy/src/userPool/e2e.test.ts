@@ -10,6 +10,7 @@ import { getUserPool, stopUserPool } from './runtime.js';
 import { readPoolConfig } from './config.js';
 import { PrewarmWorker } from './worker.js';
 import { realProvisioner } from './provisioner.js';
+import { UserPoolStore } from './store.js';
 
 test('empty SQLite prewarms, serves exclusive HTTP callers, replenishes idle inventory and recycles expired leases', async () => {
   const settings = {
@@ -27,7 +28,8 @@ test('empty SQLite prewarms, serves exclusive HTTP callers, replenishes idle inv
   config.ssoBaseUrl = 'http://sso.mock.test';
   config.loginBaseUrl = 'http://login.mock.test';
   config.copilotApiBaseUrl = 'http://copilot.mock.test';
-  const store = (await getUserPool())!;
+  const store = await getUserPool();
+  assert.ok(store instanceof UserPoolStore);
   let now = Date.now();
   store.now = () => now;
   const users = new Map<string, SsoUserDto>();

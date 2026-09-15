@@ -1,0 +1,84 @@
+services:
+  proxy:
+    image: ghcp-pool-mysql-proxy:production-fix
+    cpus: 2
+    mem_limit: 1g
+  proxy2:
+    image: ghcp-pool-mysql-proxy:production-fix
+    cpus: 2
+    mem_limit: 1g
+  mysql:
+    cpus: 3
+    mem_limit: 3g
+  console:
+    image: ghcp-pool-mysql-console:production-fix
+    environment:
+      PROXY_BASE_URL: http://pool-lb:8081
+  sso:
+    environment:
+      PROXY_BASE_URL: http://pool-lb:8081
+  login:
+    environment:
+      PROXY_BASE_URL: http://pool-lb:8081
+  mock:
+    environment:
+      PROXY_BASE_URL: http://pool-lb:8081
+      MYSQL_STABILITY_FIXTURE: "1"
+    cpus: 1
+    mem_limit: 512m
+  pool-lb:
+    image: haproxy@sha256:694c3627658abb674c8a4d04ae9133effca81e141787920325753820b3f3ad4c
+    volumes:
+      - ./haproxy.stability.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks: [isolated]
+    cpus: 1
+    mem_limit: 256m
+  bridge:
+    environment:
+      MYSQL_STABILITY_FIXTURE: "1"
+    ports:
+      - "127.0.0.1:18103:18103"
+      - "127.0.0.1:18105:18105"
+      - "127.0.0.1:18106:18106"
+      - "127.0.0.1:18107:18107"
+  gateway-postgres:
+    profiles: [gateway]
+    image: postgres:16
+    environment:
+      POSTGRES_USER: pool_gateway
+      POSTGRES_PASSWORD: mysql-fixture-gateway-db-only
+      POSTGRES_DB: litellm_mysql_fixture
+    volumes:
+      - gateway-pg-data:/var/lib/postgresql/data
+    networks: [isolated]
+    cpus: 1
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pool_gateway -d litellm_mysql_fixture"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+  litellm:
+    profiles: [gateway]
+    image: ghcr.io/berriai/litellm:v1.99.1
+    command: ["--config", "/fixtures/config.yaml", "--port", "7000", "--num_workers", "1"]
+    environment:
+      DATABASE_URL: postgresql://pool_gateway:mysql-fixture-gateway-db-only@gateway-postgres:5432/litellm_mysql_fixture
+      LITELLM_MASTER_KEY: sk-mysql-fixture-gateway-master-only
+      LITELLM_SALT_KEY: mysql-fixture-gateway-salt-only
+      GHCP_POOL_API_BASES: http://pool-lb:8080
+      GHCP_PROXY_API_KEY: mysql-fixture-api-only
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+      LITELLM_TELEMETRY: "False"
+      PYTHONPATH: /fixtures
+    volumes:
+      - ./litellm-mysql-config.yaml:/fixtures/config.yaml:ro
+      - ../../litellm/user_pool_hook.py:/fixtures/user_pool_hook.py:ro
+    networks: [isolated]
+    depends_on:
+      gateway-postgres: { condition: service_healthy }
+    cpus: 2
+    mem_limit: 2g
+volumes:
+  gateway-pg-data:
+    name: ghcp-user-pool-mysql-test-${POOL_MYSQL_VOLUME_SET:-stability}-gateway-pg

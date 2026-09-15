@@ -52,7 +52,7 @@ test('N=50 and idle=30 registers all 20 missing accounts but runs at most five s
     peak = Math.max(peak, ++active);
     return task.promise.finally(() => { active--; });
   } });
-  worker.start();
+  await worker.start();
   await waitFor(() => steps.size === 5);
   assert.equal(f.store.counts().total, 50);
   assert.equal(f.store.counts().provisioning, 20);
@@ -80,7 +80,7 @@ test('one slow stage cannot block other lanes from advancing through the full pi
     if (row.stage === 'new') return { stage: 'warmup' };
     return f.ready(row.identity);
   } }, 2);
-  worker.start();
+  await worker.start();
   await waitFor(() => f.store.counts().ready_idle === 7);
   assert.equal(calls.get(first), 1);
   assert.equal(f.store.counts().provisioning, 1);
@@ -97,7 +97,7 @@ test('OAuth wait yields its lane and cannot be hot-polled by request wake storms
     if (row.identity === waiter) { polls++; return {}; }
     return f.ready(row.identity);
   } }, 1, 5000);
-  worker.start();
+  await worker.start();
   await waitFor(() => f.store.counts().ready_idle === 2);
   assert.equal(polls, 1);
   await Promise.all(Array.from({ length: 100 }, () => worker.tick()));
@@ -149,7 +149,7 @@ test('pause stops new dispatch while active stages finish; shrink does not delet
   const f = setup(t, 6);
   const running = new Map<string, ReturnType<typeof deferred<ProvisionPatch>>>();
   const worker = f.worker({ step(row) { const step = deferred<ProvisionPatch>(); running.set(row.identity, step); return step.promise; } }, 2);
-  worker.start();
+  await worker.start();
   await waitFor(() => running.size === 2);
   f.store.updateSettings(f.store.settings().version, { paused: 1, idle_target: 0, max_accounts: 1 });
   for (const [identity, step] of running) step.resolve(f.ready(identity));
@@ -171,9 +171,10 @@ test('owner loss aborts all lanes and fences late results', async (t) => {
   const worker = f.worker({ step(_row, context) {
     contexts.push(context); const step = deferred<ProvisionPatch>(); tasks.push(step); return step.promise;
   } });
-  worker.start();
+  await worker.start();
   await waitFor(() => contexts.length === 5);
   f.db.prepare("UPDATE user_pool_settings SET owner='replacement-owner'").run();
+  await worker.tick();
   assert.equal(worker.isActive(), false);
   await worker.stop();
   assert.ok(contexts.every(context => context.signal.aborted));
@@ -185,11 +186,11 @@ test('owner loss aborts all lanes and fences late results', async (t) => {
 test('stopped concurrent stages resume their individual persisted checkpoints after restart', async (t) => {
   const f = setup(t, 3);
   const tasks: ReturnType<typeof deferred<ProvisionPatch>>[] = [];
-  const first = f.worker({ step(row, context) {
-    context.checkpoint({ stage: 'oauth-dispatch', oauth_attempt_id: `nonce-${row.ordinal}` });
+  const first = f.worker({ async step(row, context) {
+    await context.checkpoint({ stage: 'oauth-dispatch', oauth_attempt_id: `nonce-${row.ordinal}` });
     const task = deferred<ProvisionPatch>(); tasks.push(task); return task.promise;
   } }, 3);
-  first.start();
+  await first.start();
   await waitFor(() => tasks.length === 3);
   await first.stop();
   const second = f.worker({ async step(row) {

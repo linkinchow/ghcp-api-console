@@ -111,7 +111,7 @@ adminApiRouter.get('/request-stats', async (req, res) => {
 
 adminApiRouter.post('/accounts/:identity/copilot-oauth/reauthorize', async (req, res) => {
   try {
-    if ((await getUserPool())?.inventory(req.params.identity)) {
+    if (await (await getUserPool())?.inventory(req.params.identity)) {
       res.status(409).json(apiError('pool_member_managed', 'Use User pool recovery controls for this account; an independent Login task cannot be started.'));
       return;
     }

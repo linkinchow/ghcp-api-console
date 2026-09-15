@@ -12,6 +12,8 @@
 // State is in memory: restart Proxy, not this fixture, for persistence testing.
 import http from 'node:http';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
+const MockLoginQueue = process.env.MYSQL_PROVISION_FIXTURE === '1'
+  ? (await import('./mock-login-queue.mjs')).MockLoginQueue : undefined;
 
 const PORT = Number(process.env.PORT ?? 8002);
 const INTERNAL = process.env.INTERNAL_API_TOKEN ?? 'local-pool-internal-test-only';
@@ -19,7 +21,9 @@ const SCIM_TOKEN = process.env.SCIM_TOKEN ?? 'local-pool-scim-test-only';
 const SEAT_PAT = process.env.SEAT_PAT ?? 'local-pool-seat-test-only';
 const SSO_PASSWORD = process.env.SSO_DEFAULT_USER_PASSWORD ?? 'local-pool-sso-test-only';
 const proxyUrl = new URL(process.env.PROXY_BASE_URL ?? 'http://proxy:3000');
-if (proxyUrl.origin !== 'http://proxy:3000' || proxyUrl.username || proxyUrl.password || proxyUrl.pathname !== '/' || proxyUrl.search || proxyUrl.hash) throw new Error('Callback must use isolated http://proxy:3000');
+const callbackOrigins = process.env.MYSQL_STABILITY_FIXTURE === '1'
+  ? ['http://proxy:3000', 'http://pool-lb:8081'] : ['http://proxy:3000'];
+if (!callbackOrigins.includes(proxyUrl.origin) || proxyUrl.username || proxyUrl.password || proxyUrl.pathname !== '/' || proxyUrl.search || proxyUrl.hash) throw new Error('Callback must use an isolated fixed Proxy origin');
 if (![INTERNAL, SCIM_TOKEN, SEAT_PAT, SSO_PASSWORD].every(Boolean)) throw new Error('Fixture credentials must be nonempty');
 const RAW_MODEL = process.env.POOL_MOCK_MODEL ?? 'claude-opus-5.2';
 const SCIM_ROOT = '/scim/v2/enterprises/local-test/Users';
@@ -167,7 +171,7 @@ async function callback(task) {
   tokens.set(token, { identity: task.identity, ghLogin: task.ghLogin });
   try {
     const target = new URL(`/internal/accounts/${encodeURIComponent(task.identity)}/copilot-oauth-token`, proxyUrl);
-    if (target.origin !== 'http://proxy:3000') throw new Error('forbidden_origin');
+    if (!callbackOrigins.includes(target.origin)) throw new Error('forbidden_origin');
     const response = await fetch(target, {
       method: 'PUT', redirect: 'error', signal: AbortSignal.timeout(8000),
       headers: { 'X-Internal-Token': INTERNAL, 'Content-Type': 'application/json' },
@@ -181,6 +185,10 @@ async function callback(task) {
   }
   task.finishedAt = isoNow();
 }
+const loginQueue = process.env.MYSQL_PROVISION_FIXTURE === '1' ? new MockLoginQueue({
+  concurrency: Number(process.env.POOL_MOCK_LOGIN_CONCURRENCY ?? 1),
+  delayMs: Number(process.env.POOL_MOCK_LOGIN_DELAY_MS ?? 50), complete: callback,
+}) : undefined;
 async function fakeLogin(req, res, url) {
   if (!authorize(req, res, INTERNAL)) return;
   if (url.pathname === '/api/tasks' && req.method === 'POST') {
@@ -192,8 +200,9 @@ async function fakeLogin(req, res, url) {
     // No deduplication/adoption: accidental duplicate POSTs remain visible.
     const task = { id: randomUUID(), identity: body.identity, ssoUser: body.ssoUser, ghLogin: body.ghLogin, oauthAttemptId: body.oauthAttemptId, ssoType: body.ssoType, status: 'running', attempts: 1, createdAt: isoNow(), startedAt: isoNow() };
     tasks.set(task.id, task); counters.taskPosts++;
+    if (loginQueue) loginQueue.enqueue(task);
     json(res, 202, task);
-    setImmediate(() => { void callback(task); });
+    if (!loginQueue) setImmediate(() => { void callback(task); });
     return;
   }
   if (url.pathname === '/api/tasks' && req.method === 'GET') {
@@ -210,12 +219,13 @@ async function fakeLogin(req, res, url) {
   failure(res, 404, 'not_found');
 }
 function parseControl(value, marker = false) {
-  if (!record(value) || Object.keys(value).some(key => !['status', 'retryAfter', 'streamMode', ...(marker ? ['id'] : [])].includes(key))) throw Object.assign(new Error('invalid_control'), { status: 400 });
+  if (!record(value) || Object.keys(value).some(key => !['status', 'retryAfter', 'streamMode', ...(process.env.MYSQL_STABILITY_FIXTURE === '1' ? ['delayMs'] : []), ...(marker ? ['id'] : [])].includes(key))) throw Object.assign(new Error('invalid_control'), { status: 400 });
   const status = value.status ?? 200, streamMode = value.streamMode ?? 'success';
   if (![200, 401, 429, 500].includes(status) || !['success', 'error', 'early-eof', 'hold'].includes(streamMode)
     || value.retryAfter !== undefined && (!Number.isInteger(value.retryAfter) || value.retryAfter < 1 || value.retryAfter > 120)
     || value.id !== undefined && (typeof value.id !== 'string' || !/^[A-Za-z0-9._-]{1,80}$/.test(value.id))) throw Object.assign(new Error('invalid_control'), { status: 400 });
-  return { status, streamMode, retryAfter: value.retryAfter ?? 5, ...(value.id ? { id: value.id } : {}) };
+  if (value.delayMs !== undefined && (!Number.isInteger(value.delayMs) || value.delayMs < 0 || value.delayMs > 25000)) throw Object.assign(new Error('invalid_delay'), { status: 400 });
+  return { status, streamMode, retryAfter: value.retryAfter ?? 5, delayMs: value.delayMs ?? 0, ...(value.id ? { id: value.id } : {}) };
 }
 function bodyControl(body) {
   const strings = [];
@@ -238,7 +248,7 @@ function payload(path, id) {
   if (path === '/chat/completions') return { id: `chatcmpl_${id}`, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: RAW_MODEL, choices: [{ index: 0, message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' }], usage: { prompt_tokens: 4, completion_tokens: 1, total_tokens: 5 } };
   return { id: `resp_${id}`, object: 'response', created_at: Math.floor(Date.now() / 1000), model: RAW_MODEL, status: 'completed', error: null, incomplete_details: null, output: [{ id: `msg_${id}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'OK', annotations: [] }] }], usage: { input_tokens: 4, output_tokens: 1, total_tokens: 5 } };
 }
-function stream(res, path, data, control, log) {
+async function stream(res, path, data, control, log) {
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
   const event = (name, value) => res.write(`${name ? `event: ${name}\n` : ''}data: ${typeof value === 'string' ? value : JSON.stringify(value)}\n\n`);
   const typed = (name, value) => event(name, { type: name, ...value });
@@ -260,6 +270,13 @@ function stream(res, path, data, control, log) {
     const deadline = setTimeout(() => end('early_eof'), 30000);
     res.once('close', () => { clearInterval(tick); clearTimeout(deadline); });
     return;
+  }
+  if (control.delayMs) {
+    const pulse = setInterval(() => { if (!res.destroyed) res.write(': fixture stream pending\n\n'); }, 250);
+    res.once('close', () => clearInterval(pulse));
+    await new Promise(resolve => setTimeout(resolve, control.delayMs));
+    clearInterval(pulse);
+    if (res.destroyed) return;
   }
   if (control.streamMode === 'early-eof') return end('early_eof');
   if (control.streamMode === 'error') typed('error', { error: { type: 'api_error', code: 'fixture_stream_error', message: 'Local fixture stream failure' } });
@@ -301,7 +318,9 @@ async function upstream(req, res, url) {
     return json(res, control.status, { type: 'error', error: { type: control.status === 401 ? 'authentication_error' : control.status === 429 ? 'rate_limit_error' : 'api_error', code: `fixture_${control.status}`, message: `Local fixture HTTP ${control.status}` } }, control.status === 429 ? { 'Retry-After': String(control.retryAfter) } : {});
   }
   const data = payload(url.pathname, log.seq);
-  if (body.stream === true) return stream(res, url.pathname, data, control, log);
+  if (body.stream === true) return await stream(res, url.pathname, data, control, log);
+  if (control.delayMs) await new Promise(resolve => setTimeout(resolve, control.delayMs));
+  if (res.destroyed) return;
   if (control.streamMode !== 'success') return failure(res, 400, 'stream_mode_requires_stream');
   log.outcome = 'complete'; log.endedAt = Date.now();
   return json(res, 200, data);
@@ -310,9 +329,15 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://fixture.invalid');
     if (req.method === 'GET' && ['/healthz', '/readyz'].includes(url.pathname)) return json(res, 200, { status: 'ok', service: 'local-pool-mock', fixture: true });
+    if (url.pathname === '/test/counts' && req.method === 'GET') {
+      if (!authorize(req, res, INTERNAL)) return;
+      return json(res, 200, { fixture: true, counters, loginQueue: loginQueue?.snapshot() ?? null,
+        counts: { users: users.size, seats: seats.size, tasks: tasks.size, inference: inference.length, otherInference: otherInference.length },
+        nextControl: nextControl ?? null });
+    }
     if (url.pathname === '/test/state' && req.method === 'GET') {
       if (!authorize(req, res, INTERNAL)) return;
-      return json(res, 200, { fixture: true, counters, concurrency, users: [...users.values()].map(({ id, userName, githubLogin, active }) => ({ id, userName, githubLogin, active })), seats: [...seats], tasks: [...tasks.values()], inference, otherInference, nextControl: nextControl ?? null });
+      return json(res, 200, { fixture: true, counters, concurrency, loginQueue: loginQueue?.snapshot() ?? null, users: [...users.values()].map(({ id, userName, githubLogin, active }) => ({ id, userName, githubLogin, active })), seats: [...seats], tasks: [...tasks.values()], inference, otherInference, nextControl: nextControl ?? null });
     }
     if (url.pathname === '/test/control' && req.method === 'POST') {
       if (!authorize(req, res, INTERNAL)) return;

@@ -1,0 +1,30 @@
+# Use with docker-compose.yml, NOT docker-compose.user-pool.yml.
+# Connect every Proxy to one external MySQL write primary; migrate existing pool data first.
+# A trusted load balancer must target the Proxy replicas and check /readyz.
+# No host Proxy port is published here, so Compose scaling does not collide on port 3000.
+services:
+  sso:
+    environment:
+      SSO_DEFAULT_USER_PASSWORD: ${SSO_DEFAULT_USER_PASSWORD:?set a strong pool SSO password}
+      PROXY_BASE_URL: ${PROXY_CLUSTER_BASE_URL:?set the internal load-balanced Proxy root URL}
+  login:
+    environment:
+      PROXY_BASE_URL: ${PROXY_CLUSTER_BASE_URL:?set the internal load-balanced Proxy root URL}
+  console:
+    environment:
+      PROXY_BASE_URL: ${PROXY_CLUSTER_BASE_URL:?set the internal load-balanced Proxy root URL}
+  proxy:
+    environment:
+      ACCOUNT_ROUTING_MODE: caller-lease
+      STORAGE_DRIVER: mysql
+      MYSQL_URL: ${MYSQL_URL:?set the shared MySQL write-primary connection URL}
+      IDENTITY_HEADER: X-User-Identity
+      IDENTITY_HEADER_REQUIRED: "true"
+      POOL_ACCOUNT_EMAIL_DOMAIN: ${POOL_ACCOUNT_EMAIL_DOMAIN:?set the pool email domain}
+      POOL_WARMUP_MODEL: ${POOL_WARMUP_MODEL:?set an available warmup model}
+      PROXY_ERROR_DIAGNOSTICS_ENABLED: "false"
+      PROXY_ERROR_DIAGNOSTICS_REDACT: "true"
+    ports: !override []
+    volumes: !override []
+    deploy:
+      replicas: ${PROXY_REPLICAS:-2}

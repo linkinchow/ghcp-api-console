@@ -39,6 +39,7 @@ import { resolveRequestIntent } from './requestIntent.js';
 import { toCanonicalRequestedModelId, withCanonicalModelIds } from '../copilot/modelIds.js';
 import { poolRequest, statIdentity, withPoolOperation, type PoolRequest } from '../userPool/runtime.js';
 import { UserPoolError } from '../userPool/config.js';
+import { isMysqlStorageUnavailable } from '../userPool/mysqlDeadline.js';
 import { isSuccessfulJson, StreamCompletion } from '../userPool/responseCompletion.js';
 import { getAccount } from '../db/accountsRepo.js';
 import { config } from '../config.js';
@@ -87,8 +88,15 @@ async function handleModels(req: Request, res: Response): Promise<void> {
     }
     res.json({ object: 'list', data: visibleModels.map((m) => ({ object: 'model', owned_by: 'github-copilot', ...m })) });
   } catch (err) {
-    await handlePoolFailure(poolRequest(res), accessToken, err);
-    if (!poolRequest(res)) await invalidateUnauthorizedAuth(identity, accessToken, err);
+    try {
+      await handlePoolFailure(poolRequest(res), accessToken, err);
+      if (!poolRequest(res)) await invalidateUnauthorizedAuth(identity, accessToken, err);
+    } catch (storageError) {
+      // Recovery is itself a storage operation; keep its outage inside the JSON
+      // error path without hiding unrelated recovery/application failures.
+      if (!isMysqlStorageUnavailable(storageError)) throw storageError;
+      err = storageError;
+    }
     await recordRequestStat({ ...statIdentity(res, identity), path: '/v1/models', success: false, failureReason: errorMessage(err) });
     if (!res.headersSent && !res.destroyed) sendCompatibleError(req, res, err);
   }
@@ -273,7 +281,7 @@ async function forwardAuthenticated(
   try {
     resolved = await resolveCopilotModel(copilot, path, requestedModel, diagnostics, context?.controller.signal);
     context?.controller.signal.throwIfAborted();
-    if (context && !context.store.heartbeat(context.held)) throw new UserPoolError(503, 'member_unavailable');
+    if (context && !await context.store.heartbeat(context.held)) throw new UserPoolError(503, 'member_unavailable');
   } catch (err) {
     await handlePoolFailure(context, copilot.accessToken, err);
     if (!context) await invalidateUnauthorizedAuth(identity, copilot.accessToken, err);
@@ -290,10 +298,10 @@ async function forwardAuthenticated(
     throw err;
   }
   if (response.status === 401) {
-    if (context) context.store.recoverUnauthorized(context.held, copilot.accessToken);
+    if (context) await context.store.recoverUnauthorized(context.held, copilot.accessToken);
     else await copilotAuthManager.invalidate(identity, copilot.accessToken);
   } else if (response.status === 429 && context) {
-    context.store.cool(identity, retryAfterSeconds(response.headers.get('retry-after'), context.options.retryAfterSeconds), context.held);
+    await context.store.cool(identity, retryAfterSeconds(response.headers.get('retry-after'), context.options.retryAfterSeconds), context.held);
   }
   return { response, request, body: upstreamBody, canonicalModel: resolved.canonicalId };
 }
@@ -301,9 +309,10 @@ async function forwardAuthenticated(
 async function requestAuth(identity: string, context?: PoolRequest): Promise<CopilotAuthContext> {
   if (!context) return copilotAuthManager.getAuth(identity);
   context.controller.signal.throwIfAborted();
-  if (!context.store.heartbeat(context.held)) throw new UserPoolError(503, 'member_unavailable');
+  if (!await context.store.heartbeat(context.held)) throw new UserPoolError(503, 'member_unavailable');
   const account = await getAccount(identity);
-  if (!account?.copilotOauthToken || account.copilotOauthStatus !== 'valid' || !context.store.heartbeat(context.held)) {
+  context.controller.signal.throwIfAborted();
+  if (!account?.copilotOauthToken || account.copilotOauthStatus !== 'valid' || !await context.store.heartbeat(context.held)) {
     throw new UserPoolError(503, 'member_unavailable');
   }
   return { identity, accessToken: account.copilotOauthToken, api: config.copilotApiBaseUrl };
@@ -312,9 +321,9 @@ async function requestAuth(identity: string, context?: PoolRequest): Promise<Cop
 async function handlePoolFailure(context: PoolRequest | undefined, token: string | undefined, error: unknown): Promise<void> {
   if (!context || !(error instanceof CopilotApiError)) return;
   if (error.status === 401 && token) {
-    context.store.recoverUnauthorized(context.held, token);
+    await context.store.recoverUnauthorized(context.held, token);
   } else if (error.status === 429) {
-    context.store.cool(context.held.member_identity, retryAfterSeconds(error.retryAfter ?? null, context.options.retryAfterSeconds), context.held);
+    await context.store.cool(context.held.member_identity, retryAfterSeconds(error.retryAfter ?? null, context.options.retryAfterSeconds), context.held);
   }
 }
 
@@ -366,7 +375,10 @@ export async function pipeAndRecord(
     }
     context?.controller.signal.throwIfAborted();
     const success = upstream.ok && (!context || isSuccessfulJson(text));
-    if (context) res.locals.poolSuccess = success;
+    if (context) {
+      res.locals.poolSuccess = success;
+      context.upstreamComplete = true;
+    }
     res.send(canonicalizeJsonResponse(body.buffer, options.canonicalModel));
     const usage = parseUsage(text);
     await recordRequestStat({
@@ -420,7 +432,10 @@ export async function pipeAndRecord(
   if (!upstream.ok) await recordHttpFailure(diagnostics, upstreamRequest, upstream, capturedBody);
   context?.controller.signal.throwIfAborted();
   const success = upstream.ok && (!completion || completion.finish());
-  if (context) res.locals.poolSuccess = success;
+  if (context) {
+    res.locals.poolSuccess = success;
+    context.upstreamComplete = true;
+  }
   res.end();
   await recordRequestStat({
     ...stat,
@@ -782,6 +797,7 @@ function requireClaudeCodeOptimized(req: Request, res: Response): boolean | unde
 }
 
 function sendCompatibleError(req: Request, res: Response, err: unknown): void {
+  if (isMysqlStorageUnavailable(err)) err = new UserPoolError(503, 'pool_storage_unavailable', 1);
   if (err instanceof UserPoolError) {
     if (err.retryAfter) res.setHeader('Retry-After', err.retryAfter);
     res.status(err.status).json({ type: 'error', error: {

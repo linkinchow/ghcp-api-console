@@ -1,0 +1,205 @@
+name: ghcp-user-pool-mysql-test
+
+x-health: &health
+  interval: 5s
+  timeout: 5s
+  retries: 90
+  start_period: 90s
+x-auth: &auth
+  INTERNAL_API_TOKEN: mysql-fixture-internal-only
+  LOG_LEVEL: warn
+x-proxy-env: &proxy-env
+  <<: *auth
+  PORT: "3000"
+  STORAGE_DRIVER: mysql
+  MYSQL_URL: mysql://pool_fixture:mysql-fixture-db-only@mysql:3306/ghcp_pool_mysql_test
+  MYSQL_CONNECTION_LIMIT: "10"
+  MYSQL_SSL_MODE: disabled
+  API_KEY: mysql-fixture-api-only
+  ACCOUNT_ROUTING_MODE: caller-lease
+  POOL_ACCOUNT_EMAIL_DOMAIN: pool.mysql.example.test
+  POOL_WARMUP_MODEL: claude-opus-5-2
+  READY_IDLE_TARGET: "0"
+  POOL_MAX_ACCOUNTS: "2000"
+  CALLER_LEASE_TTL_SECONDS: "600"
+  PROVISIONAL_LEASE_TTL_SECONDS: "60"
+  PREWARM_POLL_SECONDS: "1"
+  PREWARM_CONCURRENCY: "2"
+  POOL_REQUEST_TIMEOUT_SECONDS: "30"
+  POOL_EXHAUSTED_RETRY_AFTER_SECONDS: "2"
+  SSO_BASE_URL: http://sso:7001
+  LOGIN_BASE_URL: http://mock:8002
+  COPILOT_API_BASE_URL: http://mock:8002
+  ENTERPRISE_SHORTCODE: test
+  REQUEST_STATS_PER_ACCOUNT_LIMIT: "100"
+  PROXY_ERROR_DIAGNOSTICS_ENABLED: "false"
+  PROXY_ERROR_DIAGNOSTICS_REDACT: "true"
+  LOG_LEVEL: warn
+x-proxy: &proxy
+  image: ghcp-pool-mysql-proxy:check
+  working_dir: /app/src/proxy
+  command: ["node", "dist/index.js"]
+  environment: *proxy-env
+  networks: [isolated]
+  healthcheck:
+    <<: *health
+    test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+
+services:
+  mysql:
+    image: mysql:8.4
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_bin", "--max-connections=80", "--log-bin-trust-function-creators=1"]
+    environment:
+      MYSQL_DATABASE: ghcp_pool_mysql_test
+      MYSQL_USER: pool_fixture
+      MYSQL_PASSWORD: mysql-fixture-db-only
+      MYSQL_ROOT_PASSWORD: mysql-fixture-root-only
+      MYSQL_ROOT_HOST: "%"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ${POOL_MYSQL_TEST_DIR:?use launch-mysql.mjs}/mysql-init.sql:/docker-entrypoint-initdb.d/01-fixture.sql:ro
+    networks: [isolated]
+    healthcheck:
+      <<: *health
+      test: ["CMD-SHELL", "MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysql --protocol=tcp -h 127.0.0.1 -uroot -Nse 'SELECT 1' >/dev/null 2>&1"]
+
+  mock:
+    image: node:22-bookworm-slim
+    command: ["node", "/fixtures/mysql-bridge.mjs", "mock"]
+    environment:
+      <<: *auth
+      SCIM_TOKEN: mysql-fixture-scim-only
+      SEAT_PAT: mysql-fixture-seat-only
+      SSO_DEFAULT_USER_PASSWORD: mysql-fixture-sso-only
+      PROXY_BASE_URL: http://proxy:3000
+    volumes:
+      - ./mock-services.mjs:/fixtures/mock-services.mjs:ro
+      - ./mysql-bridge.mjs:/fixtures/mysql-bridge.mjs:ro
+    networks: [isolated]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8002/healthz').then(async r=>process.exit(r.ok&&(await r.json()).fixture===true?0:1)).catch(()=>process.exit(1))"]
+
+  sso:
+    image: ghcp-pool-mysql-sso:check
+    build: { context: ../.., dockerfile: src/sso/Dockerfile }
+    working_dir: /app/src/sso
+    command: ["node", "dist/index.js"]
+    environment:
+      <<: *auth
+      PORT: "7001"
+      DB_PATH: /data/sso.sqlite
+      BASE_URL: http://sso:7001
+      PROXY_BASE_URL: http://proxy:3000
+      SESSION_SECRET: mysql-fixture-session-only
+      SSO_DEFAULT_USER_PASSWORD: mysql-fixture-sso-only
+      SSO_USER_EVENTS_LOG: /data/sso-user-events.log
+      ENTERPRISE_SLUG: local-test
+      ENTERPRISE_SHORTCODE: test
+      GITHUB_API_BASE_URL: http://mock:8002
+      GITHUB_COPILOT_SEAT_PAT: mysql-fixture-seat-only
+      SCIM_BASE_URL: http://mock:8002/scim/v2/enterprises/local-test
+      SCIM_TOKEN: mysql-fixture-scim-only
+      SP_ENTITY_ID: http://mock:8002/saml
+      SP_ACS_URL: http://mock:8002/saml/acs
+      CERT_DIR: /certs
+    volumes:
+      - sso-data:/data
+      - ${POOL_MYSQL_TEST_DIR:?use launch-mysql.mjs}/certs:/certs:ro
+    networks: [isolated]
+    depends_on:
+      mock: { condition: service_healthy }
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7001/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+
+  login:
+    image: ghcp-pool-mysql-login:check
+    build: { context: ../.., dockerfile: src/login/Dockerfile }
+    working_dir: /app/src/login
+    command: ["node", "dist/index.js"]
+    environment:
+      <<: *auth
+      PORT: "7003"
+      DB_PATH: /data/login.sqlite
+      PROXY_BASE_URL: http://proxy:3000
+      LOG_DIR: /logs/login
+      SSO_URL: http://sso:7001/login
+      SSO_PROVIDER: custom
+      AUTH_HEADLESS: "true"
+      GITHUB_OAUTH_CLIENT_ID: mysql-fixture-unused
+    volumes: ["login-data:/data", "login-logs:/logs"]
+    networks: [isolated]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7003/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+
+  # Start the first scheduler before its standby: fresh-run failover can identify
+  # the initial owner without adding a production owner/debug endpoint.
+  proxy:
+    <<: *proxy
+    build: { context: ../.., dockerfile: src/proxy/Dockerfile }
+    depends_on:
+      mysql: { condition: service_healthy }
+      sso: { condition: service_healthy }
+      mock: { condition: service_healthy }
+  proxy2:
+    <<: *proxy
+    depends_on:
+      proxy: { condition: service_healthy }
+
+  console:
+    image: ghcp-pool-mysql-console:check
+    build: { context: ../.., dockerfile: src/console/Dockerfile }
+    working_dir: /app/src/console
+    command: ["node", "dist/server/index.js"]
+    environment:
+      <<: *auth
+      PORT: "7004"
+      ADMINS_FILE: /data/admins.json
+      SESSION_SECRET: mysql-fixture-session-only
+      PROXY_BASE_URL: http://proxy:3000
+      SSO_BASE_URL: http://sso:7001
+      LOGIN_BASE_URL: http://login:7003
+    volumes: ["console-data:/data"]
+    networks: [isolated]
+    depends_on:
+      proxy2: { condition: service_healthy }
+      login: { condition: service_healthy }
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7004/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+
+  # ONLY the fixed-target bridge joins the non-internal network / publishes ports.
+  bridge:
+    image: node:22-bookworm-slim
+    command: ["node", "/fixtures/mysql-bridge.mjs", "bridge"]
+    environment: *auth
+    volumes: ["./mysql-bridge.mjs:/fixtures/mysql-bridge.mjs:ro"]
+    ports:
+      - "127.0.0.1:18100:18100"
+      - "127.0.0.1:18101:18101"
+      - "127.0.0.1:18102:18102"
+      - "127.0.0.1:18104:18104"
+      - "127.0.0.1:33184:33184"
+    networks: [isolated, preview]
+    depends_on:
+      console: { condition: service_healthy }
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:18102/__mysql/manifest').then(async r=>process.exit(r.ok&&(await r.json()).fixture===true?0:1)).catch(()=>process.exit(1))"]
+
+networks:
+  isolated: { internal: true }
+  preview: {}
+volumes:
+  mysql-data:
+    name: ghcp-user-pool-mysql-test-${POOL_MYSQL_VOLUME_SET:-v2}-mysql
+  sso-data:
+    name: ghcp-user-pool-mysql-test-${POOL_MYSQL_VOLUME_SET:-v2}-sso
+  login-data:
+    name: ghcp-user-pool-mysql-test-${POOL_MYSQL_VOLUME_SET:-v2}-login
+  login-logs:
+    name: ghcp-user-pool-mysql-test-${POOL_MYSQL_VOLUME_SET:-v2}-logs
+  console-data:
+    name: ghcp-user-pool-mysql-test-${POOL_MYSQL_VOLUME_SET:-v2}-console

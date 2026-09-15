@@ -84,6 +84,19 @@ if (!isMainThread) {
     db.close();
   }
 } else {
+  test('already canceled inference and catalog admission do not mutate SQLite holds or leases', t => {
+    const f = fixture(t);
+    f.ready();
+    const controller = new AbortController();
+    const reason = new Error('disconnected before admission');
+    controller.abort(reason);
+    assert.throws(() => f.store.acquire(caller(1), controller.signal), error => error === reason);
+    assert.throws(() => f.store.acquireCatalog(caller(1), controller.signal), error => error === reason);
+    assert.equal(f.store.leases().length, 0);
+    assert.equal((f.db.prepare('SELECT COUNT(*) n FROM user_pool_holds').get() as { n: number }).n, 0);
+    assert.equal((f.db.prepare('SELECT COUNT(*) n FROM user_pool_catalog_holds').get() as { n: number }).n, 0);
+  });
+
   test('initial pool schema upgrades preserve inventory and drain unfenced legacy holds', (t) => {
     const dir = mkdtempSync(join(tmpdir(), 'user-pool-migration-'));
     const db = new BetterSqlite3(join(dir, 'legacy.sqlite'));
@@ -337,15 +350,15 @@ if (!isMainThread) {
     assert.equal(inference.member_identity, member);
     const lease = f.store.leases()[0];
     f.store.finish(catalog, true);
-    assert.deepEqual(f.store.leases()[0], lease);
+    assert.deepEqual(f.store.leases()[0], { ...lease, active_requests: 2 });
     f.store.finish(inference, true);
     const active = f.store.leases()[0];
     f.clock.now += 1000;
     f.store.finish(second, true);
-    assert.deepEqual(f.store.leases()[0], active);
+    assert.deepEqual(f.store.leases()[0], { ...active, active_requests: 0 });
     const onActive = f.store.acquireCatalog(caller(1));
     f.store.finish(onActive, true);
-    assert.deepEqual(f.store.leases()[0], active);
+    assert.deepEqual(f.store.leases()[0], { ...active, active_requests: 0 });
   });
 
   test('catalog-only finish/expiry promptly frees capacity, while disable/retry respects discovery holds', (t) => {

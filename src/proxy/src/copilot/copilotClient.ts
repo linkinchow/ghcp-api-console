@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import {
   DiagnosticBodyCapture,
@@ -32,9 +32,23 @@ interface ModelsSnapshot {
   expiresAt: number;
 }
 
+interface ModelsWaiter {
+  resolve: (snapshot: ModelsSnapshot) => void;
+  reject: (error: unknown) => void;
+  cleanup: () => void;
+}
+
+interface ModelsRefresh {
+  controller: AbortController;
+  waiters: Set<ModelsWaiter>;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
 interface ModelsCacheEntry {
+  identity: string;
+  retired?: boolean;
   snapshot?: ModelsSnapshot;
-  refreshPromise?: Promise<ModelsSnapshot>;
+  refresh?: ModelsRefresh;
 }
 
 export interface ModelInfo {
@@ -84,6 +98,8 @@ export class CopilotModelPathError extends Error {
 const MODELS_CACHE_TTL_MS = 60 * 60 * 1000;
 const MODELS_CACHE_STALE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const MODELS_CACHE_NEGATIVE_RECHECK_MS = 60 * 1000;
+const MODELS_REFRESH_TIMEOUT_MS = 30_000;
+const MODELS_RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
 const modelsCache = new Map<ModelsCacheKey, ModelsCacheEntry>();
 const modelsCacheLogger = new Logger('models-cache');
 
@@ -107,7 +123,7 @@ async function fetchModels(copilot: CopilotAuthContext, diagnostics?: ErrorDiagn
   const res = await executeWithDiagnostics(request, diagnostics, signal);
   let body: { buffer: Buffer; capture: CapturedResponseBody };
   try {
-    body = await readWithDiagnostics(request, res, diagnostics);
+    body = await readWithDiagnostics(request, res, diagnostics, signal);
   } catch (error) {
     if ([401, 403, 429].includes(res.status)) {
       throw new CopilotApiError(`List models failed with HTTP ${res.status}.`, res.status, res.headers.get('retry-after') ?? undefined);
@@ -128,7 +144,10 @@ export async function validateCopilotOauthToken(identity: string, accessToken: s
 }
 
 export function clearModelsCache(identity: string): void {
-  modelsCache.delete(identity);
+  // In-flight callers may finish, but their detached entries cannot repopulate the cache.
+  for (const [key, entry] of modelsCache) {
+    if (entry.identity === identity) modelsCache.delete(key);
+  }
 }
 
 export async function forwardCopilotRequest(
@@ -200,7 +219,7 @@ async function getModelsSnapshot(
 ): Promise<ModelsSnapshot> {
   options.signal?.throwIfAborted();
   const cacheKey = modelsCacheKey(copilot);
-  const entry = modelsCacheEntry(cacheKey);
+  const entry = modelsCacheEntry(cacheKey, copilot.identity);
   const now = Date.now();
   const snapshot = entry.snapshot;
   if (!options.forceRefresh && snapshot && snapshot.expiresAt > now) return snapshot;
@@ -223,10 +242,22 @@ async function getModelsSnapshot(
   }
 }
 
-function modelsCacheEntry(cacheKey: ModelsCacheKey): ModelsCacheEntry {
+function modelsCacheEntry(cacheKey: ModelsCacheKey, identity: string): ModelsCacheEntry {
   const existing = modelsCache.get(cacheKey);
-  if (existing) return existing;
-  const created: ModelsCacheEntry = {};
+  if (existing && !existing.retired) return existing;
+  // Keep only the latest credential snapshot per identity. Old live refreshes remain
+  // joinable until they settle, but cannot restore their retired snapshots afterward.
+  for (const [key, entry] of modelsCache) {
+    if (entry.identity !== identity || key === cacheKey) continue;
+    entry.retired = true;
+    entry.snapshot = undefined;
+    if (!entry.refresh) modelsCache.delete(key);
+  }
+  if (existing) {
+    existing.retired = false;
+    return existing;
+  }
+  const created: ModelsCacheEntry = { identity };
   modelsCache.set(cacheKey, created);
   return created;
 }
@@ -238,33 +269,70 @@ function refreshModelsSnapshot(
   diagnostics?: ErrorDiagnosticContext,
   signal?: AbortSignal,
 ): Promise<ModelsSnapshot> {
-  // Request-scoped cancellation must not abort another caller's catalog refresh.
-  if (!signal && entry.refreshPromise) return entry.refreshPromise;
-
-  const promise = fetchModels(copilot, diagnostics, signal)
-    .then((models) => {
-      const now = Date.now();
-      const snapshot: ModelsSnapshot = {
-        models,
-        modelIndex: buildModelIdIndex(models),
-        pathMap: buildPathMap(models),
-        fetchedAt: now,
-        expiresAt: now + MODELS_CACHE_TTL_MS,
-      };
-      entry.snapshot = snapshot;
-      modelsCacheLogger.info('refresh-done', 'Refreshed Copilot models cache', {
-        cacheKey,
-        modelCount: models.length,
-        ttlSeconds: Math.round(MODELS_CACHE_TTL_MS / 1000),
-      });
-      return snapshot;
-    })
-    .finally(() => {
-      if (entry.refreshPromise === promise) entry.refreshPromise = undefined;
-    });
-
-  if (!signal) entry.refreshPromise = promise;
+  signal?.throwIfAborted();
+  const existing = entry.refresh;
+  const refresh: ModelsRefresh = existing ?? { controller: new AbortController(), waiters: new Set<ModelsWaiter>() };
+  entry.refresh = refresh;
+  const promise = new Promise<ModelsSnapshot>((resolve, reject) => {
+    const waiter: ModelsWaiter = { resolve, reject, cleanup: () => signal?.removeEventListener('abort', abort) };
+    const abort = () => {
+      refresh.waiters.delete(waiter);
+      waiter.cleanup();
+      reject(signal!.reason);
+      if (refresh.waiters.size === 0) {
+        // Detach immediately: a new caller must not join the cancelled refresh.
+        if (entry.refresh === refresh) entry.refresh = undefined;
+        clearTimeout(refresh.timer);
+        if (entry.retired && modelsCache.get(cacheKey) === entry) modelsCache.delete(cacheKey);
+        refresh.controller.abort(signal!.reason);
+      }
+    };
+    refresh.waiters.add(waiter);
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+  if (!existing) {
+    refresh.timer = setTimeout(() => {
+      const error = new CopilotApiError('List models refresh timed out.', 504);
+      // Expire the waiters first, then abort work that no longer has any consumers.
+      settleModelsRefresh(cacheKey, entry, refresh, { error });
+      refresh.controller.abort(error);
+    }, MODELS_REFRESH_TIMEOUT_MS);
+    refresh.timer.unref();
+    void fetchModels(copilot, diagnostics, refresh.controller.signal)
+      .then((models) => {
+        // Also guard against a transport that completes after it was cancelled.
+        refresh.controller.signal.throwIfAborted();
+        const now = Date.now();
+        const snapshot: ModelsSnapshot = {
+          models,
+          modelIndex: buildModelIdIndex(models),
+          pathMap: buildPathMap(models),
+          fetchedAt: now,
+          expiresAt: now + MODELS_CACHE_TTL_MS,
+        };
+        if (!entry.retired) entry.snapshot = snapshot;
+        modelsCacheLogger.info('refresh-done', 'Refreshed Copilot models cache', {
+          cacheKey,
+          modelCount: models.length,
+          ttlSeconds: Math.round(MODELS_CACHE_TTL_MS / 1000),
+        });
+        settleModelsRefresh(cacheKey, entry, refresh, { snapshot });
+      })
+      .catch((error: unknown) => settleModelsRefresh(cacheKey, entry, refresh, { error }));
+  }
   return promise;
+}
+
+function settleModelsRefresh(cacheKey: ModelsCacheKey, entry: ModelsCacheEntry, refresh: ModelsRefresh, result: { snapshot: ModelsSnapshot } | { error: unknown }): void {
+  if (entry.refresh === refresh) entry.refresh = undefined;
+  if (entry.retired && !entry.refresh && modelsCache.get(cacheKey) === entry) modelsCache.delete(cacheKey);
+  clearTimeout(refresh.timer);
+  for (const waiter of refresh.waiters) {
+    waiter.cleanup();
+    if ('snapshot' in result) waiter.resolve(result.snapshot);
+    else waiter.reject(result.error);
+  }
+  refresh.waiters.clear();
 }
 
 function buildPathMap(models: ModelInfo[]): Map<string, CopilotApiPath[]> {
@@ -284,7 +352,8 @@ function modelPathError(model: string, path: CopilotApiPath, supportedPaths: Cop
 }
 
 function modelsCacheKey(copilot: CopilotAuthContext): ModelsCacheKey {
-  return copilot.identity;
+  // Never retain or log a raw credential, or share a snapshot across credentials/endpoints.
+  return createHash('sha256').update(JSON.stringify([copilot.identity, copilot.api.replace(/\/+$/, ''), copilot.accessToken])).digest('hex');
 }
 
 function errorMessage(err: unknown): string {
@@ -308,30 +377,40 @@ async function readWithDiagnostics(
   request: PreparedCopilotRequest,
   response: Response,
   diagnostics: ErrorDiagnosticContext | undefined,
+  signal?: AbortSignal,
 ): Promise<{ buffer: Buffer; capture: CapturedResponseBody }> {
   const reader = response.body?.getReader();
   if (!reader) {
+    signal?.throwIfAborted();
     return {
       buffer: Buffer.alloc(0),
       capture: { buffer: Buffer.alloc(0), byteLength: 0, complete: true, truncated: false },
     };
   }
+  const cancel = () => { void reader.cancel(signal?.reason).catch(() => {}); };
+  signal?.addEventListener('abort', cancel, { once: true });
   const capture = new DiagnosticBodyCapture();
   const chunks: Buffer[] = [];
   let totalBytes = 0;
   try {
+    signal?.throwIfAborted();
     for (;;) {
       const { done, value } = await reader.read();
+      signal?.throwIfAborted();
       if (done) break;
-      const chunk = Buffer.from(value);
-      chunks.push(chunk);
-      totalBytes += chunk.byteLength;
+      totalBytes += value.byteLength;
+      if (totalBytes > MODELS_RESPONSE_MAX_BYTES) throw new CopilotApiError('List models response exceeds 8 MiB.', 502);
+      chunks.push(Buffer.from(value));
       capture.add(value);
     }
   } catch (err) {
+    void reader.cancel(err).catch(() => {});
     const partial = capture.result(false);
     if (diagnostics) await recordStreamFailure(diagnostics, request, response, partial, err);
     throw err;
+  } finally {
+    signal?.removeEventListener('abort', cancel);
+    reader.releaseLock();
   }
   return {
     buffer: Buffer.concat(chunks, totalBytes),
