@@ -1,70 +1,25 @@
-# Frozen-v4 worker process/owner-failure qualification
+# 冻结 v4 的 worker 进程/owner 故障验证
 
-**Status: actual disposable-MySQL process acceptance passed — two subcases, TAP 3 pass / 0 fail / 0 skipped including the parent wrapper, 66.454 seconds.** Both subcases used a real SIGKILL and a real approximately 30-second owner-TTL wait. This is not three business cases or coverage of every process-failure permutation.
+**状态：实际可丢弃 MySQL 进程验收已通过——两个子用例，TAP 共 3 项通过 / 0 项失败 / 0 项跳过（含父级包装测试），66.454 秒。** 两个子用例都使用了真实 SIGKILL 和实际约 30 秒的 owner TTL 等待。这不是三个业务用例，也不覆盖进程故障的所有组合。
 
-Frozen source commit: `2bc12b363e62923ca6c1db0185e42f9ed5c78bf9`.
-Only `worker*.ts`, `worker*.mjs`, and this README belong to this harness. It does not
-modify production source, package scripts, configuration, route fixtures, or Docker.
-The harness was run against frozen v4; it does not qualify the later observability
-production increment, whose image is starting via preview with runtime acceptance still pending.
+冻结源码提交：`2bc12b363e62923ca6c1db0185e42f9ed5c78bf9`。
+仅 `worker*.ts`、`worker*.mjs` 和本 README 属于此测试工具。它不修改生产源码、包脚本、配置、路由测试夹具或 Docker。
+本测试工具基于冻结 v4 运行；它不验证后续的可观测性生产代码增量，该增量的镜像正在通过预览启动，运行时验收仍待完成。
 
-## Two executed cases
+## 两个已执行用例
 
-Both cases start two **independent Node child processes**, each with the real
-`PrewarmWorker`, `realProvisioner`, `MysqlPoolStore`, and `MysqlStorage`. HTTP uses
-real `fetch`, the real model resolver and real warmup request code. A synthetic
-SSO/Login/model HTTP server lives in the **parent test process**, bound by
-`listen(0, '127.0.0.1')` to a dynamically assigned port. That exact origin is passed
-only to its own children; tasks and captured request ledger survive child termination.
-It does not deduplicate Login POSTs. Control barriers are in-process/IPC fixture
-controls, not production debug HTTP APIs.
+两个用例均启动两个**独立 Node 子进程**，各自使用真实的 `PrewarmWorker`、`realProvisioner`、`MysqlPoolStore` 和 `MysqlStorage`。HTTP 使用真实 `fetch`、真实模型解析器和真实预热请求代码。模拟 SSO/Login/模型 HTTP 服务器位于**父测试进程**中，通过 `listen(0, '127.0.0.1')` 绑定动态分配的端口。该确切源地址仅传给其自身的子进程；任务和捕获的请求台账不随子进程终止而丢失。它不对 Login POST 去重。控制屏障是进程内/IPC 测试夹具控制，不是生产调试 HTTP API。
 
-1. **Accepted Login POST, checkpoint held, owner killed.** Seed one synthetic
-   already-synced member (SSO/SCIM/seat creation are deliberately outside scope).
-   The real worker creates the nonce, begins authorization and reserves the Login
-   slot. Login accepts exactly one POST and returns a task. A fixture wrapper
-   holds the owner's `oauth-wait` checkpoint before its SQL write. The parent
-   verifies persisted `oauth-dispatch`, original nonce and null task ID, then
-   sends `SIGKILL` and waits for the actual child exit event. No `worker.stop()`,
-   `releaseOwner`, SQL owner replacement, clock override or lease truncation is
-   used for this fault. The successor first proves standby, waits for real
-   **30-second DB owner TTL**, claims with a fresh owner UUID, searches Login by
-   identity, and adopts the **original task and nonce without a second POST**.
-   A repository callback using the correct nonce then permits real HTTP warmup
-   and `ready`. Incorrect/replayed nonce callbacks cannot overwrite credentials.
-2. **Aged running Login task and late callback safety.** Repeat the same actual
-   accepted-POST/owner-kill/recovery sequence, but the external mock task is born
-   16 minutes old. The successor must terminally fail with `oauth_task_stalled`,
-   retain the task/nonce and Login slot, and perform no warmup. Hold a terminal
-   observation GET response containing the old `running` task. Deliver the
-   matching late callback through real `MysqlStorage.saveCopilotOauthToken`, mark
-   the external task successful, and release the captured OLD response while holding
-   the next, fresh success response. Child IPC must prove the old-generation
-   observation finished; SQL must still exactly match the post-callback failed row.
-   Only then release the fresh response. It may release the slot, but state/attempt
-   count/error remain `failed`/`3`/`oauth_task_stalled`; there is no automatic retry or
-   warmup. This prevents a quick fresh release from masking a stale-response bug.
+1. **Login POST 已被接受，检查点被阻挡，owner 被终止。** 植入一个已同步的模拟成员（刻意将 SSO/SCIM/席位创建排除在范围之外）。真实 worker 创建 nonce，开始授权并预留 Login 槽位。Login 恰好接受一次 POST 并返回任务。测试夹具包装器在 owner 的 `oauth-wait` 检查点写入 SQL 前将其阻挡。父进程验证已持久化的 `oauth-dispatch`、原始 nonce 及空任务 ID，然后发送 `SIGKILL` 并等待真实子进程退出事件。此故障不使用 `worker.stop()`、`releaseOwner`、SQL owner 替换、时钟覆盖或租约截短。继任者先证明自身处于待命状态，等待真实的 **30 秒数据库 owner TTL**，使用新的 owner UUID 取得所有权，按身份查询 Login，并接管**原始任务和 nonce，不发起第二次 POST**。随后，使用正确 nonce 的仓储回调允许执行真实 HTTP 预热并达到 `ready`。错误/重放 nonce 的回调不能覆盖凭据。
+2. **长时间运行的 Login 任务与迟到回调安全性。** 重复相同的真实 POST 接受/owner 终止/恢复序列，但外部模拟任务在创建时就已是 16 分钟前的任务。继任者必须以 `oauth_task_stalled` 进入终止失败状态，保留任务/nonce 和 Login 槽位，且不进行预热。阻挡一条包含旧 `running` 任务的终态观测 GET 响应。通过真实 `MysqlStorage.saveCopilotOauthToken` 递交匹配的迟到回调，将外部任务标为成功，并释放已捕获的旧响应，同时阻挡下一条新的成功响应。子进程 IPC 必须证明旧代次的观测已完成；SQL 必须仍与回调后的失败行完全一致。只有此后才释放新的响应。它可以释放槽位，但状态/尝试次数/错误仍为 `failed`/`3`/`oauth_task_stalled`；不发生自动重试或预热。这可防止新的响应快速释放槽位而掩盖陈旧响应缺陷。
 
-The second case tests stalled-task callback safety, **not** a request-deadline
-network-hang/restart case. SSO creation ambiguity and network-hang restart are not
-implemented. Callback acceptance is exercised at the real repository nonce fence,
-not through the production HTTP callback route; route fixtures are separately
-owned. No real Login service, SSO service, browser automation or upstream provider
-is started. The checkpoint wrapper holds only one `store.update` invocation and
-never fakes database contents, switches owners, or changes production code.
+第二个用例测试停滞任务的回调安全性，**不是**请求截止时间相关的网络挂起/重启用例。SSO 创建结果不明确及网络挂起重启场景尚未实现。回调接受验证在真实仓储的 nonce 防护边界进行，而非经过生产 HTTP 回调路由；路由测试夹具由另一项工作负责。不启动真实 Login 服务、SSO 服务、浏览器自动化或上游提供商。检查点包装器仅阻挡一次 `store.update` 调用，绝不伪造数据库内容、切换 owner 或更改生产代码。
 
-## Safe execution
+## 安全执行
 
-Use Node 22+ with the project's dependencies already available (`tsx`, TypeScript,
-`mysql2`, and built `@ghcp/shared`). No installation/build is performed by these
-commands. The launcher requires a real Git checkout: `git rev-parse HEAD` must be
-exactly the frozen SHA, and `git diff --exit-code <SHA> -- src/proxy src/packages/shared`
-must succeed. For a remote runner, restore a frozen Git bundle/checkout; a source
-archive without Git metadata is deliberately rejected. Do not bypass this guard.
-It expects the existing built shared dependency to match the checkout; resolving
-an ancestor workspace's built package is not a hermetic build attestation.
+使用 Node 22+，且项目依赖已就绪（`tsx`、TypeScript、`mysql2` 及已构建的 `@ghcp/shared`）。这些命令不执行安装/构建。启动器要求真实 Git 检出目录：`git rev-parse HEAD` 必须恰好为冻结 SHA，且 `git diff --exit-code <SHA> -- src/proxy src/packages/shared` 必须成功。远程运行器应恢复冻结的 Git bundle/检出目录；不含 Git 元数据的源码归档会被有意拒绝。不要绕过此防护。启动器要求现有共享依赖构建产物与检出内容匹配；解析到上级工作区的已构建包并不能证明构建具有封闭性。
 
-From the frozen worktree root:
+从冻结工作树根目录运行：
 
 ```sh
 node --check tests/user-pool-process/worker-run.mjs
@@ -72,98 +27,34 @@ node tests/user-pool-process/worker-run.mjs --typecheck
 node tests/user-pool-process/worker-run.mjs --gate-check
 ```
 
-`--typecheck` uses the TypeScript API with `noEmit`, including the production
-Express type augmentation. `--gate-check` strips MySQL opt-ins even if present in
-the calling shell, runs socket-free URL/environment safety tests, and reports the
-process acceptance suite **skipped**. Neither mode contacts MySQL or starts HTTP.
-Do not count its green gate tests as process acceptance.
+`--typecheck` 使用带 `noEmit` 的 TypeScript API，包括生产 Express 类型扩展。即使调用 shell 中已有 MySQL 显式启用变量，`--gate-check` 也会移除它们，运行不使用套接字的 URL/环境安全测试，并将进程验收套件报告为**已跳过**。两种模式都不访问 MySQL，也不启动 HTTP。不要将其通过的门禁测试算作进程验收。
 
-An actual acceptance run must be separately, explicitly opted in against an
-already-running disposable LOCAL MySQL server. Supply credentials via the process
-environment only; do not put them in argv, load `.env`/`production.env`, or use a
-production server. Required environment variables:
+实际验收运行必须针对已运行的、可丢弃的**本地** MySQL 服务器单独显式启用。仅通过进程环境提供凭据；不要将其放入 argv、加载 `.env`/`production.env`，或使用生产服务器。所需环境变量：
 
 - `MYSQL_POOL_PROCESS_TEST=1`
 - `MYSQL_POOL_TEST_DISPOSABLE=1`
-- `MYSQL_TEST_URL`: `mysql:` URL with username exactly `root`, hostname exactly
-  `localhost`, `127.0.0.1` or `[::1]`, and database marker
-  `ghcp_pool_test_[a-z0-9_]+`. No query parameters or fragment. Root must be able to
-  create/drop an isolated database and install the normal schema/trigger.
+- `MYSQL_TEST_URL`：`mysql:` URL，用户名必须恰好为 `root`，主机名必须恰好为 `localhost`、`127.0.0.1` 或 `[::1]`，数据库标记为 `ghcp_pool_test_[a-z0-9_]+`。不得包含查询参数或片段。Root 必须能够创建/删除隔离数据库并安装常规表结构/触发器。
 
-Then run:
+随后运行：
 
 ```sh
 node tests/user-pool-process/worker-run.mjs --run
 ```
 
-The URL's named database is **never selected, migrated, cleared, or dropped**.
-The suite generates exactly one random sibling database named
-`ghcp_pool_test_<32 random hex>`, uses it for both cases, and drops only that sibling
-in `finally`. The random name is printed so an interrupted parent can be cleaned
-up manually. Never use wildcard drops. Ordinary failure cleanup terminates remaining
-children before closing mock sockets/pools and dropping the sibling. Abruptly
-killing the parent may leave the disposable sibling behind; children exit on IPC
-disconnect, and have a 120s absolute lifetime. Mock ports and random sibling names
-are independent between concurrent suites; there is no shared fixed-port fixture.
-The runner has a 300s hard watchdog, ordinary case/suite cleanup uses bounded waits,
-tracked MySQL connections are destroyed before pool shutdown, and only actual
-`ChildProcess` handles created by this harness receive SIGKILL. A DROP is refused if
-a worker's exit was not confirmed. Hard watchdog/OS interruption can leave a sibling
-for exact-name manual cleanup; never claim that destructive interruption is clean.
+**绝不选择、迁移、清空或删除** URL 中指定的数据库。测试套件仅生成一个名为 `ghcp_pool_test_<32 random hex>` 的随机同级数据库，两个用例共用它，并在 `finally` 中仅删除该同级数据库。会打印随机名称，以便父进程中断后进行人工清理。绝不使用通配符删除。普通失败清理会先终止剩余子进程，再关闭模拟套接字/连接池并删除同级数据库。突然终止父进程可能留下该可丢弃同级数据库；子进程在 IPC 断连时退出，且具有 120s 的绝对生命周期。并发测试套件的模拟端口及随机同级数据库名相互独立；不存在共享固定端口的测试夹具。运行器设有 300s 的硬性看门狗时限，普通用例/套件清理使用有界等待，关闭连接池前会销毁已跟踪的 MySQL 连接，且仅向此测试工具创建的真实 `ChildProcess` 句柄发送 SIGKILL。若未确认某个 worker 已退出，则拒绝 DROP。硬性看门狗终止/操作系统中断可能留下同级数据库，需要按确切名称人工清理；绝不能声称破坏性中断能够干净清理。
 
-The launcher/children use an environment allowlist, discard inherited provider
-credentials/proxy variables/`NODE_OPTIONS`, suppress child stdout/stderr, and set
-`DOTENV_CONFIG_PATH` to the OS null device before production imports. Credentials
-are fixed synthetic values; HTTP URLs use the parent-owned dynamic loopback port.
-The only externally configurable network target is the gated local MySQL endpoint.
-The launcher validates all three opt-ins and the complete URL before any test/worker
-spawn or DB connection; the child independently revalidates its random database and
-mock origin. Launcher uses `spawn(process.execPath, ..., { shell: false })`; workers
-use `fork(worker-child.ts, [], { execArgv: ['--import', 'tsx'] })` (no shell or argv
-credentials). All seven harness paths are ordinary files, not symlinks. Do not launch
-the test/child files directly; use the launcher so its commit/environment guards apply.
+启动器/子进程使用环境变量允许列表，丢弃继承的提供商凭据/代理变量/`NODE_OPTIONS`，抑制子进程 stdout/stderr，并在导入生产代码前将 `DOTENV_CONFIG_PATH` 设为操作系统空设备。凭据为固定模拟值；HTTP URL 使用父进程拥有的动态回环端口。唯一可从外部配置的网络目标是受门禁约束的本地 MySQL 端点。启动器在启动任何测试/worker 或建立数据库连接前验证全部三个显式启用条件及完整 URL；子进程独立重新验证其随机数据库和模拟源地址。启动器使用 `spawn(process.execPath, ..., { shell: false })`；worker 使用 `fork(worker-child.ts, [], { execArgv: ['--import', 'tsx'] })`（不使用 shell，也不通过 argv 传递凭据）。全部七个测试工具路径均为普通文件，而非符号链接。不要直接启动测试/子进程文件；应使用启动器，确保提交/环境防护生效。
 
-Budget: two cases, each with a real ~30s lease wait; 100s timeout per case, 240s
-suite timeout, bounded IPC/SQL polling and cleanup. No artificial DB-clock changes
-are made. Expected success normally takes roughly 65–90 seconds on healthy local
-MySQL. Cleanup can add bounded time; a forced parent interruption is not guaranteed
-to remove the random sibling.
+预算：两个用例，各自包含真实的约 30s 租约等待；每个用例超时 100s，套件超时 240s，IPC/SQL 轮询及清理均有界。不人为更改数据库时钟。在正常本地 MySQL 上，预期成功运行通常约需 65–90 秒。清理可能额外增加有限时间；强制中断父进程不保证移除随机同级数据库。
 
-## Evidence and exact current validation limits
+## 证据及当前验证的确切限制
 
-A successful actual run emits TAP diagnostics containing parent/killed/successor
-PIDs, OS exit result, old/new owner UUIDs, DB expiry/claim times, original nonce and
-task ID, HTTP task POST/GET ledger, warmup count and final state. Passwords, tokens,
-DB URLs and connection error details are not included in that evidence. Before
-clean shutdown, SQL and child IPC must agree that the fresh successor is the live
-owner. Callback wrong-nonce and replay rejection, stage/attempt/generation fences,
-slot retention/release and absence of a second Login POST are asserted, not merely
-logged.
+成功的实际运行会输出 TAP 诊断，包含父进程/被终止进程/继任进程 PID、操作系统退出结果、旧/新 owner UUID、数据库到期/取得所有权时间、原始 nonce 和任务 ID、HTTP 任务 POST/GET 台账、预热次数及最终状态。证据不包含密码、令牌、数据库 URL 或连接错误详情。在干净关闭前，SQL 和子进程 IPC 必须一致确认新继任者为当前有效 owner。错误 nonce 和重放回调的拒绝、阶段/尝试次数/代次防护、槽位保留/释放以及没有第二次 Login POST 都通过断言验证，而不只是记录日志。
 
-Preparation-stage history: prepared locally on Windows with Node **v24.14.0**.
-During that preparation, Docker was not started, no cloud was contacted, and no
-local MySQL engine run was attempted (unavailable there). Its syntax, TypeScript
-`noEmit`, socket-free gate and skipped acceptance results remain offline evidence,
-not process-acceptance passes.
+准备阶段历史：在 Windows 上使用 Node **v24.14.0** 进行本地准备。准备期间未启动 Docker，未访问云，也未尝试在本地运行 MySQL 引擎测试（该环境不可用）。其语法、TypeScript `noEmit`、无套接字门禁及跳过验收的结果仍属于离线证据，不是进程验收通过记录。
 
-The parent subsequently completed the explicitly opted-in disposable real-MySQL
-run against frozen v4: **two actual subcases passed; TAP 3 pass / 0 fail / 0 skipped
-includes the parent wrapper; elapsed 66.454 seconds**. Both actual SIGKILL/exit and
-real approximately 30-second TTL waits completed. The independent successor
-recovered the original task/nonce without a second Login POST; the normal recovery
-and aged-task/late-callback subcases reached their expected ready/failed states.
-The run exercised the normal schema setup, HTTP recovery, stale-observation fences
-and live-run cleanup on that runner. It is not certification of every grant
-configuration or kill/exit behavior on both Windows and POSIX.
+父级随后完成了针对冻结 v4、经显式启用的可丢弃真实 MySQL 运行：**两个实际子用例通过；TAP 3 项通过 / 0 项失败 / 0 项跳过包含父级包装测试；耗时 66.454 秒**。两次实际 SIGKILL/退出及真实约 30 秒 TTL 等待均已完成。独立继任者恢复了原始任务/nonce，未发起第二次 Login POST；正常恢复与老化任务/迟到回调子用例分别达到了预期 ready/failed 状态。该运行验证了该运行器上的常规表结构设置、HTTP 恢复、陈旧观测防护及实际运行清理。它并不认证所有授权配置，也不认证 Windows 和 POSIX 两种平台上的所有终止/退出行为。
 
-The complete execution log is archived locally at `.claude/post-v4-worker-full.log`,
-SHA-256 `7a6328f89a35c72f200ad484ec31cef269edb6b5e0cde62ed5573cde2deb1eb5`.
-Only aggregate results and this checksum are published here, not raw runtime
-identifiers, endpoints or credentials. See [post-v4 progress](../../docs/user-pool-post-v4-progress.md)
-for the separate routes result and observability increment status.
+完整执行日志已在本地归档至 `.claude/post-v4-worker-full.log`，SHA-256 为 `7a6328f89a35c72f200ad484ec31cef269edb6b5e0cde62ed5573cde2deb1eb5`。此处仅发布汇总结果及该校验和，不发布原始运行时标识符、端点或凭据。独立的路由结果及可观测性增量状态见 [v4 后续进展](../../docs/user-pool-post-v4-progress.md)。
 
-All scope exclusions above remain: no SSO/SCIM/seat side-effect process matrix,
-network-hang/service-restart case, long-paused old process resuming after takeover,
-production HTTP callback-route acceptance, real upstream or deployment HA claim.
-The later local-diagnostics implementation does not deliver global owner alerts or
-customer SQLite owner-loss recovery; its new image has not yet passed runtime acceptance.
+上述所有范围排除项仍然成立：不包含 SSO/SCIM/席位副作用进程矩阵、网络挂起/服务重启用例、接管后长时间暂停的旧进程恢复、生产 HTTP 回调路由验收，也不构成真实上游或部署高可用性声明。后续本地诊断实现不提供全局 owner 告警或客户 SQLite owner 丢失恢复；其新镜像尚未通过运行时验收。

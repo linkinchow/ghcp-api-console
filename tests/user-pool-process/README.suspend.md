@@ -1,27 +1,17 @@
-# v5 SIGSTOP/SIGCONT owner-expiry process acceptance
+# v5 SIGSTOP/SIGCONT owner 到期进程验收
 
-TEST ONLY. Source baseline is exactly `356f8f5e33a21ccfe7cf8c5db07060ab1ac47846`
-(parent branch `ghcp-user-pool-resilience-tests`). The isolated implementation checkout
-was verified clean at that HEAD before adding these files. `suspend-run.mjs` rejects
-another HEAD or changes to production/reused helper sources. Existing `worker-*`
-helpers are read/reused, never modified; **the frozen-v4 worker launcher remains
-unchanged** and is not the entry point for this test.
+仅用于测试。源码基线恰好为 `356f8f5e33a21ccfe7cf8c5db07060ab1ac47846`（父分支 `ghcp-user-pool-resilience-tests`）。添加这些文件前，已确认隔离实现检出目录在该 HEAD 上没有变更。`suspend-run.mjs` 会拒绝其他 HEAD 或对生产/复用辅助源码的更改。现有 `worker-*` 辅助代码仅读取/复用，绝不修改；**冻结 v4 的 worker 启动器保持不变**，且不是本测试的入口。
 
-## Commands
+## 命令
 
-Run from a checkout at the exact baseline with these new test files overlaid and
-Node 22+, workspace dependencies (including `tsx`, `typescript`, `mysql2`) already
-available. Do not load dotenv, supply NODE_OPTIONS, or use real service credentials.
+从确切基线的检出目录运行，并在其上叠加这些新增测试文件；要求 Node 22+，且工作区依赖（包括 `tsx`、`typescript`、`mysql2`）已就绪。不要加载 dotenv、提供 NODE_OPTIONS 或使用真实服务凭据。
 
 ```sh
 node tests/user-pool-process/suspend-run.mjs --typecheck
 node tests/user-pool-process/suspend-run.mjs --gate-check
 ```
 
-Actual acceptance is **Linux only**, with procfs available to verify kernel state `T`.
-Windows cannot perform this test; neither typecheck nor offline guards imply a
-SIGSTOP/MySQL pass. On Linux, provision the disposable local MySQL separately and
-export only these explicit opt-ins using synthetic, disposable credentials:
+实际验收**仅限 Linux**，且需有 procfs 以验证内核状态 `T`。Windows 无法执行此测试；类型检查和离线防护均不代表 SIGSTOP/MySQL 测试通过。在 Linux 上，单独准备可丢弃的本地 MySQL，并使用模拟、可丢弃凭据，仅导出以下显式启用变量：
 
 ```sh
 export MYSQL_POOL_SUSPEND_TEST=1
@@ -31,77 +21,30 @@ export MYSQL_TEST_URL='mysql://root:DISPOSABLE_TEST_PASSWORD@127.0.0.1:3306/ghcp
 node tests/user-pool-process/suspend-run.mjs --run
 ```
 
-The URL is read from environment, never child arguments or printed. The account
-must be `root`, scheme `mysql:`, hostname literal loopback (`localhost`, `127.0.0.1`,
-`[::1]`), database marker `ghcp_pool_test_[a-z0-9_]+`, no options or fragments.
-Only a random sibling `ghcp_pool_test_<32 hex>` is created/migrated/dropped; the
-marker database is never opened. Use an actually disposable local instance, not a
-port-forward/tunnel to a real service. This harness does not start MySQL, Docker,
-Azure, or any real provider. Expected runtime **35–90 seconds**, including a real
-30-second owner lease expiry; bounded test timeout 140s, launcher watchdog 160s.
+URL 从环境读取，绝不作为子进程参数传递，也不打印。账号必须为 `root`，协议为 `mysql:`，主机名为回环字面值（`localhost`、`127.0.0.1`、`[::1]`），数据库标记为 `ghcp_pool_test_[a-z0-9_]+`，不带选项或片段。仅创建/迁移/删除随机同级数据库 `ghcp_pool_test_<32 hex>`；绝不打开标记数据库。使用真正可丢弃的本地实例，而不是通往真实服务的端口转发/隧道。此测试工具不启动 MySQL、Docker、Azure 或任何真实提供商服务。预计运行时间为 **35–90 秒**，包括真实的 30 秒 owner 租约到期等待；测试超时上限为 140s，启动器看门狗时限为 160s。
 
-## Evidence and assertions
+## 证据与断言
 
-1. Parent seeds one synthetic synced account, then makes only bounded SELECTs
-   until cleanup DROP. Two IPC children construct the real MySQL store,
-   `PrewarmWorker` (multi-replica), and `realProvisioner`. Only the account-read
-   dependency is wired to the child's MySQL storage; the fetch wrapper counts and
-   delegates actual HTTP. Existing `WorkerMock` listens at a dynamic loopback port,
-   retains task state outside both children, and does not deduplicate POSTs.
-2. Old worker performs exactly one Login POST. A test-only barrier intercepts its
-   resulting `oauth-wait` checkpoint immediately before the real store update,
-   outside any SQL transaction/lock. Parent sends actual `SIGSTOP` and confirms
-   `/proc/<child pid>/stat` is `T`. Owner row still has 25–30s of the production 30s
-   lease. No fake clock, direct owner mutation, shortened lease, or worker stop.
-3. Successor first reports standby, then claims a distinct UUID only after natural
-   DB expiry. DB time and elapsed wall time are recorded. It searches and finds
-   the original task/nonce, and is held at its own checkpoint. The inventory stays
-   **exactly the original row**, making owner the only mismatching fence.
-4. Parent sends `SIGCONT`. The old worker's original retained call invokes the
-   **real SQL-backed store update** with its original row fence/old owner. It must
-   return false, with exact inventory and credentials unchanged. This exercises
-   the storage transaction's owner rejection, not a fake store return and not
-   merely a rejection caused by a successor changing the row generation/stage.
-   Snapshot diagnostics must report `local_tenure_expired`, one acquisition,
-   one loss, inactive/standby. Retained context assertion/checkpoint calls must
-   reject without reaching another store update or HTTP operation.
-5. Release successor checkpoint; it succeeds. The successor performs a synthetic
-   repository OAuth callback with the original nonce (not HTTP callback route
-   acceptance). Parent marks the mock task successful; successor performs real
-   model lookup/warmup and reaches ready with original attempt/task/nonce. Exactly
-   one Login POST, one credential-reset request, one model GET, one warmup POST.
-   Old process stays alive in standby through additional scheduling cycles, with
-   no extra steps, provider HTTP, checkpoint calls or ownership acquisitions.
+1. 父进程植入一个已同步的模拟账号，此后直到清理 DROP 前仅执行有界 SELECT。两个 IPC 子进程构造真实 MySQL 存储、`PrewarmWorker`（多副本）及 `realProvisioner`。仅将账号读取依赖连接到子进程的 MySQL 存储；fetch 包装器计数并转交真实 HTTP 调用。现有 `WorkerMock` 在动态回环端口监听，在两个子进程之外保留任务状态，且不对 POST 去重。
+2. 旧 worker 恰好执行一次 Login POST。仅用于测试的屏障在真实存储更新前立即拦截由此产生的 `oauth-wait` 检查点，位置在任何 SQL 事务/锁之外。父进程发送真实 `SIGSTOP`，并确认 `/proc/<child pid>/stat` 为 `T`。Owner 行仍剩余生产 30s 租约中的 25–30s。不伪造时钟、不直接变更 owner、不缩短租约，也不停止 worker。
+3. 继任者先报告待命，然后仅在数据库自然到期后使用不同 UUID 取得所有权。记录数据库时间和实际经过的墙钟时间。它搜索并找到原始任务/nonce，随后被阻挡在自身的检查点。清单保持为**完全相同的原始行**，使 owner 成为唯一不匹配的防护条件。
+4. 父进程发送 `SIGCONT`。旧 worker 原始保留调用携带其原始行防护条件/旧 owner，调用**真实 SQL 支撑的存储更新**。它必须返回 false，且清单和凭据完全不变。这验证的是存储事务的 owner 拒绝，而非伪造存储返回值，也不仅仅是继任者更改行代次/阶段而导致的拒绝。快照诊断必须报告 `local_tenure_expired`、一次所有权获取、一次丢失、非活动/待命。保留上下文的断言/检查点调用必须被拒绝，且不得再执行其他存储更新或 HTTP 操作。
+5. 释放继任者检查点；其成功执行。继任者使用原始 nonce 执行模拟仓储 OAuth 回调（不是 HTTP 回调路由验收）。父进程将模拟任务标为成功；继任者执行真实模型查询/预热，并以原始尝试次数/任务/nonce 达到 ready。恰好一次 Login POST、一次凭据重置请求、一次模型 GET、一次预热 POST。旧进程在额外调度周期中继续存活并保持待命，不增加步骤、提供商 HTTP、检查点调用或所有权获取。
 
-TAP diagnostics include baseline, sibling, PIDs, both owner UUIDs, expiry/claim
-DB timestamps, wall wait, retained SQL result, local-loss snapshot, synthetic
-nonce/task ID and counts. They do not include credentials or MySQL URLs.
+TAP 诊断包含基线、同级数据库、PID、两个 owner UUID、到期/取得所有权的数据库时间戳、墙钟等待时间、保留 SQL 结果、本地丢失快照、模拟 nonce/任务 ID 及计数。不包含凭据或 MySQL URL。
 
-## Lifetime and cleanup
+## 生命周期与清理
 
-Fresh allowlisted child environments discard inherited provider secrets, proxy
-variables and NODE_OPTIONS; dotenv path is the null device before production
-imports. Mock origins are fixed to the dynamically assigned loopback listener.
-Connection/query deadlines, bounded observations, child lifetime timers and a
-**parent-side watchdog that still runs during SIGSTOP** bound the fixture.
-Cleanup always sends SIGCONT before terminating each owned ChildProcess and awaits
-its real exit event before DROP. No process-group kill, PID discovery/kill,
-`pkill`, `taskkill`, or global reset. Interrupt handlers perform the same cleanup.
-Failure to confirm child exit refuses DROP and reports the sibling for inspection.
-As with any process harness, SIGKILL of the entire parent or machine loss cannot
-run its cleanup handlers; inspect the reported disposable sibling in that case.
+全新且受允许列表约束的子进程环境会丢弃继承的提供商密钥、代理变量及 NODE_OPTIONS；在导入生产代码前，dotenv 路径即设为空设备。模拟源地址固定为动态分配的回环监听器。连接/查询截止时间、有界观测、子进程生命周期计时器以及 **SIGSTOP 期间仍继续运行的父进程侧看门狗**共同限制测试夹具。清理始终先发送 SIGCONT，再终止各个归本测试工具所有的 ChildProcess，并在 DROP 前等待其真实退出事件。不使用进程组终止、PID 发现/终止、`pkill`、`taskkill` 或全局重置。中断处理器执行相同清理。无法确认子进程退出时，会拒绝 DROP 并报告同级数据库以供检查。与任何进程测试工具一样，若整个父进程被 SIGKILL 或机器失联，则无法运行清理处理器；此时应检查报告的可丢弃同级数据库。
 
-## Local test report
+## 本地测试报告
 
-Implementation platform: Windows 11. Executed local checks:
+实现平台：Windows 11。已执行本地检查：
 
-- `--typecheck`: PASS (after correcting a test-only assertion-narrowing error in
-  the initial run); final noEmit check has no diagnostics.
-- `--gate-check`: PASS, 4 offline checks, 0 failures, 1 intentional live-acceptance
-  skip. Verifies strict gates, environment/sibling isolation, safe refusal before
-  loader/network, exact v5 baseline and unchanged frozen-v4 launcher.
-- Scope check: exactly these six new files; no tracked-file changes.
+- `--typecheck`：通过（修正首次运行中仅涉及测试的断言类型收窄错误后）；最终 noEmit 检查无诊断信息。
+- `--gate-check`：通过，4 项离线检查、0 项失败、1 项有意跳过的实际运行验收。验证严格门禁、环境/同级数据库隔离、加载器/网络启动前的安全拒绝、确切 v5 基线及未更改的冻结 v4 启动器。
+- 范围检查：恰好这六个新增文件；无已跟踪文件变更。
 
-Actual Linux SIGSTOP/TTL/MySQL acceptance was not run by the Windows implementer. The parent subsequently executed it on the approved isolated Linux/MySQL host: **1 passed, 0 failed, 0 skipped**, 34.808 seconds. Natural takeover consumed 30.092 seconds; the retained old SQL checkpoint returned false with the same row fence and unchanged data. Original Login POST count was one, warmup count one, final state Ready. Production source remained exactly v5.
+Windows 实现者未运行实际 Linux SIGSTOP/TTL/MySQL 验收。父级随后在获准的隔离 Linux/MySQL 主机上执行了验收：**1 项通过、0 项失败、0 项跳过**，34.808 秒。自然接管耗时 30.092 秒；保留的旧 SQL 检查点在行防护条件相同、数据不变的情况下返回 false。原始 Login POST 次数为一，预热次数为一，最终状态为 Ready。生产源码仍与 v5 完全一致。
 
-Execution log SHA-256: `30f2cf6e424eabe854e04e3a05c498c35b459da5cee6c9a7731e7f7397df9766`. See [the bounded resilience report](../../docs/user-pool-v5-resilience-tests.md). Offline gates and the Linux acceptance result are separate counts.
+执行日志 SHA-256：`30f2cf6e424eabe854e04e3a05c498c35b459da5cee6c9a7731e7f7397df9766`。见[有界韧性测试报告](../../docs/user-pool-v5-resilience-tests.md)。离线门禁与 Linux 验收结果分别计数。

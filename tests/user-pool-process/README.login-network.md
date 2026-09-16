@@ -1,36 +1,36 @@
-# Login network process acceptance (v5 test-only follow-up)
+# Login 网络进程验收（v5 仅测试后续工作）
 
-**Both actual Linux/MySQL network cases passed against `356f8f5e33a21ccfe7cf8c5db07060ab1ac47846`: two subcases, TAP 3 passes including the parent wrapper, 0 failures/skips, 140.659 seconds.** Windows preparation and offline tests are separate evidence; actual runtime records and retained fixture failures are summarized below.
-No production, existing worker/routes helper, build or package files are changed. The runner checks that the production Proxy/shared sources and reused worker helpers equal that baseline (test-only descendant commits are allowed).
+**两个实际 Linux/MySQL 网络用例均已基于 `356f8f5e33a21ccfe7cf8c5db07060ab1ac47846` 通过：两个子用例，TAP 共 3 项通过（含父级包装测试），0 项失败/跳过，耗时 140.659 秒。** Windows 准备工作和离线测试是独立证据；实际运行记录及保留的测试夹具失败记录汇总如下。
+未更改生产代码、现有 worker/路由辅助代码、构建文件或包文件。运行器会检查生产 Proxy/shared 源码及复用的 worker 辅助代码是否与该基线一致（允许仅包含测试变更的后续提交）。
 
-## What the two cases exercise
+## 两个用例的验证内容
 
-- **Silent connected GET, real production timeout.** A real Worker/Provisioner creates one task with a real HTTP POST and checkpoints its ID/nonce in an isolated shared MySQL database. With the worker stopped, the fixture explicitly establishes an exhausted `failed/3` reservation using the real store failure operation. This is an operator-state precondition, **not** a claim that three naturally timed-out attempts were executed. A new real worker makes a task GET to an independent local wire-server process that accepts the HTTP request but sends **no headers or body**. It neither returns 503 nor uses a promise sentinel. `ServerResponse.close` records GET ID, monotonic start/close and elapsed time when the production client aborts. Existing server-side request/socket timeouts are disabled, not the production client timeout.
-- While that GET is in flight, a separately seeded, credential-valid account becomes eligible for real SSO/model lookup/warmup and reaches ready. Ordinary concurrency is **one**, Login capacity is **one**: this proves the supported exhausted-reservation background-observation contract, **not** that a hung ordinary step leaves its own ordinary concurrency slot free. Retained reservation identity, nonce, task ID, generation, attempts, error and slot count remain unchanged. Worker diagnostics must report owner with zero ownership losses, ruling out early tenure-loss cancellation.
-- Production `readPoolConfig` supplies the unmodified **120,000 ms** request timeout. Worker and Provisioner both use it. The existing worker fixture's 15-second timeout and 120-second child lifetime are deliberately not reused. Assertions require wire GET and worker observation duration in **118–135 seconds**: up to two seconds may already have elapsed in real SQL/assertions before GET reaches the wire. The harness never shortens the client deadline, advances clocks, changes owner TTL/expiry, or manually closes that GET. It records the actual duration, requires no headers, and verifies production timeout reason. Later GETs can respond, but changing the future-GET mode cannot release the stalled connection.
-- **Independent wire-server death and restart.** Login POST is accepted in the synthetic server but its response stays open. The test observes that accepted task over IPC, observes persisted `oauth-dispatch` intent with no task ID, then kills only that server via its own `ChildProcess` handle and waits for the real exit event. After the ordinary POST failure, the fixture establishes exhausted operator state without changing any retry deadlines. A live worker's read-only observation fails against the stopped port; this connection-refused observation is **not** counted as timeout coverage. A new server process binds the same loopback port and restores the exact accepted task DTO from the parent IPC ledger. Recovery uses list GETs only, retains the original nonce and provisioning attempt, and issues no second task POST.
-- Both cases apply a repository-layer nonce-checked synthetic callback, publish synthetic task success, and observe capacity release while preserving failed/3/error/retry protection. Three further scheduler periods must not warm or retry the failed member. Only an **explicit** `store.retry` operator action is then allowed to reach ready through the real Provisioner/model resolver/warmup, still with exactly one task POST. Wrong/repeated callback nonces cannot overwrite credentials.
+- **连接建立后无响应的 GET，真实生产超时。** 真实 Worker/Provisioner 通过真实 HTTP POST 创建一个任务，并将其 ID/nonce 作为检查点写入隔离的共享 MySQL 数据库。在 worker 停止后，测试夹具通过真实存储失败操作，显式建立尝试次数已耗尽的 `failed/3` 预留。这是操作员状态前置条件，**并非**声称已执行三次自然超时的尝试。一个新的真实 worker 向独立的本地网络服务器进程发起任务 GET；该进程接受 HTTP 请求，但**不发送任何响应头或响应体**。它既不返回 503，也不使用 Promise 哨兵。生产客户端中止请求时，`ServerResponse.close` 会记录 GET ID、单调时钟的开始/关闭时间及耗时。禁用的是现有服务端请求/套接字超时，而不是生产客户端超时。
+- 在该 GET 进行期间，另一个单独植入、凭据有效的账号满足真实 SSO/模型查询/预热的条件，并达到 ready。普通并发数为**一**，Login 容量为**一**：这证明的是系统支持的尝试次数耗尽后保留预留并在后台观测的约定，**并非**证明挂起的普通步骤不会占用自身的普通并发槽位。保留的预留身份、nonce、任务 ID、代次、尝试次数、错误和槽位数量均保持不变。Worker 诊断必须报告其为 owner，且所有权丢失次数为零，从而排除因任期提前丢失而取消请求的可能。
+- 生产 `readPoolConfig` 提供未经修改的 **120,000 ms** 请求超时。Worker 和 Provisioner 均使用该值。刻意不复用现有 worker 测试夹具的 15 秒超时及 120 秒子进程生命周期。断言要求网络 GET 和 worker 观测时长均在 **118–135 秒**以内：GET 到达网络服务器前，真实 SQL/断言可能已耗时最多两秒。测试工具绝不会缩短客户端截止时间、推进时钟、更改 owner TTL/到期时间，或手动关闭该 GET。它记录实际时长，要求没有响应头，并验证生产超时原因。后续 GET 可以响应，但更改后续 GET 的模式不能解除已停滞的连接。
+- **独立网络服务器终止并重启。** 模拟服务器接受 Login POST，但保持响应未结束。测试通过 IPC 观测已接受的任务，确认已持久化不含任务 ID 的 `oauth-dispatch` 意图，随后仅通过该服务器自身的 `ChildProcess` 句柄终止它，并等待真实退出事件。普通 POST 失败后，测试夹具建立尝试次数已耗尽的操作员状态，不更改任何重试截止时间。运行中的 worker 针对已停止的端口进行只读观测并失败；此连接被拒绝的观测**不**计入超时覆盖。新的服务器进程绑定同一回环端口，并从父进程 IPC 台账中完整恢复已接受的任务 DTO。恢复仅使用列表 GET，保留原始 nonce 和开通尝试标识，且不发起第二次任务 POST。
+- 两个用例都在仓储层应用经过 nonce 校验的模拟回调，发布模拟任务成功状态，并在保留 failed/3/错误/重试保护的同时观测容量释放。再经过三个调度周期，也不得预热或重试该失败成员。此后，只有**显式**的 `store.retry` 操作员操作才能允许其通过真实 Provisioner/模型解析器/预热达到 ready，且任务 POST 仍恰好只有一次。错误或重复的回调 nonce 不能覆盖凭据。
 
-The synthetic task ledger lives in parent memory, survives the wire process, and is restored over IPC. This tests process-boundary wire recovery, **not durable actual Login storage**, the actual Login service, Playwright/browser execution, real SSO/GitHub/Copilot, or the callback HTTP route. SSO/model/warmup responses reuse `worker-mock.ts` unchanged; its Login routes are never used. Production HTTP fetch, worker, store, mutation fences, warmup resolver and SQL execute for real against synthetic loopback services/shared isolated MySQL.
+模拟任务台账保存在父进程内存中，不随网络进程终止而丢失，并通过 IPC 恢复。这测试的是跨进程边界的网络恢复，**不是实际 Login 存储的持久性**，也不是实际 Login 服务、Playwright/浏览器执行、真实 SSO/GitHub/Copilot 或回调 HTTP 路由。SSO/模型/预热响应原样复用 `worker-mock.ts`；绝不使用其中的 Login 路由。生产 HTTP fetch、worker、存储、变更防护、预热解析器和 SQL 均真实执行，访问的是模拟回环服务及共享的隔离 MySQL。
 
-## Safety and bounds
+## 安全要求与边界
 
-Use only the wrapper below. `--run` validates all three opt-ins **before git, loaders, test/child spawn, HTTP listener or database connection**. Direct children independently validate gates/IPC/random sibling name before side effects. No `.env` loading: wrapper and children use allowlisted environments and `DOTENV_CONFIG_PATH=/dev/null` (`NUL` on Windows). Provider credentials, `NODE_OPTIONS`, proxy variables and HTTP timeout overrides are not inherited. Provider origins are assigned locally; HTTP clients forbid redirects.
+仅使用下方包装入口。`--run` 会在 **git、加载器、测试/子进程启动、HTTP 监听或数据库连接之前**验证全部三个显式启用条件。直接子进程在产生副作用之前，也会独立验证门禁/IPC/随机同级数据库名。不加载 `.env`：包装入口和子进程使用环境变量允许列表，并设置 `DOTENV_CONFIG_PATH=/dev/null`（Windows 上为 `NUL`）。不继承提供商凭据、`NODE_OPTIONS`、代理变量或 HTTP 超时覆盖配置。提供商源地址在本地指定；HTTP 客户端禁止重定向。
 
-MySQL must be disposable, on literal `localhost`, `127.0.0.1` or `[::1]`, with literal `root` username and `/ghcp_pool_test_...` marker. URL query/fragment options are rejected. Each case creates a **random sibling** `ghcp_pool_test_<32 hex>`; the supplied marker database is never selected, migrated, cleared or dropped. Parent and real worker use independent pools to that sibling. Nothing creates Docker/cloud infrastructure.
+MySQL 必须可丢弃，主机名必须为字面值 `localhost`、`127.0.0.1` 或 `[::1]`，用户名必须为字面值 `root`，并带有 `/ghcp_pool_test_...` 标记。拒绝 URL 查询/片段选项。每个用例创建一个**随机同级数据库** `ghcp_pool_test_<32 hex>`；绝不选择、迁移、清空或删除所提供的标记数据库。父进程和真实 worker 使用各自独立的连接池访问该同级数据库。不创建任何 Docker/云基础设施。
 
-- Production request deadline: 120 seconds; production SQL budgets stay unchanged (ordinary pool operations 5 seconds; migration implementation capped at 60 seconds).
-- Test migration waits: 25/20 seconds with socket destruction on cleanup; parent CREATE/DROP statement deadlines: 8 seconds, reads: 5 seconds, connection establishment: 5 seconds; finite MySQL queues (4/16).
-- Socket-timeout case: 230 seconds; restart case: 90 seconds; complete suite: 360 seconds.
-- Cleanup: one 30-second budget; all tracked children killed/drained before DROP, all tracked SQL sockets destroyed, listener closed, pools ended. DROP is refused if any child exit is unconfirmed. Failure names only the generated sibling for manual inspection.
-- Child lifetime: 400 seconds, plus immediate parent-disconnect exit. Engine mode runs the `node:test` file directly, without an intermediate coordinator. The runner forwards SIGTERM on interruption or at 380 seconds, allows 30 seconds for fixture cleanup, then escalates to SIGKILL at the 410-second ceiling. Fixture signal handlers abort outstanding work and perform bounded cleanup. If an OS hard kill prevents cleanup, a sibling can remain: inspect the printed random name; never guess or drop the marker. A hard-kill deadline is not a successful cleanup claim.
-- At most two fixture accounts, four synthetic tasks, 1,500 wire HTTP calls and 10,000 IPC proofs per process; long stalled-GET SQL verification polls once per second.
+- 生产请求截止时间：120 秒；生产 SQL 时限保持不变（普通连接池操作为 5 秒；迁移实现上限为 60 秒）。
+- 测试迁移等待：25/20 秒，清理时销毁套接字；父进程 CREATE/DROP 语句截止时间：8 秒，读取：5 秒，建立连接：5 秒；MySQL 队列有界（4/16）。
+- 套接字超时用例：230 秒；重启用例：90 秒；完整测试套件：360 秒。
+- 清理：共用一个 30 秒预算；DROP 前终止并等待所有已跟踪子进程结束，销毁所有已跟踪 SQL 套接字，关闭监听器并结束连接池。任何子进程退出未获确认时，都拒绝 DROP。失败时只报告生成的同级数据库名，供人工检查。
+- 子进程生命周期：400 秒，另在父进程断连时立即退出。引擎模式直接运行 `node:test` 文件，不经过中间协调进程。运行器在中断时或达到 380 秒时转发 SIGTERM，给测试夹具 30 秒进行清理，随后在 410 秒的上限处升级为 SIGKILL。测试夹具的信号处理器会中止未完成工作，并执行有界清理。如果操作系统强制终止导致无法清理，可能会留下同级数据库：检查打印出的随机名称；绝不猜测名称或删除标记数据库。强制终止截止时间不代表清理成功。
+- 每个进程最多包含两个测试账号、四个模拟任务、1,500 次网络 HTTP 调用及 10,000 条 IPC 证明记录；长时间停滞 GET 的 SQL 验证每秒轮询一次。
 
-Expected healthy Linux duration is roughly **155–190 seconds**, dominated by the real 120-second timeout; allow the stated finite upper bounds. Run serially with other tests using this disposable server because production migration advisory locks are server-wide. Normal execution has no owner-TTL sleep and never rewrites owner leases.
+正常 Linux 环境下的预计时长约为 **155–190 秒**，主要耗时来自真实的 120 秒超时；应允许上述有限时间上界。由于生产迁移命名锁是服务器级别的，使用同一可丢弃服务器的其他测试应与本测试串行运行。正常执行不包含 owner TTL 休眠等待，也绝不改写 owner 租约。
 
-## Commands
+## 命令
 
-Prerequisites: Node 22+, existing project dependencies/shared build, and an already running disposable local MySQL 8.4 instance. Run from this checkout. Do not put credentials into command arguments or shared logs.
+前置条件：Node 22+、已有项目依赖/shared 构建产物，以及已经运行的可丢弃本地 MySQL 8.4 实例。从此检出目录运行。不要将凭据放入命令参数或共享日志。
 
 ```sh
 node --check tests/user-pool-process/login-network-run.mjs
@@ -39,7 +39,7 @@ node tests/user-pool-process/login-network-run.mjs --typecheck
 node tests/user-pool-process/login-network-run.mjs --offline
 ```
 
-Linux acceptance, only after the disposable MySQL instance has been independently selected:
+Linux 验收，仅在单独选定可丢弃 MySQL 实例后执行：
 
 ```sh
 # MYSQL_TEST_URL is supplied privately via environment, for example through an
@@ -48,27 +48,27 @@ MYSQL_POOL_LOGIN_NETWORK_TEST=1 MYSQL_POOL_TEST_DISPOSABLE=1 \
   node tests/user-pool-process/login-network-run.mjs --run
 ```
 
-Save stdout/stderr with the parent test report if desired. Each case emits sanitized JSON TAP diagnostics with generated sibling, parent/worker/wire PIDs, actual GET start/abort and timeout reason, full task HTTP call ledger, task ID/nonce, before/released/final inventory, explicit retry flag and warmup counts. Synthetic nonces/IDs are evidence, not real credentials. Failed assertions fail the case; an absent opt-in is a clearly named **UNRUN skip**, never acceptance success.
+如有需要，可将 stdout/stderr 与父级测试报告一同保存。每个用例都会输出经过脱敏的 JSON TAP 诊断，包含生成的同级数据库名、父进程/worker/网络服务器 PID、实际 GET 开始/中止时间及超时原因、完整任务 HTTP 调用台账、任务 ID/nonce、操作前/释放后/最终清单、显式重试标志及预热次数。模拟 nonce/ID 是证据，不是真实凭据。断言失败即判定用例失败；缺少显式启用条件时，会明确标记为**未运行（UNRUN）并跳过**，绝不视为验收成功。
 
-## Actual local test report
+## 实际本地测试报告
 
-Windows 11, Node `v24.14.0`; no MySQL/acceptance server/cloud/Docker/external traffic was run locally.
+Windows 11，Node `v24.14.0`；本地未运行 MySQL/验收服务器/云/Docker，也未产生外部流量。
 
-| Executed check | Actual result |
+| 已执行检查 | 实际结果 |
 | --- | --- |
-| Runner and offline-file `node --check` | PASS; final rerun 0.207 s / 0.158 s |
-| First scoped noEmit typecheck | FAIL: unsupported `shell` property in `ForkOptions`; removed in new fixture only |
-| Corrected scoped `--typecheck` | PASS, 3.465 s; intermediate rerun 2.879 s; final hardened rerun 7.652 s |
-| `--offline` | PASS each run: 3 tests, 0 failures, 1 explicit MySQL/network UNRUN skip; first 1.493 s, intermediate 1.339 s, final hardened rerun 2.498 s (1962.819 ms test runner) |
-| Working-tree scope/whitespace check | Only new `login-network-*` files and this README; no existing tracked diff |
-| Real MySQL silent-GET/restart acceptance | **UNRUN locally; parent Linux execution required** |
+| 运行器及离线文件的 `node --check` | 通过；最终重跑耗时 0.207 s / 0.158 s |
+| 首次限定范围的 noEmit 类型检查 | 失败：`ForkOptions` 不支持 `shell` 属性；仅在新测试夹具中移除 |
+| 修正后的限定范围 `--typecheck` | 通过，3.465 s；中间重跑 2.879 s；最终加固后重跑 7.652 s |
+| `--offline` | 每次运行均通过：3 项测试、0 项失败、1 项显式 MySQL/网络未运行（UNRUN）跳过；首次 1.493 s，中间 1.339 s，最终加固后重跑 2.498 s（测试运行器 1962.819 ms） |
+| 工作树范围/空白检查 | 仅新增的 `login-network-*` 文件及本 README；现有跟踪文件无差异 |
+| 真实 MySQL 无响应 GET/重启验收 | **本地未运行（UNRUN）；需由父级在 Linux 上执行** |
 
-## Actual Linux execution
+## 实际 Linux 执行
 
-The first run stopped after 2.207 seconds because the test worker treated its own graceful IPC disconnect as abnormal, and the stop waiter rejected a queued acknowledgement after exit. The fixture now distinguishes deliberate shutdown and requires both the acknowledgement and exit 0; missing acknowledgement, nonzero exit, signals and fatal IPC remain failures. Three new deterministic regression tests increased offline checks to six passes.
+首次运行在 2.207 秒后停止，原因是测试 worker 将自身正常 IPC 断连视为异常，且停止等待器在退出后拒绝了已排队的确认消息。测试夹具现在会区分主动关闭，并要求同时收到确认消息和退出码 0；缺少确认消息、非零退出码、信号退出及致命 IPC 问题仍判定为失败。新增的三个确定性回归测试使离线检查增加至六项通过。
 
-The second run stopped after 3.071 seconds because ordinary `store.update` correctly refuses disabled members. The unrelated warmup setup now uses supported operator `store.retry`, asserting the new attempt and Ready outcome, without changing the stalled member or production fences. Both early failure logs are retained; neither completed the 120-second timeout scenario.
+第二次运行在 3.071 秒后停止，原因是普通 `store.update` 正确拒绝了已禁用成员。不相关账号的预热准备现在改用受支持的操作员 `store.retry`，断言新的尝试及 Ready 结果，不改动停滞成员或生产防护条件。两次早期失败日志均已保留；它们都没有完成 120 秒超时场景。
 
-The corrected third run completed both actual scenarios: **TAP 3 pass / 0 fail / 0 skipped, 140.659 seconds**. Log SHA-256: `9c30f7ee4149d8f16b529dc259d1e8054d0f74eee509f79d9a6e604eb3e9f8d6`. See [the bounded resilience report](../../docs/user-pool-v5-resilience-tests.md) for measured socket durations and final evidence. No production changes were required.
+修正后的第三次运行完成了两个实际场景：**TAP 3 项通过 / 0 项失败 / 0 项跳过，140.659 秒**。日志 SHA-256：`9c30f7ee4149d8f16b529dc259d1e8054d0f74eee509f79d9a6e604eb3e9f8d6`。套接字实测时长及最终证据见[有界韧性测试报告](../../docs/user-pool-v5-resilience-tests.md)。无需更改生产代码。
 
-Offline tests validate unsafe/partial opt-in refusal, random sibling construction, exact production timeout, child environment sanitization, and instrument socket/listener/fetch/process APIs to prove entrypoints reject **before even attempting** side effects. They do not stand in for the real socket/MySQL cases.
+离线测试验证对不安全/不完整显式启用条件的拒绝、随机同级数据库构造、精确的生产超时、子进程环境净化，并监测套接字/监听器/fetch/进程 API，以证明入口在**甚至尚未尝试**产生副作用前就会拒绝执行。它们不能替代真实套接字/MySQL 用例。

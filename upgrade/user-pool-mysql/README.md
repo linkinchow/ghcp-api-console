@@ -1,85 +1,85 @@
-# Offline user-pool SQLite → MySQL 8 migration
+# User Pool 从 SQLite 离线迁移到 MySQL 8
 
-This tool migrates **caller-lease pool data**, unlike `upgrade/sqlite-to-mysql` (the older direct-mode tool). It performs no GitHub, SSO, SCIM, Login, seat, or model requests. Use a maintenance window, a consistent offline backup, and a dedicated empty MySQL 8/InnoDB database. Migration is not zero-downtime.
+本工具迁移的是 **caller-lease 账号池数据**，不同于用于旧 direct 模式的 `upgrade/sqlite-to-mysql`。工具不会请求 GitHub、SSO、SCIM、Login、席位或模型接口。迁移需要维护窗口、一致的离线备份，以及专用的空 MySQL 8／InnoDB 数据库；不支持零停机迁移。
 
-**Status (2026-09-14): reviewed defects fixed and isolated regressions passed.** The [production review and remediation record](../../docs/user-pool-mysql-production-review.md) retains the original failures and records the repairs. This remains an unpublished candidate; customer backup rehearsal, resource/SLO and infrastructure acceptance are separate. These instructions do not authorize production access.
+**状态（2026-09-14）：审查发现的问题已修复，隔离回归已通过。** [生产审查与修复记录](../../docs/user-pool-mysql-production-review.md)保留了原始失败及修复过程。该状态记录对应当时尚未发布的候选版本；客户备份演练、资源／SLO及基础设施验收是独立事项。本文不构成访问生产环境的授权。
 
-## Before running
+## 执行前准备
 
-1. Pause pool prewarming. Stop admitting new traffic and drain every inference/catalog request and every dispatched provisioning/Login operation. Resolve ambiguous creation, SCIM, seat, and OAuth outcomes using the operational reconciliation process; do not simply clear safety fields to pass validation.
-2. Stop all old Proxy writers and their scheduler. Stop any Login callback writer that could change the backup's source. Keep the original deployment, credentials, certificates, SSO/Login/Console volumes, and original SQLite files untouched by this tool.
-3. Produce a consistent **standalone backup copy**, not a raw copy of a live SQLite main file with an uncheckpointed WAL. This tool requires a rollback-journal-format backup, with no `-wal`, `-shm`, or `-journal` sidecars. If the backup is in WAL mode, produce another standalone copy offline, or convert only the disposable backup copy to `journal_mode=DELETE` with SQLite after confirming consistency. Never do this to a running/original database as part of migration.
-4. Stop every service connected to the target. Provision an empty, dedicated MySQL 8 database and a migration login with schema creation, DML, verification, and advisory-lock permissions. No target traffic until acceptance is complete. Injected test pools need at least **three connections**: the importer holds one connection throughout schema initialization.
+1. 暂停账号池预热，停止接收新流量，排空所有推理／目录请求及已派发的开通／Login操作。对创建、SCIM、席位和OAuth结果不明的任务，按运维核对流程处理；不要只为通过校验而清除安全字段。
+2. 停止所有旧Proxy写入进程及其调度器，也停止可能通过回调修改源数据的Login写入端。本工具不得改动原部署、凭据、证书、SSO／Login／Console卷和原SQLite文件。
+3. 生成一致的**独立备份副本**，不能只复制仍在运行且有未合并WAL的SQLite主文件。工具要求回滚日志格式的备份，且不存在`-wal`、`-shm`或`-journal`伴随文件。若备份仍为WAL模式，应离线生成另一份独立副本，或确认一致性后，仅对可丢弃的备份副本设置`journal_mode=DELETE`。迁移时绝不能对运行中的数据库或原数据库执行该转换。
+4. 停止所有连接目标库的服务。准备专用空MySQL 8数据库，以及具备建表、DML、校验和执行命名锁操作所需权限的迁移账号。验收完成前，不开放目标流量。注入的测试连接池至少需要**三条连接**：导入器在整个表结构初始化期间会持续占用一条连接。
 
-## Commands
+## 命令
 
-From the repository root (root scripts wrap the corresponding `tsx` files):
+从仓库根目录执行，根目录脚本会调用相应的`tsx`文件：
 
 ```sh
 npm run upgrade:user-pool-mysql -- --sqlite /safe/offline/backup.sqlite --dry-run
 ```
 
-Dry-run is **source-only**: no MySQL connection, no environment loading, no schema writes, and no target inspection. It checks the complete source snapshot, integrity, relationships, values, and maintenance-state conditions. It prints only per-table counts.
+预检（dry-run）**只检查源数据**：不连接MySQL、不加载环境文件、不写表结构，也不检查目标库。它校验完整源快照、完整性、关联关系、字段值及维护状态，仅输出各表记录数。
 
-Provide `MYSQL_URL` using your secure environment injection mechanism. The tool does not load `.env` files and deliberately rejects `--mysql-url` and all URL query parameters. Do not put credentials into command arguments or paste them into logs.
+通过安全的环境注入机制提供`MYSQL_URL`。工具不会加载`.env`文件，并明确拒绝`--mysql-url`参数及所有URL查询参数。不要把凭据放入命令参数或日志。
 
-For writes, also provide the intended deployment's `POOL_WARMUP_MODEL` and pool invariant environment options (`PROVISIONAL_LEASE_TTL_SECONDS`, `PREWARM_POLL_SECONDS`, `PREWARM_CONCURRENCY`, `POOL_EXHAUSTED_RETRY_AFTER_SECONDS`, `POOL_REQUEST_TIMEOUT_SECONDS`, and any new runtime pool options). The normal `readPoolConfig` defaults apply. The backup supplies domain and mutable idle-target/cap/lease settings; an explicitly different domain is refused. `MysqlPoolStore.initialize()` seeds the fingerprint from these real deployment options; no placeholder model is used and no warmup request is made. Every future Proxy must use the same invariant configuration. The programmatic API accepts an exact `poolConfig: PoolConfig` and an optional caller-owned `pool: mysql2.Pool`; injected pools must use verified TLS for remote targets and at least three connections. `MYSQL_CONNECTION_LIMIT` configures the built-in pool (3–100, default 3).
+执行写入时，还需提供目标部署的`POOL_WARMUP_MODEL`及账号池不变量环境配置（`PROVISIONAL_LEASE_TTL_SECONDS`、`PREWARM_POLL_SECONDS`、`PREWARM_CONCURRENCY`、`POOL_EXHAUSTED_RETRY_AFTER_SECONDS`、`POOL_REQUEST_TIMEOUT_SECONDS`及新增的运行时池配置）。默认值遵循正常的`readPoolConfig`。备份提供域名及可变的空闲目标／容量／租约配置；显式指定不同域名会被拒绝。`MysqlPoolStore.initialize()`根据实际部署选项初始化配置指纹，不使用占位模型，也不会发起预热请求。后续所有Proxy必须使用相同的不变量配置。编程接口接受明确的`poolConfig: PoolConfig`，以及可选、由调用者持有的`pool: mysql2.Pool`；注入的连接池访问远程目标时必须验证TLS，并且至少有三条连接。`MYSQL_CONNECTION_LIMIT`配置工具内置连接池，范围3～100，默认3。
 
-TLS environment variables use the existing names and modes:
+TLS环境变量沿用现有名称和模式：
 
-- `MYSQL_SSL_MODE=disabled`: allowed only for `localhost`, `127.0.0.1`, or `::1`.
-- `MYSQL_SSL_MODE=required`: encrypted but unverified; allowed only for those loopback hosts.
-- `MYSQL_SSL_MODE=verify-ca`: requires `MYSQL_SSL_CA_PATH`; validates certificate trust **and host identity**. Mandatory for nonlocal hosts; it is the nonlocal default. Loopback defaults to `disabled`.
+- `MYSQL_SSL_MODE=disabled`：仅允许`localhost`、`127.0.0.1`或`::1`。
+- `MYSQL_SSL_MODE=required`：加密但不验证证书；也仅允许上述回环地址。
+- `MYSQL_SSL_MODE=verify-ca`：要求`MYSQL_SSL_CA_PATH`，验证证书信任及**主机身份**。非本机地址必须使用此模式，且默认使用此模式；回环地址默认`disabled`。
 
-Then explicitly attest to both maintenance conditions:
+然后明确确认以下两个维护条件：
 
 ```sh
 npm run upgrade:user-pool-mysql -- --sqlite /safe/offline/backup.sqlite \
   --confirm-offline-source --confirm-empty-target
 ```
 
-Both flags are required for writes. They are operational attestations, not an automated guarantee that external services are stopped.
+执行写入必须同时提供这两个标志。它们是操作者的确认声明，不会自动保证外部服务已经停止。
 
-## Validation and preservation
+## 校验与数据保留
 
-Supported input is the current pool schema, including OAuth recovery fields and caller/lease stats columns. Unknown tables, views, trigger names, missing/extra critical columns, generated columns, or incompatible SQLite column types are refused. **The credential-fence exception requires the canonical SQLite trigger definition, not just its name.** Legacy/custom schemas require a separate reviewed upgrade; the importer never upgrades or modifies its source. Arbitrary SQLite indexes and schema migration history are not copied; MySQL creates its own indexes and migration history.
+支持的输入是当前账号池表结构，包括OAuth恢复字段及caller／lease统计列。未知表、视图、触发器名称、关键列缺失或多余、生成列，以及不兼容的SQLite列类型都会被拒绝。**允许保留凭据隔离触发器的前提是其SQLite定义符合标准，不能只检查名称。** 旧版或自定义结构需要单独审查升级；导入器绝不升级或修改源库。任意SQLite索引和表结构迁移历史不会直接复制，MySQL会创建自己的索引与迁移历史。
 
-Preflight uses a readonly connection with `query_only`, one read transaction for the schema, `integrity_check`, `foreign_key_check`, and every data table, plus explicit relationship/value validation. Refusal includes:
+预检使用只读连接并设置`query_only`，在同一个读事务中读取表结构、执行`integrity_check`和`foreign_key_check`、读取所有数据表，并显式校验关联关系和字段值。以下情况会被拒绝：
 
-- Source not paused, live owner deadline, any inference/catalog hold **even expired**, or any identity-initialization claim.
-- Any provisioning member, refreshing account, unresolved account OAuth callback, unknown state/stage, intent-stage or ambiguous/unconfirmed external work.
-- Failed/disabled members with unresolved Login task evidence. Historical task and OAuth IDs are accepted and preserved only when both exist on a verified `ready`/`cooling` member at stage `ready` with valid account credentials and no pending account callback. That is the worker's persisted completed-provisioning checkpoint; it is not an external Login query.
-- Invalid caller hashes, orphan references, duplicate allocation keys, unsafe/fractional/negative epoch values, inconsistent lease deadlines, invalid name ordinals/domain/settings, or malformed/noncanonical ISO dates.
+- 源池未暂停，调度owner尚未到期，存在任何推理／目录hold（**即使已过期**），或存在身份初始化占用记录。
+- 存在开通中的成员、刷新中的账号、未结束的账号OAuth回调、未知状态／阶段、操作意图阶段，或结果不明／未确认的外部操作。
+- failed／disabled成员仍有未结束的Login任务证据。只有在成员已完成验证、状态为`ready`／`cooling`、阶段为`ready`、账号凭据有效且无待处理回调，并且历史task和OAuth ID同时存在时，才接受并保留这些ID。这依据的是worker持久化的开通完成检查点，不是向外部Login服务查询所得的状态。
+- caller哈希非法、关联记录缺失、分配键重复、时间戳不安全／带小数／为负、租约期限不一致、姓名序号／域名／设置无效，或ISO时间格式错误／不规范。
 
-Copies all proxy accounts and their OAuth credentials; request stats with caller/lease attribution; settings including version, domain, capacity, lease duration, and next ordinal; inventory with generation, recovery counters/window, errors, retry/verification/cooldown times, and settled correlation fields; leases; catalog cooldowns; and event IDs/content. Historical stat/event references to no-longer-existing leases remain historical references and do not require a current lease row.
+复制内容包括：全部Proxy账号和OAuth凭据；含caller／lease归属的请求统计；设置版本、域名、容量、租约时长和下一个序号；成员库存的generation、恢复计数／窗口、错误、重试／验证／冷却时间及已结束的关联字段；租约；目录冷却；事件ID及内容。统计／事件中引用已不存在租约的历史字段仍视为历史引用，不要求当前租约表中存在对应记录。
 
-Valid leases retain their original deadlines. Expired leases and cooldowns are also copied unchanged for normal runtime reclamation; migration never renews TTLs or runs reclamation. Only account timestamps and stats `requested_at` convert canonical UTC ISO strings to MySQL `DATETIME(3)`. All pool epoch-millisecond values and the SSO creation marker remain unchanged. Owner is cleared, owner deadline is zero, and target prewarming is forcibly paused.
+有效租约保留原到期时间。已过期的租约与冷却记录也原样复制，后续由正常运行逻辑回收；迁移不会续租或执行回收。只有账号时间字段及统计的`requested_at`会从规范UTC ISO字符串转换为MySQL `DATETIME(3)`。所有账号池毫秒时间戳及SSO创建标记保持不变。目标owner被清除，owner期限置零，并强制暂停预热。
 
-## Target atomicity and failures
+## 目标原子性与失败处理
 
-The importer holds a target advisory lock from the first target empty check through initialization, copy, verification, and commit/rollback. It permits only empty application tables (plus the known MySQL migration history and an unused, unpaused, matching singleton settings seed from `MysqlPoolStore.initialize()`). A nonempty partial schema is refused **before migrations run**. Empty base stats tables without caller/lease columns can be initialized. Unexpected tables, views, trigger metadata, migration history, generated columns, and non-InnoDB tables are refused. Shared startup/importer schema validation checks supported column types/nullability/defaults, required binary collations, complete primary/unique keys, foreign-key actions, required query indexes/CHECK predicates and the canonical credential-fence body. Altered or missing fences after the migration marker are refused without repair. The known historical TEXT token collation upgrade remains available only before its marker; unknown custom shapes require a reviewed migration.
+从首次检查目标为空开始，直到初始化、复制、校验及提交／回滚结束，导入器一直持有目标命名锁。只接受空应用表，以及已知MySQL迁移历史和由`MysqlPoolStore.initialize()`生成、尚未使用、未暂停且配置匹配的单例设置种子。非空的部分表结构会在**执行迁移前**被拒绝；不含caller／lease列的空基础统计表可以初始化。未知表、视图、触发器元数据、迁移历史、生成列和非InnoDB表均被拒绝。启动与导入器共用的结构校验会检查受支持的列类型、可空性、默认值、必须的二进制排序规则、完整主键／唯一键、外键行为、查询索引、CHECK条件及标准凭据隔离触发器定义。存在迁移标记后发现隔离机制被修改或缺失，会直接拒绝，不自动修复。已知历史TEXT token排序规则升级仅允许在对应迁移标记出现前执行；其他自定义结构需要单独审查迁移。
 
-Schema initialization calls the base MySQL migrations and `MysqlPoolStore(pool, config).initialize()`. MySQL DDL and the initial settings seed are **not transactional with the import** and may remain after failure. All imported DML uses one serializable transaction: settings mutex first, then locking empty checks on all tables, copy, and read-back verification. All field values—including tokens—are compared internally, together with counts and key relationships, before commit. No credentials, caller values, source paths, URLs, or driver errors are printed. The target is never merged with existing data.
+表结构初始化调用基础MySQL迁移和`MysqlPoolStore(pool, config).initialize()`。MySQL DDL和初始settings种子**不与数据导入处于同一个事务**，因此失败后可能保留。全部导入DML使用一个可串行化事务：先锁settings，再对所有表做加锁空库检查、复制及读回校验。提交前在内部比对所有字段值（包括token）、记录数及关键关联。不会输出凭据、caller值、源路径、URL或驱动错误。绝不把导入数据合并进已有目标数据。
 
-A failed transaction rolls back imported data; schema/seed can remain. A COMMIT error returns `commit_outcome_unknown`, destroys the connection, and **does not attempt rollback or retry**. A rollback error returns `rollback_unconfirmed`. In either case, **do not blindly retry or resume either deployment**. Inspect the target privately under maintenance conditions first. The tool does not retry writes automatically. A nonempty target blocks reruns, including a successful migration of an empty source (the persisted settings are paused). A failed advisory-lock release destroys rather than recycles the connection.
+事务失败会回滚导入的数据，但表结构／种子可能保留。COMMIT异常返回`commit_outcome_unknown`并销毁连接，**不会尝试回滚或重试**。回滚异常返回`rollback_unconfirmed`。出现任一情况，**不要盲目重试，也不要恢复任意一侧部署**；先在维护状态下私下检查目标。工具不会自动重试写入。非空目标会阻止重跑，即使上次成功迁移的是空源库也一样，因为settings已持久化为暂停状态。释放命名锁失败时销毁连接，不将其放回池中。
 
-## Cutover and rollback
+## 切换与回退
 
-Start **one** MySQL Proxy first while prewarming remains paused. Privately verify inventory counts, credentials/leases, readiness, routing, and deadline behavior using authorized acceptance procedures. Ensure shared pool configuration matches the migrated domain/settings, then resume prewarming/traffic deliberately and scale routing proxies only after acceptance. Never serve traffic from old SQLite and MySQL simultaneously.
+首先只启动**一个**MySQL Proxy，预热继续暂停。按已授权验收步骤私下核对库存数、凭据／租约、就绪状态、路由和期限行为。确认共享配置与迁移后的域名／settings一致，再明确恢复预热／流量，通过验收后才增加Proxy副本。绝不能同时从旧SQLite和MySQL两侧承接流量。
 
-A cutover may return to the preserved source only while the target has had **no post-import runtime writes**, not merely while public traffic is still closed. Startup pruning, scheduler and reclamation writes also count. After any such MySQL writes, do not switch to the old SQLite snapshot without separately planned reconciliation and maintenance. Existing SSO/Login/Console volumes and certificates remain in place.
+只有目标**尚未产生任何导入后的运行时写入**时，才可回到保留的源库；仅仅“公共流量尚未开放”并不足够。启动统计裁剪、调度和回收也属于写入。一旦发生此类MySQL写入，就不能在没有另行安排一致性核对和维护的情况下切回旧SQLite快照。原SSO／Login／Console卷和证书保留。
 
-Set and verify the same `REQUEST_STATS_PER_ACCOUNT_LIMIT` on every Proxy before startup, and archive history independently when required. The default retains two records per account; runtime pruning can remove statistics the importer correctly preserved. Startup now validates pool configuration before pruning or starting the worker. A rejected pool configuration cannot first prune history; a valid startup still applies retention.
+每个Proxy启动前都应明确设置并核对相同的`REQUEST_STATS_PER_ACCOUNT_LIMIT`，需要时独立归档历史。默认每账号只保留两条记录；运行时裁剪可能删除导入器已正确保留的统计。启动会先校验账号池配置，再裁剪统计或启动worker；被拒绝的配置不会先裁剪历史，但有效配置启动仍会执行保留策略。
 
-Programmatic `poolConfig` optional concurrency defaults are normalized and validated before fingerprinting, matching `readPoolConfig`. The real-parser cutover path is covered by integration tests. Existing fingerprints produced by the full runtime parser are unchanged; a legacy development fixture seeded with omitted fields is not silently rewritten. Rehearse offline rather than altering the persisted hash to bypass a mismatch.
+编程接口`poolConfig`中可选并发值会在生成指纹前进行默认值归一化和校验，与`readPoolConfig`一致。使用实际解析器的切换路径有集成测试覆盖。由完整运行时解析器生成的既有指纹保持不变；早期开发夹具因省略字段而生成的指纹不会被静默改写。应先离线演练，不要改持久化哈希绕过不匹配。
 
-## Tests
+## 测试
 
 ```sh
 npx tsc -p upgrade/user-pool-mysql/tsconfig.json
 npx tsx --test upgrade/user-pool-mysql/migrate.test.ts
 ```
 
-Default tests use only generated synthetic SQLite fixtures in the OS temporary directory. They do not read deployment `.env`, `.local-sso`, old databases, or volumes. The MySQL test is skipped unless `RUN_USER_POOL_MIGRATION_MYSQL_TESTS=1` **and** `USER_POOL_MIGRATION_TEST_MYSQL_URL` is provided. It never uses `MYSQL_URL`.
+默认测试仅使用操作系统临时目录中生成的合成SQLite夹具，不读取部署`.env`、`.local-sso`、旧数据库或数据卷。仅当同时提供`RUN_USER_POOL_MIGRATION_MYSQL_TESTS=1`和`USER_POOL_MIGRATION_TEST_MYSQL_URL`时，才执行MySQL测试；测试绝不使用`MYSQL_URL`。
 
-The integration URL must point to a loopback host and database named `user_pool_migration_test`, on an independently provisioned **disposable local** MySQL 8 server. The test creates and drops only a uniquely suffixed database (`user_pool_migration_test_<uuid>`) on that server; it needs create/drop database permissions. The test covers a source-only dry-run, competing importers, exact preserved credentials/timestamps/leases/recovery fields, and rollback after a synthetic token mismatch. Do not enable it against an existing deployment or use real credentials. Integration execution is separate from the default offline test suite and requires the MySQL pool provider implementation.
+集成URL必须指向回环地址、名为`user_pool_migration_test`的数据库，且MySQL 8实例必须是在本机独立准备的**可丢弃测试实例**。测试只创建并删除带唯一后缀的数据库（`user_pool_migration_test_<uuid>`），需要创建／删除数据库权限。覆盖源端只读预检、竞争导入器、凭据／时间戳／租约／恢复字段精确保留，以及合成token不匹配时的回滚。不要对已有部署启用测试，也不要使用真实凭据。集成执行与默认离线套件分开，需要实际MySQL连接池实现。

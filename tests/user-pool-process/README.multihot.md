@@ -1,12 +1,12 @@
-# Multi-distinct-hotcaller overload extension
+# 多个不同热点调用方的过载扩展测试
 
-Single selected case only: **five independent Proxy child processes**, one shared disposable MySQL sibling, **three different hot caller IDs × four requests per caller per child = 60 A requests**, and one ordinary B probe per child. Five baseline B and five recovery B requests are additional checks, not another load matrix. There is no cancellation, owner-death, streaming, soak, throughput or extra replica-count case here.
+仅选择一个用例：**五个独立代理子进程**，共享一个一次性 MySQL 同级数据库，**三个不同热点调用方 ID × 每个子进程中每个调用方四个请求 = 60 个 A 请求**，以及每个子进程一个普通 B 探测。另外五个基线 B 请求和五个恢复 B 请求是附加检查，不是另一组负载矩阵。此处不包含取消、所有者死亡、流式、持续负载、吞吐量或额外副本数量的用例。
 
-## Safety and invocation
+## 安全与调用
 
-**Current execution authorization: workload runs only on the parent's isolated Azure test VM, against that VM's loopback disposable MySQL. Local checks are offline/typecheck only. Docker Desktop is authorized for functional/UI testing, not this load case.** This fixture creates no Docker/cloud resources. Never point it at real GHE, SSO/Login services, model endpoints or paid seats. All upstream provisioning, login and inference use the existing `replicas-mock.ts` loopback synthetic service. The unchanged `replicas-child.ts` runtime enforces its existing exact-origin/path/auth/redirect guards, synthetic credentials and empty dotenv path.
+**当前执行授权：负载仅在主控方的隔离 Azure 测试虚拟机上运行，连接该虚拟机回环接口上的一次性 MySQL。本地检查仅限离线检查和类型检查。Docker Desktop 获准用于功能/UI 测试，不适用于本负载用例。** 此夹具不创建 Docker 或云资源。绝不能将其指向真实 GHE、SSO/Login 服务、模型端点或付费席位。所有上游预配、登录和推理均使用现有 `replicas-mock.ts` 回环合成服务。未修改的 `replicas-child.ts` 运行时继续执行其现有的精确源地址、路径、认证和重定向防护，使用合成凭据及空的 dotenv 路径。
 
-From the repository root with installed development dependencies:
+从仓库根目录使用已安装的开发依赖运行：
 
 ```sh
 node --import tsx --test tests/user-pool-process/multihot-offline.test.mjs
@@ -17,30 +17,30 @@ MYSQL_TEST_URL='mysql://root:DISPOSABLE_PASSWORD@127.0.0.1:3306/ghcp_pool_test_o
 node --import tsx tests/user-pool-process/multihot-run.mjs
 ```
 
-Do not put real credentials in saved reports. The URL must use literal `root`, a loopback hostname, a disposable `ghcp_pool_test_*` marker and no URL options/fragments. The marker database is never used: the harness creates and drops a fresh random UUID sibling. One read-only admin/observer connection plus three dedicated named-lock connections is the entire fixture DB budget; the five real children each retain the production four-connection limit (24 connections maximum including observers). No SQL row seeding or forced expiry is used. Only sibling DDL and session-scoped named locks are fixture writes; synthetic OAuth callbacks use the existing production repository path.
+不要在保存的报告中写入真实凭据。URL 必须使用字面用户名 `root`、回环主机名、一次性 `ghcp_pool_test_*` 标记，且不得包含 URL 选项或片段。标记数据库绝不使用：测试框架创建并删除一个新的随机 UUID 同级数据库。整个夹具的数据库连接预算为一个只读管理/观测连接，加上三个专用命名锁连接；五个真实子进程各自保留生产环境的四连接限制（含观测连接最多 24 个连接）。不使用 SQL 行数据预置或强制到期。夹具写操作仅包括同级数据库 DDL 和会话级命名锁；合成 OAuth 回调使用现有生产仓储路径。
 
-The runner accepts test-only descendant HEADs of production baseline `356f8f5e33a21ccfe7cf8c5db07060ab1ac47846`. It verifies `src`, root manifests/lockfile and base TypeScript configuration match that baseline and are clean, including untracked source. It does not call the older exact-HEAD `replicas-run.mjs`. The runner has no arguments or adjustable replica/burst/duration knobs. A shared absolute deadline reserves cleanup before 110 seconds; a 119-second outer kill ceiling includes startup/production checks. This one finite run belongs inside the parent's **30-minute aggregate additional-test budget**, never alongside unbudgeted automatic extensions. Parent controls any Azure execution. Missing opt-in skips the live test; unsafe explicit input or direct live entry without the runner deadline refuses before network activity.
+运行器接受生产基线 `356f8f5e33a21ccfe7cf8c5db07060ab1ac47846` 之后、仅含测试变更的后代 HEAD。它验证 `src`、根目录清单/锁文件及基础 TypeScript 配置与该基线匹配且无变更，也检查未跟踪源码。它不调用旧的、要求精确 HEAD 的 `replicas-run.mjs`。运行器没有参数，也没有可调整的副本数、突发量或时长选项。共享绝对截止时间会预留清理时间，确保在 110 秒前结束；119 秒的外层强制终止上限包含启动和生产代码检查。此次单次有限运行属于主控方**累计 30 分钟的附加测试预算**，不得附带未纳入预算的自动扩展。任何 Azure 执行都由主控方控制。缺少显式授权会跳过实际数据库测试；不安全的显式输入，或未提供运行器截止时间而直接进入实际数据库测试，都会在网络活动前被拒绝。
 
-## Predeclared contract
+## 预先声明的验收约定
 
-1. Real production workers prewarm synthetic Ready inventory. Five ordinary callers establish leases and succeed before pressure; Ready reserve is restored before the overload begins.
-2. Three separate MySQL connections acquire the exact production lock name `SHA256(JSON.stringify([randomSiblingDatabase, callerId]))`. Once all three locks are held, a 6,500ms timer releases them and destroys the lock sockets. No production gate, native pool, SQL deadline, worker timing or SQL result is changed.
-3. The finite burst must visibly produce **three active caller-gate heads and nine FIFO followers in each child**, plus **five real GET_LOCK waiters for each of the three different lock names**. This qualifies multi-caller resource occupancy, not a single hot caller duplicated in a test label.
-4. All 60 A responses must be JSON `503`, `error.code=pool_storage_unavailable`, `Retry-After: 1`, within **4,000–6,500ms**. The unchanged SQL deadline is 5,000ms; the upper bound allows 1,500ms scheduling/transport tolerance. No client transport error, 500, HTML fallback or other error code counts as success.
-5. B pressure availability is **measured as successful 200 responses / five probes**, with each PID's status and latency printed. Both valid JSON 200 and the same safe JSON 503 are acceptable within **6,500ms**. There is deliberately **no minimum B success fraction or promise B is always 200 under aggregate exhaustion**. The case does not artificially exhaust the fourth connection, so its results must not be described as a full-pool-exhaustion SLA.
-6. Child-only instrumentation reads the actual mysql2 pool internals and existing read-only caller-gate diagnostic. It samples every 25ms and immediately after each real `getConnection()` invocation, returning the original driver promise without modifying its result. Native connections must remain ≤4; configured native queue limit must remain 1024; the **finite-load observed queue high-water must be ≤16 per child**, active callers ≤4, FIFO followers ≤9, retained tickets ≤13. Values/maxima and sample counts are printed per PID. This is observed finite-load behavior, not a proof about arbitrary loads or an event-exact history of every caller ticket.
-7. After release, all three named locks must be unowned and all three fixture connection IDs plus timed-out GET_LOCK sessions disappear. Caller tickets and native queues drain. Every replica's ordinary B must return valid 200 with unchanged lease/member affinity. Both durable hold tables drain. No failed A can create a lease or dispatch upstream, including after a further 5,500ms post-release replay observation window. Successful B dispatches exactly once; failed B dispatches zero times.
-8. All owned child processes exit and the sibling database is dropped. Failure-path cleanup also destroys all named-lock sockets; if cleanup cannot complete, the random sibling name is reported for manual cleanup. Product child logs are drained but suppressed rather than risk exposing raw SQL credentials.
+1. 真实生产工作器预热合成 Ready 库存。五个普通调用方在施压前建立租约并成功返回；过载开始前须恢复 Ready 储备。
+2. 三个独立 MySQL 连接获取精确的生产锁名称 `SHA256(JSON.stringify([randomSiblingDatabase, callerId]))`。三个锁全部持有后，启动 6,500ms 定时器，届时释放锁并销毁锁套接字。不更改生产门控、原生连接池、SQL 截止时间、工作器时序或 SQL 结果。
+3. 这次有限突发必须明确观察到**每个子进程中有三个活动调用方门控队首和九个 FIFO 跟随者**，以及**三个不同锁名称各有五个真实 GET_LOCK 等待者**。这验证的是多个调用方的资源占用，而不是只在测试标签中重复单个热点调用方。
+4. 全部 60 个 A 响应必须是 JSON `503`、`error.code=pool_storage_unavailable`、`Retry-After: 1`，耗时在 **4,000–6,500ms** 内。SQL 截止时间保持 5,000ms 不变；上限允许 1,500ms 的调度和传输容差。客户端传输错误、500、HTML 回退或其他错误码均不算成功。
+5. B 在压力下的可用性**按成功的 200 响应数 / 五次探测衡量**，并打印每个 PID 的状态和延迟。在 **6,500ms** 内返回有效 JSON 200 或同样安全的 JSON 503 均可接受。这里刻意**不设 B 最低成功比例，也不承诺在总体资源耗尽时 B 始终返回 200**。该用例不会人为耗尽第四个连接，因此不得将其结果描述为连接池完全耗尽时的 SLA。
+6. 仅在子进程内的观测代码读取实际 mysql2 连接池内部状态及现有的只读调用方门控诊断。它每 25ms 采样一次，并在每次真实 `getConnection()` 调用后立即采样，原样返回驱动的 promise，不修改结果。原生连接数必须保持 ≤4；配置的原生队列上限必须保持 1024；**有限负载下观测到的队列高水位必须为每个子进程 ≤16**，活动调用方 ≤4、FIFO 跟随者 ≤9、保留的票据 ≤13。按 PID 打印数值、最大值和采样次数。这是有限负载的观测行为，既不是对任意负载的证明，也不是每张调用方票据精确到事件的完整历史。
+7. 释放后，三个命名锁都必须没有所有者，三个夹具连接 ID 以及超时的 GET_LOCK 会话均须消失。调用方票据和原生队列须清空。每个副本的普通 B 都必须返回有效 200，租约/成员亲和性保持不变。两张持久化占用表须清空。任何失败的 A 都不能创建租约或向上游派发请求，包括释放后额外 5,500ms 的重放观测窗口内。成功的 B 恰好派发一次；失败的 B 零次派发。
+8. 全部所属子进程退出，同级数据库被删除。失败路径清理也会销毁全部命名锁套接字；如果无法完成清理，会报告随机同级数据库名称以便手动清理。产品子进程日志会持续排空，但不展示，以免暴露原始 SQL 凭据。
 
-## Execution report
+## 执行报告
 
-Local offline verification on 2026-09-15 (Node v24.14.0, checkout `5ea75af7ac0000b37758efd751a606ea86010a00`):
+2026-09-15 的本地离线验证（Node v24.14.0，检出版本 `5ea75af7ac0000b37758efd751a606ea86010a00`）：
 
-- `multihot-offline.test.mjs`: **3/3 passed**, zero side effects for refused entrypoints; repeated after fixes and still 3/3 passed.
-- `tsc -p tests/user-pool-process/multihot-tsconfig.json`: **passed** after correcting two initial test-only typing errors; covers the new TypeScript and reused replica fixture/runtime imports.
-- `node --check tests/user-pool-process/multihot-run.mjs`: **passed**.
-- Production comparison to `356f8f5`: **no differences** in source, manifests/lockfile or base TypeScript configuration.
-- Parent-managed live MySQL execution subsequently **passed**, 26.408s, TAP1 pass/0 failures/skips. All60 A requests returned safe503 in5031.821–5101.432ms; pressure B5/5 returned200 in29.391–124.877ms, and recovery B5/5 returned200 in33.079–65.873ms. Observed native queue peak1 per child; named locks, queues and holds drained, all children exited and the random database was dropped.
-- Complete log SHA256: `2dd2329b40a34ea8946b5cc0cc859ec4c548c5871476c918a600bef33543a8e5`; see [the final load report](../../docs/user-pool-final-load-validation.md). No local Docker load was performed.
+- `multihot-offline.test.mjs`：**3/3 通过**，被拒绝的入口零副作用；修复后重复运行，仍为 3/3 通过。
+- `tsc -p tests/user-pool-process/multihot-tsconfig.json`：修正最初两个仅涉及测试的类型错误后**通过**；覆盖新增 TypeScript 及复用的副本夹具/运行时导入。
+- `node --check tests/user-pool-process/multihot-run.mjs`：**通过**。
+- 与 `356f8f5` 的生产代码比较：源码、清单/锁文件及基础 TypeScript 配置均**无差异**。
+- 主控方管理的真实 MySQL 执行随后**通过**，耗时 26.408s，TAP 1 项通过 / 0 项失败或跳过。全部 60 个 A 请求在 5031.821–5101.432ms 内返回安全 503；压力阶段 B 为 5/5 返回 200，耗时 29.391–124.877ms；恢复阶段 B 为 5/5 返回 200，耗时 33.079–65.873ms。观测到每个子进程的原生队列峰值为 1；命名锁已释放，队列及占用已清空，全部子进程已退出，随机数据库已删除。
+- 完整日志 SHA256：`2dd2329b40a34ea8946b5cc0cc859ec4c548c5871476c918a600bef33543a8e5`；参见[最终负载报告](../../docs/user-pool-final-load-validation.md)。未执行本地 Docker 负载测试。
 
-**Offline authoring and actual MySQL execution are separate evidence**, both recorded above. Measurements are limited to the declared finite scenario, not inferred from test authoring or a general availability SLA. The diagnostics provide per-replica A/B status/latency, B availability fraction, observed native/caller queue bounds, recovery, lock release and cleanup evidence. No old replica matrix was rerun as part of this extension.
+**离线编写验证和真实 MySQL 执行是独立证据**，均已记录于上文。测量结果仅限于已声明的有限场景，不能从测试编写情况推断，也不是通用可用性 SLA。诊断信息提供各副本的 A/B 状态和延迟、B 可用比例、观测到的原生队列及调用方队列边界，以及恢复、锁释放和清理证据。本扩展未重跑旧的副本矩阵。

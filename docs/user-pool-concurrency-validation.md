@@ -1,41 +1,41 @@
-# Bounded concurrent prewarming — validation
+# 有界并发预热——验证记录
 
-Date: 2026-09-09. Branch: `ghcp-user-pool`. This supersedes the initial serial-worker behavior. No changes to customer/AKS environments or real GitHub accounts were made.
+日期：2026-09-09。分支：`ghcp-user-pool`。本次实现取代了最初的串行worker行为。未修改客户／AKS环境，也未操作真实GitHub账号。
 
-## Implemented behavior
+## 已实现行为
 
-- `PREWARM_CONCURRENCY=5` by default; valid range 1–20. It is a Proxy startup setting, not yet a Console-editable setting. Change the environment and recreate Proxy to apply it.
-- One process owner, one scheduler, separate per-account controllers/promises. At most the configured number of asynchronous account stages run simultaneously; a single identity never has overlapping stages.
-- A scheduling pass atomically reserves the entire deficit, bounded by total account cap and remaining name capacity. Queued/provisioning jobs and retryable failures (even during backoff) count as projected future supply. Reservations are persisted before side effects.
-- Example: target 50, ready 30, no existing queued/retrying work: reserve 20 candidates and start up to 5 account stages. This is not 20 simultaneous browser sessions.
-- Progressed stages become eligible for further work immediately; a free slot refills without waiting for another lane's slow request. Waiting stages persist their next poll time and release their slot. Wake storms do not bypass this delay.
-- Pause prevents new dispatch, allowing already-running stages to settle. Shrinking target/cap never deletes pending accounts or seats; already-reserved jobs drain when unpaused. Idle may exceed a subsequently lowered target.
-- All controllers abort on ownership loss/shutdown. Persisted intent/attempt and credential-generation fences remain in force; restart resumes each account's own checkpoint.
+- `PREWARM_CONCURRENCY`默认5，允许范围1～20。这是Proxy启动配置，当时尚不支持在Console中编辑；修改环境变量后重新创建Proxy以生效。
+- 一个进程owner、一个调度器，每个账号使用独立的控制器和Promise。异步账号阶段最多按配置数量同时执行；同一identity的阶段不会重叠。
+- 一轮调度原子地预占全部缺口，但受账号总cap及剩余姓名容量限制。已排队／开通中的任务和可重试失败（即使正在退避）均计入预计供给；在执行外部副作用前持久化预占记录。
+- 例如：target50、Ready30、没有已有排队或重试工作时，预占20个候选，最多同时启动5个账号阶段，不是同时启动20个浏览器会话。
+- 已推进的阶段可立即继续调度；空闲位置无需等待另一条执行路径的慢请求。等待阶段持久化下次轮询时间并让出执行位置；频繁唤醒不能绕过该等待。
+- 暂停阻止新派发，但允许正在执行的阶段结束。降低target／cap不删除待处理账号或席位；已预占任务在取消暂停后继续处理。降低目标后，空闲数量可能暂时超过新目标。
+- 失去owner或关闭时中止所有控制器；持久化的操作意图／attempt及凭据generation隔离仍生效，重启从各账号自己的检查点恢复。
 
-## Verification
+## 验证结果
 
-- Full workspace typecheck passed.
-- Full deployment build passed.
-- Proxy suite: **154 passed, 0 failed, 1 MySQL integration test skipped**.
-- Compose configuration tests: **3 passed**.
-- Clean Proxy Docker build passed using the already-approved protected npm feed.
-- Added nine real-SQLite concurrency tests: the 50/30/20 case; cap five under wake storms; immediate refill behind a slow lane; waiting-stage yield/poll bounds; backoff supply accounting; partial catalog exhaustion; selection fairness; pause/shrink; multi-lane ownership loss; and concurrent checkpoint restart (some behaviors share a test case).
-- Separate actual Docker project `ghcp-user-pool-concurrent` with fresh volumes and local mocks reserved a **20-account deficit** immediately and completed **20 unique SCIM creations, 20 seat assignments, 20 OAuth callbacks**, with **peak concurrent HTTP stages exactly 5**. All 20 became ready, no failures or duplicate jobs.
-- Production Console at `http://127.0.0.1:17404/#user-pool` showed 20/20 ready. Existing port-17304 test project was not replaced.
-- Actual concurrent-project Proxy restart preserved settings, caller lease, credentials and all 20 inventory rows without repeated provisioning; the authenticated HTTP restart checks passed.
+- 全工作区类型检查通过。
+- 完整部署构建通过。
+- Proxy套件：**154通过、0失败、1项MySQL集成测试跳过**。
+- Compose配置测试：**3通过**。
+- 使用已批准的受保护npm包源完成Proxy Docker干净构建。
+- 新增九项真实SQLite并发测试，覆盖50/30/20场景、频繁唤醒下cap5、慢执行路径后的立即补位、等待阶段让位／轮询边界、退避供给计数、部分姓名目录耗尽、选择公平性、暂停／缩容、多执行路径失权和并发检查点重启；部分行为合并在同一用例中。
+- 独立实际Docker项目`ghcp-user-pool-concurrent`使用新卷和本地mock，立即预占**20账号缺口**，完成**20次唯一SCIM创建、20次席位分配、20次OAuth回调**，HTTP阶段并发峰值**恰好为5**。全部20个账号Ready，无失败或重复任务。
+- 运行生产Console代码的`http://127.0.0.1:17404/#user-pool`显示20/20 Ready；原17304端口测试项目未替换。
+- 实际重启并发项目的Proxy后，settings、caller租约、凭据及20条库存记录全部保留，没有重复开通；带鉴权的HTTP重启核对通过。
 
-Run the fresh-project fixture with `tests/docker-user-pool/launch-concurrent.mjs`, then `node tests/docker-user-pool/concurrent-smoke.mjs`. The harness uses only synthetic credentials and local mocks; see [Docker harness](../tests/docker-user-pool/README.md).
+通过`tests/docker-user-pool/launch-concurrent.mjs`启动新项目夹具，再执行`node tests/docker-user-pool/concurrent-smoke.mjs`。夹具只使用合成凭据和本地mock，详见[Docker测试夹具](../tests/docker-user-pool/README.md)。
 
-## Login concurrency five — separate browser check
+## Login并发5——独立浏览器检查
 
-The concurrent test environment's actual Login service (`17403`, Console `17404`) was updated through its version-checked runtime API from concurrency 1 to **5** (settings version 2). Other settings were unchanged. A Login container restart preserved the value; the older `17303` test environment remains at 1. Console Settings displayed 5 after restart.
+通过带版本校验的运行时API，将并发测试环境的实际Login服务（17403端口，Console为17404）的并发从1改为**5**，settings版本变为2；其他设置未变。重启Login容器后该值保留，旧17303测试环境仍为1；重启后Console Settings显示5。
 
-`tests/docker-user-pool/login-concurrency-smoke.mjs` executed inside the actual Login container using the compiled `LoginQueue` class and its persisted concurrency snapshot. It injected an in-memory task repository and local-page runner instead of the GitHub device-flow runner. Ten tasks ran through the queue in two batches, with five **separate real Chromium browser instances** simultaneously open per batch. Each filled/submitted a local page; all ten succeeded. Peak active tasks = 5, peak live browsers = 5; observed container memory at the batch checkpoints was approximately 513 MiB. That measurement is for trivial local pages, not a production GitHub browser memory estimate. No test tasks were persisted and no GitHub/OAuth calls were made.
+`tests/docker-user-pool/login-concurrency-smoke.mjs`在实际Login容器内运行，使用编译后的`LoginQueue`及持久化并发快照。测试注入内存任务仓库和本地页面执行器，替代GitHub device-flow执行器。十个任务分两批通过队列，每批同时打开五个**独立真实Chromium浏览器实例**，分别填写并提交本地页面，十个任务均成功。活动任务峰值5、浏览器峰值5；批次检查点观测到容器内存约513MiB。这是简单本地页面的测量，不是生产GitHub浏览器内存估算。没有持久化测试任务，没有GitHub／OAuth调用。
 
-Login regression suite also passed **7/7**, including dynamic queue-limit changes. This test verifies queue bounds and local browser capacity; it does **not** claim five real SAML/OAuth authorizations or the entire prewarm-to-real-Login chain passed. The pool harness still uses fake Login completion.
+Login回归套件也**7/7通过**，包括动态队列并发调整。此测试验证队列边界和本地浏览器能力，**不代表五路真实SAML／OAuth授权或预热到真实Login的整条链路通过**；账号池夹具仍使用模拟Login完成结果。
 
-## Operational boundary
+## 运维边界
 
-`PREWARM_CONCURRENCY` controls Proxy **stage concurrency**, not the number of pending Login tasks or running browsers. The Login service has its own runtime concurrency setting (default one); SCIM has its own request pacing and retries. Configure those capacities together. OAuth waits yield slots, so Login may accumulate more pending jobs than the prewarm concurrency value. The existing 15-minute Login task age guard includes queue time; very large deficits with slow login need appropriate Login capacity and monitoring.
+`PREWARM_CONCURRENCY`控制的是Proxy的**阶段并发数**，不是待处理Login任务数或浏览器数量。Login服务有独立运行时并发设置，默认1；SCIM也有独立的请求节流和重试，应协同配置。OAuth等待会让出阶段位置，因此Login待处理任务可能超过预热并发值。已有15分钟Login任务年龄保护包含排队时间；缺口大且登录慢时，需要合适的Login容量和监控。
 
-The implementation remains single Proxy/SQLite; SSO does not need multiple replicas. No schema migration or new queue service is required: existing provisioning rows and `retry_at` persist the queue. Real tenant SAML/OAuth/SCIM and quota acceptance remain a separate release gate. No commit or push was performed.
+该阶段实现仍为单Proxy／SQLite，SSO不需要多副本。不需要新增schema迁移或队列服务，已有开通记录和`retry_at`用于持久化队列。真实租户SAML／OAuth／SCIM及额度验收仍属于独立发布门槛；本次未commit或push。

@@ -1,61 +1,61 @@
-# User Pool — Local Validation Report
+# User Pool——本地验证报告
 
-Date: 2026-09-09. Branch: `ghcp-user-pool`. Scope: Docker fork only; single Proxy process and SQLite. This report records the **initial local automated pass**, not production acceptance. **Follow-up Docker builds, container/wire tests and runtime results are recorded in [Docker validation](user-pool-docker-validation.md); they supersede the earlier Docker/LiteLLM blockers below.** No live tenant, GitHub, Azure or paid-seat operations were performed. Changes remain uncommitted; no push or customer deployment was performed.
+日期：2026-09-09。分支：`ghcp-user-pool`。范围仅为Docker fork、单Proxy进程和SQLite。本报告记录**最初一次本地自动化验证通过**，不是生产验收。**后续Docker构建、容器／HTTP链路及运行时结果见[Docker验证](user-pool-docker-validation.md)，这些后续结果已解决下文较早的Docker／LiteLLM阻塞。** 本次未操作真实租户、GitHub、Azure或付费席位；当时改动尚未提交，未push或部署客户环境。
 
-## Delivered behavior
+## 已交付行为
 
-- Exact authenticated LiteLLM key hash (`sha256:<64 lowercase hex>`) maps to one exclusive GHCP member. No alias/email/team/session routing.
-- New generation requests receive a five-minute provisional lease; completed successful generation promotes/renews a configurable TTL (48-hour default).
-- In-flight holds, absolute deadlines, credential generations and owner fencing prevent stale completions or failed credentials from renewing/reassigning an active member.
-- Catalog and token counting use request-scoped holds without creating/renewing caller leases.
-- Serial prewarm maintains the configured ready-idle target and total account cap using 1,000 synthetic bases × ten suffixes. Stages include SSO, strict create-only SCIM, paid seat, Login callback and validated model output.
-- Read-only SSO login-credential retrieval verifies the recorded user's creation time/email and never creates or resets users. SCIM conflicts cannot adopt existing GitHub identities.
-- Console supports counts, settings/pause, reconciliation, member disable/retry/resume, confirmed lease release and bounded account/lease/event lists.
-- Canonical Claude IDs and direct routing remain covered by regression tests. Warmup can select Messages, Chat Completions or Responses from live model capabilities.
-- HTTP 429 keeps binding/cooldown and does not rotate accounts. HTTP 401 quarantines the selected member and returns failure **without automatic replay**.
+- 精确的已认证LiteLLM key hash（`sha256:<64 lowercase hex>`）映射到一个排他GHCP成员，不使用alias／邮箱／team／session路由。
+- 新推理请求领取5分钟临时租约；完整成功后升级／续租，TTL可配置，默认48小时。
+- 在途hold、绝对截止时间、凭据generation和owner隔离，防止迟到完成或失效凭据续租／重新分配活跃成员。
+- 模型目录和token counting使用请求级hold，不创建或续期caller租约。
+- 串行预热按空闲目标和账号总cap维护库存，姓名空间为1,000个合成基础姓名×10种后缀。阶段包含SSO、严格create-only SCIM、付费席位、Login回调和模型输出验证。
+- 只读获取SSO登录凭据时校验已记录用户的创建时间／邮箱，不创建或重置用户；SCIM冲突不能用于接管既有GitHub身份。
+- Console支持计数、设置／暂停、协调、成员禁用／重试／恢复、确认后释放租约，以及有界账号／租约／事件列表。
+- 标准Claude模型ID和direct路由继续由回归测试覆盖；预热可按实际模型能力选择Messages、Chat Completions或Responses。
+- HTTP429保留绑定／冷却，不轮换账号；HTTP401隔离选中成员并返回失败，**不自动重放**。
 
-## Executed checks
+## 已执行检查
 
-| Check | Result |
+| 检查项 | 结果 |
 | --- | --- |
-| Full workspace typecheck, including upgrade utilities | Passed |
-| Full workspace production build | Passed |
-| Proxy tests | 145 passed, 0 failed, 1 MySQL integration test skipped |
-| SSO tests | 21 passed, 0 failed |
-| Login tests | 7 passed, 0 failed |
-| Console tests | 6 passed, 0 failed |
-| Offline Console browser regression using installed Microsoft Edge | 1 passed, 0 failed |
-| LiteLLM hook offline tests | 15 passed, 0 failed |
-| Docker Compose rendering/contract tests | 3 passed, 0 failed |
-| Real LiteLLM runtime tests | 5 skipped; pinned dependency unavailable |
-| Whitespace validation | Passed |
-| Changed/new deliverable scan for known customer identifiers, credential literals and private endpoints | No matches; heuristic scan, not a secret-scanner certification |
+| 全工作区类型检查，包括升级工具 | 通过 |
+| 全工作区生产构建 | 通过 |
+| Proxy测试 | 145通过、0失败、1项MySQL集成测试跳过 |
+| SSO测试 | 21通过、0失败 |
+| Login测试 | 7通过、0失败 |
+| Console测试 | 6通过、0失败 |
+| 使用已安装Microsoft Edge的离线Console浏览器回归 | 1通过、0失败 |
+| LiteLLM hook离线测试 | 15通过、0失败 |
+| Docker Compose渲染／契约测试 | 3通过、0失败 |
+| 真实LiteLLM运行时测试 | 5项跳过，固定版本依赖不可用 |
+| 空白格式校验 | 通过 |
+| 修改／新增交付文件中的已知客户标识、凭据字面量和私有端点扫描 | 未命中；这是启发式扫描，不是专业秘密扫描认证 |
 
-**Total: 198 passed, 0 failed, 6 skipped.** Core SQLite tests use real parallel database connections; browser tests intercept network requests locally. Runtime dependency installation was blocked by package-feed/TLS access. No bypass of TLS verification was used.
+**合计：198通过、0失败、6跳过。** 核心SQLite测试使用实际并行数据库连接；浏览器测试在本地拦截网络请求。运行时依赖安装受到包源／TLS访问限制，没有绕过TLS校验。
 
-## Integrated mock lifecycle
+## 集成mock生命周期
 
-`src/proxy/src/userPool/e2e.test.ts` uses the actual SQLite pool store, actual prewarm worker/provisioner and actual Express inference path with fake SSO/Login/Copilot responses:
+`src/proxy/src/userPool/e2e.test.ts`使用实际SQLite账号池存储、真实预热worker／provisioner和Express推理路径，SSO／Login／Copilot响应由测试替身提供：
 
-1. Start with empty inventory and idle target two.
-2. Create two synthetic SSO users; strictly create EMU identities; assign mock seats; execute mock Login callbacks; validate model output.
-3. Confirm two ready-idle members.
-4. Send requests for two different hashes; confirm exclusive members, stable repeat mapping and canonical model IDs.
-5. Reconcile until two additional idle members are ready while the first two remain leased.
-6. Advance the test clock beyond the active TTL; reclaim leases and reuse an existing member for a third caller without increasing total inventory.
+1. 从空库存、空闲目标2开始。
+2. 创建两个合成SSO用户，严格创建EMU身份、分配模拟席位、执行模拟Login回调并验证模型输出。
+3. 确认两个Ready idle成员。
+4. 用两个不同hash发送请求，确认成员排他、重复调用映射稳定及标准模型ID。
+5. 在前两个成员仍被租用时，通过协调使另外两个空闲成员Ready。
+6. 推进测试时钟超过active TTL，回收租约，并为第三个caller复用既有成员，总库存不增加。
 
-This proves local orchestration and state integration. It does not exercise real SAML/Playwright, GitHub propagation or provider policies.
+这证明本地编排与状态集成，不覆盖真实SAML／Playwright、GitHub传播延迟或提供方策略。
 
-## Known release gates and limits
+## 当时已知的发布门槛与限制
 
-- Docker Desktop's Linux engine was not running (`dockerDesktopLinuxEngine` named pipe absent). Compose rendering passed, but **image builds and container startup smoke were not run**.
-- The LiteLLM hook was source-inspected against 1.81.14 and offline-tested. Real installed-LiteLLM callback/Router tests and final HTTP-wire tests remain unverified. The initial supported integration contract is async Proxy/Router chat completion; native Messages/Responses gateway adapters are not certified.
-- Real SAML, SCIM propagation, entitlement, OAuth and upstream model calls require separately authorized tenant acceptance.
-- One Proxy process and SQLite only. Multiple replicas/MySQL pool mode are unsupported.
-- Console loads at most 1,000 accounts, 1,000 leases and 200 recent events. Its filtering/pagination applies to loaded rows only.
-- No same-request 401 replacement/replay is implemented; another caller request may select a ready member after the quarantined member's holds drain.
-- Ambiguous non-idempotent external operations stop for reconciliation after bounded retries. Account/seat deletion and automatic shrinking are intentionally absent.
-- Default-password policy is unchanged. Existing custom passwords that cannot be retrieved are rejected, not reset.
-- Proxy, SSO and Console must be rebuilt from this branch together because prewarm uses the new authenticated SSO safety endpoints.
+- Docker Desktop的Linux引擎未运行，`dockerDesktopLinuxEngine`命名管道不存在。Compose渲染通过，但**未执行镜像构建或容器启动smoke**。
+- LiteLLM hook已对照1.81.14源码审查并完成离线测试；实际安装的LiteLLM回调／Router和最终HTTP链路仍未验证。最初支持的集成契约为异步Proxy／Router Chat Completions，原生Messages／Responses网关适配器未认证。
+- 真实SAML、SCIM传播、权益、OAuth及上游模型调用需要另行授权的租户验收。
+- 仅支持单Proxy进程和SQLite；当时不支持多副本／MySQL账号池。
+- Console最多加载1,000账号、1,000租约和200条最近事件，过滤／分页只作用于已加载记录。
+- 未实现同一请求在401后更换账号／重放；隔离成员的hold排空后，后续caller请求可选择Ready成员。
+- 非幂等外部操作结果不明时，在有界重试后停止并要求核对；刻意不提供账号／席位删除和自动缩池。
+- 默认密码策略未变；不能取得的既有自定义密码会被拒绝，而不是重置。
+- Proxy、SSO和Console须从此分支配套重新构建，因为预热使用新增的SSO鉴权安全端点。
 
-See [design](user-pool-design.md), [setup and operations](user-pool-implementation.md), and [LiteLLM integration](user-pool-litellm.md).
+参见[设计](user-pool-design.md)、[配置与运维](user-pool-implementation.md)、[LiteLLM集成](user-pool-litellm.md)。

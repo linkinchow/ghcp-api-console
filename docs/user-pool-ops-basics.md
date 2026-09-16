@@ -1,44 +1,46 @@
-# User-pool MySQL operations basics
+# 用户池 MySQL 运维基础
 
-Updated 2026-09-16. Bounded handoff for the existing MySQL user pool at baseline `5ea75af`. This adds an optional read-only adapter for an **existing monitoring platform**, not another monitoring service, production deployment, automatic recovery mechanism or SLA. The adapter changes no production source, schema or runtime configuration. Separately authorized local migration and functional checks have now used real data with three MySQL Proxy instances and Console; their actual results are distinguished below from customer integration acceptance. The 100k expansion was reverted in all eight affected files to HEAD, the runtime limit remains 10000, and no 100k release or production-source change is delivered. New offline SQL maintenance helpers, tests and handoff documents remain uncommitted; the final delivery source SHA is not fixed. This document authorizes no further endpoint calls or service/configuration changes.
+更新于 2026-09-16。本交接仅涵盖基线 `5ea75af` 上现有 MySQL 用户池的有限范围工作。此次新增的是面向**现有监控平台**的可选只读适配器，而不是另一个监控服务、生产部署、自动恢复机制或 SLA（服务等级协议）。适配器不更改任何生产源码、数据库结构或运行时配置。另行获批的本地迁移和功能检查已使用真实数据、三个 MySQL Proxy 实例及 Console 执行；下文明确区分其实际结果与客户集成验收。100k 扩容涉及的全部八个文件均已回退至 HEAD，运行时上限仍为 10000，本次不交付 100k 版本，也不交付生产源码变更。新增的离线 SQL 维护工具、测试和交接文档仍未提交；最终交付源码的 SHA 尚未确定。本文档不授权任何进一步的端点调用或服务/配置变更。
 
-## 1. Collect three independent signals
+## 1. 采集三类相互独立的信号
 
-1. **Each actual Proxy instance:** authenticated `GET /api/user-pool/diagnostics/local`, without query parameters. Use direct instance addresses or instance-pinned routing, never a load-balanced URL pretending to represent every replica. Assign bounded, non-sensitive labels such as `proxy-a`; exclude tokens, URLs, caller/member IDs and owner UUIDs from metric labels. This local-memory endpoint does no SQL and returns `Cache-Control: no-store`. A local `owner` means locally unexpired, not database-verified ownership. `standby`, `stopped`, `localScheduler: null`, a 401, or an unreachable instance never establishes cluster owner absence.
-2. **The authoritative shared MySQL writer:** run the supplied [SELECT-only query](../ops/user-pool-monitor/owner-observation.sql) through the customer's existing authorized SQL collector. It uses the same DB-clock expression and `owner_until > DB_NOW` boundary as the application. Use the correct shared schema and writer endpoint, not a read replica or a transaction holding an old snapshot. The query emits only row count, DB time, owner-presence bit, deadline and paused bit, not owner identity. A missing/invalid singleton, query failure, stale observation or unreachable SQL is **unknown ownership**, never “no owner.” A ping alone proves neither scheduler ownership nor admission health.
-3. **Existing traffic and stock observations:** retain safe HTTP status + exact pool error code counters from existing gateway/access logs. Where an existing platform already polls authenticated `GET /api/user-pool/summary`, use only `observedAt`, `settings.paused`, `settings.idle_target`, `settings.max_accounts` and aggregate `counts.ready_idle/leased/provisional/provisioning/cooling/failed/disabled/total`. Do not substitute the full account/lease/event list. Summary has no authoritative global owner field; no missing field implies absence. `ready_idle` measures headroom for new callers, not whether every already-bound caller can be served.
+1. **每个实际 Proxy 实例：**调用经过身份验证的 `GET /api/user-pool/diagnostics/local`，不带查询参数。使用实例直连地址或固定到实例的路由，绝不能用负载均衡 URL 冒充每个副本的观测。分配取值范围受限且不敏感的标签，例如 `proxy-a`；指标标签中不得包含令牌、URL、调用方/成员 ID 或 owner（调度所有者）UUID。此端点只读取本地内存，不执行 SQL，并返回 `Cache-Control: no-store`。本地 `owner` 只表示本地租期尚未到期，不代表数据库已验证其所有权。`standby`（备用状态）、`stopped`、`localScheduler: null`、401 或实例不可达，都不能证明集群中没有 owner。
+2. **具有权威性的共享 MySQL 写入端：**通过客户现有且已获授权的 SQL 采集器运行随附的[只执行 SELECT 的查询](../ops/user-pool-monitor/owner-observation.sql)。它使用与应用相同的数据库时钟表达式和 `owner_until > DB_NOW` 边界。必须使用正确的共享数据库及写入端点，而不是只读副本或持有旧快照的事务。查询只输出行数、数据库时间、owner 存在标志位、到期时间和暂停标志位，不输出 owner 身份。单例记录缺失或无效、查询失败、观测过期或 SQL 不可达，均表示**所有权未知**，绝不表示“没有 owner”。仅有 ping 成功既不能证明调度所有权正常，也不能证明准入健康。
+3. **现有流量与库存观测：**从现有网关/访问日志中保留安全的 HTTP 状态码与精确用户池错误码计数。若现有平台已经轮询经过身份验证的 `GET /api/user-pool/summary`，只使用 `observedAt`、`settings.paused`、`settings.idle_target`、`settings.max_accounts` 和汇总值 `counts.ready_idle/leased/provisional/provisioning/cooling/failed/disabled/total`。不要改用完整的账号/租约/事件列表。汇总中没有权威的全局 owner 字段；任何字段缺失都不代表 owner 不存在。`ready_idle` 衡量的是可供新调用方使用的余量，而不是每个已绑定调用方是否都能获得服务。
 
-Healthy MySQL standby instances can serve existing Ready members using shared admission/hold/credential protection. They do not need to become owner to be ready. Missing scheduler primarily stops replenishment/repair; stock and request impact determine urgency. SQL failure is a separate service dependency outage and may cause safe 503 or interrupt an already-started stream.
+健康的 MySQL standby（备用实例）可以通过共享的准入、hold（占用保护）和凭据保护机制，为现有 Ready（就绪）成员提供服务。它们不需要成为 owner 才能就绪。调度器缺失主要会停止补充和修复；应根据库存与请求受影响的程度判断紧急性。SQL 故障是独立的服务依赖故障，可能导致安全地返回 503，或中断已经开始的流式响应。
 
-## 2. Optional one-shot adapter: no new dependencies
+## 2. 可选的单次运行适配器：不引入新依赖
 
-Files live in `ops/user-pool-monitor/`. Requires an already installed Node.js 20+ runtime. There is no package install, listener, database driver, daemon, cron installer, mutating API, retry or automatic restart. Existing monitoring schedules each invocation and ingests its one JSON line.
+文件位于 `ops/user-pool-monitor/`。要求已安装 Node.js 20+ 运行时。不涉及安装软件包、监听端口、数据库驱动、守护进程、cron 安装程序、写入型 API、重试或自动重启。每次运行由现有监控系统调度，并由其接收输出的单行 JSON。
 
-Configure a separate protected monitoring configuration from `config.example.json`. The example's `.invalid` endpoints are intentionally unusable. Do not edit production env files, load application `.env` files or copy customer secrets into this repository. `endpoints` is the exact allowlist (1–32 entries, unique instance names and URLs). Every URL must be HTTPS and the exact diagnostics path, with no URL credentials, query or fragment. An explicit `allowLoopbackHttp: true` is available only for literal `localhost`, `127.0.0.1`, or `[::1]`, e.g. an approved local tunnel; it does not allow plaintext remote addresses.
+基于 `config.example.json` 创建独立且受保护的监控配置。示例中的 `.invalid` 端点是刻意设置为不可用的。不要编辑生产环境变量文件、加载应用的 `.env` 文件，或将客户密钥复制到本仓库。`endpoints` 是精确白名单（1–32 项，实例名称和 URL 均须唯一）。每个 URL 必须使用 HTTPS 和精确的诊断路径，不得包含 URL 凭据、查询参数或片段。只有字面值为 `localhost`、`127.0.0.1` 或 `[::1]` 的地址才能显式设置 `allowLoopbackHttp: true`，例如获批的本地隧道；此选项不允许使用明文远程地址。
 
-The existing secret manager must inject the matching service token into each configured `tokenEnv` at invocation time. It is sent only as `X-Internal-Token`. This is the existing privileged internal API token, **not a newly scoped monitoring credential**: restrict collector access and egress accordingly. Never put it in CLI arguments, URLs, a checked-in file or shell history. Do not enable HTTP trace/debug logging, shell tracing or token-dumping wrappers. The adapter refuses `NODE_DEBUG`/`NODE_DEBUG_NATIVE`. No proxy-environment routing is used; HTTPS certificate verification remains enabled. If the approved environment needs a private CA, provision trust through its existing process, not by disabling verification.
+现有密钥管理器必须在每次运行时将匹配的服务令牌注入各配置项指定的 `tokenEnv`。令牌仅通过 `X-Internal-Token` 发送。这是现有的特权内部 API 令牌，**不是新建的、权限范围仅限监控的凭据**：必须据此限制采集器访问权限和出站流量。绝不能将令牌放入 CLI 参数、URL、已纳入版本控制的文件或 shell 历史记录中。不要启用 HTTP 跟踪/调试日志、shell 跟踪或会输出令牌的包装程序。适配器拒绝启用 `NODE_DEBUG`/`NODE_DEBUG_NATIVE` 的环境。不使用代理环境变量路由；HTTPS 证书验证保持启用。如果获批环境需要私有 CA，应通过其现有流程配置证书信任，而不是关闭验证。
 
-Example command shapes (paths contain configuration/observations, never credentials):
+命令格式示例（路径指向配置/观测文件，绝不包含凭据）：
 
 ```sh
 node ops/user-pool-monitor/monitor.mjs /protected/monitor-config.json
 node ops/user-pool-monitor/monitor.mjs /protected/monitor-config.json --db-observation /protected/db-observation.json --previous /protected/previous-monitor-report.json
 ```
 
-The first is deliberately **local-only**: global ownership is unknown and exit code is 2. The adapter reads but never writes either input. The existing platform can atomically save the safe output as the next `--previous`; prevent overlapping scheduled runs. It must also retain exit-2 output as current unknown data rather than keep showing a previous green sample. Protect/expire these files and avoid concurrent partial writes. The adapter accepts at most 1 MiB per JSON input and 32 KiB per HTTP response.
+第一个命令刻意设置为**仅采集本地信息**：全局所有权未知，退出码为 2。适配器只读取输入，绝不写入任一输入文件。现有平台可以原子方式保存安全输出，供下次通过 `--previous` 使用；须避免调度任务重叠运行。平台还必须将退出码为 2 的输出保留为当前的未知数据，而不是继续展示先前的绿色样本。保护这些文件并设置过期清理，避免并发写入产生不完整文件。适配器最多接受每个 JSON 输入 1 MiB、每个 HTTP 响应 32 KiB。
 
-Defaults: 3,000 ms **total** per HTTP attempt including DNS/TLS/headers/body, max observation age 15,000 ms, concurrency 4. Configurable bounds: timeout 100–10,000 ms, max age at least timeout and at most 60,000 ms, concurrency 1–4. No redirects (including same-origin), retries, body/error logging, decompression or cache. A 200 missing `no-store`, invalid body/schema or clock skew is rejected. All endpoint results are rechecked for freshness at report publication. Size the schedule/freshness budget for the endpoint count: slow instances can make earlier results stale; this should surface unknown, not silently extend validity.
+默认值：每次 HTTP 尝试的**总时限**为 3,000 ms，涵盖 DNS/TLS/响应头/响应体；观测最大有效期为 15,000 ms；并发数为 4。可配置范围：超时 100–10,000 ms，最大有效期至少等于超时且不超过 60,000 ms，并发数 1–4。不进行重定向（包括同源重定向）、重试、响应体/错误日志记录、解压或缓存。若 200 响应缺少 `no-store`、响应体/结构无效或存在时钟偏差，则拒绝接受。发布报告时会重新检查所有端点结果是否仍在有效期内。应按端点数量规划采样周期和有效期预算：较慢的实例可能使较早返回的结果过期；此时应呈现为未知，而不是悄悄延长有效期。
 
-### SQL observation adapter contract
+<a id="sql-observation-adapter-contract"></a>
 
-The existing SQL collector must:
+### SQL 观测适配器约定
 
-- Use a dedicated read-only identity with `SELECT` on `user_pool_settings`, normal TLS validation and the application's actual writer/schema. Do not create users/grants as part of running this adapter.
-- Execute the supplied query once outside a retained transaction; no locking clause, UPDATE, owner clear, lease extension or SQL retry. Set a combined connect/query deadline (suggested 3 seconds). The query's 2-second `MAX_EXECUTION_TIME` hint is an extra bound, **not** a substitute for a client/connection deadline.
-- Record `observedAtUnixMs` on the collector host **at query start**, and `queryDurationMs` at completion. The sampler and that collector require synchronized host clocks (or run together). The DB clock may differ: never compare host time with `owner_until`. A stale file must not be given a fresh timestamp at ingestion or on retry.
-- Normalize MySQL BIGINT/COUNT aliases to safe JSON integers, rejecting precision loss; no strings or nulls in a successful one-row observation. Write the following wrapper atomically. `source: "writer"` is an operator assertion backed by collector configuration, not something a JSON file can prove.
+现有 SQL 采集器必须：
 
-Synthetic example (not a current observation):
+- 使用专用只读身份，具有对 `user_pool_settings` 的 `SELECT` 权限，执行正常的 TLS 验证，并连接应用实际使用的写入端/数据库。不要在运行此适配器时创建用户或授予权限。
+- 在不持有持续事务的情况下执行一次随附查询；不得添加锁定子句、执行 UPDATE、清除 owner、延长租约或重试 SQL。设置覆盖连接和查询的总时限（建议 3 秒）。查询中的 2 秒 `MAX_EXECUTION_TIME` 提示只是额外限制，**不能**替代客户端/连接时限。
+- 在采集器主机上于**查询开始时**记录 `observedAtUnixMs`，在完成时记录 `queryDurationMs`。采样器和该采集器的主机时钟必须同步（或在同一主机运行）。数据库时钟可能不同：绝不能将主机时间与 `owner_until` 比较。不得在接收或重试时给过期文件赋予新的时间戳。
+- 将 MySQL BIGINT/COUNT 别名字段的值规范化为安全的 JSON 整数，拒绝精度丢失；成功的单行观测中不得出现字符串或 null。以原子方式写入以下封装结构。`source: "writer"` 是由采集器配置支持的运维人员声明，而不是 JSON 文件本身能够证明的事实。
+
+模拟示例（不是当前观测）：
 
 ```json
 {
@@ -57,89 +59,91 @@ Synthetic example (not a current observation):
 }
 ```
 
-On transport/connection/deadline failure, publish fresh `{schemaVersion:1, source:"writer", status:"sql_unreachable", observedAtUnixMs:<query-start>}` with **no** driver message, URL or old row. For other SQL/schema/auth/query failures use `status: "query_failed"` (ownership unknown), not false owner absence. A failed/missing file is unknown. Validate writer/schema identity through the existing operational configuration before enabling ownership alerts; this adapter cannot independently authenticate that assertion.
+传输/连接/时限失败时，发布带有本次查询时间的 `{schemaVersion:1, source:"writer", status:"sql_unreachable", observedAtUnixMs:<query-start>}`，**不得**包含驱动消息、URL 或旧数据行。其他 SQL/结构/身份验证/查询失败使用 `status: "query_failed"`（所有权未知），而不是误报 owner 不存在。文件读取失败或缺失均视为未知。启用所有权告警前，应通过现有运维配置验证写入端/数据库身份；此适配器无法独立验证该声明。
 
-### Output and continuity semantics
+### 输出与连续性语义
 
-- `database.status`: `ok`, `sql_unreachable`, or `unknown` with a bounded reason. `ownerAtObservation`: `present`, `absent`, or `unknown`. Ownership is true **at that DB observation**, not continuously certified until the next sample. With fresh valid evidence only, the predicate is `ownerPresent == 1 && ownerUntilUnixMs > dbNowUnixMs`.
-- `database.leaseExpiredForMs`: DB-clock difference only when an absent owner's recorded deadline is nonzero; null for zero/uninitialized deadline, present owner, invalid row or unknown. This is time since that recorded lease expired, **not a proven continuous cluster outage duration**. Zero deadline must not become a huge epoch-length outage.
-- `instances[]`: configured safe label, bounded observation status, local state/ages, local counters and allowlisted last loss. Raw diagnostics fields, error text, endpoints and tokens are never copied into output. Last loss is historical, not proof of an ongoing DB outage.
-- Counter deltas are null unless the current and previous fresh samples have an identical `processStartUnixMs`, supplied per endpoint by the existing process/container inventory. It must refer to the **actual process start**, not a Pod's unchanged creation time across container restarts. Do not hardcode it. A decreased counter or changed epoch means `counterContinuity: "reset"`, not a negative rate. Without epoch evidence increasing counters are still `unknown`: a restart can catch up between samples. Missing samples/stale history also break continuity. No process UUID is invented from worker tenure ages; those reset on normal renewals.
-- `collectionComplete` is collection validity, not a health verdict. Exit 0 means all configured local observations and authoritative DB observation are valid; an absent owner or stopped worker can still yield 0. Exit 2 means incomplete/unknown observations (including intentional local-only mode). Exit 1 is a sanitized configuration/input failure. Ingest the JSON fields, not just the process exit code. If stdout itself cannot be written, the platform must flag the failed collection.
+- `database.status`：`ok`、`sql_unreachable` 或带有取值受限原因的 `unknown`。`ownerAtObservation`：`present`、`absent` 或 `unknown`。所有权结论仅在**该次数据库观测时刻**成立，不代表在下一次采样前持续得到认证。只有证据新鲜且有效时，才使用判定式 `ownerPresent == 1 && ownerUntilUnixMs > dbNowUnixMs`。
+- `database.leaseExpiredForMs`：仅当 owner 不存在且其记录的到期时间非零时，返回基于数据库时钟计算的差值；到期时间为零/未初始化、owner 存在、数据行无效或未知时返回 null。这是自记录的租约到期以来的时间，**不是经过证明的集群持续故障时长**。不得将零到期时间转化为从纪元起点算起的巨额故障时长。
+- `instances[]`：配置的安全标签、取值受限的观测状态、本地状态/经过时长、本地计数器和白名单内的最近一次所有权丢失信息。原始诊断字段、错误文本、端点和令牌绝不会复制到输出中。最近一次丢失属于历史信息，不是数据库当前仍在故障的证据。
+- 除非当前和上一次的新鲜样本具有相同的 `processStartUnixMs`，否则计数器增量为 null；该值由现有进程/容器清单按端点提供。它必须指向**实际进程启动时间**，而不是在容器重启前后保持不变的 Pod 创建时间。不要硬编码。计数器减小或进程运行周期变化意味着 `counterContinuity: "reset"`，而不是负速率。没有进程运行周期的证据时，即使计数器递增也仍然是 `unknown`：重启后的计数可能在两次采样之间追平。样本缺失/历史过期也会打断连续性。不得根据工作进程任期时长编造进程 UUID；正常续约时这些时长会重置。
+- `collectionComplete` 表示采集有效性，不是健康判定。退出码 0 表示所有配置的本地观测和权威数据库观测均有效；即使 owner 不存在或工作进程已停止，也可能返回 0。退出码 2 表示观测不完整/未知（包括有意使用的仅本地模式）。退出码 1 表示已脱敏的配置/输入失败。必须接收并处理 JSON 字段，而不只是进程退出码。如果标准输出本身无法写入，平台必须将其标记为采集失败。
 
-The collector is not shipped as an exporter. Map these finite states into the customer's current metrics/event scheme. A useful convention is `pool_monitor_local_observed{instance}`, `pool_monitor_db_observed`, `pool_monitor_sql_unreachable`, `pool_monitor_owner_present_at_observation`, `pool_monitor_owner_absent_at_observation` and safe API error-class counters. Represent unknown with an explicit validity/state series; do **not** fill unknown owner values with zero or carry previous values forward. Apply the same 15-second freshness gate in the platform if the adapter stops emitting. Never sum last loss counters across restarts or add caller/model request identifiers as metric labels.
+该采集器并非以 exporter（指标导出器）形式交付。应将这些有限状态映射到客户当前的指标/事件体系。可参考的命名约定是 `pool_monitor_local_observed{instance}`、`pool_monitor_db_observed`、`pool_monitor_sql_unreachable`、`pool_monitor_owner_present_at_observation`、`pool_monitor_owner_absent_at_observation` 以及安全的 API 错误分类计数器。使用显式的有效性/状态序列表示未知；**不要**将未知的 owner 值填为零，也不要沿用先前的值。如果适配器停止输出，平台也应应用相同的 15 秒有效期门槛。绝不能跨重启累加最近丢失计数器，也不能将调用方/模型请求标识符加入指标标签。
 
-## 3. Suggested alerts, not SLAs or installed rules
+## 3. 建议告警：不是 SLA，也不是已安装的规则
 
-These are starting suggestions for an operator to configure after measuring normal scrape latency, process churn and request volume. They are not recovery promises or customer SLOs. A nominal 5-second sampling cadence and max 15-second freshness are reasonable for a small pool; stagger/limit work and do not poll the DB per request.
+以下只是运维人员在测量正常抓取延迟、进程变动和请求量后配置告警的起点建议。它们不是恢复承诺，也不是客户 SLO（服务等级目标）。对于小型用户池，名义上每 5 秒采样一次、最大有效期 15 秒是合理的；应错开并限制采集任务，不要对每个请求都轮询数据库。
 
-| Signal | Suggested configurable condition | Interpretation/action |
+| 信号 | 建议的可配置条件 | 含义/操作 |
 | --- | --- | --- |
-| Authoritative owner absent | Fresh writer query reports absent on every expected sample for 90 seconds | Investigate scheduler/DB/configuration/paused state; existing Ready traffic may still work. Urgency increases with low stock or request errors. |
-| Ownership unknown / SQL unreachable | Unknown for 30 seconds, or SQL unreachable on 3 consecutive observations | Alert as telemetry/query or storage failure, not no-owner. Restore observation/DB service before declaring owner recovery. |
-| Instance telemetry missing | 3 missed/invalid expected instance samples | Check process, direct endpoint, auth/TLS and inventory. Keep independent of owner state. |
-| Owner loss churn | More than 3 verified transitions in 10 minutes for continuous process epochs, or corresponding safe `ownership-lost` log events | Investigate pause/CPU/storage/renewal causes. Not every failed election is a loss. Reset/unknown counters must not synthesize transitions. |
-| Low replenishment stock | Fresh `ready_idle < max(2, 0.2 * idle_target)` for 2 minutes when `idle_target > 0`, unpaused, with new-caller demand | Suggested headroom warning; combine provisioning/cap/failed/cooling aggregates. Existing leases can still serve. A deliberately zero target or maintenance pause needs its own policy. |
-| Exhaustion | At least 5 `429 pool_exhausted` in 1 minute | Actual admission pressure; inventory/cap/repair action, not a blind owner restart. Adjust to traffic. |
-| Storage 503 | At least 5 `503 pool_storage_unavailable` in 1 minute or >1% of requests in 5 minutes with at least 100 requests | DB connection, budget/queue/resource failure; separate from admission exhaustion. Use whichever traffic-qualified threshold fits the customer. |
-| Member failures / cooling | Track `503 member_unavailable` separately; suggested warning after 5/minute. Track `429 member_cooling` without reclassifying it as owner outage | Check repair/reauthorization/cooling. Do not rotate callers across accounts to bypass limits. |
+| 权威观测确认 owner 不存在 | 连续 90 秒内，每次预期采样的新鲜写入端查询均报告不存在 | 排查调度器/数据库/配置/暂停状态；现有 Ready 流量可能仍可正常服务。库存低或请求出错时，紧急程度上升。 |
+| 所有权未知 / SQL 不可达 | 连续 30 秒未知，或连续 3 次观测 SQL 不可达 | 按遥测/查询或存储故障告警，不要按无 owner 告警。先恢复观测/数据库服务，再宣布 owner 恢复。 |
+| 实例遥测缺失 | 3 次预期实例采样缺失/无效 | 检查进程、直连端点、身份验证/TLS 和实例清单。此信号应与 owner 状态独立。 |
+| owner 丢失频繁变化 | 对连续的进程运行周期，10 分钟内出现超过 3 次经验证的转换，或出现相应的安全 `ownership-lost` 日志事件 | 排查暂停/CPU/存储/续约原因。并非每次选举失败都属于所有权丢失。重置/未知计数器不得虚构状态转换。 |
+| 补充库存偏低 | 在 `idle_target > 0`、未暂停且有新调用方需求时，新鲜观测持续 2 分钟满足 `ready_idle < max(2, 0.2 * idle_target)` | 建议作为余量预警；结合供应中数量/容量上限/失败/冷却的汇总值判断。现有租约仍可服务。有意将目标设为零或维护暂停时，需要单独策略。 |
+| 耗尽 | 1 分钟内至少 5 次 `429 pool_exhausted` | 实际准入压力；应处理库存/容量上限/修复，而不是盲目重启 owner。根据流量调整阈值。 |
+| 存储 503 | 1 分钟内至少 5 次 `503 pool_storage_unavailable`，或 5 分钟内请求数至少 100 且错误占比 >1% | 数据库连接、预算/队列/资源故障；与准入耗尽分开处理。根据客户流量选用适当阈值。 |
+| 成员失败 / 冷却 | 单独跟踪 `503 member_unavailable`；建议达到每分钟 5 次后预警。跟踪 `429 member_cooling`，不要将其重新归类为 owner 故障 | 检查修复/重新授权/冷却。不要让调用方轮换账号以绕过限制。 |
 
-**Continuous absence requires continuous valid observations.** The platform starts its absence timer on the first fresh authoritative absent sample, resets it on present, and resets/marks it unknown on query failure, stale sample, missed cadence beyond the configured gap, or DB-clock regression. Do not backdate to `owner_until` or count unobserved time through a collector/DB outage. Sampled continuity does not prove there was no short owner between samples. Recovery should require consecutive fresh present observations plus relevant readiness/traffic/stock checks, not simply a process start or `local state: owner`. `paused` is an independent maintenance flag, not an owner substitute; maintenance suppression must be explicitly authorized and expire.
+**持续不存在需要持续有效的观测。** 平台在首次收到新鲜、权威的 owner 不存在样本时启动不存在计时器；观测到存在时重置；查询失败、样本过期、采样间隔超过配置的允许间隙或数据库时钟倒退时，重置并标记为未知。不要将起点追溯至 `owner_until`，也不要把采集器/数据库故障期间未观测的时间算进去。采样连续并不能证明两次采样之间没有短暂出现过 owner。恢复判定应要求连续的新鲜存在观测，加上相关的就绪/流量/库存检查，而不是只看进程启动或 `local state: owner`。`paused` 是独立的维护标志，不能替代 owner；维护期间的告警抑制必须明确获批并设定到期时间。
 
-The exported `classifyApiSignal(status, code)` helper maps **only exact pairs**:
+导出的 `classifyApiSignal(status, code)` 辅助函数**只映射精确匹配的组合**：
 
-- `503 pool_storage_unavailable` → storage unavailability.
-- `503 pool_owner_unavailable` → existing **SQLite** owner guard. Unexpected on a purported MySQL fleet: verify actual backend/configuration/mixed deployment, rather than diagnosing MySQL standby.
-- `503 member_unavailable` → member admission/hold/credential availability.
-- `429 pool_exhausted` → pool stock exhaustion.
-- `429 member_cooling` → cooldown.
-- Everything else → other. A generic 503, upstream 429 or SSE interruption is not automatically any of the above. Once headers/SSE started, a safe abort cannot change the original 200 into a new HTTP 503; use existing stream-failure evidence too.
+- `503 pool_storage_unavailable` → 存储不可用。
+- `503 pool_owner_unavailable` → 现有的 **SQLite** owner 保护。在声称使用 MySQL 的实例群中出现此错误属于异常：应核实实际后端/配置/混合部署，而不是将问题归因于 MySQL standby（备用实例）。
+- `503 member_unavailable` → 成员准入/hold（占用保护）/凭据可用性。
+- `429 pool_exhausted` → 用户池库存耗尽。
+- `429 member_cooling` → 冷却。
+- 其他一切 → 其他类别。通用 503、上游 429 或 SSE 中断不会自动归入上述任何类别。一旦响应头/SSE 已开始发送，安全中止也无法把原来的 200 改为新的 HTTP 503；还须使用现有的流失败证据。
 
-The CLI does not read traffic logs or summary endpoints. Keep those in the existing collector; the helper/rules document their exact mapping without creating another log ingestion stack.
+CLI 不读取流量日志或汇总端点。这些采集应保留在现有采集器中；辅助函数/规则仅记录精确映射，不另建日志采集体系。
 
-## 4. Manual recovery and drain/restart runbook
+<a id="4-manual-recovery-and-drainrestart-runbook"></a>
 
-1. **Preserve a bounded safe timeline first.** Record UTC window, instance labels, deployment version, restarts/process epochs, local diagnostic states, fresh writer observation status, readiness outcomes and counts of exact safe error codes. Use existing `ownership-lost` events with their allowlisted reason/subclass. Do not copy raw headers, request bodies, account credentials, full caller/member values or arbitrary SQL/driver errors into an incident or monitoring report. If existing detailed logs contain them, access remains restricted; extract only the needed safe fields.
-2. **Separate process, scheduler and storage.** `/healthz` checks process HTTP liveness, not DB health. `/readyz` pings storage and has the existing SQLite owner guard; normal MySQL standby does not fail readiness solely for being standby. A green diagnostic endpoint while SQL is down is expected. A DB ping is not end-to-end admission/hold/credential proof. Verify each actual instance and the common writer; do not start multiple restarts based on an LB-routed snapshot.
-3. **Storage unavailable:** investigate the actual writer/network/TLS/connection/queue/lock/resource problem via the existing DB process. Treat ownership as unknown until a valid query succeeds. Do not clear owner, manually extend leases, disable fences, replay ambiguous inference, or restart every Proxy for a shared DB transient. Once storage returns, MySQL workers normally re-enter elections; observe actual outcomes rather than promise recovery in the nominal 30-second lease duration.
-4. **DB healthy, repeatedly no valid scheduler:** inspect stopped/missing processes, event-loop/resource stalls, effective shared configuration, maintenance pause and safe owner-loss events. Ready stock can keep serving; replenish/repair may stall. If a process intervention is justified and approved, drain **one affected instance** while confirming other ready backends/capacity. A healthy standby is not an affected instance just because it is standby. Use normal shutdown/lease expiry and election; no forced owner SQL writes. Confirm fresh writer ownership after intervention and maintain capacity before touching another instance.
-5. **Unknown external side effects:** SSO/SCIM/seat/Login timeout, dispatch ambiguity, cancellation uncertainty or callback mismatch needs manual reconciliation using existing restricted operation/task evidence. A timeout, 404 or cancelled response is not proof that no external action happened. Preserve task/nonce/generation/fence state; do not repeat POST, clear slots, reset attempts, manufacture a Ready member or create replacement users/seats. `manual_reconciliation_required` stays a stop condition. Where existing guards permit, an operator explicitly retries/resumes only after reconciling the original outcome. Recovery of scheduler ownership is not authorization to replay an unknown external action.
-6. **Readiness, liveness and restart policy stay distinct.** Use `/readyz` for backend admission/removal and `/healthz` for a suitably tolerant process liveness probe; neither probe should require MySQL scheduler ownership. DB-driven readiness failures may remove all backends during a shared outage; liveness should not turn the same transient into a fleet restart storm. Container `unhealthy` alone does not trigger Docker `on-failure`; Kubernetes readiness removes traffic, liveness restarts, and the process supervisor's restart budget/backoff is separate. This handoff changes none of them.
-7. **Planned termination:** first remove/drain new LB traffic using the existing platform; account for endpoint propagation and long streams, then SIGTERM using the approved process workflow. Baseline shutdown closes HTTP and force-closes connections at about 25 seconds before worker/storage cleanup completes; this is not guaranteed graceful completion of every stream or external operation. Configure termination grace with measured LB drain + server close + cleanup margin, not a token 30-second promise. Check in-flight traffic/holds through existing restricted tooling and expect bounded TTL cleanup for crashed processes. Never force-release an active hold or replay uncertain requests merely to speed draining. Canary one restart, observe recovery, then decide whether any others are needed.
+## 4. 手动恢复与排空/重启操作手册
 
-Customer SQLite recovery is a **different deferred workstream**. Preserve single-writer evidence and use the existing [SQLite guidance](user-pool-sqlite-owner-recovery.md) for any separately approved action. No automatic SQLite exit/restart patch or production fix is delivered here.
+1. **先保留范围受限且安全的时间线。** 记录 UTC 时间窗口、实例标签、部署版本、重启/进程运行周期、本地诊断状态、新鲜写入端观测状态、就绪检查结果和精确安全错误码的计数。使用现有 `ownership-lost` 事件及白名单内的原因/子类别。不要将原始响应头或请求头、请求体、账号凭据、完整调用方/成员值或任意 SQL/驱动错误复制到事件或监控报告中。如果现有详细日志包含这些信息，访问仍须受限；只提取所需的安全字段。
+2. **区分进程、调度器和存储。** `/healthz` 检查进程的 HTTP 存活性，不检查数据库健康。`/readyz` 会 ping 存储，并包含现有的 SQLite owner 保护；正常的 MySQL standby（备用实例）不会仅因处于 standby 状态而就绪检查失败。SQL 不可用时诊断端点仍显示绿色是预期现象。数据库 ping 成功不是端到端准入/hold/凭据可用的证明。应验证每个实际实例和共用写入端；不要根据经负载均衡路由取得的快照启动多实例重启。
+3. **存储不可用：**通过现有数据库运维流程排查实际写入端/网络/TLS/连接/队列/锁/资源问题。在有效查询成功之前，所有权一律视为未知。不要清除 owner、手动延长租约、禁用 fence（栅栏保护）、重放结果不明的推理请求，或因共享数据库短暂故障而重启所有 Proxy。存储恢复后，MySQL 工作进程通常会重新参与选举；应观测实际结果，而不是承诺在名义上的 30 秒租期内恢复。
+4. **数据库健康，但反复观测不到有效调度器：**检查停止/缺失的进程、事件循环/资源阻塞、生效的共享配置、维护暂停和安全的 owner 丢失事件。Ready 库存可能继续服务，但补充/修复可能停滞。如果进程干预确有必要且已获批，在确认其他就绪后端和容量充足的同时，排空**一个受影响实例**。健康的 standby 不会仅因处于备用状态就成为受影响实例。使用正常关闭/租约到期和选举流程；不要通过 SQL 强制写入 owner。干预后确认新鲜的写入端所有权观测，在处理另一实例前始终维持容量。
+5. **外部副作用未知：**SSO/SCIM/席位/Login 超时、派发结果不明、取消结果不确定或回调不匹配，都需要使用现有受限操作/任务证据进行人工核对。超时、404 或已取消的响应不能证明外部动作没有发生。保留任务/nonce（一次性随机值）/generation（代次）/fence（栅栏）状态；不要重复 POST、清空槽位、重置尝试次数、伪造 Ready 成员或创建替代用户/席位。`manual_reconciliation_required` 仍是必须停止的条件。在现有保护机制允许的情况下，运维人员只有在核对原始结果后才能显式重试/恢复。调度所有权恢复并不授权重放结果未知的外部动作。
+6. **就绪、存活和重启策略始终分开。** 使用 `/readyz` 决定后端加入/移出流量，使用 `/healthz` 作为具有适当容忍度的进程存活探针；两种探针都不应要求拥有 MySQL 调度所有权。共享故障期间，数据库引发的就绪失败可能移除所有后端；存活探针不应把同一短暂故障升级为整个实例群的重启风暴。仅有容器 `unhealthy` 状态不会触发 Docker `on-failure`；Kubernetes 就绪探针负责移除流量，存活探针负责重启，进程管理器的重启预算/退避策略则独立生效。本交接不更改其中任何机制。
+7. **计划终止：**先通过现有平台移除/排空新的负载均衡流量；考虑端点变更传播和长流式连接，再按获批的进程流程发送 SIGTERM。基线关闭流程会关闭 HTTP，并在约 25 秒时强制关闭连接，随后才完成工作进程/存储清理；这不保证每个流或外部操作都能优雅完成。终止宽限期应按实测的负载均衡排空时间 + 服务端关闭时间 + 清理余量配置，而不是象征性地承诺 30 秒。通过现有受限工具检查进行中的流量/hold，并预期崩溃进程通过有界 TTL 完成清理。绝不能仅为加快排空而强制释放活动 hold 或重放结果不确定的请求。先对一个实例试行重启，观测恢复后再决定是否需要处理其他实例。
 
-### Separately validated local concurrency maintenance
+客户 SQLite 恢复属于**另一个延后处理的工作项**。保留单写入者证据，并对任何另行获批的操作遵循现有 [SQLite 指引](user-pool-sqlite-owner-recovery.md)。本次不交付自动退出/重启 SQLite 的补丁或生产修复。
 
-The new `upgrade/user-pool-mysql/reconfigure-concurrency.ts` utility is an **offline, quiescent configuration migration**, not an owner-recovery command or an online way around fingerprint validation. Its 31 offline tests passed; an isolated real MySQL rehearsal verified that the new configuration starts and the old configuration is refused. An initial synthetic rehearsal incorrectly reused a cached storage instance and failed the old-config rejection assertion; validation was corrected to use a fresh storage instance before the real pool was changed. That historical failure is retained in the [two-account report](user-pool-real-mysql-two-account-validation.md).
+### 另行验证的本地并发维护
 
-For the separately approved real local operation, the pool was paused and drained; all three Proxy instances and Login/SSO were stopped; owner expiry and quiescent state were confirmed. Only the expected configuration fingerprint was updated using CAS, changing prewarm concurrency / Login pending limit from 1/1 to 5/2; all other records and fields were compared and preserved. Login's own runtime concurrency was set to 2 through its versioned management API. All Proxy configurations were made consistent before restart. Backups of the database and old configuration were retained privately. **Do not replace this with an arbitrary hash UPDATE, clear an owner/hold, or apply it to live writers.** The local execution does not authorize customer maintenance or prove a customer restore procedure.
+新增工具 `upgrade/user-pool-mysql/reconfigure-concurrency.ts` 用于**离线、静默状态下的配置迁移**，不是 owner 恢复命令，也不是在线绕过指纹校验的方法。其 31 项离线测试全部通过；隔离的真实 MySQL 演练验证了新配置可启动、旧配置会被拒绝。最初的一次模拟演练错误地复用了缓存的存储实例，导致旧配置拒绝断言失败；在变更真实用户池之前，验证已修正为使用新的存储实例。该历史失败保留在[双账号报告](user-pool-real-mysql-two-account-validation.md)中。
 
-## 5. LiteLLM exact fallback and request correlation checks
+另行获批的真实本地操作中，先暂停并排空用户池；停止全部三个 Proxy 实例及 Login/SSO；确认 owner 已到期且处于静默状态。仅通过 CAS（比较并交换）更新了预期配置指纹，将预热并发数 / Login 待处理上限从 1/1 改为 5/2；所有其他记录和字段均经过比对并保持不变。Login 自身的运行时并发数通过其带版本的管理 API 设置为 2。重启前已将所有 Proxy 配置统一。数据库和旧配置的备份已私下保留。**不要用任意哈希 UPDATE 替代此流程，不要清除 owner/hold，也不要将此操作用于仍在运行的写入进程。** 本地执行不代表客户维护已获授权，也不能证明客户恢复流程有效。
 
-Use only the customer's **already available** restricted logs and effective configuration supplied/approved for inspection; do not query the offline old UI or live model/service endpoints for this handoff. Do not deploy fallback, edit a real config, enable verbose payload logs, run a canary, or spend a real account/seat without separate approval.
+## 5. LiteLLM 精确回退与请求关联检查
 
-1. From the existing failure, preserve the exact requested LiteLLM **model group**, including prefix/case: `ghcp/claude-sonnet-5` and `claude-sonnet-5` are distinct groups. Inspect effective model-group/alias mapping and the **exact** fallback key that is selected, not a similar key in a source template. A provider-qualified downstream model string is not automatically a router group key. Check both spellings independently where both are exposed.
-2. Confirm every configured fallback target resolves to an existing, allowed model group; no self-reference/cycle, no unintended return to the same failed Proxy/DB dependency. Confirm permitted provider, capability/API compatibility, budget and data-routing rules. Inspect configured exception/status eligibility and retry limits in the installed LiteLLM version; do not infer that a generic `ServiceUnavailableError` takes any desired fallback or that a missing prefixed key is covered by an unprefixed one. If there is no exact eligible fallback, record **unconfigured/unverified** rather than silently inventing one.
-3. Match existing LiteLLM request/call ID and attempted deployment/model group to the gateway/LB request ID and backend instance **only when those fields actually exist and are linked**. Baseline Proxy does not provide a universal automatic inbound request-ID middleware linking every admission error. Existing upstream failure logs have `diagnosticId`; where it was already captured, use it for that upstream error, not as proof an admission rejection has the same ID. Existing debug request-header logs are sensitive; do not enable debug or export raw headers to fill a correlation gap.
-4. Build a safe incident row: UTC timestamp/window, existing request/correlation ID (restricted incident record, not metric label), exact group and selected route, method/path without sensitive query, status + exact safe error code, backend instance/version, local diagnostics and nearest fresh writer observation. If no shared ID exists, say “time-window correlation only, not proven same request.” Do not invent IDs, log full caller keys, or equate the DB hold UUID with a gateway request ID.
-5. Distinguish first attempt failure, configured retry and fallback attempt in the existing evidence; record whether each occurred. A fallback succeeding elsewhere only restores that request path; it does **not** repair the GHCP scheduler, DB or inventory. Streaming/unknown-result failures may not be safe to replay. Any future fallback change or real canary requires its own customer approval and pre-shared exact URL/account scope; none is installed or validated here.
+仅使用客户**已经具备**且已提供/获批供检查的受限日志和生效配置；不要为本交接查询已离线的旧 UI 或在线模型/服务端点。未经单独批准，不得部署回退、编辑真实配置、启用详细载荷日志、运行金丝雀测试，或消耗真实账号/席位。
 
-## 6. Executed validation and handoff limits
+1. 从现有故障中保留请求的精确 LiteLLM **模型组**，包括前缀和大小写：`ghcp/claude-sonnet-5` 与 `claude-sonnet-5` 是不同的组。检查生效的模型组/别名映射和实际选中的**精确**回退键，而不是源码模板中的相似键。带提供商前缀的下游模型字符串不会自动成为路由器的组键。如果两种拼写都对外提供，应分别独立检查。
+2. 确认每个已配置的回退目标都能解析到现有且获准使用的模型组；不存在自引用/循环，也不会意外回到同一个已故障的 Proxy/数据库依赖。确认允许的提供商、能力/API 兼容性、预算和数据路由规则。检查已安装 LiteLLM 版本中配置的异常/状态触发条件和重试上限；不要推断通用 `ServiceUnavailableError` 会走任意期望的回退，也不要认为缺失的带前缀键可由无前缀键覆盖。如果不存在精确且符合触发条件的回退，应记录为**未配置/未验证**，而不是悄悄编造一个。
+3. **仅在字段实际存在且已建立关联时**，将现有 LiteLLM 请求/调用 ID 和尝试使用的部署/模型组，与网关/负载均衡请求 ID 及后端实例匹配。基线 Proxy 不提供能自动关联所有准入错误的通用入站请求 ID 中间件。现有上游故障日志带有 `diagnosticId`；如果此前已采集该字段，可用于关联该上游错误，但不能据此证明某次准入拒绝具有相同 ID。现有调试请求头日志包含敏感信息；不要为填补关联缺口而启用调试或导出原始请求头。
+4. 构建安全的事件记录行：UTC 时间戳/窗口、现有请求/关联 ID（仅存于受限事件记录中，不用作指标标签）、精确模型组和所选路由、不含敏感查询参数的方法/路径、状态码 + 精确安全错误码、后端实例/版本、本地诊断和时间上最近的新鲜写入端观测。如果没有共享 ID，应注明“仅按时间窗口关联，未证明是同一请求”。不要编造 ID、记录完整调用方密钥，或将数据库 hold UUID 等同于网关请求 ID。
+5. 在现有证据中区分首次尝试失败、已配置的重试和回退尝试，分别记录是否发生。回退在其他位置成功只恢复了该请求路径；它**不会**修复 GHCP 调度器、数据库或库存。流式请求/结果未知的失败不一定能安全重放。今后任何回退变更或真实金丝雀测试都需要客户单独批准，并提前共享精确 URL/账号范围；本次没有安装或验证任何此类内容。
 
-Offline commands, run from the repository root using the installed runtime, require no environment loading, services, containers or network:
+## 6. 已执行的验证与交接边界
+
+以下离线命令从仓库根目录使用已安装的运行时执行，不需要加载环境、启动服务/容器或访问网络：
 
 ```sh
 node --check ops/user-pool-monitor/monitor.mjs
 node --test ops/user-pool-monitor/monitor.test.mjs
 ```
 
-The adapter's final offline suite actually passed **30/30, 0 failed, 0 skipped**, exit 0. The earlier 28-test run overlaps and is not additional coverage. These tests use synthetic data, injected HTTP event emitters and mocked timers: no listening sockets, DNS, SQL, real Proxy or model requests. They cover exact status/code classification, DB-clock expiry, stale/future/missing/invalid/SQL-unreachable evidence, normal standby/null, process-reset counter continuity, authentication/header/redirect/no-store/deadline/body bounds, config/label allowlists and credential omission. `ops/user-pool-monitor/test-report.json` records that original **offline** run; its “SQL not executed” and former 30-minute campaign statements describe the earlier checkpoint, not the later real collection or the latest load authorization.
+适配器最终离线测试套件的实际结果为 **30/30 通过、0 失败、0 跳过**，退出码 0。早先的 28 项测试运行与其重叠，不算额外覆盖。这些测试使用模拟数据、注入的 HTTP 事件发射器和模拟计时器：不监听套接字，不执行 DNS、SQL、真实 Proxy 或模型请求。覆盖内容包括精确状态码/错误码分类、数据库时钟到期判定、过期/未来/缺失/无效/SQL 不可达证据、正常 standby（备用状态）/null、进程重置后的计数器连续性、身份验证/响应头/重定向/no-store/时限/响应体限制、配置/标签白名单及凭据不出现在输出中。`ops/user-pool-monitor/test-report.json` 记录的是最初那次**离线**运行；其中“未执行 SQL”和原 30 分钟测试活动的表述描述的是较早检查点，不是后续真实采集或最新负载授权。
 
-**Subsequent real local collection passed.** After importing the original four real members, two request-stat rows and 25 events into a new MySQL database and starting three Proxy instances plus Console, the adapter actually collected all three direct instance diagnostics and the SELECT-only MySQL owner observation. It returned `collectionComplete=true`, owner present and paused=true; all replicas were ready/storage=mysql, with one local owner and two standby. This proves a valid observation at that time, not continuous ownership, customer collector credentials, delivery of an alert, or cross-node HA. See the [real migration record](user-pool-real-mysql-migration-validation.md).
+**后续真实本地采集已通过。** 将原有四个真实成员、两行请求统计和 25 个事件导入新的 MySQL 数据库，并启动三个 Proxy 实例及 Console 后，适配器实际采集了三个实例的直连诊断和只执行 SELECT 的 MySQL owner 观测。返回 `collectionComplete=true`，owner 存在且 paused=true；所有副本均就绪且 storage=mysql，其中一个本地 owner、两个 standby（备用实例）。这证明当时的观测有效，不证明持续所有权、客户采集器凭据有效、告警送达或跨节点 HA（高可用）。参见[真实迁移记录](user-pool-real-mysql-migration-validation.md)。
 
-Later separately approved functional checks added exactly two real members in 114.099 seconds, with overlapping first-success Login tasks of 89.236 and 91.784 seconds. The resulting six ReadyIdle members were then exercised by four LiteLLM virtual keys: four requests returned HTTP200/completed with four distinct member leases. **Latest recorded state is total6 / leased4 / ready_idle2, idle target2, cap6, paused1, leaseTTL172800**, not the earlier six-idle checkpoint. Request and catalog holds drained. Test keys were revoked; Proxy leases were deliberately retained and expire through normal TTL handling. These results are in the [two-account](user-pool-real-mysql-two-account-validation.md) and [four-key](user-pool-real-mysql-four-key-validation.md) reports. The local traffic path was LiteLLM container → **Proxy1 directly** → shared MySQL; it did not test load-balanced distribution or fallback.
+随后另行获批的功能检查在 114.099 秒内恰好新增两个真实成员，首次成功的 Login 任务分别耗时 89.236 和 91.784 秒，执行时间存在重叠。随后使用四个 LiteLLM 虚拟密钥测试所得到的六个 ReadyIdle 成员：四个请求均返回 HTTP200/completed，使用四个不同的成员租约。**最新记录状态为 total6 / leased4 / ready_idle2，空闲目标 2，容量上限 6，paused1，leaseTTL172800**，不是早先六个成员全部空闲的检查点。请求和目录 hold 已排空。测试密钥已撤销；Proxy 租约有意保留，通过正常 TTL 处理到期。这些结果记录在[双账号](user-pool-real-mysql-two-account-validation.md)和[四密钥](user-pool-real-mysql-four-key-validation.md)报告中。本地流量路径为 LiteLLM 容器 → **直连 Proxy1** → 共享 MySQL；未测试负载均衡分发或回退。
 
-Customer integration remains unverified: correct writer/schema and read-only collector identity; instance-pinned routing and secret handling in the existing monitoring platform; freshness/unknown/reset states and alert windows; **actual customer alert delivery**; readiness/drain and effective LiteLLM correlation/fallback. The customer's reported path is LiteLLM and Proxy in the same Rancher cluster via existing internal Service DNS. Prefer that existing Kubernetes Service; no new NGINX layer is required by this handoff. Its actual type, selector, ports, EndpointSlices, healthy backends and node distribution must still be confirmed. Local Proxy1 direct calls and three-process observations do not validate that topology. No customer production availability, fallback, cross-node HA or actual customer drain is claimed.
+客户集成仍未验证的事项包括：写入端/数据库是否正确及只读采集器身份；现有监控平台中的实例固定路由和密钥处理；有效期/未知/重置状态和告警窗口；**实际客户告警送达**；就绪/排空以及生效的 LiteLLM 关联/回退。客户报告的路径是 LiteLLM 和 Proxy 位于同一 Rancher 集群，通过现有内部 Service DNS 通信。优先使用该现有 Kubernetes Service；本交接不要求新增 NGINX 层。其实际类型、选择器、端口、EndpointSlices、健康后端和节点分布仍须确认。本地直连 Proxy1 的调用和三进程观测不能验证该拓扑。本次不宣称已验证客户生产可用性、回退、跨节点 HA 或实际客户排空。
 
-The user's latest load limit **replaces the former 30-minute plan with one maximum-10-minute (600-second) campaign**, including already-used 62.001 seconds, failed/diagnostic runs and recovery observation. The 26.408-second multihot run passed (A60 safely resolved in about 5 seconds; B5/5 succeeded). Short stream runs of 17.176 and 18.162 seconds failed on planned-cancellation log-count assertions; those failures remain recorded even though the assertion scope was repaired without changing the production engine. A 120-second smoke and conditional 300-second run are assigned elsewhere; **no later stream-engine pass has been confirmed at this documentation checkpoint**. They share the remaining budget and cannot restart the clock or become another soak/24-hour run. The [delivery plan](user-pool-delivery-plan.md) tracks these states; final results require the actual execution report.
+用户最新的负载限制**以一次最长 10 分钟（600 秒）的测试活动取代原 30 分钟计划**，其中包括已使用的 62.001 秒、失败/诊断运行以及恢复观测。26.408 秒的多热键运行已通过（A60 在约 5 秒内安全完成处理；B5/5 成功）。耗时 17.176 和 18.162 秒的短流式运行在计划取消的日志计数断言上失败；虽然断言范围已修正且未更改生产引擎，这些失败仍保留记录。120 秒冒烟测试和有条件执行的 300 秒运行已分配给其他工作项；**在本文档检查点，尚未确认任何后续流式引擎测试通过**。它们共用剩余预算，不能重新计时，也不能变成另一次长时间稳定性测试/24 小时运行。[交付计划](user-pool-delivery-plan.md)跟踪这些状态；最终结果必须以实际执行报告为准。

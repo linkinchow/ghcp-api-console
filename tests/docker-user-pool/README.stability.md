@@ -1,72 +1,72 @@
-# Isolated MySQL stability qualification
+# 隔离 MySQL 稳定性验证
 
-This fixture extends the two-Proxy test stack with an actual **HAProxy** and optionally a fixed **LiteLLM v1.99.1 + PostgreSQL** gateway. All provider URLs remain on the internal Docker network; nothing here is a customer deployment or authorization for real seats/models.
+本测试夹具在双 Proxy 测试栈的基础上，加入真实的 **HAProxy**，并可选配固定版本的 **LiteLLM v1.99.1 + PostgreSQL** 网关。所有提供方 URL 均保留在 Docker 内部网络中；这里的任何内容都不是客户部署方案，也不构成使用真实席位或模型的授权。
 
-## Existing verified candidate
+## 现有已验证候选版本
 
-See [review/remediation](../../docs/user-pool-mysql-production-review.md) and [validation](../../docs/user-pool-mysql-validation.md) for the frozen production-fix images and earlier 2,000-member results. The additional work follows the [stability plan](../../docs/user-pool-mysql-stability-plan.md).
+有关已冻结的生产修复镜像及此前 2,000 个成员的测试结果，请参阅[审查与修复](../../docs/user-pool-mysql-production-review.md)和[验证](../../docs/user-pool-mysql-validation.md)。新增工作遵循[稳定性计划](../../docs/user-pool-mysql-stability-plan.md)。
 
-Upstream's MySQL support supplies shared storage for multiple Proxy replicas, not a concrete LB deployment. This HAProxy is a new **test fixture**. The production overlay still accepts an operator-provided trusted LB; the operator template is optional, not an inherited upstream service.
+上游的 MySQL 支持为多个 Proxy 副本提供共享存储，并不提供具体的负载均衡器部署。本 HAProxy 是新增的**测试夹具**。生产环境叠加配置仍接受由运维人员提供的可信负载均衡器；运维模板是可选项，并非从上游继承的服务。
 
-## Safe startup
+## 安全启动
 
-Prepare the ordinary MySQL fixture with `launch-mysql.mjs prepare`, retaining its printed state path. Start only via preview tools, using `launch-stability.mjs up --state=<that run.json> --set=stability-<unique-name> --profile=base`. Never use a deployment env or old live volumes. New sets preserve earlier data/evidence. `start` reuses containers; `up` force-recreates them, including mock memory. `config` is silent configuration validation; `stop-bridge` frees only the fixed test ingress ports.
+使用 `launch-mysql.mjs prepare` 准备常规 MySQL 测试夹具，并保留其打印的状态文件路径。只能通过预览工具启动，使用 `launch-stability.mjs up --state=<that run.json> --set=stability-<unique-name> --profile=base`。绝不要使用部署环境配置或旧的在线卷。创建新测试集可保留此前的数据与证据。`start` 会复用容器；`up` 会强制重建容器，包括模拟服务的内存状态。`config` 执行无输出的配置校验；`stop-bridge` 仅释放固定的测试入口端口。
 
-Combine `compose.mysql.yaml` then `compose.stability.yaml`. Both Proxy images and Console use the reviewed `production-fix` tags; record their digests before each run. HAProxy uses a pinned digest. App/MySQL/mock/LB/gateway/Postgres use only the internal network; the fixed bridge alone also has a preview network and publishes loopback ports. There is no Docker socket or arbitrary forwarding endpoint.
+按先 `compose.mysql.yaml`、后 `compose.stability.yaml` 的顺序合并配置。两个 Proxy 镜像和 Console 均使用经过审查的 `production-fix` 标签；每次运行前都要记录其摘要。HAProxy 使用固定摘要。应用/MySQL/模拟服务/负载均衡器/网关/Postgres 仅使用内部网络；只有固定桥接器还接入预览网络，并发布回环端口。不提供 Docker 套接字或任意转发端点。
 
-Resource ceilings: each Proxy 2 CPUs/1 GiB; MySQL 3 CPUs/3 GiB; mock 1 CPU/512 MiB; HAProxy 1 CPU/256 MiB; optional LiteLLM 2 CPUs/2 GiB and gateway Postgres 1 CPU/1 GiB. These are test ceilings on a shared host, not reserved cores or production sizing recommendations.
+资源上限：每个 Proxy 为 2 个 CPU/1 GiB；MySQL 为 3 个 CPU/3 GiB；模拟服务为 1 个 CPU/512 MiB；HAProxy 为 1 个 CPU/256 MiB；可选的 LiteLLM 为 2 个 CPU/2 GiB，网关 Postgres 为 1 个 CPU/1 GiB。这些是共享主机上的测试资源上限，并非预留核心，也不是生产环境容量配置建议。
 
-| Port | Purpose |
+| 端口 | 用途 |
 | --- | --- |
-| 18100 / 18101 | Direct Proxy diagnostics/assertions |
-| 18102 | Mock and authenticated read-only SSO/Login inspection |
-| 18103 | Actual LiteLLM HTTP gateway (gateway profile) |
-| 18104 | Actual Console |
-| 18105 / 18106 | HAProxy business / authenticated internal paths |
-| 18107 | Read-only HAProxy statistics |
-| 33184 | Fixed TCP bridge to test MySQL |
+| 18100 / 18101 | 直接访问 Proxy 进行诊断/断言 |
+| 18102 | 检查模拟服务，以及经过身份验证的只读 SSO/Login 状态 |
+| 18103 | 真实的 LiteLLM HTTP 网关（网关配置档） |
+| 18104 | 真实的 Console |
+| 18105 / 18106 | HAProxy 业务路径/经过身份验证的内部路径 |
+| 18107 | 只读 HAProxy 统计信息 |
+| 33184 | 通往测试 MySQL 的固定 TCP 桥接器 |
 
-HAProxy uses round-robin and `/readyz`; failed backends are removed after two checks and require two successful checks to return. Health detection is not instantaneous. It has `retries 0`, no redispatch and no session affinity. Separate path ACLs are not authentication: Proxy still checks its API/internal tokens. The fixture adds `X-Fixture-Backend` for test proof only. All internal service roots, including mock OAuth completion, use `http://pool-lb:8081`.
+HAProxy 使用轮询调度和 `/readyz`；后端连续两次检查失败后被移除，恢复时需要连续两次检查成功。健康状态检测并非即时完成。它设置了 `retries 0`，不进行重新分派，也不启用会话亲和性。独立的路径 ACL 不等于身份验证：Proxy 仍会检查其 API/内部令牌。测试夹具添加 `X-Fixture-Backend` 仅用于提供测试证据。所有内部服务根地址（包括模拟 OAuth 完成流程）均使用 `http://pool-lb:8081`。
 
-## Functional and gateway sequence
+## 功能与网关验证顺序
 
-1. Wait for app/DB readiness, then run existing `mysql-smoke.mjs run` on an empty set. It provisions exactly three synthetic accounts through the real worker/SSO and mocked external chain.
-2. Run `mysql-lb-smoke.mjs`. It validates ACLs, stops the first test Proxy, waits for actual LB health removal, uses the survivor, creates a fourth synthetic member through the surviving callback path, then restores and observes both backends. Cleanup restores the stopped Proxy. An already elected second-Proxy scheduler is valid; do not require owner UUID change when stopping a nonowner.
-3. For gateway qualification, start the same fixture with `--profile=gateway` and `start`, not force-recreate. Wait for LiteLLM migrations/readiness. Release only drained synthetic fixture leases and keep prewarming paused with at least three ready-idle members. Run `litellm-mysql-smoke.mjs --confirm-local-fixture` exclusively, without concurrent business/Console polling through the LB. It creates actual internal-user DB virtual keys via supported HTTP APIs, verifies auth/spoofing/revocation/fallback, and revokes its keys in cleanup. See [gateway notes](litellm-mysql-notes.md). PostgreSQL is only LiteLLM's test database, not a new pool backend.
+1. 等待应用/数据库就绪，然后在空测试集上运行现有的 `mysql-smoke.mjs run`。它通过真实的工作进程/SSO 及模拟的外部调用链，恰好预配三个合成账户。
+2. 运行 `mysql-lb-smoke.mjs`。它会验证 ACL，停止第一个测试 Proxy，等待负载均衡器实际通过健康检查移除该后端，使用存活副本，通过仍可用的回调路径创建第四个合成成员，然后恢复并观察两个后端。清理流程会恢复已停止的 Proxy。如果第二个 Proxy 上的调度器已经当选，这也是有效状态；停止非所有者副本时，不要要求所有者 UUID 发生变化。
+3. 若要进行网关验证，请使用 `--profile=gateway` 和 `start` 启动同一测试夹具，不要强制重建。等待 LiteLLM 迁移完成并就绪。仅释放请求已排空的合成测试夹具租约，并保持预热暂停，同时确保至少有三个就绪且空闲的成员。独占运行 `litellm-mysql-smoke.mjs --confirm-local-fixture`，不要同时通过负载均衡器执行其他业务请求或 Console 轮询。它通过受支持的 HTTP API，在数据库中创建真实的内部用户虚拟密钥，验证身份验证/伪造/撤销/回退行为，并在清理时撤销所创建的密钥。请参阅[网关说明](litellm-mysql-notes.md)。PostgreSQL 只是 LiteLLM 的测试数据库，并非新增的池后端。
 
-## Bounded soak
+## 有界长稳测试
 
-`mysql-soak.mjs --seconds=1800 --concurrency=6` requires `POOL_MYSQL_SOAK_CONFIRM=ghcp-user-pool-mysql-test`. It accepts the verified three/four-member setup or a previously qualified twelve-member synthetic fixture, drains prior requests and releases only fixture leases, then uses twelve real mock-provisioned members. It sets TTL60 for natural expiry and target0 after initial warmup; worker stays active for one controlled401 repair. It does not seed SQL or provision real accounts.
+`mysql-soak.mjs --seconds=1800 --concurrency=6` 要求设置 `POOL_MYSQL_SOAK_CONFIRM=ghcp-user-pool-mysql-test`。它接受已验证的三/四成员配置，或此前通过验证的十二成员合成测试夹具，先排空此前的请求并仅释放测试夹具租约，然后使用十二个通过模拟链路实际预配的成员。它将 TTL 设为 60 以测试自然过期，并在初始预热后将目标数设为 0；工作进程保持活动，以执行一次受控的 401 修复。它不会通过 SQL 灌入种子数据，也不会预配真实账户。
 
-The runner mixes JSON/SSE, successful2–20s delayed streams, cancellation,10s429cooling with strict binding checks, one401repair of the original member, and an inactive caller's natural expiry. Caller/member continuity is checked against the same unexpired lease epoch; a correctly expired or401-invalidated lease may later allocate another member and is not mislabeled sharing. Markers establish no HTTP replay and correlate every mock inference. Maximum10,000requests and duration60–3600seconds plus bounded setup/drain;60seconds is debugging, not30-minute acceptance.
+运行器混合执行 JSON/SSE、延迟 2–20 秒且成功完成的流式响应、取消操作、带有严格绑定检查的 10 秒 429 冷却、一次针对原成员的 401 修复，以及不活跃调用方的自然过期。调用方/成员连续性以同一未过期租约时期为基准进行检查；正确过期或因 401 而失效的租约，之后可能分配到另一个成员，这不会被误判为共享。标记用于证明没有 HTTP 重放，并关联每一次模拟推理。最多 10,000 个请求，持续时间为 60–3600 秒，另加有界的准备/排空时间；60 秒仅用于调试，不属于 30 分钟验收。
 
-At about one-third of traffic duration the fixed controller stops Proxy1 for35seconds, then restores it; around two-thirds it pauses MySQL for12seconds then unpauses. Faults are serialized and cleanup restores resources. Network/502/503/504/incomplete stream outcomes count as expected only within explicit fault/recovery windows; other errors fail. Infrastructure outage tests do not promise already-running streams survive.
+在流量持续时间约三分之一处，固定控制器会停止 Proxy1，持续 35 秒后恢复；约三分之二处会暂停 MySQL，持续 12 秒后解除暂停。故障按顺序注入，清理流程会恢复资源。网络错误/502/503/504/流式响应不完整等结果，只有在明确的故障/恢复窗口内才计为预期结果；其他错误均判为失败。基础设施中断测试不承诺已在运行的流式响应能够存活。
 
-The cooldown baseline waits for the caller's previous hold to drain before reading lease timestamps. The ten-second injected interval is distinct from product defaults; the immediate probe must still observe a live database cooldown, so a delayed probe after expiry cannot be called a product failure. Unexpected responses retain sanitized error codes for diagnosis. Failures outside explicit fault windows remain failures.
+冷却基线会等待调用方此前的占用排空后，再读取租约时间戳。注入的十秒间隔与产品默认值不同；紧随其后的探测必须仍能观察到数据库中有效的冷却状态，因此，探测若延迟到冷却过期后才执行，不能据此认定产品故障。非预期响应会保留经过脱敏的错误码，以便诊断。明确故障窗口之外的失败仍然判为失败。
 
-`stability-control.mjs` only accepts `stop-proxy`, `start-proxy`, `pause-mysql`, `unpause-mysql`, `snapshot`. It inspects fixed project/service labels before actions. Snapshot returns fixed-service aggregate CPU/memory/pids and MySQL connection counters, never credentials. Do not reuse this against any other project. No Docker command is accepted from HTTP.
+`stability-control.mjs` 仅接受 `stop-proxy`、`start-proxy`、`pause-mysql`、`unpause-mysql`、`snapshot`。执行操作前，它会检查固定的项目/服务标签。快照返回固定服务的 CPU/内存/PID 汇总及 MySQL 连接计数器，绝不返回凭据。不要将其复用于任何其他项目。不接受通过 HTTP 传入任何 Docker 命令。
 
-Run long tests via a preview-owned process or another approved supervisor with a timeout exceeding the runner's bound. A terminal tool's ten-minute command limit cannot certify30minutes. JSONL progress and final JSON are created under a new OS temp directory; preserve failures, stop/recovery reasons, resources and reported actual traffic duration. Never count an interrupted pilot as a completed soak. No builds or unrelated load during measurements.
+长时间测试应通过预览工具管理的进程或其他获准的进程监督器运行，且超时时间必须超过运行器的时限。终端工具十分钟的命令时限无法证明完成了 30 分钟测试。JSONL 进度和最终 JSON 会写入新建的操作系统临时目录；应保留失败、停止/恢复原因、资源情况，以及所报告的实际流量持续时间。绝不要将中断的试运行计为已完成的长稳测试。测量期间不得进行构建或施加无关负载。
 
-## Offline migration rehearsal
+## 离线迁移演练
 
-`mysql-rehearsal.mjs generate` uses current schemas to produce standalone readonly synthetic SQLite, state and a narrowly scoped Compose override in a new `ghcp-mysql-rehearsal-*` directory. `preflight --state=...` is source-only. `import` and `verify` require `POOL_MYSQL_REHEARSAL_CONFIRM=ghcp-user-pool-mysql-test`.
+`mysql-rehearsal.mjs generate` 使用当前模式，在新的 `ghcp-mysql-rehearsal-*` 目录中生成独立的只读合成 SQLite、状态文件，以及范围严格受限的 Compose 覆盖配置。`preflight --state=...` 仅检查源端。`import` 和 `verify` 要求设置 `POOL_MYSQL_REHEARSAL_CONFIRM=ghcp-user-pool-mysql-test`。
 
-Import first verifies the original control DB marker at loopback33184, creates a random `ghcp_pool_test_rehearsal_<uuid>` target, and runs the unchanged importer. Never add a fixture marker to the import target; the importer correctly refuses unknown tables. The generated override changes both Proxy MYSQL_URLs and the bridge's explicit rehearsal manifest, and gives SSO/Login/Console auxiliary volumes unique rehearsal names so previous synthetic users do not contaminate the freshness assertions. It deliberately leaves the MySQL volume unchanged. Start it through the preview launcher with `--rehearsal=<generated compose.rehearsal.yaml>` only after the soak is finished. Recreate mock memory, preserve the existing MySQL volume/target, and keep imported settings paused.
+导入首先验证回环端口 33184 上原控制数据库的标记，创建随机的 `ghcp_pool_test_rehearsal_<uuid>` 目标，然后运行未经修改的导入器。绝不要向导入目标添加测试夹具标记；导入器会正确地拒绝未知表。生成的覆盖配置会更改两个 Proxy 的 MYSQL_URL 和桥接器的显式演练清单，并为 SSO/Login/Console 辅助卷设置唯一的演练名称，以免此前的合成用户干扰初始状态断言。它会刻意保持 MySQL 卷不变。只有在长稳测试结束后，才可通过预览启动器使用 `--rehearsal=<generated compose.rehearsal.yaml>` 启动。重建模拟服务的内存状态，保留现有 MySQL 卷/目标，并保持导入的设置处于暂停状态。
 
-`verify` registers the existing load adapter's synthetic tokens (only three corresponding credentials exist in the imported DB), checks two retained leases through both direct replicas/LB, executes twelve JSON/SSE requests without reprovisioning, verifies source bytes unchanged and statistics retention106→103 after startup→109 after requests. Regenerate immediately before import: source leases last3600seconds, and the helper rejects ≤120seconds remaining. This tests synthetic migration, not a customer's backup or external provisioning state.
+`verify` 会注册现有负载适配器的合成令牌（导入的数据库中仅存在三个对应凭据），通过两个直连副本/负载均衡器检查两条保留的租约，在不重新预配的情况下执行十二个 JSON/SSE 请求，验证源文件字节未变，以及统计数据保留情况：106→启动后 103→请求后 109。必须紧接导入前重新生成：源租约有效期为 3600 秒，辅助程序会拒绝剩余时间 ≤120 秒的情况。本测试验证的是合成迁移，而非客户备份或外部预配状态。
 
-## Additional lifecycle and failure-boundary runners
+## 其他生命周期与故障边界运行器
 
-See the [extended report](../../docs/user-pool-extended-test-report.md) for actual outcomes and candidate digests; preparation or syntax checks are not passes.
+有关实际结果和候选版本摘要，请参阅[扩展报告](../../docs/user-pool-extended-test-report.md)；准备工作或语法检查不算通过验证。
 
-- `mysql-lifecycle.mjs`: exact `POOL_MYSQL_LIFECYCLE_CONFIRM=ghcp-user-pool-mysql-test`, empty fixture only. Real worker growth 8→14→20→26→32 under traffic, settings/cap/pause/disable/retry, held release, full-pool401 repair, and distinct post-repair lease epochs. SELECT-only observer; no Ready seed; bounded ten-minute run. Old lease IDs are deliberately expired by401, not preserved forever.
-- `mysql-contention.mjs`: exact `POOL_MYSQL_CONTENTION_CONFIRM`, paused mock-provisioned Ready fixture. Two-replica hot-caller requests, named-lock contention and cancellation, SQL deadline plus delayed cleanup/quiet-window checks. Other callers may share pool exhaustion; their latency/errors are reported rather than hidden.
-- `mysql-restart.mjs`: exact `POOL_MYSQL_RESTART_CONFIRM`, service-VM-only fixed labelled MySQL container. Real SSE before a35-second database stop/start; preserves the volume, checks owner/lease/settings and no Proxy restart. It exposes no arbitrary target/control and restores MySQL on failure. Reports include synthetic per-request diagnostics and belong in private test evidence, not public logs.
-- `mysql-failover-recovery.mjs` is a retained-failure diagnostic, not an empty-start benchmark: an acknowledged failed Login task can have one new nonce; same-nonce dispatch cannot repeat. Preserve the original strict failed run. It is not a migration or real-account recovery tool.
+- `mysql-lifecycle.mjs`：必须精确设置 `POOL_MYSQL_LIFECYCLE_CONFIRM=ghcp-user-pool-mysql-test`，且仅可用于空测试夹具。在流量下，由真实工作进程将成员数按 8→14→20→26→32 增长，验证设置/容量上限/暂停/禁用/重试、被占用时的释放、满池 401 修复，以及修复后彼此独立的租约时期。观察器仅执行 SELECT；不预置 Ready 成员；运行时限为十分钟。旧租约 ID 会因 401 而刻意失效，并非永久保留。
+- `mysql-contention.mjs`：必须精确设置 `POOL_MYSQL_CONTENTION_CONFIRM`，用于已暂停、通过模拟链路预配的 Ready 测试夹具。验证双副本热点调用方请求、命名锁争用与取消、SQL 截止时间，以及延迟清理/静默窗口检查。其他调用方也可能受到池耗尽影响；其延迟/错误会如实报告，而非隐藏。
+- `mysql-restart.mjs`：必须精确设置 `POOL_MYSQL_RESTART_CONFIRM`，仅适用于服务虚拟机中带固定标签的 MySQL 容器。先建立真实 SSE，再将数据库停止 35 秒后启动；保留卷，检查所有者/租约/设置，并确认 Proxy 未重启。它不开放任意目标/控制能力，并会在失败时恢复 MySQL。报告包含每个合成请求的诊断信息，应存放在私有测试证据中，而非公开日志中。
+- `mysql-failover-recovery.mjs` 用于保留失败状态下的诊断，并非从空状态启动的基准测试：已经确认失败的 Login 任务可以获得一个新 nonce；相同 nonce 的分派不能重复。保留原始严格检查失败的运行记录。它不是迁移工具，也不是真实账户恢复工具。
 
-The HTTP bridge must propagate **response** aborted/error/incomplete-close after headers; plain `pipe()` does not do this. `mysql-bridge.test.mjs` runs real local HTTP normal-EOF and truncated-response regressions against the forwarder's actual source. Do not turn a truncated stream into clean EOF to make a fault test pass.
+HTTP 桥接器必须在响应头之后继续传播**响应**的中止/错误/未完整结束就关闭等情况；仅使用 `pipe()` 无法做到这一点。`mysql-bridge.test.mjs` 针对转发器的实际源代码，运行真实本地 HTTP 的正常 EOF 和截断响应回归检查。不要为了让故障测试通过而将截断的流伪装成正常 EOF。
 
-## Results discipline
+## 结果记录规范
 
-Record actual outcomes separately from this procedure. A passing short load, gate test, or node syntax check is not a soak or migration-runtime pass. Representative customer resources/SLO, remote TLS, DB primary failover/HA, backups and real-tenant authorization remain separate release gates.
+实际结果应与本操作流程分开记录。短时负载、门禁测试或 Node 语法检查通过，并不代表长稳测试或迁移运行时验证通过。具有代表性的客户资源/SLO、远程 TLS、数据库主节点故障转移/HA、备份和真实租户授权，仍是独立的发布门禁。

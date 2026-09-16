@@ -1,53 +1,53 @@
-# Bounded independent-proxy longstream/resource soak
+# 独立代理的有限长流/资源持续负载测试
 
-**Corrected smoke and bounded soak both passed against real isolated MySQL.** The first smoke and diagnostic stopped on a planned cancellation's production `upstream-stream-failed` log; those failures are retained. The corrected fixture narrowly pairs that event with the exact pre-registered, actually aborted request/PID and native stream closure; other warnings/errors remain failures. Configured120s smoke took121.026s; configured300s soak took299.609s, both with zero unexpected events and complete cleanup. Cumulative campaign usage was482.940/600 seconds including prior failures. See [the final load report](../../docs/user-pool-final-load-validation.md). The parser permits at most1800 seconds per invocation, but does not override a tighter campaign authorization. No day-long mode or local Docker load was used.
+**修正后的冒烟测试和有限持续负载测试均已在真实隔离 MySQL 上通过。** 首次冒烟运行及诊断运行因计划内取消产生的生产 `upstream-stream-failed` 日志而停止；这些失败记录予以保留。修正后的夹具仅将该事件与预先注册、确实已中止的准确请求/PID 及原生流关闭进行严格配对；其他警告和错误仍视为失败。配置为 120s 的冒烟测试耗时 121.026s；配置为 300s 的持续负载测试耗时 299.609s，两者均无意外事件且清理完整。包括此前失败在内，本轮累计使用预算为 482.940/600 秒。参见[最终负载报告](../../docs/user-pool-final-load-validation.md)。参数解析器允许每次调用最多 1800 秒，但不能覆盖更严格的整轮测试授权。未使用全天模式或本地 Docker 负载测试。
 
-## Scope and reuse
+## 范围与复用
 
-New `stream-soak-*` files only; production and existing fixtures are unchanged. The harness starts **three or five independent Node child processes**, each mounting production authentication, `routeUserPool`, compatible SSE routes, real MySQL storage, and the real `startUserPool()` scheduler. Every child PID must return a successful streaming request. Independent UUIDs, PIDs, proxy/control origins, and per-PID mock requests are recorded, so multiple listening ports are not mistaken for independent proxies.
+仅新增 `stream-soak-*` 文件；生产代码及现有夹具均保持不变。测试框架启动**三个或五个独立 Node 子进程**，每个子进程挂载生产认证、`routeUserPool`、兼容 SSE 路由、真实 MySQL 存储及真实的 `startUserPool()` 调度器。每个子进程 PID 都必须成功返回一次流式请求。会记录独立 UUID、PID、代理/控制源地址，以及按 PID 区分的模拟请求，避免将多个监听端口误认为独立代理。
 
-`replicas-safety.ts` supplies the existing disposable-DB, synthetic credential, model, URL, and timeout primitives. `replicas-mock.ts` is reused read-only for bounded provisioning/models/warmup; business SSE passes through a new local mock shim instead of its request ledger. The existing replica child/harness have approximately 190-second lifetimes and retain request history; the new child and harness are necessary finite-lifetime/bounded-memory seams. As in that fixture, synthetic Login callback delivery invokes the production nonce-fenced OAuth repository API, not direct credential/Ready/lease SQL seeding. The deployment callback route/server packaging are not exercised.
+`replicas-safety.ts` 提供现有的一次性数据库、合成凭据、模型、URL 和超时基础工具。只读复用 `replicas-mock.ts`，用于有上限的预配、模型和预热；业务 SSE 经过新的本地模拟服务适配层，而不进入原模拟服务的请求台账。现有副本子进程及测试框架的生命周期约为 190 秒，并保留请求历史；新的子进程和测试框架是实现有限生命周期及有界内存所必需的测试边界。与原夹具相同，合成 Login 回调调用生产 OAuth 仓储 API，并遵守其 nonce 围栏，而非通过 SQL 直接预置凭据、Ready 状态或租约。未验证部署回调路由或服务器打包。
 
-## One combined workload, no extra categories
+## 单一组合负载，不增加其他类别
 
-- Default **60 seconds total setup + workload**, 30-second deterministic SSE streams, three client lanes, three children. CLI permits 10–60-second streams, two–five lanes (no more than child count), and three/five children. These small declared bounds are test inputs, **not production capacity claims**.
-- Each lane has at most one submitted request and awaits its completion/drain before another. There is no producer queue or automatic retry. Each `(lane, sequence)` must increment exactly once at the mock; a duplicate, delayed replay, skipped sequence, extra upstream attempt, unexpected status, or SSE error fails.
-- Each complete cycle runs one partial cancellation plus the other long streams concurrently. Cancellation occurs only after three content deltas and at least two seconds, before the terminal event. Read-only SQL proves the held slot existed, then drains, and lease ID/member/phase/expiry/last-success remain exactly unchanged. The same caller's **explicit new** recovery request runs through a different child, completes valid SSE, and renews its unchanged lease. This is not a transparent retry.
-- Successful streams must contain a start, content delta, valid terminal event and clean EOF; full streams must really last at least the declared stream duration. Headers/partial data cannot renew the preceding lease. Every complete cycle and final observation require both SQL hold tables and mock active slots to drain.
-- Every child gets a one-second streaming affinity probe before the long cycles. The parser retains only one bounded partial event, not response bodies. A last stream that cannot finish within the declared workload budget is **not started**; the final fraction of a cycle is explicitly idle observation to catch delayed replay. Reports distinguish that phase. At least one full/cancel/recovery cycle is required; slow setup that leaves insufficient time fails rather than claiming acceptance.
+- 默认**设置 + 负载总计 60 秒**，确定性的 SSE 流持续 30 秒，三个客户端通道，三个子进程。CLI 允许 10–60 秒的流、二至五个通道（不超过子进程数），以及三个或五个子进程。这些较小且明确声明的边界是测试输入，**不是生产容量声明**。
+- 每个通道最多有一个已提交请求，等待其完成并释放资源后才发起下一个。没有生产者队列或自动重试。每个 `(lane, sequence)` 在模拟服务处必须恰好递增一次；重复、延迟重放、跳过序号、额外上游尝试、意外状态或 SSE 错误均使测试失败。
+- 每个完整周期同时执行一次部分取消及其他长流。取消只能发生在三个内容增量且至少两秒之后、终止事件之前。只读 SQL 证明被占用的槽位曾存在且随后释放，并且租约 ID、成员、阶段、到期时间和最后成功时间均保持完全不变。同一调用方的**显式新建**恢复请求经过另一个子进程，完成有效 SSE，并续期其原有租约。这不是透明重试。
+- 成功流必须包含开始事件、内容增量、有效终止事件及正常 EOF；完整流必须真实持续至少声明的流时长。响应头或部分数据不能续期先前租约。每个完整周期和最终观测都要求两张 SQL 占用表及模拟服务活动槽位清空。
+- 长周期开始前，每个子进程都会执行一次一秒流式亲和性探测。解析器仅保留一个有界的不完整事件，不保留响应体。如果最后一个流无法在声明的负载预算内完成，则**不启动**；周期最后不足一轮的时间明确用于空闲观测，以捕获延迟重放。报告会区分该阶段。至少要求完成一个完整流/取消/恢复周期；若设置过慢而导致剩余时间不足，则判定失败，不得宣称验收通过。
 
-## Safety, resource limits and evidence
+## 安全、资源限制与证据
 
-All engine side effects require `MYSQL_POOL_STREAM_SOAK_TEST=1`, `MYSQL_POOL_TEST_DISPOSABLE=1`, and `MYSQL_TEST_URL`. The URL uses literal `root`, loopback only, `mysql:`, a `/ghcp_pool_test_*` marker and no query/fragment. The marker is never selected or touched. Only a generated `ghcp_pool_test_<32 hex>` sibling is created, used and dropped.
+任何数据库引擎副作用都要求 `MYSQL_POOL_STREAM_SOAK_TEST=1`、`MYSQL_POOL_TEST_DISPOSABLE=1` 和 `MYSQL_TEST_URL`。URL 使用字面用户名 `root`，仅限回环地址，使用 `mysql:` 和 `/ghcp_pool_test_*` 标记，不得包含查询参数或片段。标记数据库绝不会被选中或操作。仅创建、使用和删除生成的 `ghcp_pool_test_<32 hex>` 同级数据库。
 
-The runner validates options **before git/file/network/fork side effects**, then verifies `HEAD:src`, working source and index against immutable production `356f8f5e33a21ccfe7cf8c5db07060ab1ac47846`. It permits the existing frozen356 Azure checkout with additive test overlays (does not demand HEAD5ea). It records SHA-256 of new/reused test files and the production tree. Parent runner environment is stripped to OS + explicit test inputs; children receive OS-allowlisted synthetic settings and an asserted-nonexistent dotenv path. No provider URL/token flags or fallback inherited production endpoints. As with all Node tools, launch from a trusted managed runner with `NODE_OPTIONS`/preloads already cleared; removing inherited environment cannot undo hooks loaded before the script started.
+运行器在**任何 git/文件/网络/fork 副作用之前**验证选项，然后将 `HEAD:src`、工作区源码和索引与不可变生产版本 `356f8f5e33a21ccfe7cf8c5db07060ab1ac47846` 对比。它允许在现有冻结 356 版本的 Azure 检出目录上增量叠加测试文件（不要求 HEAD 为 5ea）。它记录新增和复用测试文件以及生产树的 SHA-256。父运行器环境被精简为操作系统环境加显式测试输入；子进程接收操作系统允许列表中的环境、合成设置以及经断言不存在的 dotenv 路径。没有提供方 URL/令牌选项，也不回退到继承的生产端点。与所有 Node 工具相同，应从可信的受管运行器启动，且事先清除 `NODE_OPTIONS`/预加载项；移除继承环境无法撤销脚本启动前已加载的钩子。
 
-All HTTP listeners bind dynamic `127.0.0.1:0`. Child outbound fetch permits only exact fixture origin, allowed methods/paths and synthetic credentials, with redirects forbidden. The mock requires registered PIDs and provisioned synthetic tokens. No actual SSO/Login/provider accounts or paid providers are called. No Docker/cloud/dependency/setup action is embedded.
+所有 HTTP 监听器都绑定动态 `127.0.0.1:0`。子进程出站 fetch 仅允许精确的夹具源地址、允许的方法和路径及合成凭据，禁止重定向。模拟服务要求已注册 PID 和已预配的合成令牌。不调用实际 SSO/Login/提供方账户或付费提供方。未内置任何 Docker、云端、依赖或环境设置操作。
 
-Bounds and observations:
+限制与观测：
 
-| Item | Limit/evidence |
+| 项目 | 限制/证据 |
 | --- | --- |
-| Combined setup/workload | CLI 60–1800 seconds; `>1800` hard refusal |
-| Cleanup | 45 seconds separate finite budget, outer watchdog; managed parent must supervise same process-group ceiling |
-| Client lanes / queue | 2–5 active, zero producer queue; pending promises removed on settlement |
-| Real MySQL connections | Four per child plus one observer/admin; observer counts exact sibling sessions |
-| mysql2 queue | Production configuration unchanged (1024 cap); read-only sampled queue must be <=8 in this modest test |
-| Synthetic inventory | At most20; real worker provisioning concurrency1, Login pending1 |
-| Child/harness RSS | Each <768MiB test safety ceiling, not a production sizing recommendation |
-| Telemetry | Parent/child RSS/heap/external, cumulative CPU, child resource usage, HTTP socket counts, pool total/free/queue, DB sessions/holds/events/stats, PID/instance/origin map |
-| Report/history | First + latest + ring of120 samples; peak counters; JSON <=2MiB; no per-request ledger |
-| Logs | Native output still emitted; bounded 4KiB per-stream scan pairs a single planned-cancel error with authenticated test-control intent and exact request/PID IPC metadata. All other WARN/ERROR and duplicate/unmatched events fail; >2MiB/child fails. No raw log fields are published. |
-| SQL data | Accounts<=20, caller leases<=lanes, request stats<=2000+lanes, events<=20000, sampled with bounded SELECTs; no observer mutation beyond sibling create/drop |
-| Mock | Constant lane sequence/active maps and counters; provisioning forwarding<=1000 and original finite ledger; no business history |
+| 设置/负载合计 | CLI 60–1800 秒；`>1800` 明确拒绝 |
+| 清理 | 独立的 45 秒有限预算、外层看门狗；受管父进程必须监督相同的进程组时限 |
+| 客户端通道 / 队列 | 2–5 个活动通道，生产者队列为零；待处理 promise 在完成或拒绝时移除 |
+| 真实 MySQL 连接 | 每个子进程四个，另加一个观测/管理连接；观测器统计准确的同级数据库会话数 |
+| mysql2 队列 | 生产配置不变（上限 1024）；在本项小规模测试中，只读采样队列必须 <=8 |
+| 合成库存 | 最多 20；真实工作器预配并发度 1，Login 待处理上限 1 |
+| 子进程/测试框架 RSS | 每个均须 <768MiB，此为测试安全上限，不是生产规模规划建议 |
+| 遥测 | 父进程/子进程 RSS/堆/外部内存、累计 CPU、子进程资源使用、HTTP 套接字数、连接池总数/空闲数/队列、数据库会话/占用/事件/统计、PID/实例/源地址映射 |
+| 报告/历史 | 首个 + 最新 + 120 个样本的环形缓冲区；峰值计数器；JSON <=2MiB；无逐请求台账 |
+| 日志 | 仍输出原生日志；每个流使用有界 4KiB 扫描，将单个计划内取消错误与经过认证的测试控制意图及准确的请求/PID IPC 元数据配对。其他所有 WARN/ERROR 及重复或未匹配事件均导致失败；每个子进程 >2MiB 则失败。不发布原始日志字段。 |
+| SQL 数据 | 账户 <=20、调用方租约 <=通道数、请求统计 <=2000+通道数、事件 <=20000，通过有界 SELECT 采样；除同级数据库创建/删除外，观测器不作修改 |
+| 模拟服务 | 固定大小的通道序号/活动映射及计数器；预配转发 <=1000，沿用原有有限台账；无业务历史 |
 
-Checkpoints print one small JSON summary every5–60 seconds (default10). With `--report`, a user-selected **new** `.json` file is atomically replaced each checkpoint; its parent directory must exist. Output includes immutable-source/test hashes, workload counters, elapsed phase, exact disposable sibling, process mapping, recent/first/last/peak telemetry, cleanup and sanitized failure location. Raw MySQL URLs, keys, tokens, errors, and child logs are not reported. Metrics are sampled observations and ceilings, **not proof of absence of all leaks** or a customer capacity result.
+检查点每 5–60 秒打印一个小型 JSON 摘要（默认 10）。使用 `--report` 时，每个检查点都会以原子方式替换用户选择的**新** `.json` 文件；其父目录必须已存在。输出包含不可变源码及测试哈希、负载计数器、已用时间及所处阶段、准确的一次性同级数据库名称、进程映射、近期/首个/最后/峰值遥测、清理情况和脱敏后的失败位置。不报告原始 MySQL URL、密钥、令牌、错误或子进程日志。指标是采样观测和上限，**不能证明不存在任何泄漏**，也不是客户容量结果。
 
-No unexpected counter, mock failure, unplanned child exit, unqualified WARN/ERROR, missing terminal, false renewal, replay, leaked final slot or failed cleanup is allowed for `passed`. The sole expected logging case requires registered cancel intent, parent-issued abort, matching active synthetic request/PID, native upstream-aborted and downstream-closed evidence, one paired IPC/log event, unchanged lease, SQL/mock drainage and subsequent explicit recovery. Offline negative cases reject armed-but-not-aborted, wrong identity/PID, false flags and duplicates. All owned child handles are shut down (forced exit counts as failure), clients/mock close, then the random sibling drops only after all owned children are confirmed dead. Ctrl-C/SIGTERM initiates the same bounded cleanup. Whole-runner SIGKILL may leave the recorded sibling for parent recovery; no unrelated process, server or database is killed.
+要获得 `passed`，不得出现意外计数器值、模拟服务失败、非计划子进程退出、不符合例外条件的 WARN/ERROR、缺失终止事件、错误续期、重放、最终槽位泄漏或清理失败。唯一允许的日志情况要求：已注册取消意图、由父进程发出中止、匹配的活动合成请求/PID、原生上游已中止及下游已关闭的证据、一对 IPC/日志事件、租约不变、SQL/模拟服务资源排空，以及随后显式恢复。离线反例会拒绝已准备但未实际中止、错误身份/PID、虚假标志和重复事件。所有所属子进程句柄均关闭（强制退出算失败），客户端和模拟服务关闭，然后仅在确认所有所属子进程均已死亡后删除随机同级数据库。Ctrl-C/SIGTERM 触发相同的限时清理。整个运行器收到 SIGKILL 时，可能遗留记录中的同级数据库，供主控方恢复处理；不会终止任何无关进程、服务器或数据库。
 
-## Commands and shared parent budget
+## 命令与主控方共享预算
 
-Use already-installed dependencies at the checkout root. Offline checks do not create sockets/MySQL traffic:
+在检出目录根目录使用已安装的依赖。离线检查不会创建套接字或产生 MySQL 流量：
 
 ```sh
 node -e 'process.argv=["node","tsc","-p","tests/user-pool-process/stream-soak-tsconfig.json"]; require("typescript/lib/tsc.js")'
@@ -58,7 +58,7 @@ env -u MYSQL_POOL_STREAM_SOAK_TEST -u MYSQL_POOL_TEST_DISPOSABLE -u MYSQL_TEST_U
   node --import tsx --test tests/user-pool-process/stream-soak-mysql.test.ts
 ```
 
-**Parent-managed Linux Azure VM only**, sequential with other resource tests, existing dedicated loopback MySQL and existing dependencies. Supply the disposable password privately. Illustrative smoke command (launch is not authorized merely by this document):
+**仅限主控方管理的 Linux Azure 虚拟机**，与其他资源测试串行运行，使用现有专用回环 MySQL 和现有依赖。私下提供一次性数据库密码。以下为冒烟命令示例（本文档本身不构成启动授权）：
 
 ```sh
 MYSQL_POOL_STREAM_SOAK_TEST=1 MYSQL_POOL_TEST_DISPOSABLE=1 \
@@ -68,17 +68,17 @@ node --import tsx tests/user-pool-process/stream-soak-run.mjs \
   --checkpoint-seconds 10 --report /existing-approved-report-directory/stream-smoke.json
 ```
 
-For the bounded soak use exactly the same workload with parent-selected `--duration-seconds REMAINING_SECONDS` and a new report path. **Do not independently allocate1800 after smoke or multi-hot contention:** the parent deducts their phase durations from the single additional-load window, and accounts for cleanup in the managed wall-clock ceiling. The CLI caps this invocation, not the cumulative duration of separate invocations. No agent launches a second soak, new infrastructure, actual accounts, local desktop load or prolonged run. A managed parent should terminate the owned process group after `duration +45` seconds if the native runner does not finish; record failed cleanup rather than counting a timeout as success.
+有限持续负载测试使用完全相同的负载，并由主控方选择 `--duration-seconds REMAINING_SECONDS` 和新的报告路径。**不得在冒烟或多热点争用测试之后独立分配 1800 秒：**主控方从单一附加负载窗口中扣除各阶段耗时，并在受管的总墙钟时限内计入清理时间。CLI 限制的是本次调用，而非多次独立调用的累计时长。任何代理都不得启动第二次持续负载、新建基础设施、创建实际账户、运行本地桌面负载或延长运行。如果原生运行器未结束，受管父进程应在 `duration +45` 秒后终止所属进程组；应记录清理失败，而不是把超时算作成功。
 
-At five children with three lanes, maximum configured MySQL demand is21 connections plus pre-existing server activity. No process RSS reservation is created; the safety threshold permits up to six Node processes (five children + harness) each under768MiB, so parent must choose concurrency/window using actual available VM resources. The mock and observer live in the harness process. A successful report requires status`passed`, zero unexpected, all evidence checks, and `childrenDead/databaseDropped/complete=true`.
+五个子进程、三个通道时，配置的最大 MySQL 需求为 21 个连接，另加已有服务器活动。不预留进程 RSS；安全阈值允许最多六个 Node 进程（五个子进程 + 测试框架），每个低于 768MiB，因此主控方必须根据虚拟机实际可用资源选择并发度和时间窗口。模拟服务和观测器位于测试框架进程中。成功报告要求状态为 `passed`、意外事件为零、全部证据检查通过，且 `childrenDead/databaseDropped/complete=true`。
 
-## Actual implementer verification record
+## 实现方实际验证记录
 
-Windows Node24.14.0, existing dependencies, no database opt-in:
+Windows Node24.14.0，现有依赖，未提供数据库显式授权：
 
-- Strict TypeScript: passed (final rerun required after any integration edits).
-- MJS syntax: passed for runner and offline suite.
-- Offline suite: **4 passed, 0 failed, 0 skipped**, including1801/86400 refusal, hostile DB guards, bounded ring/parser, and zero network/fork/git attempts on invalid entrypoints.
-- Unopted MySQL discovery: **0 passed, 0 failed, 1 skipped**, as intended. This is not engine acceptance.
-- One initial TypeScript command form was refused by isolation command verification and one wrong relative binary path failed to resolve; the dependency-resolved command above passed. No bypass/dependency change was used.
-- Parent-managed actual MySQL validation subsequently passed: smoke17sent/6full/3canceled/8recovered; soak41sent/18full/9canceled/14recovered, zero unexpected. All owned children and sibling DBs cleaned. Full report SHA256 `383961942e78a6bec97ff97dd845ffd242991f9e10ed57b5351c05503f1d7102`; smoke SHA256 `1f8fd155a0efc37997cc0f1492fe103725c0fe6ffe899c1423ab601b2b740606`. Real-customer capacity remains unmeasured.
+- 严格 TypeScript：通过（任何集成编辑后都要求最终重跑）。
+- MJS 语法：运行器和离线套件均通过。
+- 离线套件：**4 项通过、0 项失败、0 项跳过**，包括拒绝 1801/86400、不安全数据库输入防护、有界环形缓冲区及解析器，以及无效入口零网络/fork/git 尝试。
+- 未显式授权的 MySQL 测试发现：**0 项通过、0 项失败、1 项跳过**，符合预期。这不是数据库引擎验收。
+- 最初一种 TypeScript 命令形式被隔离命令验证拒绝，另一个错误的相对可执行文件路径无法解析；上方按依赖解析的命令已通过。未绕过限制，也未更改依赖。
+- 主控方管理的真实 MySQL 验证随后通过：冒烟测试发送 17 个/完整完成 6 个/取消 3 个/恢复 8 个；持续负载测试发送 41 个/完整完成 18 个/取消 9 个/恢复 14 个，意外事件为零。全部所属子进程及同级数据库均已清理。完整报告 SHA256 `383961942e78a6bec97ff97dd845ffd242991f9e10ed57b5351c05503f1d7102`；冒烟报告 SHA256 `1f8fd155a0efc37997cc0f1492fe103725c0fe6ffe899c1423ab601b2b740606`。真实客户容量仍未测量。

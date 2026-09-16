@@ -1,38 +1,38 @@
-# Frozen-v5 three/five-process replica qualification
+# 冻结 v5 三进程/五进程副本验证
 
-Baseline: `356f8f5e33a21ccfe7cf8c5db07060ab1ac47846` (v5). **Both actual MySQL replica cases passed on the isolated Linux host**, after the Windows implementer completed preparation. The designated verifier used the parent's explicitly scheduled Azure load-VM window against its existing dedicated loopback MySQL. No new infrastructure, Docker deployment, production traffic, commits or pushes are part of this suite.
+基线：`356f8f5e33a21ccfe7cf8c5db07060ab1ac47846`（v5）。Windows 实现方完成准备后，**两个真实 MySQL 副本用例均已在隔离 Linux 主机上通过**。指定验证方使用主控方明确安排的 Azure 负载测试虚拟机时间窗口，连接该虚拟机现有的专用回环 MySQL。本套件不涉及新建基础设施、Docker 部署、生产流量、提交或推送。
 
-## What is actually exercised
+## 实际验证的内容
 
-Two sequential top-level TAP cases: **startup3** and **startup5**, each using a new random sibling database and respectively three or five independent Node OS child processes. Each child mounts the production API-key/identity middleware, `routeUserPool`, compatible inference routes, actual MySQL storage, and calls production `startUserPool()` to initialize and start its real `PrewarmWorker`/`realProvisioner`. Separate address spaces provide separate model caches, caller gates, pools and runtime singletons.
+两个顺序执行的顶层 TAP 用例：**startup3** 和 **startup5**，各自使用新的随机同级数据库，分别启动三个或五个独立 Node 操作系统子进程。每个子进程均挂载生产 API 密钥/身份中间件、`routeUserPool`、兼容推理路由和真实 MySQL 存储，并调用生产 `startUserPool()` 来初始化和启动其真实的 `PrewarmWorker`/`realProvisioner`。独立地址空间带来独立的模型缓存、调用方准入门控、连接池及运行时单例。
 
-The existing `routes.child.ts` is not used: it constructs a separate worker and manually ticks it, but does **not** start the runtime's production scheduler. Existing `routes.*`, worker files, package scripts and the frozen launcher are untouched. All adapters here are test-only `replicas-*` files. The production deployment entrypoint/server packaging is not exercised.
+未使用现有 `routes.child.ts`：它会构建独立工作器并手动触发 tick，但**不会**启动运行时的生产调度器。现有 `routes.*`、工作器文件、包脚本和冻结启动器均未修改。此处所有适配器均为仅供测试的 `replicas-*` 文件。未验证生产部署入口或服务器打包。
 
-Five core business checks **per size** (ten grouped checks, but only **two engine TAP tests**, not ten passes):
+**每种规模**有五项核心业务检查（共十项分组检查，但仅有**两个数据库引擎 TAP 测试**，并非十项通过）：
 
-1. **One DB-valid owner, all replicas route.** Read the singleton SQL owner and unexpired DB-clock TTL, map its tenure UUID to one child through a pass-through observer of successful `claimOwner` calls, and check all local worker snapshots. Mock provisioning POSTs initially originate only from that owner. Authentication denial is tested on every child before workers start.
-2. **Concurrent same-caller affinity.** Clear local model caches; one concurrent held inference per replica must produce a cold upstream model lookup from every distinct PID, one SQL member/lease, and one hold per outstanding request. All return business 200 with a valid synthetic assistant response; holds drain and the lease stays the same.
-3. **Concurrent distinct-caller exclusivity.** One different caller per replica remains simultaneously held at the mock. SQL and wire member identities must be distinct (including the original caller). All responses succeed and both lease/catalog hold tables drain.
-4. **Bounded hot-caller lock isolation.** Hold the exact production named-lock key `SHA256(JSON.stringify([randomDatabase, hotCaller]))` in a dedicated session for at least 6.5 seconds. Issue **four A admissions per child** (12 at startup3, 20 at startup5), so the process-local caller gate is actually needed with each child's four-connection pool. While A waits, issue one existing distinct B caller per child. Every B must return a real business 200 within the predeclared **3,000 ms** ceiling; exact per-PID milliseconds are printed. All A responses must be 503 `pool_storage_unavailable`, at least 4 seconds and **at most 6,000 ms**: the unchanged 5-second production SQL budget plus an explicit 1-second fixture scheduling tolerance, selected before any engine run. Every A duration is printed individually by PID/request, not just an aggregate. There must be no upstream request, replay, lease or residual hold. No replay is checked both immediately after lock release and against the **final raw mock ledger after election and provisioning**, catching delayed work. This phase costs about 6.5 seconds per size and is not a throughput benchmark.
-5. **Actual owner death and automatic recovery.** Natural idle-inventory consumption causes a fresh Login POST. The mock records/accepts that POST but withholds its response; SQL must still show the original nonce at `oauth-dispatch`, with no task ID. Kill the **actual DB owner child via its own `ChildProcess.kill('SIGKILL')` handle**, not a PID lookup or fake clock. Check the retained owner row still has 24–30 seconds left, is not renewed/cleared/shortened, and can only change after the real DB expiry. Surviving processes execute successful same-caller inference every second throughout the election gap; one new caller must also obtain a member from pre-existing Ready inventory. The successor must search for the retained task, reverify it through real warmup, then provision another genuinely new account. Raw mock POST accounting must contain exactly one user POST and one Login POST per identity, with no deduplication hiding a duplicate. Original caller member/lease identity survives the failure.
+1. **数据库认定的有效所有者只有一个，所有副本均可路由。** 读取 SQL 中的单例所有者及按数据库时钟计算的未过期 TTL，通过对成功 `claimOwner` 调用进行透传观测，将其任期 UUID 映射到一个子进程，并检查所有本地工作器快照。初始模拟预配 POST 仅来自该所有者。在工作器启动前，对每个子进程测试认证拒绝。
+2. **同一调用方的并发亲和性。** 清除本地模型缓存；每个副本各有一个并发阻塞的推理请求，必须观察到每个不同 PID 都发起冷缓存上游模型查询、SQL 中只有一个成员及租约，并且每个未完成请求对应一个占用。所有请求均返回业务 200 和有效的合成助手响应；占用全部释放，租约保持相同。
+3. **不同调用方的并发排他性。** 每个副本各有一个不同调用方，其请求同时阻塞在模拟服务处。SQL 和网络请求中的成员身份必须互不相同（包括原调用方）。所有响应均成功，租约占用表和目录占用表都必须清空。
+4. **有时限的热点调用方锁隔离。** 在专用会话中持有精确的生产命名锁键 `SHA256(JSON.stringify([randomDatabase, hotCaller]))` 至少 6.5 秒。**每个子进程发出四个 A 准入请求**（startup3 为 12 个，startup5 为 20 个），使每个子进程的四连接池确实需要进程内调用方门控。A 等待期间，每个子进程使用一个既有且不同的 B 调用方发出请求。每个 B 都必须在预先声明的 **3,000 ms** 上限内返回真实业务 200；打印每个 PID 的准确毫秒耗时。所有 A 响应都必须为 503 `pool_storage_unavailable`，耗时至少 4 秒且**不超过 6,000 ms**：包括未修改的生产 SQL 5 秒预算，以及在任何数据库引擎运行之前选定的、明确的 1 秒夹具调度容差。每个 A 的耗时按 PID/请求逐一打印，而非只提供汇总。不得出现上游请求、重放、租约或残余占用。既在锁释放后立即检查无重放，也对照**选举和预配完成后的最终原始模拟服务台账**再次检查，以捕获延迟执行的工作。此阶段每种规模约耗时 6.5 秒，不是吞吐量基准测试。
+5. **真实调度owner进程退出与自动恢复。** 空闲库存的自然消耗触发新的 Login POST。模拟服务记录并接受该 POST，但暂不返回响应；SQL 仍须显示位于 `oauth-dispatch` 的原 nonce，且没有任务 ID。通过**实际数据库所有者子进程自身的 `ChildProcess.kill('SIGKILL')` 句柄终止它**，而非通过 PID 查找或伪造时钟。检查保留的所有者记录仍有 24–30 秒有效期，未被续期、清除或缩短，且只能在真实数据库到期后变更。整个选举空档期间，存活进程每秒执行成功的同一调用方推理；另一个新调用方也必须能从既有 Ready 库存获得成员。继任者必须查找保留的任务，通过真实预热重新验证，然后再预配另一个真正的新账户。原始模拟 POST 计数必须表明每个身份恰好有一次用户 POST 和一次 Login POST，不得通过去重隐藏重复请求。原调用方的成员及租约身份在故障后保持不变。
 
-SSO/SCIM/seat state, Login tasks and model/inference responses are synthetic local services. SSO create returns an already-active/seat-assigned synthetic identity, so actual remote SCIM or seat-assignment POST paths are **not** qualified. Synthetic Login callback delivery calls the nonce-fenced production `saveCopilotOauthToken` repository API through a separate capability-protected test endpoint; the deployment's internal HTTP callback route is **not** mounted. No inventory Ready/verified timestamps, leases, owner UUIDs or owner TTLs are seeded/mutated by test SQL. Every Ready member was provisioned and warmed by production worker code.
+SSO/SCIM/席位状态、Login 任务及模型/推理响应均由合成本地服务提供。SSO 创建会返回已经激活且已分配席位的合成身份，因此**未**验证实际远端 SCIM 或席位分配 POST 路径。合成 Login 回调通过独立的、由能力凭据保护的测试端点，调用生产仓储 API `saveCopilotOauthToken`，并遵守其 nonce 围栏；**未**挂载部署使用的内部 HTTP 回调路由。测试 SQL 不会预置或修改库存的 Ready/verified 时间戳、租约、所有者 UUID 或所有者 TTL。每个 Ready 成员均由生产工作器代码完成预配和预热。
 
-## Safety and cleanup
+## 安全与清理
 
-- All three explicit inputs are mandatory for engine side effects: `MYSQL_POOL_REPLICAS_TEST=1`, `MYSQL_POOL_TEST_DISPOSABLE=1`, `MYSQL_TEST_URL`. Missing dedicated opt-in causes direct engine discovery to skip both cases. A present but invalid opt-in or unsafe URL hard-refuses. The dedicated runner always requires full opt-in.
-- MySQL accepts only `mysql:`, literal username `root`, loopback `127.0.0.1`/`localhost`/`[::1]`, a `/ghcp_pool_test_[a-z0-9_]+` marker, and no query or fragment. The marker database is never selected, migrated, written or dropped. The fixture creates/drops only its own `ghcp_pool_test_<32 random hex>` sibling.
-- The guarded runner refuses any HEAD other than exact v5 and any staged/unstaged/untracked change under `src`. It is additive and does not invoke/modify the frozen launcher. It strips inherited product configuration and Node hooks before launching the test process.
-- Child environments are OS-allowlisted plus explicit synthetic configuration. Each uses an asserted-nonexistent random dotenv path. No inherited provider credentials, proxies, `NODE_OPTIONS`, product URLs or SQLite fallback. The shared package is pinned to this checkout's source via `replicas-tsconfig.json`, and the child asserts its resolution.
-- Listeners bind dynamically allocated `127.0.0.1:0` ports. Child fetch permits only the exact fixture mock origin, expected methods/paths and synthetic credentials, attaches its PID and uses native fetch with redirects forbidden. The mock only accepts registered child PIDs. No external service traffic is allowed.
-- Provisioning concurrency is **1 per active worker**, Login pending cap **1**, child MySQL pool **4**. Synthetic member cap is **20 per database** (expected final count 11 for startup3, 15 for startup5); no size exceeds 20 simultaneous blocked A requests plus its three/five short B probes. MySQL connection demand is approximately `4 * replicaCount + 2` at peak, plus existing server/admin connections. Run sequentially with other shared-engine resource tests.
-- Parent imports no production runtime/config/storage. SQL after create/drop DDL is read-only except the explicitly documented dedicated named-lock session. Observer queries have 3-second deadlines; DDL 5 seconds; connection establishment 3 seconds. Lock socket destruction releases the named lock on failure.
-- Client/control requests, setup barriers and shutdown are bounded and linked to the test abort signal. Idempotent cleanup is registered before setup side effects. It aborts clients, destroys the lock socket, drains or kills owned children, closes the mock and drops the sibling **only after every child is confirmed dead**. Intentional owner SIGKILL is accepted; every other forced/nonzero child exit fails cleanup. The exact sibling drop is printed. Child internal ceiling is 190 seconds plus 5-second forced shutdown; parent child ceiling 195 seconds; each TAP case has a 180-second timeout. Runner ceiling is 410 seconds. Unexpected whole-runner termination may still require manual cleanup of the printed disposable sibling.
-- No test authorizes killing MySQL, unrelated Node processes or changing shared/prod database state. No paid/cloud resource creation is needed.
+- 产生数据库引擎副作用必须提供全部三个显式输入：`MYSQL_POOL_REPLICAS_TEST=1`、`MYSQL_POOL_TEST_DISPOSABLE=1`、`MYSQL_TEST_URL`。缺少专用显式授权时，直接发现数据库引擎测试会跳过两个用例。已提供但无效的授权或不安全的 URL 会被明确拒绝。专用运行器始终要求完整授权。
+- MySQL 只接受 `mysql:`、字面用户名 `root`、回环地址 `127.0.0.1`/`localhost`/`[::1]`、`/ghcp_pool_test_[a-z0-9_]+` 标记，且不得包含查询参数或片段。标记数据库绝不会被选中、迁移、写入或删除。夹具只创建和删除其自身的 `ghcp_pool_test_<32 random hex>` 随机同级数据库。
+- 带防护的运行器拒绝非精确 v5 的任何 HEAD，以及 `src` 下任何已暂存、未暂存或未跟踪的变更。它仅作增量添加，不调用或修改冻结启动器。在启动测试进程前，会移除继承的产品配置和 Node 钩子。
+- 子进程环境仅包含操作系统允许列表及显式合成配置。每个子进程使用经断言不存在的随机 dotenv 路径。不继承提供方凭据、代理、`NODE_OPTIONS` 或产品 URL，也不回退到 SQLite。共享包通过 `replicas-tsconfig.json` 固定到当前检出目录的源码，子进程会断言其解析结果。
+- 监听器绑定动态分配的 `127.0.0.1:0` 端口。子进程 fetch 仅允许精确的夹具模拟服务源地址、预期的方法和路径以及合成凭据，附加自身 PID，并使用禁止重定向的原生 fetch。模拟服务只接受已注册的子进程 PID。不允许任何外部服务流量。
+- 预配并发度为**每个活动工作器 1**，Login 待处理上限为 **1**，子进程 MySQL 连接池大小为 **4**。合成成员上限为**每个数据库 20**（预期最终数量：startup3 为 11，startup5 为 15）；任何规模都不会超过 20 个同时阻塞的 A 请求，加上其三个或五个短 B 探测。MySQL 峰值连接需求约为 `4 * replicaCount + 2`，另加现有服务器及管理连接。应与其他共享数据库引擎资源测试串行运行。
+- 父进程不导入生产运行时、配置或存储。创建/删除数据库 DDL 之后的 SQL 均为只读，唯一例外是明确记载的专用命名锁会话。观测查询时限为 3 秒；DDL 为 5 秒；建立连接为 3 秒。失败时销毁锁套接字以释放命名锁。
+- 客户端及控制请求、设置屏障和关闭操作均有时限，并关联测试中止信号。在设置副作用发生之前注册幂等清理。清理会中止客户端、销毁锁套接字、排空或终止所属子进程、关闭模拟服务，并且**仅在确认每个子进程都已死亡后**删除同级数据库。有意对所有者发送 SIGKILL 属于可接受行为；其他任何强制终止或非零子进程退出都会使清理失败。会打印准确的同级数据库删除信息。子进程内部上限为 190 秒，另加 5 秒强制关闭时间；父进程对子进程的上限为 195 秒；每个 TAP 用例超时为 180 秒。运行器上限为 410 秒。整个运行器意外终止后，仍可能需要手动清理打印出的一次性同级数据库。
+- 任何测试都不授权终止 MySQL、无关 Node 进程或更改共享/生产数据库状态。不需要创建付费或云端资源。
 
-## Local checks (no MySQL needed)
+## 本地检查（无需 MySQL）
 
-Run at the worktree root using already-installed dependencies:
+在工作树根目录使用已安装的依赖运行：
 
 ```sh
 node -e "process.argv=['node','tsc','-p','tests/user-pool-process/replicas-tsconfig.json']; require('typescript/lib/tsc.js')"
@@ -43,11 +43,11 @@ env -u MYSQL_POOL_REPLICAS_TEST -u MYSQL_POOL_TEST_DISPOSABLE -u MYSQL_TEST_URL 
   node --import tsx --test --test-concurrency=1 tests/user-pool-process/replicas-mysql.test.ts
 ```
 
-Offline entrypoint checks replace sockets/listeners/fetch/child-spawn APIs with throwing sentinels, then prove child, fixture, engine and runner refuse absent/unsafe opt-ins with **zero attempted side effects**. Do not count either offline guards or skipped engine discovery as real MySQL acceptance.
+离线入口检查将套接字、监听器、fetch 和子进程启动 API 替换为会抛错的哨兵，从而证明子进程、夹具、数据库引擎和运行器会拒绝缺失或不安全的显式授权，并且**未尝试任何副作用**。不得将离线防护通过或跳过的数据库引擎测试发现计作真实 MySQL 验收。
 
-## Dedicated verifier command (Linux Azure load VM)
+## 专用验证方命令（Linux Azure 负载测试虚拟机）
 
-Only in the agreed shared-engine window, with existing dependencies and dedicated disposable MySQL already running on the VM loopback, and exact frozen-v5 source plus these files:
+仅可在约定的共享数据库引擎时间窗口内运行，要求虚拟机回环接口上已经运行专用一次性 MySQL、已有依赖，并具备精确的冻结 v5 源码及这些文件：
 
 ```sh
 MYSQL_POOL_REPLICAS_TEST=1 MYSQL_POOL_TEST_DISPOSABLE=1 \
@@ -55,17 +55,17 @@ MYSQL_TEST_URL='mysql://root:DISPOSABLE_PASSWORD@127.0.0.1:3306/ghcp_pool_test_o
 node --import tsx tests/user-pool-process/replicas-run.mjs
 ```
 
-Supply the dedicated password privately; do not publish URLs/credentials in the report. No npm install/build or Docker command is part of this runner. The marker name above is only an opt-in marker; both real case schemas are random siblings.
+私下提供专用密码；不要在报告中发布 URL 或凭据。运行器不包含 npm 安装/构建或 Docker 命令。上面的标记名称仅用于显式授权；两个实际用例的数据库均为随机同级数据库。
 
-Expected normal duration: **60–90 seconds per size, approximately 2–3 minutes total** (estimate, not measured). Hard test budget: 180 seconds per size; outer runner ceiling 410 seconds. Exactly **two non-skipped engine TAP passes**, exit code zero, distinct child PID evidence for both sizes, complete per-phase diagnostics, fixed-threshold hot-caller probe latencies, real election timing, duplicate-POST assertions and successful drop diagnostics for **both** sibling databases are required for acceptance. A partially executed case or failed cleanup is not a pass. Do not relax latency/election/POST assertions retrospectively to make a run pass.
+预期正常耗时：**每种规模 60–90 秒，总计约 2–3 分钟**（估算值，非实测值）。硬性测试预算：每种规模 180 秒；外层运行器上限为 410 秒。验收必须具备恰好**两项未跳过的数据库引擎 TAP 测试通过**、退出码为零、两种规模的不同子进程 PID 证据、完整的分阶段诊断、按固定阈值检查的热点调用方探测延迟、真实选举时序、重复 POST 断言以及**两个**同级数据库均成功删除的诊断。用例只执行一部分或清理失败都不算通过。不得在运行后放宽延迟、选举或 POST 断言以使运行通过。
 
-## Preparation validation record
+## 准备阶段验证记录
 
-- Strict TypeScript: passed locally on Node v24.14.0 (Windows); final validation repeated after all edits.
-- Offline guards: two tests passed, zero failed/skipped; runner coverage included in final rerun.
-- MJS syntax: checked in final validation.
-- Unopted engine discovery: expected zero passes/two skipped; recorded separately in final handoff.
-- Real startup3/startup5 MySQL execution was subsequently performed by the designated verifier: **2 passed, 0 failed, 0 skipped**, 101.921 seconds total. At three replicas, B probes completed in 29–39ms and all 12 A probes failed safely in 5010.975–5025.720ms; at five replicas, B took 46–76ms and all 20 A probes 5009.806–5024.028ms. Natural elections took 30.239/30.505 seconds with 58/112 successful survivor requests across the gaps. All phase assertions and child/sibling cleanup passed.
-- Actual log SHA-256: `c068687cb2a861652259896aad5677ba6122ed14b04b2b13dc0819453a1b083f`. See [the bounded resilience report](../../docs/user-pool-v5-resilience-tests.md).
+- 严格 TypeScript：在本地 Node v24.14.0（Windows）上通过；全部编辑完成后重复了最终验证。
+- 离线防护：两项测试通过，零失败、零跳过；最终重跑包含运行器覆盖。
+- MJS 语法：已在最终验证中检查。
+- 未显式授权的数据库引擎测试发现：预期为零通过、两项跳过；已在最终交接中单独记录。
+- 随后，指定验证方执行了真实 startup3/startup5 MySQL 测试：**2 项通过、0 项失败、0 项跳过**，总耗时 101.921 秒。三个副本时，B 探测耗时 29–39ms，全部 12 个 A 探测在 5010.975–5025.720ms 内安全失败；五个副本时，B 耗时 46–76ms，全部 20 个 A 探测耗时 5009.806–5024.028ms。自然选举分别耗时 30.239/30.505 秒，空档期间存活进程分别成功处理 58/112 个请求。所有阶段断言以及子进程和同级数据库清理均通过。
+- 实际日志 SHA-256：`c068687cb2a861652259896aad5677ba6122ed14b04b2b13dc0819453a1b083f`。参见[有限范围韧性测试报告](../../docs/user-pool-v5-resilience-tests.md)。
 
-This finite single-host multi-process test is not production throughput, cross-node HA, long-duration soak, all cancellation/credential-race permutations, packaging or a real-provider acceptance result. It intentionally does not rerun 2,000-call or 30-minute tests for each size.
+这项有限的单主机多进程测试不构成生产吞吐量、跨节点高可用、长时间持续负载、所有取消/凭据竞态排列、打包或真实提供方的验收结果。它有意不为每种规模重跑 2,000 次调用或 30 分钟测试。
