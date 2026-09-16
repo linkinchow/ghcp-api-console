@@ -7,11 +7,51 @@
 > proxy 参考repo https://github.com/hooyao/copilot-bridge
 > 获得 GitHub Copilot Token的部分参考了 OpenCode 项目
 
-> 管理员的配置手册: ([guidance/guidance.md](./guidance/guidance.md))
-> 网络配置的说明: ([guidance/network-deployment.md](./guidance/network-deployment.md))
-> 可选独占用户账号池（默认关闭）: [设计](./docs/user-pool-design.md) · [实现与配置](./docs/user-pool-implementation.md) · **[现有Docker客户升级手册](./docs/user-pool-upgrade-guide.md)** · [LiteLLM Hash Hook](./docs/user-pool-litellm.md) · [页面操作说明](./docs/user-pool-console-guide.md) · [发布检查](./docs/user-pool-release-checklist.md)
->
-> **存量升级注意**：新版本默认仍为 `direct`。旧SSO/Proxy账号和席位不会自动加入User Pool；启用pool后入口要求 `sha256:<key hash>`，旧用户名/邮箱header不兼容。保留数据和切换路由必须分阶段验证，不能将账号池cap当作企业总席位上限。
+> 管理员的通用配置手册：[guidance/guidance.md](./guidance/guidance.md) · 网络配置：[guidance/network-deployment.md](./guidance/network-deployment.md)
+
+## User Pool：多 Proxy＋MySQL
+
+当前 `ghcp-user-pool-ops-handoff` 分支支持 **MySQL 共享账号池和多个 Proxy 副本**，同时保留 SQLite 单 Proxy 和默认 `direct` 模式。已有 SQLite User Pool 升级时，请从下面的客户指南开始，不要直接照后文的新环境快速启动命令操作原数据。
+
+### 客户部署与迁移入口
+
+| 要做的事情 | 文档或配置 |
+| --- | --- |
+| **已有单 Proxy／SQLite User Pool 升级到多 Proxy／MySQL** | **[客户升级指南](./docs/user-pool-mysql-upgrade-guide.md)**：数据库迁移、四组件升级、Service切换、验证与回退 |
+| Kubernetes 部署配置 | **[K8s YAML模板](./deploy/user-pool-mysql-customer/kubernetes.template.yaml)**：先启动1个Proxy验证，再扩为3个或所需数量 |
+| 数据库迁移参数与兼容处理 | [User Pool 专用迁移工具](./upgrade/user-pool-mysql/README.md) |
+| 自行构建四组件镜像 | [固定源码构建与部署包](./deploy/user-pool-mysql-customer/README.md) |
+| 日常监控、诊断与恢复 | [运维基础](./docs/user-pool-ops-basics.md) · [本机调度诊断](./docs/user-pool-local-diagnostics.md) |
+| LiteLLM caller身份与页面操作 | [LiteLLM Hash Hook](./docs/user-pool-litellm.md) · [User pool页面说明](./docs/user-pool-console-guide.md) |
+
+客户从固定源码提交自行构建镜像，按现有K8s镜像分发流程部署。YAML是需要填写实际值的模板，**不包含MySQL部署，也不重建原SSO/Login/Console或其数据卷**。客户准备专用空MySQL数据库、账号权限和TLS，迁移工具负责创建应用表并导入数据。不要在迁移前启动目标Proxy写入该库。
+
+### 多副本运行方式
+
+```text
+LiteLLM → 现有 Kubernetes Proxy Service → Proxy 1 / Proxy 2 / Proxy 3
+                                                 │
+                                                 └→ 同一个 MySQL 写主库／数据库
+SSO / Login / Console → 同一个 Proxy Service
+```
+
+- **Proxy**：`STORAGE_DRIVER=mysql`、`ACCOUNT_ROUTING_MODE=caller-lease`，各副本使用相同池配置和同一MySQL数据库。K8s通过Secret注入`MYSQL_URL`，不将真实连接串写入公开YAML。
+- **SSO、Login、Console**：配套升级但各保持1个实例。SSO/Login保留原SQLite及数据卷，Console保留管理员文件和原卷；SAML地址、签名证书及现有凭据不因迁移而重建。
+- **业务与后台调度分开**：健康Proxy均可处理请求，只有一个调度owner负责补池和修复。MySQL模式的standby副本仍可服务；数据库故障仍可能返回安全503。
+- **账号排他使用**：已认证LiteLLM virtual-key hash映射到成员租约，完整成功推理才续租。模型列表、失败或取消不会续租；恢复补池可能创建新成员，必须符合批准的账号和席位预算。
+- **先迁移、后扩容**：暂停并排空、备份、导入空MySQL、先验证1个新Proxy，再扩容和切换原Service；旧SQLite与新MySQL不得同时承接业务。只改`STORAGE_DRIVER`不会自动搬迁数据。
+
+### 按现有部署选择升级路径
+
+| 当前部署与升级目标 | 对应指南或工具 |
+| --- | --- |
+| 已使用 SQLite User Pool（`caller-lease`），升级到 MySQL 多副本 | [SQLite User Pool → MySQL 多副本升级指南](./docs/user-pool-mysql-upgrade-guide.md)，保留现有池成员和有效凭据，不重新开户 |
+| 使用普通 `direct` 模式，仅将账号数据库从 SQLite 迁到 MySQL | [direct 模式数据库迁移工具](./upgrade/sqlite-to-mysql/README.md)，不用于迁移 User Pool 表 |
+| 尚未启用 User Pool，希望在单 Proxy／SQLite 部署中启用账号池 | [单副本 User Pool 启用与升级指南](./docs/user-pool-upgrade-guide.md)；原 direct 账号不会自动成为池成员 |
+
+`ACCOUNT_ROUTING_MODE`默认仍为`direct`。启用`caller-lease`后，入口要求`X-User-Identity: sha256:<key hash>`，不能继续使用用户名／邮箱header。旧版[SQLite设计](./docs/user-pool-design.md)、[SQLite实现](./docs/user-pool-implementation.md)和[发布检查](./docs/user-pool-release-checklist.md)保留为历史参考，不作为本分支MySQL部署入口。
+
+开发与验收参考：[MySQL设计](./docs/user-pool-mysql-design.md) · [MySQL实施细节](./docs/user-pool-mysql-implementation.md) · [详细迁移与验证记录](./docs/user-pool-customer-migration-guide.md) · [真实迁移报告](./docs/user-pool-real-mysql-migration-validation.md) · [多热点与长流式验证](./docs/user-pool-final-load-validation.md)。这些记录不替代客户自己的备份恢复、Service路由或MySQL HA验收。
 
 ## 背景
 
@@ -73,16 +113,17 @@ Client
 
 ## 配置模型：`.env` 与 Settings
 
-项目有两类互不覆盖的配置：
+配置按以下来源管理，已有运行时设置与启动参数的生效方式不同：
 
 | 配置来源 | 保存位置 | 适合内容 | 生效方式 |
 | --- | --- | --- | --- |
-| 环境变量 / `.env` | 进程环境；不写入业务数据库 | 端口、服务地址、密钥、数据库/日志/证书路径、认证 header、浏览器静态选项 | 启动时读取，修改后需要重启对应服务。 |
-| Console **Settings** | `sso.sqlite` 或 `login.sqlite` | 管理员需要在线调整的限额、并发、超时、重试和调试开关 | 保存后持久化并在当前服务实例立即应用，无需重启。 |
+| 环境变量 / `.env` / K8s Secret与ConfigMap | 进程环境 | 端口、服务地址、密钥、数据库/日志/证书路径、认证 header、浏览器静态选项 | 启动时读取；更新后需重新创建容器或滚动更新Pod，单纯restart不会更新容器环境。 |
+| Console **Settings**（SSO/Login） | `sso.sqlite` 或 `login.sqlite` | 管理员需要在线调整的限额、并发、超时、重试和调试开关 | 保存后持久化并在当前服务实例立即应用，无需重启。 |
+| Console **User pool → Pool settings** | Proxy的SQLite或共享MySQL `user_pool_settings` | idle target、账号cap、正式租约TTL、暂停补池 | 通过版本化管理API保存，所有MySQL Proxy共享；已有设置不会被启动env覆盖。 |
 
 根目录 `.env` 只用于 Docker Compose 的变量插值；只有 `docker-compose.yml` 的 `environment`、`ports`、`volumes` 中明确引用的变量才会传入容器。`src/<service>/.env` 面向单独运行该 workspace 的场景。显式注入的进程环境变量优先于 `.env`，两者都没有时才使用代码默认值。
 
-敏感值和部署拓扑只放环境变量，不放 Settings，例如 `API_KEY`、`INTERNAL_API_TOKEN`、`SESSION_SECRET`、GitHub/SCIM token、数据库路径和服务 URL。当前运行时 Settings 没有同名环境变量，因此不存在覆盖优先级；升级首次创建 settings 表时使用代码默认值，不从旧环境变量导入。
+敏感值和部署拓扑使用受保护的环境变量或K8s Secret，不放管理页面Settings，例如`API_KEY`、`INTERNAL_API_TOKEN`、`SESSION_SECRET`、GitHub/SCIM token、数据库连接串和服务URL。SSO/Login运行时Settings首次初始化使用代码默认值，不从旧环境变量自动导入。User Pool的target/cap/正式TTL仅首次由env提供种子，之后以数据库为准；MySQL还保存域名、模型、预热并发等不变量的配置指纹，所有Proxy与迁移进程必须一致，不能只改某一副本的env或手工改hash绕过检查。
 
 SSO runtime settings：
 
@@ -107,7 +148,9 @@ Login runtime settings：
 
 `REQUEST_STATS_PER_ACCOUNT_LIMIT` 和 `PROXY_ERROR_DIAGNOSTICS_*` 仍是 Proxy 环境变量，不属于 runtime Settings；前者控制每个 identity 保留的请求统计条数，后者控制上游失败现场的启用、目录、脱敏和文件轮转。Login task 历史目前没有自动保留条数/天数配置，终态任务会一直保留，直到通过 Console 或 API 手动删除。
 
-## 快速启动（Docker Compose）
+## 快速启动（Docker Compose，新环境默认direct）
+
+下面是通用新环境启动流程，不是已有账号池的迁移步骤。已有SQLite User Pool升级到MySQL/K8s，请使用[客户升级指南](./docs/user-pool-mysql-upgrade-guide.md)，保留原卷和签名证书，不重新生成或覆盖。
 
 1. 复制并修改环境变量：
 
@@ -160,7 +203,7 @@ cp .env.example .env
 
 > **升级提示**：如果旧 `proxy.sqlite` 仍为 `gh_token` / 短期 `copilot_token`结构，首次启动会保留identity/SSO/GH关联，但清除旧凭据并要求重新授权；若已具备当前OAuth三列，则保留已有OAuth token而不重建账号表。迁移后启动还会按 `REQUEST_STATS_PER_ACCOUNT_LIMIT` 裁剪统计（默认2），因此必须先备份、核对schema和保留量，并在副本演练。详见[存量升级手册](./docs/user-pool-upgrade-guide.md)。
 
-已有 Proxy SQLite 数据迁移到 MySQL 时，使用 [`upgrade/sqlite-to-mysql`](./upgrade/sqlite-to-mysql/README.md) 的显式迁移工具；Proxy 启动不会自动跨数据库搬迁数据。
+SQLite → MySQL必须按源模式选择迁移工具：**已有User Pool（`caller-lease`）用 [`upgrade/user-pool-mysql`](./upgrade/user-pool-mysql/README.md)**；普通direct账号数据用 [`upgrade/sqlite-to-mysql`](./upgrade/sqlite-to-mysql/README.md)。两者不能互换。客户先创建专用空数据库和账号权限，迁移工具负责创建应用表并导入；Proxy启动不会自动跨数据库搬迁数据。
 
 2. 准备 SAML 证书：
 
@@ -230,6 +273,8 @@ docker compose -f docker-compose.yml -f docker-compose.mysql.yml up -d --build -
 > **SSO 改密与自动登录**：SSO 只保存密码哈希，不能把修改后的任意密码提供给 Login。若新密码不是当前 `SSO_DEFAULT_USER_PASSWORD` 或该用户的 `ssoUser`，后续自动初始化无法取得密码；请在 Console 的 **Reauthorize Copilot OAuth** 中手动输入新密码。Login 仅使用该次请求提供的密码执行任务，不会把密码保存到任务历史。
 
 ## 调用 API
+
+以下`alice`等用户名示例用于默认 **direct** 模式；`caller-lease`模式应经已配置的LiteLLM Hash Hook调用，由已认证virtual key派生`sha256:<hash>`，不能原样使用下面的用户名header。详见[LiteLLM接入说明](./docs/user-pool-litellm.md)。
 
 设置API_KEY环境变量
 ```
