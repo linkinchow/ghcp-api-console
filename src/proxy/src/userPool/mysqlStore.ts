@@ -10,6 +10,7 @@ import type { HeldLease, Inventory, InventoryFence, Lease, PoolSettings } from '
 import type { PoolStore, WorkerCredentialFence, WorkerCredentialMutation } from './storage.js';
 import type { PoolList, PoolPage, PoolPageQuery } from './paging.js';
 import { LOGIN_CAPACITY_SQL, PendingSelection } from './scheduling.js';
+import { inferenceHoldTimeoutMs } from './inferenceTimeout.js';
 
 type Connection = Pool | PoolConnection;
 interface Tx { connection: PoolConnection; credentials?: Map<string, Credential | undefined> }
@@ -199,8 +200,9 @@ export class MysqlPoolStore implements PoolStore {
   async counts(): Promise<Record<string, number>> { return this.tx((tx) => this.readCounts(tx)); }
   async reclaim(): Promise<void> { await this.tx((tx) => this.reclaimTx(tx)); }
 
-  async acquire(caller: string, signal?: AbortSignal): Promise<HeldLease> {
+  async acquire(caller: string, signal?: AbortSignal, requestTimeoutMs?: number): Promise<HeldLease> {
     normalizeCaller(caller);
+    const holdTimeoutMs = inferenceHoldTimeoutMs(requestTimeoutMs, this.options.requestTimeoutMs);
     return this.admit(caller, async (tx, identity, current) => {
       let lease = current;
       if (!lease) {
@@ -213,7 +215,7 @@ export class MysqlPoolStore implements PoolStore {
         await this.exec(tx, 'UPDATE user_pool_accounts SET updated_at=? WHERE identity=?', [now, identity]);
         await this.addEvent(tx, 'lease_acquired', identity, caller, lease.lease_id);
       }
-      return this.hold(tx, lease, 'lease');
+      return this.hold(tx, lease, 'lease', holdTimeoutMs);
     }, signal);
   }
 
@@ -766,9 +768,9 @@ export class MysqlPoolStore implements PoolStore {
     }
   }
 
-  private async hold(tx: Tx, lease: Lease, kind: 'lease' | 'catalog'): Promise<HeldLease> {
+  private async hold(tx: Tx, lease: Lease, kind: 'lease' | 'catalog', timeoutMs = this.options.requestTimeoutMs): Promise<HeldLease> {
     const requestId = randomUUID();
-    const deadline = await this.time(tx.connection) + this.options.requestTimeoutMs;
+    const deadline = await this.time(tx.connection) + timeoutMs;
     const generation = (await this.readInventory(tx.connection, lease.member_identity))!.generation;
     if (kind === 'catalog') {
       await this.exec(tx, `INSERT INTO user_pool_catalog_holds

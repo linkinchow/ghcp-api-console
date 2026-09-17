@@ -22,6 +22,8 @@ data:
   POOL_LOGIN_MAX_PENDING: "5"
   POOL_EXHAUSTED_RETRY_AFTER_SECONDS: "30"
   POOL_REQUEST_TIMEOUT_SECONDS: "120"
+  # 可选：仅新版Proxy推理请求预算；旧参数及MySQL指纹不变。先完成版本验证再启用。
+  # POOL_INFERENCE_TIMEOUT_SECONDS: "600"
   # 仅首次初始化种子，已有settings从SQLite导入，不由这些env覆盖。
   READY_IDLE_TARGET: "0"
   POOL_MAX_ACCOUNTS: "100"

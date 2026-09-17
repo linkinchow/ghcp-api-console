@@ -6,6 +6,7 @@ import { accountName, NAME_CAPACITY } from './names.js';
 import { poolPageSql, type PoolList, type PoolPage, type PoolPageQuery } from './paging.js';
 import type { WorkerCredentialFence, WorkerCredentialMutation } from './storage.js';
 import { LOGIN_CAPACITY_SQL, PendingSelection } from './scheduling.js';
+import { inferenceHoldTimeoutMs } from './inferenceTimeout.js';
 
 export interface Inventory {
   identity: string;
@@ -402,8 +403,9 @@ export class UserPoolStore {
     }).immediate();
   }
 
-  acquire(caller: string, signal?: AbortSignal): HeldLease {
+  acquire(caller: string, signal?: AbortSignal, requestTimeoutMs?: number): HeldLease {
     normalizeCaller(caller);
+    const holdTimeoutMs = inferenceHoldTimeoutMs(requestTimeoutMs, this.options.requestTimeoutMs);
     signal?.throwIfAborted();
     return this.admit(() => {
       this.assertCallerNotCooling(caller);
@@ -429,7 +431,7 @@ export class UserPoolStore {
         `).run(caller, identity, lease.lease_id, lease.phase, now, lease.expires_at);
         this.event('lease_acquired', identity, caller, lease.lease_id);
       }
-      return this.hold(lease, 'lease');
+      return this.hold(lease, 'lease', holdTimeoutMs);
     });
   }
 
@@ -504,9 +506,9 @@ export class UserPoolStore {
     if (!valid) throw new UserPoolError(503, 'member_unavailable');
   }
 
-  private hold(lease: Lease, kind: 'lease' | 'catalog'): HeldLease {
+  private hold(lease: Lease, kind: 'lease' | 'catalog', timeoutMs = this.options.requestTimeoutMs): HeldLease {
     const requestId = randomUUID();
-    const deadline = this.now() + this.options.requestTimeoutMs;
+    const deadline = this.now() + timeoutMs;
     const generation = this.inventory(lease.member_identity)!.generation;
     if (kind === 'catalog') {
       this.db.prepare(`

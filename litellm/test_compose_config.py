@@ -17,6 +17,7 @@ class ComposeConfigTests(unittest.TestCase):
         for line in (ROOT / ".env.example").read_text().splitlines():
             if line and not line.startswith("#") and "=" in line:
                 env.pop(line.split("=", 1)[0], None)
+        env.pop("POOL_INFERENCE_TIMEOUT_SECONDS", None)
         env.update(overrides)
         command = ["docker", "compose", "--env-file", str(ROOT / ".env.example"),
                    "-f", str(ROOT / "docker-compose.yml")]
@@ -71,6 +72,20 @@ class ComposeConfigTests(unittest.TestCase):
         for name in ["sso", "login", "console"]:
             self.assertEqual(services[name]["environment"]["PROXY_BASE_URL"], "http://lb.test:8081")
             self.assertTrue(services[name]["volumes"])
+
+    def test_inference_override_is_separate_and_defaults_to_legacy_budget(self):
+        for legacy, override, expected in (("120", None, "120"), ("300", None, "300"), ("120", "600", "600")):
+            values = {"POOL_REQUEST_TIMEOUT_SECONDS": legacy}
+            if override is not None:
+                values["POOL_INFERENCE_TIMEOUT_SECONDS"] = override
+            with self.subTest(legacy=legacy, override=override):
+                result = self.render(**values)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                services = json.loads(result.stdout)["services"]
+                self.assertEqual(services["proxy"]["environment"]["POOL_REQUEST_TIMEOUT_SECONDS"], legacy)
+                self.assertEqual(services["proxy"]["environment"]["POOL_INFERENCE_TIMEOUT_SECONDS"], expected)
+                for name in ("sso", "login", "console"):
+                    self.assertNotIn("POOL_INFERENCE_TIMEOUT_SECONDS", services[name]["environment"])
 
     def test_mysql_pool_requires_database_and_internal_load_balancer(self):
         self.assertNotEqual(self.render(mysql_pool=True, POOL_ACCOUNT_EMAIL_DOMAIN="pool.example.test",

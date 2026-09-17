@@ -10,6 +10,7 @@ import type { HeldLease } from './store.js';
 import type { PoolStore } from './storage.js';
 import { boundedAdmission } from './admission.js';
 import { isMysqlStorageUnavailable } from './mysqlDeadline.js';
+import { readInferenceTimeoutMs } from './inferenceTimeout.js';
 
 export interface PoolRequest {
   held: HeldLease;
@@ -25,11 +26,16 @@ export interface PoolRequest {
 let store: PoolStore | undefined;
 let worker: PrewarmWorker | undefined;
 let options: PoolConfig | undefined;
+let inferenceTimeoutMs: number | undefined;
 let wakeTimer: ReturnType<typeof setTimeout> | undefined;
 const logger = new Logger('user-pool');
 
 export async function getUserPool(): Promise<PoolStore | undefined> {
-  options ??= readPoolConfig(process.env);
+  if (!options) {
+    const parsed = readPoolConfig(process.env);
+    inferenceTimeoutMs = readInferenceTimeoutMs(process.env, parsed.enabled);
+    options = parsed;
+  }
   if (!options.enabled) return undefined;
   await initializeStorage();
   const storage = getStorage();
@@ -43,6 +49,10 @@ export async function startUserPool(): Promise<void> {
     if (!config.apiKey || !config.internalApiToken) throw new Error('User pool requires Proxy API and internal service authentication');
     worker = new PrewarmWorker(current, realProvisioner(current, options!), options!.pollMs, options!.prewarmConcurrency, undefined,
       { multiReplica: !(getStorage() instanceof SqliteStorage) });
+    logger.info('timeouts', 'Pool request budgets', {
+      inferenceTimeoutMs: inferenceTimeoutMs ?? options!.requestTimeoutMs,
+      catalogAndProvisionTimeoutMs: options!.requestTimeoutMs,
+    });
     await worker.start();
   }
 }
@@ -54,6 +64,7 @@ export async function stopUserPool(): Promise<void> {
   worker = undefined;
   store = undefined;
   options = undefined;
+  inferenceTimeoutMs = undefined;
 }
 
 /** No initialization or storage access. Undefined means no worker in THIS process,
@@ -111,16 +122,18 @@ export const routeUserPool: RequestHandler = async (req, res, next) => {
     if (req.method === 'POST' && (!req.body || Array.isArray(req.body) || typeof req.body.model !== 'string' || !req.body.model.trim())) {
       throw new UserPoolError(400, 'invalid_model');
     }
+    const isInference = req.method === 'POST' && path !== '/v1/messages/count_tokens';
+    const requestTimeoutMs = isInference ? inferenceTimeoutMs ?? options!.requestTimeoutMs : options!.requestTimeoutMs;
     const admittedAt = performance.now();
     const admission = new AbortController();
-    const admissionTimeout = setTimeout(() => admission.abort(), options!.requestTimeoutMs);
+    const admissionTimeout = setTimeout(() => admission.abort(), requestTimeoutMs);
     admissionTimeout.unref();
     const disconnect = () => admission.abort();
     res.once('close', disconnect);
     let held: HeldLease;
     try {
-      held = await boundedAdmission(() => req.method === 'GET' || req.method === 'HEAD' || path === '/v1/messages/count_tokens'
-        ? current.acquireCatalog(caller, admission.signal) : current.acquire(caller, admission.signal), admission.signal,
+      held = await boundedAdmission(() => isInference
+        ? current.acquire(caller, admission.signal, inferenceTimeoutMs) : current.acquireCatalog(caller, admission.signal), admission.signal,
       async late => {
         try { await current.finish(late, false); }
         catch { logger.error('request-finish-failed', 'Late admission cleanup failed; its bounded hold will expire'); }
@@ -138,7 +151,7 @@ export const routeUserPool: RequestHandler = async (req, res, next) => {
     };
     res.locals.userPool = context;
     req.identity = held.member_identity;
-    const canRenew = req.method === 'POST' && path !== '/v1/messages/count_tokens';
+    const canRenew = isInference;
     let responseSucceeded = false;
     let finishing: Promise<void> | undefined;
     const finish = (success: boolean): Promise<void> => {
@@ -171,7 +184,7 @@ export const routeUserPool: RequestHandler = async (req, res, next) => {
       } else if (!res.writableEnded) {
         res.destroy();
       }
-    }, Math.max(1, options!.requestTimeoutMs - (performance.now() - admittedAt)));
+    }, Math.max(1, requestTimeoutMs - (performance.now() - admittedAt)));
     let checking = false;
     const heartbeat = setInterval(() => {
       if (checking || context.completed) return;
