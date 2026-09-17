@@ -47,6 +47,8 @@ v1.99.1中 `via_virtual_key` 是服务端设置的标记，普通构造输入会
 
 ## 3. 路由与授权边界
 
+需要按 key hash 首位逐步开放 GHCP 时，参见[灰度准入 Hook](user-pool-litellm-canary.md)。这是可选替换回调，默认身份 Hook 的全量业务 key 行为不变；新灰度功能的验证状态在独立说明中记录。
+
 - LiteLLM正常执行key的模型访问和预算限制。模型组权限通常不是组内provider级权限。
 - 当前单租户默认池的约定是：被授权访问该模型组的普通业务key可使用其中的GHCP deployment。若需要“同组某些key只能走其他provider”，仍需独立服务端deployment准入策略，不能把hash当权限。
 - `GHCP_POOL_API_BASES` 明确列出GHCP根地址，精确匹配scheme/host/port/path（去尾斜杠），不按模型名或域名子串猜测。

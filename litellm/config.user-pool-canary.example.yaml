@@ -1,0 +1,22 @@
+# 合并到已有 LiteLLM 配置，不是独立网关部署文件。
+# 挂载 user_pool_hook.py 和 user_pool_canary_hook.py 到同一可导入目录。
+# 保留原 model_list、数据库认证、密钥权限及模型/provider 配置。
+# 如有非 GHCP 候选，未入组 key 将只在这些候选中选路。
+# 如模型只有 GHCP 候选，未入组 key 会收到 403，而不是调用 GHCP。
+litellm_settings:
+  callbacks:
+    # 替换 user_pool_hook.proxy_handler_instance，不要两者同时注册。
+    # 移除旧 ghcp_identity_hook 回调，保留其他不冲突的回调。
+    # 此回调须位于其他修改 header/URL 的回调之后。
+    - user_pool_canary_hook.proxy_handler_instance
+  set_verbose: false
+  cache: false
+  turn_off_message_logging: true
+
+# 灰度本身不启用自动重试或回退。若原网关需要其他提供方的回退，
+# 应单独审核后合并设置，不要用该示例覆盖整个网关的既有策略。
+router_settings:
+  num_retries: 0
+  fallbacks: []
+  context_window_fallbacks: []
+  content_policy_fallbacks: []
