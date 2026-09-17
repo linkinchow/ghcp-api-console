@@ -240,6 +240,12 @@ class CanaryHookTests(unittest.IsolatedAsyncioTestCase):
         await self.authenticate("2" + "a" * 63)
         self.assertIs(await self.filtered(), self.candidates)
 
+    async def test_early_hook_is_discoverable_on_concrete_callback_class(self):
+        callback = vars(type(self.hook)).get("async_pre_call_hook")
+        self.assertTrue(callable(callback))
+        await callback(self.hook, StubAuth(token=CANARY_HASH), None, {}, "completion")
+        self.assertEqual((await self.deploy())["headers"]["X-User-Identity"], "sha256:" + CANARY_HASH)
+
     def test_missing_litellm_filter_contract_fails_startup(self):
         with patch.object(canary_module.CustomLogger, "async_filter_deployments", None):
             with self.assertRaises(RuntimeError):

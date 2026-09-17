@@ -28,6 +28,10 @@ class UserPoolCanaryHook(UserPoolIdentityHook):
             raise ValueError("Allowed hash prefixes must contain only lowercase hexadecimal digits")
         self._prefixes = frozenset(prefixes)
 
+    async def async_pre_call_hook(self, user_api_key_dict, cache, data: dict, call_type):
+        # LiteLLM discovers this callback on the concrete class, not inherited methods.
+        return await super().async_pre_call_hook(user_api_key_dict, cache, data, call_type)
+
     def _is_enrolled(self) -> bool:
         identity = self._identity.get()
         return identity is not None and identity[len("sha256:")] in self._prefixes

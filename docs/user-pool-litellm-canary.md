@@ -1,5 +1,7 @@
 # LiteLLM User Pool 灰度准入 Hook
 
+> 2026-09-17 Azure 真实运行验证发现：`80e8315` 的灰度子类没有显式声明认证前置回调，LiteLLM v1.99.1 的具体类方法发现机制会跳过继承的方法。**`80e8315` 及未包含本修复的版本不能直接作为灰度上线版本使用。** 本提交已补显式转调，修正后的 12 项真实 Router 测试全部通过；默认放行首位仍为 `"0"`，身份校验规则不变。
+
 ## 1. 本次实现的行为
 
 适用于已有 LiteLLM virtual key 认证、现有 GHCP `caller-lease` 账号池：不再检查旧 `metadata.ghcp_identity`，只允许服务端认证后的 key hash 首位属于配置集合的调用方进入 GHCP。
@@ -105,3 +107,17 @@ python -m unittest discover -s litellm -p 'test_user_pool*runtime.py' -v
 结果：**0 项运行时通过、12 项跳过**，其中新增灰度 7 项、原身份 5 项。原因是本机没有安装 LiteLLM；现有 Docker Desktop Linux 引擎也未运行，没有启动引擎或客户服务。新增真实 Router 用例已编写，但**尚未执行，不能据离线桩测试宣称客户版本已经验收**。实际 HTTP 认证、Messages/Responses、流式以及客户部署/重试策略也未在本次执行。
 
 本轮收尾检查还包括 Python 语法、YAML 解析、文档链接及改动范围。不会将历史身份 Hook 的运行时通过结果算作新增灰度的运行时验收。
+
+### Azure补充验证与修复（2026-09-17）
+
+上述39通过/12跳过是初始本地记录，保留其原始状态。随后在Azure的真实LiteLLM v1.99.1镜像中执行，暴露具体类回调发现问题：初次12项中2失败、1错误；灰度类补显式 `async_pre_call_hook` 转调后，**40项离线通过、12项真实Router全部通过**。
+
+随后完整HTTP链路使用测试配置 `prefixes="047ad"`，经过真实数据库virtual key认证、Hook、NGINX、五个真实Proxy及一个MySQL实例的五个独立数据库，**25个检查全部通过**；21次获准推理、7次拒绝探测均符合预期。没有真实GitHub/席位/模型调用。该链路验证使用Messages JSON/SSE，不等于客户K8s或其他协议全部验收；NGINX组件及其完整报告独立交付，不包含在本次Hook修复提交中。仓库默认前缀仍为 `"0"`。
+
+证据校验值：
+
+- 首次真实Router失败日志：`1696c55e060aefd8450ebae379a5a134e6beb93334d431547200e69527ea8040`。
+- 修正后真实Router日志（12项通过）：`f8072fe81ec5202fcba15b951b482ef449ef50257fd1c94a342e33cff1413fe6`。
+- HTTP端到端报告：`5122ca97d551a4cacbaa6374ac7da006d24c0b04e83918af714f61b6fe8cf5cd`。
+
+更新时只替换LiteLLM中的灰度Hook文件并按原发布流程重新加载进程，保留基础身份Hook、现有允许地址和客户选定的前缀配置。无需因此重建GHCP Proxy镜像或更改数据库。
