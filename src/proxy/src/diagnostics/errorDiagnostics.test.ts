@@ -299,7 +299,8 @@ test('persists JSON, SSE, plain-text, and bodyless upstream HTTP failures', asyn
     assert.deepEqual(new Set(listed.items.map((item) => item.status)), new Set([400, 429, 502, 503]));
     const stats = (await listRequestStats(identity, 10)).filter((stat) => !stat.success);
     assert.equal(stats.length, config.requestStatsPerAccountLimit);
-    assert.deepEqual(stats.map((stat) => stat.failureReason), ['HTTP 503', 'HTTP 502']);
+    assert.deepEqual(stats.map((stat) => stat.failureReason?.split(' [ref: ')[0]), ['HTTP 503', 'HTTP 502']);
+    assert.ok(stats.every(stat => /\[ref: [a-f0-9-]{36}\]$/.test(stat.failureReason ?? '')));
   });
 });
 

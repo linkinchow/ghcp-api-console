@@ -27,6 +27,7 @@ import { Input } from './components/ui/input.js';
 import { Textarea } from './components/ui/textarea.js';
 import { Tooltip } from './components/ui/tooltip.js';
 import { formatDate, formatNumber, statusTone, tokenTotal } from './lib/format.js';
+import { RequestFailure } from './components/RequestFailure.js';
 import { UserPoolPage } from './pages/UserPoolPage.js';
 
 interface SetupState {
@@ -680,7 +681,7 @@ function RequestStatsPage() {
       </Card>
       {loading ? <LoadingState label="Loading request stats..." /> : null}
       {error ? <ErrorState message={error} /> : null}
-      <Card className="overflow-hidden p-0">
+      <Card className="overflow-x-auto p-0">
         <RequestStatsTable stats={filtered} />
       </Card>
     </div>
@@ -2139,7 +2140,7 @@ function RequestStatsTable(props: { stats: ProxyRequestStatDto[]; compact?: bool
               {!props.compact ? <Td>{formatNumber(stat.cacheWriteTokens)}</Td> : null}
               {!props.compact ? <Td>{formatNumber(cache)}</Td> : null}
               <Td>{formatNumber(total)}</Td>
-              <Td className="max-w-xs truncate" title={stat.failureReason}>{stat.failureReason ?? '-'}</Td>
+              <Td><RequestFailure reason={stat.failureReason} /></Td>
             </tr>
           );
         })}

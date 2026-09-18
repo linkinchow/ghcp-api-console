@@ -2,7 +2,7 @@
 
 更新：2026-09-11。对应Console左侧 **User pool** 页面，管理员登录后可见。本文使用“4个账号、2个已租出、2个idle、cap5、target2”的通用示例，不包含实际客户账号或key hash。
 
-配套：[设计原理](user-pool-design.md) · [配置与API](user-pool-implementation.md) · [存量Docker升级](user-pool-upgrade-guide.md) · [真实测试过程](user-pool-real-e2e-validation.md) · [仅升级Console：完整hash复制](user-pool-console-upgrade-guide.md)
+配套：[设计原理](user-pool-design.md) · [配置与API](user-pool-implementation.md) · [存量Docker升级](user-pool-upgrade-guide.md) · [真实测试过程](user-pool-real-e2e-validation.md) · [仅升级Console：完整hash复制](user-pool-console-upgrade-guide.md) · [HTTP错误详情与定位](user-pool-http-error-details.md)
 
 ## 1. 先看懂三个对象
 

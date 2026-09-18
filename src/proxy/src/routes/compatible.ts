@@ -44,6 +44,7 @@ import { isSuccessfulJson, StreamCompletion } from '../userPool/responseCompleti
 import { getAccount } from '../db/accountsRepo.js';
 import { config } from '../config.js';
 import type { CopilotAuthContext } from '../copilot/copilotAuth.js';
+import { summarizeHttpFailure } from '../diagnostics/httpFailureSummary.js';
 
 export const compatibleRouter = Router();
 const requestStatsLogger = new Logger('request-stats');
@@ -350,9 +351,10 @@ export async function pipeAndRecord(
   const retryAfter = upstream.headers.get('retry-after');
   if (retryAfter) res.setHeader('Retry-After', retryAfter);
   if (!upstream.body) {
-    if (!upstream.ok) await recordHttpFailure(diagnostics, upstreamRequest, upstream);
+    const failureReason = upstream.ok ? (context ? 'empty_upstream_body' : undefined)
+      : await recordHttpFailureSummary(diagnostics, upstreamRequest, upstream);
     res.end();
-    await recordRequestStat({ ...stat, success: upstream.ok && !context, failureReason: upstream.ok ? (context ? 'empty_upstream_body' : undefined) : `HTTP ${upstream.status}` });
+    await recordRequestStat({ ...stat, success: upstream.ok && !context, failureReason });
     return;
   }
   const shouldBuffer = contentType.includes('application/json')
@@ -366,11 +368,12 @@ export async function pipeAndRecord(
       await handleStreamReadFailure(upstream, upstreamRequest, res, stat, diagnostics, err);
       throw new HandledUpstreamStreamError(err.cause);
     }
-    if (!upstream.ok) await recordHttpFailure(diagnostics, upstreamRequest, upstream, body.capture);
+    const failureReason = upstream.ok ? undefined
+      : await recordHttpFailureSummary(diagnostics, upstreamRequest, upstream, body.capture);
     const text = body.buffer.toString('utf8');
     if (options.claudeCodeOptimized && shouldTranslateWebSearchError(upstream.status, text, options.requestBody)) {
       sendAnthropicError(res, 400, 'not_supported', webSearchUnsupportedMessage(options.requestBody));
-      await recordRequestStat({ ...stat, success: false, failureReason: `HTTP ${upstream.status}` });
+      await recordRequestStat({ ...stat, success: false, failureReason });
       return;
     }
     context?.controller.signal.throwIfAborted();
@@ -384,7 +387,7 @@ export async function pipeAndRecord(
     await recordRequestStat({
       ...stat,
       success,
-      failureReason: success ? undefined : upstream.ok ? 'invalid_upstream_body' : `HTTP ${upstream.status}`,
+      failureReason: success ? undefined : upstream.ok ? 'invalid_upstream_body' : failureReason,
       ...usageStatFields(usage),
     });
     return;
@@ -429,7 +432,8 @@ export async function pipeAndRecord(
     flushSseRemainder(sseBuffer, res, usage, options.canonicalModel, false);
   }
   const capturedBody = capture.result(true);
-  if (!upstream.ok) await recordHttpFailure(diagnostics, upstreamRequest, upstream, capturedBody);
+  const failureReason = upstream.ok ? undefined
+    : await recordHttpFailureSummary(diagnostics, upstreamRequest, upstream, capturedBody);
   context?.controller.signal.throwIfAborted();
   const success = upstream.ok && (!completion || completion.finish());
   if (context) {
@@ -440,9 +444,47 @@ export async function pipeAndRecord(
   await recordRequestStat({
     ...stat,
     success,
-    failureReason: success ? undefined : upstream.ok ? 'incomplete_or_failed_stream' : `HTTP ${upstream.status}`,
+    failureReason: success ? undefined : upstream.ok ? 'incomplete_or_failed_stream' : failureReason,
     ...usageStatFields(usage),
   });
+}
+
+async function recordHttpFailureSummary(
+  diagnostics: ErrorDiagnosticContext,
+  request: PreparedCopilotRequest,
+  response: globalThis.Response,
+  body?: CapturedResponseBody,
+): Promise<string> {
+  const diagnosticId = await recordHttpFailure(diagnostics, request, response, body);
+  const sensitiveValues = [config.apiKey, config.internalApiToken];
+  const addHeader = (name: string, value: string) => {
+    if (!/(?:authorization|cookie|token|secret|password|api[-_]?key|identity)/i.test(name)) return;
+    sensitiveValues.push(value);
+    if (/authorization/i.test(name)) sensitiveValues.push(value.replace(/^\S+\s+/, ''));
+    if (/cookie/i.test(name)) {
+      for (const cookie of value.split(';')) {
+        const separator = cookie.indexOf('=');
+        if (separator !== -1) sensitiveValues.push(cookie.slice(separator + 1).trim());
+      }
+    }
+  };
+  for (const [name, value] of Object.entries(request.headers)) addHeader(name, value);
+  for (let index = 0; index + 1 < diagnostics.inboundRequest.rawHeaders.length; index += 2) {
+    addHeader(diagnostics.inboundRequest.rawHeaders[index]!, diagnostics.inboundRequest.rawHeaders[index + 1]!);
+  }
+  const addUrlSecrets = (url: string) => {
+    try {
+      const parsed = new URL(url, 'http://summary.invalid');
+      for (const raw of [parsed.username, parsed.password]) {
+        if (raw) { sensitiveValues.push(raw); try { sensitiveValues.push(decodeURIComponent(raw)); } catch { /* Keep encoded value. */ } }
+      }
+      for (const [name, value] of parsed.searchParams) addHeader(name, value);
+    } catch { /* An invalid URL cannot supply additional redaction hints. */ }
+  };
+  addUrlSecrets(request.url);
+  addUrlSecrets(diagnostics.inboundRequest.url);
+  return summarizeHttpFailure({ status: response.status, contentType: response.headers.get('content-type') ?? undefined,
+    body, sensitiveValues, diagnosticId });
 }
 
 interface PipeOptions {
