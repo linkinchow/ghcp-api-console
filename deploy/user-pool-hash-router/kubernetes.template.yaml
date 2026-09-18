@@ -1,0 +1,139 @@
+# 填写所有 REPLACE_*；不要直接应用此模板。
+# 先由 render.py 生成 nginx.conf，并创建 REPLACE_ROUTER_CONFIGMAP。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ghcp-hash-router
+  namespace: REPLACE_NAMESPACE
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ghcp-hash-router
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ghcp-hash-router
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 330
+      # 如使用私有镜像仓库，在这里引用已有 imagePullSecrets。
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ghcp-hash-router
+      containers:
+        - name: nginx
+          image: REPLACE_APPROVED_NGINX_IMAGE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: [nginx]
+          args: [-c, /etc/nginx/nginx.conf, -g, "daemon off;"]
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 101
+            runAsGroup: 101
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              exec:
+                command: [/bin/sh, -c, "sleep 10; nginx -s quit -c /etc/nginx/nginx.conf"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: runtime
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: REPLACE_ROUTER_CONFIGMAP
+        - name: runtime
+          emptyDir:
+            sizeLimit: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ghcp-hash-router
+  namespace: REPLACE_NAMESPACE
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ghcp-hash-router
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# CNI 必须支持 NetworkPolicy。与 nginx trustedCidrs 一起限制入口，
+# 不能只检查 identity 格式就把它当成已认证身份。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ghcp-hash-router-ingress
+  namespace: REPLACE_NAMESPACE
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ghcp-hash-router
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: REPLACE_LITELLM_NAMESPACE
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: REPLACE_LITELLM_APP_LABEL
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ghcp-hash-router
+  namespace: REPLACE_NAMESPACE
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ghcp-hash-router

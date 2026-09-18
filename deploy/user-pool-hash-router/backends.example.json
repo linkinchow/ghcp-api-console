@@ -1,0 +1,12 @@
+{
+  "backends": [
+    "ghcp-proxy.pool1.svc.cluster.local:3000",
+    "ghcp-proxy.pool2.svc.cluster.local:3000",
+    "ghcp-proxy.pool3.svc.cluster.local:3000",
+    "ghcp-proxy.pool4.svc.cluster.local:3000",
+    "ghcp-proxy.pool5.svc.cluster.local:3000"
+  ],
+  "trustedCidrs": [
+    "192.0.2.10/32"
+  ]
+}
