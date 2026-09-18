@@ -35,7 +35,7 @@ test('offline browser covers pool controls, version conflicts, disabled mode, an
     await page.getByRole('heading', { name: 'Default user pool' }).waitFor();
     await page.getByText('Low idle capacity:', { exact: false }).waitFor();
     assert.equal(await page.locator(`code[title="${hash}"]`).count(), 1);
-    assert.match(await page.locator(`code[title="${hash}"]`).first().innerText(), /^sha256:.*…/);
+    assert.equal(await page.locator(`code[title="${hash}"]`).first().textContent(), hash);
     await page.getByLabel('Refresh every 10s').uncheck();
     if (process.env.POOL_UI_SCREENSHOT) await page.screenshot({ path: process.env.POOL_UI_SCREENSHOT, fullPage: true });
 
@@ -276,6 +276,172 @@ function deferred() {
   const promise = new Promise<void>((complete) => { resolve = complete; });
   return { promise, resolve };
 }
+
+test('full LiteLLM hashes copy from accounts, leases, events and confirmation', { timeout: 90000 }, async () => {
+  const fixture = await offlinePool(overview());
+  const { page } = fixture;
+  try {
+    await page.addInitScript({ content: `
+      window.__clipboardWrites = [];
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+        writeText: async function(value) { window.__clipboardWrites.push(value); }
+      } });
+    ` });
+    await page.goto('http://pool-console.test/#user-pool');
+    await page.getByRole('heading', { name: 'Default user pool' }).waitFor();
+    await page.getByLabel('Refresh every 10s').uncheck();
+    const accounts = page.getByRole('region', { name: 'Pool accounts' });
+    const code = accounts.locator(`code[title="${hash}"]`);
+    assert.equal(await code.textContent(), hash);
+    const selected = await code.evaluate(element => {
+      const selection = window.getSelection()!;
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      selection.removeAllRanges(); selection.addRange(range);
+      return selection.toString();
+    });
+    assert.equal(selected, hash);
+    await accounts.getByRole('button', { name: 'Copy LiteLLM key hash', exact: true }).click();
+    await accounts.getByRole('status').filter({ hasText: 'Hash copied.' }).waitFor();
+    await accounts.getByRole('button', { name: 'Copy LiteLLM key hash', exact: true }).focus();
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => (window as unknown as { __clipboardWrites: string[] }).__clipboardWrites.length === 2);
+    assert.equal(await accounts.getByRole('row').filter({ hasText: 'birch00' }).getByRole('button', { name: /Copy/ }).count(), 0);
+    await page.getByRole('button', { name: 'Leases', exact: true }).click();
+    const leases = page.getByRole('region', { name: 'Caller leases' });
+    await leases.getByRole('button', { name: 'Copy LiteLLM key hash', exact: true }).focus();
+    await page.keyboard.press('Space');
+    await leases.getByRole('status').filter({ hasText: 'Hash copied.' }).waitFor();
+    await leases.getByRole('button', { name: 'Release', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByRole('button', { name: 'Copy LiteLLM key hash', exact: true }).click();
+    await dialog.getByRole('status').filter({ hasText: 'Hash copied.' }).waitFor();
+    assert.equal(fixture.mutations.length, 0, 'copy must not release a lease');
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await page.getByRole('button', { name: 'Recent events', exact: true }).click();
+    const events = page.getByRole('region', { name: 'Recent pool events' });
+    await events.getByRole('button', { name: 'Copy LiteLLM key hash', exact: true }).click();
+    await events.getByRole('status').filter({ hasText: 'Hash copied.' }).waitFor();
+    const writes = await page.evaluate(() => (window as unknown as { __clipboardWrites: string[] }).__clipboardWrites);
+    assert.deepEqual(writes, Array(5).fill(hash.slice(7)));
+    assert.ok(writes.every(value => !value.includes('…') && !value.includes('...')));
+    assert.deepEqual(fixture.mutations, []);
+    assert.deepEqual(fixture.errors, []);
+  } finally { await fixture.close(); }
+});
+
+test('copy icon hints on hover or focus and success clears without changing row height', { timeout: 90000 }, async () => {
+  const fixture = await offlinePool(overview());
+  const { page } = fixture;
+  try {
+    await page.addInitScript({ content: `
+      window.__clipboardWrites = [];
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+        writeText: async function(value) { window.__clipboardWrites.push(value); }
+      } });
+    ` });
+    await page.goto('http://pool-console.test/#user-pool');
+    await page.getByRole('heading', { name: 'Default user pool' }).waitFor();
+    await page.getByLabel('Refresh every 10s').uncheck();
+    const accounts = page.getByRole('region', { name: 'Pool accounts' });
+    const button = accounts.getByRole('button', { name: 'Copy LiteLLM key hash', exact: true });
+    const row = accounts.getByRole('row').filter({ has: page.getByText('amber00', { exact: true }) });
+    assert.equal(await button.innerText(), '');
+    assert.equal(await button.locator('svg').count(), 1);
+    assert.equal(await button.evaluate(element => getComputedStyle(element).borderTopWidth), '0px');
+    const before = (await row.boundingBox())!.height;
+    await button.hover();
+    await accounts.getByRole('tooltip', { name: 'Copy hash', exact: true }).waitFor();
+    await page.getByRole('heading', { name: 'Default user pool' }).hover();
+    await accounts.getByRole('tooltip').waitFor({ state: 'hidden' });
+    await button.focus();
+    await accounts.getByRole('tooltip', { name: 'Copy hash', exact: true }).waitFor();
+    await page.keyboard.press('Escape');
+    await accounts.getByRole('tooltip').waitFor({ state: 'hidden' });
+    await button.click();
+    await accounts.getByRole('tooltip', { name: 'Copied', exact: true }).waitFor();
+    assert.equal((await row.boundingBox())!.height, before);
+    await accounts.getByRole('tooltip').waitFor({ state: 'hidden', timeout: 5000 });
+    assert.equal(await accounts.getByRole('status').textContent(), '');
+    assert.equal((await row.boundingBox())!.height, before);
+    await button.press('Enter');
+    await accounts.getByRole('tooltip', { name: 'Copied', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Leases', exact: true }).click();
+    await page.getByRole('button', { name: 'Accounts', exact: true }).click();
+    await accounts.getByRole('button', { name: 'Copy LiteLLM key hash', exact: true }).waitFor();
+    assert.equal(await accounts.getByRole('tooltip').count(), 0);
+    await button.hover();
+    await accounts.getByRole('tooltip', { name: 'Copy hash', exact: true }).waitFor();
+    assert.deepEqual(await page.evaluate(() => (window as unknown as { __clipboardWrites: string[] }).__clipboardWrites), [hash.slice(7), hash.slice(7)]);
+    assert.deepEqual(fixture.mutations, []);
+    assert.deepEqual(fixture.errors, []);
+  } finally { await fixture.close(); }
+});
+
+test('clipboard rejection or absence exposes exact selectable value and clears on refreshed identity', { timeout: 90000 }, async () => {
+  const fixture = await offlinePool(overview());
+  const { page } = fixture;
+  try {
+    await page.addInitScript({ content: `
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+        writeText: async function() { throw new Error('Synthetic permission denial'); }
+      } });
+    ` });
+    await page.goto('http://pool-console.test/#user-pool');
+    await page.getByRole('heading', { name: 'Default user pool' }).waitFor();
+    await page.getByLabel('Refresh every 10s').uncheck();
+    await page.getByRole('button', { name: 'Copy LiteLLM key hash', exact: true }).click();
+    const hashInput = page.getByRole('textbox', { name: 'LiteLLM key hash — full value', exact: true });
+    await hashInput.waitFor();
+    assert.equal(await hashInput.inputValue(), hash.slice(7));
+    assert.equal(await hashInput.evaluate(input => (input as HTMLInputElement).readOnly), true);
+    assert.equal(await hashInput.evaluate(input => document.activeElement === input && (input as HTMLInputElement).selectionEnd === 64), true);
+    assert.equal(await page.getByRole('status').filter({ hasText: 'copied.' }).count(), 0);
+    await page.evaluate(() => Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined }));
+    await page.getByRole('button', { name: 'Copy LiteLLM key hash', exact: true }).click();
+    await hashInput.waitFor();
+    assert.equal(await hashInput.inputValue(), hash.slice(7));
+    await page.setViewportSize({ width: 375, height: 812 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+    const changed = `sha256:${'b'.repeat(64)}`;
+    fixture.data.accounts[0]!.callerKeyHash = changed;
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await page.locator(`code[title="${changed}"]`).waitFor();
+    assert.equal(await page.getByRole('textbox', { name: /full value/ }).count(), 0);
+    await page.getByRole('button', { name: 'Copy LiteLLM key hash', exact: true }).click();
+    assert.equal(await page.getByRole('textbox', { name: 'LiteLLM key hash — full value', exact: true }).inputValue(), changed.slice(7));
+    await page.getByRole('button', { name: 'Leases', exact: true }).click();
+    await page.getByRole('button', { name: 'Release', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByRole('button', { name: 'Copy LiteLLM key hash', exact: true }).click();
+    await dialog.getByRole('textbox', { name: 'LiteLLM key hash — full value', exact: true }).waitFor();
+    assert.equal(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth), true);
+    assert.deepEqual(fixture.mutations, []);
+    assert.deepEqual(fixture.errors, []);
+  } finally { await fixture.close(); }
+});
+
+test('malformed caller IDs are neither rendered nor copyable', { timeout: 60000 }, async () => {
+  const data = overview();
+  data.accounts[0]!.callerKeyHash = 'sk-not-a-caller-hash';
+  data.leases[0]!.callerKeyHash = `sha256:${'A'.repeat(64)}`;
+  data.events[0]!.callerKeyHash = `sha256:${'b'.repeat(63)}`;
+  const fixture = await offlinePool(data);
+  try {
+    await fixture.page.goto('http://pool-console.test/#user-pool');
+    await fixture.page.getByRole('heading', { name: 'Default user pool' }).waitFor();
+    await fixture.page.getByLabel('Refresh every 10s').uncheck();
+    for (const tab of ['Accounts', 'Leases', 'Recent events']) {
+      await fixture.page.getByRole('button', { name: tab, exact: true }).click();
+      await paint(fixture.page);
+      assert.equal(await fixture.page.getByRole('button', { name: /Copy/ }).count(), 0);
+      assert.equal(await fixture.page.locator('code[title^="sha256:"]').count(), 0);
+      assert.equal(await fixture.page.getByText('sk-not-a-caller-hash', { exact: true }).count(), 0);
+    }
+    assert.deepEqual(fixture.mutations, []);
+    assert.deepEqual(fixture.errors, []);
+  } finally { await fixture.close(); }
+});
 
 async function offlinePool(initialData: UserPoolOverview) {
   const browser = await chromium.launch({ headless: true, channel: process.env.PLAYWRIGHT_CHANNEL || undefined });

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { ConsoleApiError } from '../api/client.js';
 import {
   getUserPoolSummary, getUserPoolPage, reconcileUserPool, releaseUserPoolLease, updateUserPoolAccount, updateUserPoolSettings,
@@ -399,8 +399,70 @@ function PoolTable({ label, headers, children }: { label: string; headers: strin
 }
 function EmptyRow({ columns, children }: { columns: number; children: ReactNode }) { return <tr><td colSpan={columns} className="py-8 text-center text-slate-500">{children}</td></tr>; }
 function CallerHash({ value, missing = '—' }: { value: string | null; missing?: string }) {
-  const formatted = formatCallerKeyHash(value);
-  return formatted ? <code className="whitespace-nowrap text-xs" title={value!} aria-label={value!}>{formatted}</code> : <span className="text-xs text-slate-500">{missing}</span>;
+  return formatCallerKeyHash(value) ? <CopyableCallerHash key={value} value={value!} /> : <span className="text-xs text-slate-500">{missing}</span>;
+}
+function CopyableCallerHash({ value }: { value: string }) {
+  const [copying, setCopying] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [showHint, setShowHint] = useState(false);
+  const [fallback, setFallback] = useState(false);
+  const input = useRef<HTMLInputElement>(null);
+  const resetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const mounted = useRef(false);
+  const tooltipId = useId();
+  const hash = value.slice('sha256:'.length);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; clearTimeout(resetTimer.current); };
+  }, []);
+  useEffect(() => {
+    if (fallback) { input.current?.focus(); input.current?.select(); }
+  }, [fallback]);
+  const hint = () => { if (!copied && !copying) setShowHint(true); };
+  const copy = async () => {
+    clearTimeout(resetTimer.current);
+    setCopying(true);
+    setCopied(false);
+    setShowHint(false);
+    setFallback(false);
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(hash);
+      if (!mounted.current) return;
+      setCopied(true);
+      resetTimer.current = setTimeout(() => { setCopied(false); }, 2000);
+    } catch {
+      if (mounted.current) setFallback(true);
+    } finally { if (mounted.current) setCopying(false); }
+  };
+  return <span className="inline-flex w-64 max-w-full flex-col items-start gap-1">
+    <span className="flex w-full items-center gap-2">
+      <code className="min-w-0 flex-1 truncate text-xs" title={value} aria-label={value}>{value}</code>
+      <span className="relative inline-flex shrink-0">
+        <button type="button" disabled={copying} onClick={() => { void copy(); }}
+          onMouseEnter={hint} onMouseLeave={() => setShowHint(false)}
+          onFocus={hint} onBlur={() => setShowHint(false)}
+          onKeyDown={(event) => { if (event.key === 'Escape') { setShowHint(false); setCopied(false); } }}
+          aria-label="Copy LiteLLM key hash" aria-describedby={showHint || copied ? tooltipId : undefined}
+          className="inline-flex h-7 w-7 items-center justify-center rounded text-slate-500 hover:bg-slate-100 hover:text-slate-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-500 disabled:cursor-wait disabled:opacity-50">
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="8" y="8" width="12" height="12" rx="1" /><path d="M16 8V4a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h4" />
+          </svg>
+        </button>
+        {showHint || copied ? <span id={tooltipId} role="tooltip"
+          className="pointer-events-none absolute bottom-full right-0 z-20 mb-2 whitespace-nowrap rounded border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 shadow-md">
+          {copied ? 'Copied' : 'Copy hash'}
+          <span aria-hidden="true" className="absolute right-2 top-full -mt-1 h-2 w-2 rotate-45 border-b border-r border-slate-200 bg-white" />
+        </span> : null}
+      </span>
+    </span>
+    <span role="status" aria-live="polite" className="sr-only">{copied ? 'Hash copied.' : fallback ? 'Automatic copy unavailable. Copy the selected full hash below.' : ''}</span>
+    {fallback ? <label className="w-full text-xs text-slate-600">Automatic copy unavailable. Copy this full hash manually.
+      <input ref={input} readOnly value={hash} aria-label="LiteLLM key hash — full value"
+        onFocus={(event) => event.target.select()}
+        className="mt-1 block w-full min-w-0 rounded border border-slate-300 bg-white px-2 py-1 font-mono text-xs text-slate-900" />
+    </label> : null}
+  </span>;
 }
 function StateLabel({ value }: { value: string }) {
   return <span className="inline-flex rounded border border-slate-200 bg-slate-50 px-2 py-1 text-xs font-medium text-slate-800">{stateLabels[value] ?? value}</span>;
