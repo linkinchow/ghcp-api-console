@@ -1,5 +1,6 @@
 import type { RequestHandler, Response } from 'express';
 import { config } from '../config.js';
+import { loadProxyEnterpriseProfile } from '../enterprise.js';
 import { getStorage, initializeStorage } from '../db/connection.js';
 import { SqliteStorage } from '../db/sqliteStorage.js';
 import { Logger } from '../logger.js';
@@ -89,11 +90,13 @@ export function poolRequest(res: Response): PoolRequest | undefined {
   return res.locals?.userPool as PoolRequest | undefined;
 }
 
-export function statIdentity(res: Response, fallback: string): { identity: string; callerId?: string; leaseId?: string } {
+export function statIdentity(res: Response, fallback: string): { identity: string; enterpriseId?: string; callerId?: string; leaseId?: string } {
   const context = poolRequest(res);
   return context
-    ? { identity: context.held.member_identity, callerId: context.held.caller_id, leaseId: context.held.lease_id }
-    : { identity: fallback };
+    ? { identity: context.held.member_identity, enterpriseId: context.held.enterprise_id, callerId: context.held.caller_id, leaseId: context.held.lease_id }
+    // Direct routes are pinned to legacy scope, including failures before account
+    // creation. Stamp new facts here; never infer/relabel historical NULL stats.
+    : { identity: fallback, enterpriseId: loadProxyEnterpriseProfile().id };
 }
 
 export async function withPoolOperation(res: Response, operation: () => Promise<void>): Promise<void> {

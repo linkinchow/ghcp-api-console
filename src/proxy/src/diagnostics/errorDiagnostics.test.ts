@@ -2,22 +2,23 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import test from 'node:test';
 import { gzipSync } from 'node:zlib';
 import express, { type Request, type Response as ExpressResponse } from 'express';
 import { INTERNAL_AUTH_HEADER } from '@ghcp/shared';
-import { config } from '../config.js';
-import { listModels, prepareCopilotRequest } from '../copilot/copilotClient.js';
-import { listRequestStats } from '../db/requestStatsRepo.js';
-import { pipeAndRecord, recordTokenCountFallbackFailure } from '../routes/compatible.js';
-import { buildApp, captureRawRequestBody } from '../server.js';
-import {
-  DiagnosticBodyCapture,
-  createErrorDiagnosticContext,
-  errorDiagnosticsStore,
-  recordHttpFailure,
-} from './errorDiagnostics.js';
+import { configureProxyFixture } from '../test/enterpriseFixtures.js';
+
+Object.assign(process.env, { STORAGE_DRIVER: 'sqlite', ACCOUNT_ROUTING_MODE: 'direct',
+  MYSQL_SSL_MODE: 'disabled', PROXY_ERROR_DIAGNOSTICS_ENABLED: 'false' });
+configureProxyFixture();
+const [{ config }, { listModels, prepareCopilotRequest }, { listRequestStats },
+  { pipeAndRecord, recordTokenCountFallbackFailure }, { buildApp, captureRawRequestBody },
+  { DiagnosticBodyCapture, createErrorDiagnosticContext, errorDiagnosticsStore, recordHttpFailure }, { createAccount }] = await Promise.all([
+    import('../config.js'), import('../copilot/copilotClient.js'), import('../db/requestStatsRepo.js'),
+    import('../routes/compatible.js'), import('../server.js'), import('./errorDiagnostics.js'), import('../db/accountsRepo.js'),
+  ]);
 
 test('writes readable headers, pretty JSON bodies, and curl commands without base64 for text', async () => {
   await withDiagnosticsStore(false, async () => {
@@ -246,6 +247,7 @@ test('records model-list HTTP, fetch, and response-stream failures', async () =>
 test('records an upstream response-stream read failure as a failed request stat', async () => {
   await withDiagnosticsStore(false, async () => {
     const identity = `stream-stat-${randomUUID()}`;
+    await createAccount({ identity, ssoUser: identity });
     const context = createErrorDiagnosticContext(fakeRequest(Buffer.from('{"model":"gpt-5"}')), identity, '/responses', 'gpt-5');
     const prepared = prepareCopilotRequest(
       { identity, accessToken: 'upstream-value', api: 'https://api.githubcopilot.com' },
@@ -279,6 +281,7 @@ test('records an upstream response-stream read failure as a failed request stat'
 test('persists JSON, SSE, plain-text, and bodyless upstream HTTP failures', async () => {
   await withDiagnosticsStore(false, async () => {
     const identity = `http-shapes-${randomUUID()}`;
+    await createAccount({ identity, ssoUser: identity });
     const context = createErrorDiagnosticContext(fakeRequest(Buffer.from('{"model":"gpt-5"}')), identity, '/responses', 'gpt-5');
     const prepared = prepareCopilotRequest(
       { identity, accessToken: 'upstream-value', api: 'https://api.githubcopilot.com' },
@@ -343,7 +346,7 @@ async function withDiagnosticsStore(redacted: boolean, run: () => Promise<void>)
     maxFiles: errorDiagnosticsStore.options.maxFiles,
     configRedacted: config.errorDiagnosticsRedact,
   };
-  const directory = join(resolve(process.cwd(), 'data', 'error-diagnostics-tests'), randomUUID());
+  const directory = join(tmpdir(), `error-diagnostics-${randomUUID()}`);
   Object.assign(errorDiagnosticsStore.options, {
     enabled: true,
     directory,

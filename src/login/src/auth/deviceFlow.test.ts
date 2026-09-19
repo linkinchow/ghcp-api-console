@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { loginWithDeviceFlow } from './deviceFlow.js';
+import { loginWithDeviceFlow, sleep } from './deviceFlow.js';
 
 test('uses the OpenCode OAuth client and headers while polling', async () => {
   const requests: Array<{ input: string | URL | Request; init?: RequestInit }> = [];
@@ -67,6 +67,30 @@ test('uses the OpenCode OAuth client and headers while polling', async () => {
     device_code: 'device-code',
     grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
   });
+});
+
+test('AbortSignal covers HTTP, strategy and sleep; late poll does not return credentials after abort',async () => {
+  const controller = new AbortController();
+  let fetches = 0,strategies = 0;
+  await assert.rejects(loginWithDeviceFlow({name:'mock',authorize:async (_device,signal) => {strategies++;assert.equal(signal,controller.signal);}},
+    {info:() => {},warn:() => {}},{
+      fetch:async (_url,init) => {fetches++;assert.equal(init?.signal,controller.signal);assert.equal(init?.redirect,'error');return jsonResponse({device_code:'device',user_code:'user',verification_uri:'https://github.com/login/device',expires_in:900,interval:1});},
+      sleep:async (_ms,signal) => {assert.equal(signal,controller.signal);controller.abort();},now:() => 0,
+    },controller.signal));
+  assert.equal(fetches,1);assert.equal(strategies,1);
+  const sleeper = new AbortController(),pending = sleep(60_000,sleeper.signal);sleeper.abort();await assert.rejects(pending);
+  let preabortedCalls = 0;
+  await assert.rejects(loginWithDeviceFlow({name:'never',authorize:async () => {preabortedCalls++;}}, {info:() => {},warn:() => {}},
+    {fetch:async () => {preabortedCalls++;return jsonResponse({});},sleep:async () => {},now:() => 0},controller.signal));
+  assert.equal(preabortedCalls,0);
+});
+
+test('device response cannot redirect browser or leak upstream body into logs/errors',async () => {
+  const logs:unknown[] = [];
+  let launched = 0;
+  await assert.rejects(loginWithDeviceFlow({name:'never',authorize:async () => {launched++;}}, {info:(...args) => {logs.push(args);},warn:(...args) => {logs.push(args);}},
+    {fetch:async () => jsonResponse({device_code:'secret-device',user_code:'secret-user',verification_uri:'https://evil.test/login',expires_in:900,interval:1}),sleep:async () => {},now:() => 0}),/device_code_response_invalid/);
+  assert.equal(launched,0);assert.ok(!JSON.stringify(logs).includes('secret-'));
 });
 
 function jsonResponse(value: unknown): Response {

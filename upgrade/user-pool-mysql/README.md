@@ -4,6 +4,12 @@
 
 **状态（2026-09-14）：审查发现的问题已修复，隔离回归已通过。** [生产审查与修复记录](../../docs/user-pool-mysql-production-review.md)保留了原始失败及修复过程。该状态记录对应当时尚未发布的候选版本；客户备份演练、资源／SLO及基础设施验收是独立事项。本文不构成访问生产环境的授权。
 
+## v1 兼容边界
+
+本目录内的导入器、`legacy-copy`、`reconfigure-concurrency` 及其测试固定为提交 `8ad76d547c9d067aac79f99391859cc67dcd7b44`（`8ad76d5`）的 v1 行为。依赖的 schema、SQLite／MySQL store、纯配置解析器和姓名目录位于 `upgrade/v1-frozen/`，是该提交中 `src/proxy/src/db/` 与 `src/proxy/src/userPool/` 所需文件的原样副本。保留完整 store 是为了保持初始化、配置指纹与旧夹具语义一致；导入这些模块不会加载运行时配置、`.env` 或启动服务。旧工具不再依赖新运行时模块；严格的列、触发器、迁移历史及环境键 allowlist 均保持基线规则，不为 enterprise schema 放宽。
+
+**导入输出／准备副本仍为 v1 schema，不是 enterprise schema。** 要交给支持 enterprise／多 SSO 的新运行时，必须保持维护状态，随后执行另行审查的 enterprise schema 迁移，再进行新运行时切换。不要把 enterprise 数据库交回这些 v1 工具，也不要修改指纹或 allowlist 来绕过拒绝。下文配置默认值、初始化和切换说明均指冻结的 v1 行为；新运行时配置由后续 enterprise 迁移流程负责。
+
 ## 执行前准备
 
 1. 暂停账号池预热，停止接收新流量，排空所有推理／目录请求及已派发的开通／Login操作。对创建、SCIM、席位和OAuth结果不明的任务，按运维核对流程处理；不要只为通过校验而清除安全字段。
@@ -42,7 +48,7 @@ npm run upgrade:user-pool-mysql -- --sqlite /safe/offline/backup.sqlite \
 
 ## 校验与数据保留
 
-支持的输入是当前账号池表结构，包括OAuth恢复字段及caller／lease统计列。未知表、视图、触发器名称、关键列缺失或多余、生成列，以及不兼容的SQLite列类型都会被拒绝。**允许保留凭据隔离触发器的前提是其SQLite定义符合标准，不能只检查名称。** 旧版或自定义结构需要单独审查升级；导入器绝不升级或修改源库。任意SQLite索引和表结构迁移历史不会直接复制，MySQL会创建自己的索引与迁移历史。
+支持的输入是上述 v1 基线的账号池表结构，包括OAuth恢复字段及caller／lease统计列。未知表、视图、触发器名称、关键列缺失或多余、生成列，以及不兼容的SQLite列类型都会被拒绝。**允许保留凭据隔离触发器的前提是其SQLite定义符合标准，不能只检查名称。** 旧版或自定义结构需要单独审查升级；导入器绝不升级或修改源库。任意SQLite索引和表结构迁移历史不会直接复制，MySQL会创建自己的索引与迁移历史。
 
 预检使用只读连接并设置`query_only`，在同一个读事务中读取表结构、执行`integrity_check`和`foreign_key_check`、读取所有数据表，并显式校验关联关系和字段值。以下情况会被拒绝：
 

@@ -1,3 +1,7 @@
+import { configureProxyFixture, fixtureOptions, fixtureReadinessEvidence } from '../test/enterpriseFixtures.js';
+import { initEnterpriseMysqlV4 } from '@ghcp/shared/enterpriseMysqlV4';
+import { loadProxyEnterpriseRegistry } from '../enterprise.js';
+import { readPoolConfig } from '../userPool/config.js';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
@@ -190,6 +194,21 @@ async function fixture(t: TestContext) {
   admin = await createConnection({ uri: adminUrl.toString(), connectTimeout: 3000 });
   await admin.query({ sql: `CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`, timeout: 5000 });
   created = true;
+  configureProxyFixture(t);
+  const initialized = await createConnection({ uri: url.toString(), connectTimeout: 3000 });
+  try {
+    const registry = loadProxyEnterpriseRegistry();
+    await initEnterpriseMysqlV4(initialized, 'proxy', registry, fixtureOptions(readPoolConfig(process.env)));
+    // Runtime never autoactivates: this isolated fixture explicitly installs
+    // synthetic matching service evidence after the fresh paused/draft v4 init.
+    for (const profile of registry.profiles) {
+      const evidence = fixtureReadinessEvidence(registry, profile.id);
+      await initialized.query(`UPDATE enterprise_pool_policy SET state='active',policy_version=3,
+        validation_kind='local_service_readiness_v1',validation_evidence_json=?,validated_at=?,updated_at=? WHERE enterprise_id=?`,
+      [JSON.stringify(evidence), evidence.checkedAt, evidence.checkedAt, profile.id]);
+    }
+    await initialized.query('UPDATE user_pool_settings SET paused=0 WHERE id=1');
+  } finally { await initialized.end(); }
   modules = await loadModules();
   savedConfig = { ...modules.config };
   Object.assign(modules.config, { storageDriver: 'mysql', mysqlUrl: url.toString(), mysqlSslMode: 'disabled',

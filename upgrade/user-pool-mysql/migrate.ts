@@ -1,11 +1,11 @@
 import Database from 'better-sqlite3';
 import { closeSync, existsSync, openSync, readFileSync, readSync } from 'node:fs';
 import { createPool, type Pool, type PoolConnection, type RowDataPacket } from 'mysql2/promise';
-import { runMysqlMigrations, TOKEN_COLLATION_MIGRATION } from '../../src/proxy/src/db/mysqlMigrations.js';
+import { runMysqlMigrations, TOKEN_COLLATION_MIGRATION } from '../v1-frozen/db/mysqlMigrations.js';
 import { canonicalSql, SQLITE_CREDENTIAL_FENCE_DDL, MysqlSchemaError,
-  MYSQL_SCHEMA, validateMysqlSchema, validateMysqlCredentialFence } from '../../src/proxy/src/db/mysqlSchema.js';
-import { normalizePoolConfig, readPoolConfig, type PoolConfig } from '../../src/proxy/src/userPool/config.js';
-import { accountName, NAME_CAPACITY } from '../../src/proxy/src/userPool/names.js';
+  MYSQL_SCHEMA, validateMysqlSchema, validateMysqlCredentialFence } from '../v1-frozen/db/mysqlSchema.js';
+import { normalizePoolConfig, readPoolConfig, type PoolConfig } from '../v1-frozen/userPool/config.js';
+import { accountName, NAME_CAPACITY } from '../v1-frozen/userPool/names.js';
 
 type Value = string | number | null;
 type Row = Record<string, Value>;
@@ -310,7 +310,7 @@ export async function migrateSqlitePoolToMysql(options: MigrationOptions): Promi
     await inspectTarget(connection, false, config);
     await runMysqlMigrations(pool);
     // Lazy load: source-only preflight stays independent of MySQL schema/provider initialization.
-    const { MysqlPoolStore } = await import('../../src/proxy/src/userPool/mysqlStore.js');
+    const { MysqlPoolStore } = await import('../v1-frozen/userPool/mysqlStore.js');
     await new MysqlPoolStore(pool, config).initialize();
     await connection.query('SET SESSION time_zone = \'+00:00\'');
     await connection.query("SET SESSION sql_mode = 'STRICT_ALL_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'");

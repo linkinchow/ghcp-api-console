@@ -2,6 +2,20 @@
 
 `src/login` 是内部登录服务，负责把“需要重新授权 Copilot OAuth 的账号”转换成可执行的登录任务：使用 OpenCode OAuth client 通过 GitHub Device Flow 获取一次性设备码，使用 Playwright 自动完成 GitHub/SSO 登录授权，拿到 OAuth token 后回写给 `proxy` 服务。它不提供面向终端用户的 UI，也不直接代理 Copilot 请求；账号与 token 的最终状态由 `proxy` 维护。
 
+## 多企业分支：契约 2 与显式初始化
+
+`feat/multi-sso-slug` 第三阶段使用schema3/contract2和`ENTERPRISE_REGISTRY_FILE`。旧库先执行显式迁移，不能直接用下方历史启动命令触发自动升级；第二阶段schema2同样需要2→3转换。以下涉及旧任务重试和nonce-only回调的章节仅保留历史背景，以本节及阶段验证报告为准。
+
+- 新入口是`/api/profiles/:enterpriseId/tasks`；旧`/api/tasks`只绑定持久化的原企业ID，不根据body或列表第一项换企业。
+- 新任务必须有企业、企业revision、账号incarnation、OAuth attempt和预期GitHub主体完整绑定；先向Proxy验证，再幂等登记。重复同attempt不新开浏览器，异绑定拒绝；删任务也保留nonce证据。
+- 重新授权必须由Proxy创建新attempt，不能对终态任务简单重跑旧nonce。迁移历史任务保留原值且只读执行绑定，不猜测历史incarnation。
+- 新状态包括`callback_pending`、`cancel_requested`、`uncertain`。取消API返回`{task,outcome}`，只有权威确认才是cancelled；未知状态不等于失败或成功，不允许直接删除。
+- 重启不恢复内存密码，不重投浏览器。最多20条/30秒有界核对，其余通过显式reconcile处理；无法确认Proxy结果时保留uncertain。
+- 成功/失败/取消回调使用`/internal/profiles/:enterpriseId/accounts/:identity/authorization-attempts/:attemptId/{success,failure,cancel}`；Proxy最终校验新token实际GitHub主体并原子消费授权绑定，旧缺绑定写入端点拒绝。
+- 浏览器和日志/artifact按企业＋任务隔离；SSO地址/selector从可信profile读取，不由请求覆盖；密码和token不写任务库。
+
+单次登录调试命令不是生产任务/回调链路，也不代替以上隔离与授权检查。测试只能使用合成凭据和mock；本轮没有真实GitHub登录授权。
+
 ## 核心功能
 
 - **登录任务队列**：`POST /api/tasks` 创建任务，内存队列按 DB 运行时设置控制并发；任务元数据持久化到 SQLite。

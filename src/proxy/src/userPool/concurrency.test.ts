@@ -1,7 +1,7 @@
+import { createSqlitePoolFixture, TEST_ENTERPRISE } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
 import Database from 'better-sqlite3';
-import { runMigrations } from '../db/migrations.js';
 import { readPoolConfig } from './config.js';
 import { UserPoolStore } from './store.js';
 import { PrewarmWorker } from './worker.js';
@@ -10,10 +10,10 @@ import type { ProvisionAdapter, ProvisionContext, ProvisionPatch } from './provi
 function setup(t: TestContext, target = 20, cap = target) {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
-  runMigrations(db);
+
   const config = readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease', POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test',
     POOL_WARMUP_MODEL: 'test-model', READY_IDLE_TARGET: String(target), POOL_MAX_ACCOUNTS: String(cap) });
-  const store = new UserPoolStore(db, config);
+  const store = createSqlitePoolFixture(db, config);
   const workers: PrewarmWorker[] = [];
   t.after(async () => { for (const worker of workers) await worker.stop(); db.close(); });
   const worker = (adapter: ProvisionAdapter, concurrency = 5, pollMs = 5000) => {
@@ -151,7 +151,9 @@ test('pause stops new dispatch while active stages finish; shrink does not delet
   const worker = f.worker({ step(row) { const step = deferred<ProvisionPatch>(); running.set(row.identity, step); return step.promise; } }, 2);
   await worker.start();
   await waitFor(() => running.size === 2);
-  f.store.updateSettings(f.store.settings().version, { paused: 1, idle_target: 0, max_accounts: 1 });
+  f.store.updateSettings(f.store.settings().version, { paused: 1, idle_target: 0 });
+  const policy = f.store.enterprisePolicy(TEST_ENTERPRISE.id)!;
+  f.store.updateEnterprisePolicy(TEST_ENTERPRISE.id, policy.policyVersion, { type: 'cap', maxAccounts: 1 });
   for (const [identity, step] of running) step.resolve(f.ready(identity));
   await waitFor(() => f.store.counts().ready_idle === 2);
   await worker.tick();

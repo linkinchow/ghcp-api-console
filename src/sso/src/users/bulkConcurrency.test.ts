@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { initSsoFixture } from '../db/enterpriseFixture.js';
 
 test('limits sync_emu concurrency and preserves result order', async () => {
-  process.env.DB_PATH = ':memory:';
   process.env.SSO_USER_EVENTS_LOG = '/dev/null';
   process.env.SCIM_BASE_URL = 'https://scim.test/scim/v2/enterprises/test';
   process.env.SCIM_TOKEN = 'test-scim-token';
@@ -10,6 +10,7 @@ test('limits sync_emu concurrency and preserves result order', async () => {
   process.env.ENTERPRISE_SLUG = 'test-enterprise';
   process.env.GITHUB_COPILOT_SEAT_PAT = 'test-seat-token';
   process.env.LOG_LEVEL = 'error';
+  const scope = initSsoFixture();
 
   const originalFetch = globalThis.fetch;
   let activeCreates = 0;
@@ -36,17 +37,17 @@ test('limits sync_emu concurrency and preserves result order', async () => {
     const { updateSsoRuntimeSettings } = await import('../db/runtimeSettingsRepo.js');
     const { runSsoUserBatch } = await import('./service.js');
     for (const ssoUser of ['charlie', 'alice', 'bob']) {
-      createUser({ ssoUser, passwordHash: 'hash', salt: 'salt', email: `${ssoUser}@example.com` });
+      createUser({ ssoUser, passwordHash: 'hash', salt: 'salt', email: `${ssoUser}@example.com` }, scope);
     }
     updateSsoRuntimeSettings({
       expectedVersion: 1,
       changes: { bulkSyncConcurrency: 2, scimRequestDelayMs: 0, scimMaxRetries: 0 },
-    });
+    }, scope);
 
     const result = await runSsoUserBatch({
       operation: 'sync_emu',
       ssoUsers: ['charlie', 'alice', 'bob'],
-    });
+    }, scope);
 
     assert.equal(maxActiveCreates, 2);
     assert.deepEqual(result.rows.map((row) => row.ssoUser), ['charlie', 'alice', 'bob']);

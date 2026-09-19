@@ -7,6 +7,9 @@ import {
   type SsoUserDto,
 } from '@ghcp/shared';
 import { config } from '../config.js';
+import { loadProxyEnterpriseProfile, loadProxyEnterpriseRegistry } from '../enterprise.js';
+import { probeEnterpriseCreationCapacity, probeEnterpriseReadiness } from '../clients/enterpriseReadiness.js';
+import type { EnterpriseProfileV3 } from '@ghcp/shared';
 import type { getAccount, beginCopilotOauthAuthorization, invalidateCopilotOauthToken } from '../db/accountsRepo.js';
 import {
   prepareCopilotRequest,
@@ -42,6 +45,7 @@ export class ProvisionFailure extends Error {
 export interface ProvisionContext {
   signal: AbortSignal;
   assertCurrent(): Awaitable<void>;
+  assertCanAdvance?(): Awaitable<void>;
   /** Fence a warmup against credential writes, including ABA token replacement. */
   pinCredentials(): Awaitable<void>;
   /** Legacy injected test adapters only; production invalidation updates its pin atomically. */
@@ -57,12 +61,16 @@ export type LoginReservationOutcome = 'success' | 'failed';
 
 export interface ProvisionAdapter {
   readonly stepTimeoutMs?: number;
+  eligibleEnterprises?(signal: AbortSignal, owner: string): Promise<readonly string[]>;
   step(row: ProvisionInventory, context: ProvisionContext): Promise<ProvisionPatch>;
   /** Observe only: never retry, cancel, begin OAuth, warm up, or modify credentials. */
   reconcileLoginReservation?(row: ProvisionInventory, context: LoginReservationContext): Promise<LoginReservationOutcome | undefined>;
 }
 
 interface ProvisionDependencies {
+  enterpriseProfile: (enterpriseId: string) => EnterpriseProfileV3;
+  verifyReadiness: (profile: EnterpriseProfileV3, signal: AbortSignal) => Promise<void>;
+  creationCapacity: (profile: EnterpriseProfileV3, signal: AbortSignal) => Promise<boolean>;
   fetch: typeof fetch;
   getAccount: typeof getAccount;
   createAccount(input: CreateAccountInput): Promise<ProxyAccountRecord>;
@@ -77,19 +85,101 @@ const LOGIN_TASK_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_TASK_PAGES = 10;
 
 export function realProvisioner(
-  store: Pick<PoolStore, 'now'>,
+  store: Pick<PoolStore, 'now'> & Partial<Pick<PoolStore, 'enterprisePolicies'>>,
   options: PoolConfig,
   dependencies: Partial<ProvisionDependencies> = {},
 ): ProvisionAdapter {
   const deps = {
+    enterpriseProfile: loadProxyEnterpriseProfile,
+    verifyReadiness: async (profile: EnterpriseProfileV3, signal: AbortSignal) => {
+      await probeEnterpriseReadiness(loadProxyEnterpriseRegistry(), profile.id, config.internalApiToken, { signal });
+    },
+    creationCapacity: (profile: EnterpriseProfileV3, signal: AbortSignal) => probeEnterpriseCreationCapacity(
+      profile, config.internalApiToken, { signal, fetch: dependencies.fetch }),
     fetch: (...args: Parameters<typeof fetch>) => fetch(...args),
     // Reads may use either storage driver. Production writes use the atomic context.
-    getAccount: (identity: string) => getStorage().getAccount(identity),
+    getAccount: (identity: string, enterpriseId?: string) => getStorage().getAccount(identity, enterpriseId),
     resolveModel: resolveCopilotModel,
     executeRequest: executePreparedCopilotRequest,
     ...dependencies,
   };
-  const email = (row: ProvisionInventory) => `${row.identity}@${options.accountDomain}`;
+  const profileFor = (row: ProvisionInventory): EnterpriseProfileV3 => {
+    if (!row.enterprise_id || !row.enterprise_revision) throw new ProvisionFailure('enterprise_scope_missing', true);
+    const profile = deps.enterpriseProfile(row.enterprise_id);
+    if (profile.id !== row.enterprise_id || profile.revision !== row.enterprise_revision) {
+      throw new ProvisionFailure('enterprise_scope_mismatch', true);
+    }
+    return profile;
+  };
+  const email = (row: ProvisionInventory) => `${row.identity}@${profileFor(row).accountDomain}`;
+  const readiness = new Map<string, number>();
+  let readinessOwner: string | undefined;
+  let readinessOffset = 0;
+  async function readyForCreation(signal: AbortSignal, owner: string): Promise<readonly string[]> {
+    signal.throwIfAborted();
+    if (readinessOwner !== owner) { readiness.clear(); readinessOffset = 0; readinessOwner = owner; }
+    // The scan deadline is separate from owner cancellation: a slow peer must not
+    // erase successful peers. The worker retains an outer watchdog for bad adapters.
+    const scan = new AbortController();
+    const scanSignal = AbortSignal.any([signal, scan.signal]);
+    const deadline = setTimeout(() => scan.abort(), Math.min(options.requestTimeoutMs, 4000));
+    deadline.unref();
+    const eligible: string[] = [];
+    try {
+      const policies = await untilSignal(Promise.resolve(store.enterprisePolicies!()), scanSignal);
+      const active = policies.filter(policy => policy.state === 'active');
+      const offset = active.length ? readinessOffset % active.length : 0;
+      let index = 0;
+      await Promise.all(Array.from({ length: Math.min(4, active.length) }, async () => {
+        while (index < active.length && !scanSignal.aborted) {
+          const policy = active[(offset + index++) % active.length]!;
+          // A bounded scan must not starve healthy profiles behind a hung prefix.
+          // Advance only this owner's cursor; scheduling scores remain unchanged.
+          if (readinessOwner === owner) readinessOffset = (offset + index) % active.length;
+          const probe = new AbortController();
+          const probeSignal = AbortSignal.any([scanSignal, probe.signal]);
+          const timeout = setTimeout(() => probe.abort(), Math.min(options.requestTimeoutMs, 1000));
+          timeout.unref();
+          try {
+            const profile = deps.enterpriseProfile(policy.enterpriseId);
+            if (profile.login.provider !== 'custom') continue;
+            if ((readiness.get(profile.id) ?? 0) <= performance.now()) {
+              await untilSignal(deps.verifyReadiness(profile, probeSignal), probeSignal);
+              probeSignal.throwIfAborted();
+              if (readinessOwner !== owner) continue;
+              readiness.set(profile.id, performance.now() + 15000);
+            }
+            // Capacity is deliberately not cached with readiness. Direct SSO users
+            // can consume it without any pool policy/evidence change.
+            if (await untilSignal(deps.creationCapacity(profile, probeSignal), probeSignal)) {
+              probeSignal.throwIfAborted();
+              if (readinessOwner === owner) eligible.push(profile.id);
+            }
+          } catch {
+            // Failed/timed-out profiles are not candidates; healthy peers survive.
+          } finally { clearTimeout(timeout); probe.abort(); }
+        }
+      }));
+    } catch {
+      // An unavailable policy list has no eligible profiles; a scan timeout keeps
+      // only already completed, identity-checked probes, never late completions.
+    } finally { clearTimeout(deadline); scan.abort(); }
+    signal.throwIfAborted();
+    return readinessOwner === owner ? eligible : [];
+  }
+  async function assertDispatch(row: ProvisionInventory, context: ProvisionContext): Promise<void> {
+    await context.assertCurrent();
+    await context.assertCanAdvance?.();
+    const profile = profileFor(row);
+    if (profile.login.provider !== 'custom') throw new ProvisionFailure('pool_provider_unsupported', true);
+    if ((readiness.get(profile.id) ?? 0) <= performance.now()) {
+      try { await deps.verifyReadiness(profile, context.signal); }
+      catch { throw new ProvisionFailure('enterprise_readiness_unavailable'); }
+      readiness.set(profile.id, performance.now() + 15000);
+    }
+    await context.assertCurrent();
+    await context.assertCanAdvance?.();
+  }
 
   async function mutate(row: ProvisionInventory, context: ProvisionContext, mutation: WorkerCredentialMutation): Promise<boolean> {
     await context.assertCurrent();
@@ -118,18 +208,23 @@ export function realProvisioner(
   }
 
   async function request<T>(
+    row: ProvisionInventory,
     context: LoginReservationContext,
     service: 'sso' | 'login',
     path: string,
     body?: unknown,
   ): Promise<T> {
     await context.assertCurrent();
-    const baseUrl = service === 'sso' ? config.ssoBaseUrl : config.loginBaseUrl;
-    const response = await deps.fetch(`${baseUrl.replace(/\/+$/, '')}${path}`, {
+    const profile=profileFor(row);
+    const baseUrl=service==='sso'?profile.routes.ssoInternalUrl:profile.routes.loginInternalUrl;
+    const scopedPath=path.replace(/^\/api(?=\/)/,`/api/profiles/${encodeURIComponent(profile.id)}`);
+    const response = await deps.fetch(`${baseUrl.replace(/\/+$/, '')}${scopedPath}`, {
       method: body === undefined ? 'GET' : 'POST',
       headers: {
         Accept: 'application/json',
         [INTERNAL_AUTH_HEADER]: config.internalApiToken,
+        'x-enterprise-id':profile.id,
+        'x-enterprise-revision':String(profile.revision),
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -138,10 +233,21 @@ export function realProvisioner(
     });
     try {
       await context.assertCurrent();
-      if (!response.ok) throw new ProvisionFailure(`${service}_http_${response.status}`);
-      const body = await readJson(response, context.signal);
+      if (!response.ok) {
+        // Only this authoritative rejection proves POST /users did not create a
+        // user. Unknown/non-JSON/redirected responses remain ambiguous.
+        if (service === 'sso' && path === '/api/users' && body !== undefined
+          && response.status === 409 && !response.redirected) {
+          const rejection = await readJson(response, context.signal) as { error?: { code?: unknown } } | null;
+          await context.assertCurrent();
+          if (rejection?.error?.code === 'sso_user_limit_reached') throw new ProvisionFailure('sso_user_limit_reached');
+        }
+        throw new ProvisionFailure(`${service}_http_${response.status}`);
+      }
+      if (response.redirected) throw new ProvisionFailure('service_invalid_response');
+      const payload = await readJson(response, context.signal);
       await context.assertCurrent();
-      return body as T;
+      return payload as T;
     } catch (error) {
       void response.body?.cancel().catch(() => {});
       throw error;
@@ -149,7 +255,8 @@ export function realProvisioner(
   }
 
   function checkUser(row: ProvisionInventory, user: SsoUserDto, creating = false): SsoUserDto {
-    if (!user || user.ssoUser !== row.identity || user.email !== email(row) || user.role !== 'user'
+    if (!user || user.enterpriseId !== row.enterprise_id || !user.userIncarnation
+      || user.ssoUser !== row.identity || user.email !== email(row) || user.role !== 'user'
       || !Number.isFinite(Date.parse(user.createdAt))) {
       throw new ProvisionFailure(creating ? 'sso_creation_ambiguous' : 'sso_identity_changed', true);
     }
@@ -160,7 +267,7 @@ export function realProvisioner(
   }
 
   async function knownUser(row: ProvisionInventory, context: ProvisionContext): Promise<SsoUserDto> {
-    return checkUser(row, await request<SsoUserDto>(context, 'sso', `/api/users/${encodeURIComponent(row.identity)}`));
+    return checkUser(row, await request<SsoUserDto>(row, context, 'sso', `/api/users/${encodeURIComponent(row.identity)}`));
   }
 
   function checkEntitlement(user: SsoUserDto): void {
@@ -171,9 +278,10 @@ export function realProvisioner(
 
   async function accountFor(row: ProvisionInventory, context: LoginReservationContext, user?: SsoUserDto): Promise<ProxyAccountRecord> {
     await context.assertCurrent();
-    const account = await deps.getAccount(row.identity);
+    const account = await deps.getAccount(row.identity, row.enterprise_id);
     await context.assertCurrent();
     if (!account || account.identity !== row.identity || account.ssoUser !== row.identity
+      || account.enterpriseId !== profileFor(row).id
       || user && account.ghLogin && account.ghLogin !== user.ghLogin) {
       throw new ProvisionFailure('proxy_identity_changed', true);
     }
@@ -183,7 +291,9 @@ export function realProvisioner(
   function checkTask(row: ProvisionInventory, task: LoginTaskDto, ghLogin: string): LoginTaskDto {
     if (!task || !task.id || row.task_id && task.id !== row.task_id
       || task.identity !== row.identity || task.ssoUser !== row.identity
-      || task.ghLogin !== ghLogin || task.oauthAttemptId !== row.oauth_attempt_id || task.ssoType !== 'custom') {
+      || task.ghLogin !== ghLogin || task.oauthAttemptId !== row.oauth_attempt_id || task.ssoType !== 'custom'
+      || task.enterpriseId !== profileFor(row).id || task.enterpriseRevision !== profileFor(row).revision
+      || task.expectedGhLogin !== ghLogin || !task.accountIncarnation) {
       throw new ProvisionFailure('oauth_task_mismatch', true);
     }
     return task;
@@ -192,7 +302,7 @@ export function realProvisioner(
   async function findTask(row: ProvisionInventory, context: LoginReservationContext, ghLogin: string): Promise<LoginTaskDto | undefined> {
     let found: LoginTaskDto | undefined;
     for (let page = 1; page <= MAX_TASK_PAGES; page++) {
-      const result = await request<PageResponse<LoginTaskDto>>(context, 'login',
+      const result = await request<PageResponse<LoginTaskDto>>(row, context, 'login',
         `/api/tasks?q=${encodeURIComponent(row.identity)}&page=${page}&pageSize=100`);
       if (!Array.isArray(result.items) || !Number.isSafeInteger(result.total) || result.total < 0) {
         throw new ProvisionFailure('oauth_task_list_invalid');
@@ -212,21 +322,31 @@ export function realProvisioner(
     await context.assertCurrent();
     if (row.stage === 'new') {
       try {
-        await request(context, 'sso', `/api/users/${encodeURIComponent(row.identity)}`);
+        await request(row, context, 'sso', `/api/users/${encodeURIComponent(row.identity)}`);
         throw new ProvisionFailure('sso_name_conflict', true);
       } catch (error) {
         if (!(error instanceof ProvisionFailure && error.code === 'sso_http_404')) throw error;
       }
       // POST /users has no idempotency key. A crash from this point requires manual
       // reconciliation, even if a later GET happens to find the expected name/email.
+      await assertDispatch(row, context);
       row = await context.checkpoint({ stage: 'sso-creating', sso_created_at: null });
       try {
-        const user = checkUser(row, await request<SsoUserDto>(context, 'sso', '/api/users', {
+        const user = checkUser(row, await request<SsoUserDto>(row, context, 'sso', '/api/users', {
           ssoUser: row.identity, email: email(row), role: 'user', poolManaged: true,
         }), true);
         return { stage: 'sso-created', sso_created_at: user.createdAt };
-      } catch {
+      } catch (error) {
         context.signal.throwIfAborted();
+        if (error instanceof ProvisionFailure && error.code === 'sso_user_limit_reached') {
+          // A confirmed non-creation may retry the SAME globally reserved name
+          // through operator Retry, not manual ambiguity reconciliation. Exhaust
+          // automatic retries so a full SSO enterprise cannot claim logical P and
+          // suppress healthy peers, or later recover beyond the global target.
+          // Never delete inventory or refund ordinals.
+          await context.checkpoint({ stage: 'new', sso_created_at: null });
+          throw new ProvisionFailure('sso_user_limit_reached', true);
+        }
         throw new ProvisionFailure('sso_creation_ambiguous', true);
       }
     }
@@ -237,9 +357,10 @@ export function realProvisioner(
       if (existing.emuStatus === 'active' && existing.ghLogin && existing.ghScimId) return { stage: 'scim-synced' };
       // Never replay a timed-out side effect while the SSO service may still be doing it.
       if (row.stage === 'scim-syncing') throw new ProvisionFailure('scim_sync_unconfirmed');
+      await assertDispatch(row, context);
       row = await context.checkpoint({ stage: 'scim-syncing' });
       const result = await request<{ rows: { ssoUser: string; status: string; user?: SsoUserDto }[] }>(
-        context, 'sso', '/api/users/batch', {
+        row, context, 'sso', '/api/users/batch', {
           operation: 'sync_emu', ssoUsers: [row.identity], assignCopilotSeat: false, createOnly: true,
         });
       const item = result.rows?.[0];
@@ -256,8 +377,9 @@ export function realProvisioner(
       if (user.emuStatus !== 'active' || !user.ghLogin || !user.ghScimId) throw new ProvisionFailure('scim_not_ready');
       if (user.copilotSeatStatus !== 'assigned') {
         if (row.stage === 'seat-assigning') throw new ProvisionFailure('seat_assignment_unconfirmed');
+        await assertDispatch(row, context);
         row = await context.checkpoint({ stage: 'seat-assigning' });
-        user = checkUser(row, await request<SsoUserDto>(context, 'sso',
+        user = checkUser(row, await request<SsoUserDto>(row, context, 'sso',
           `/api/users/${encodeURIComponent(row.identity)}/copilot-seat`, {}));
       }
       checkEntitlement(user);
@@ -277,11 +399,12 @@ export function realProvisioner(
     }
 
     if (row.stage === 'oauth-starting') {
+      await assertDispatch(row, context);
       if (!row.oauth_attempt_id) throw new ProvisionFailure('oauth_attempt_missing', true);
       const user = await knownUser(row, context);
       checkEntitlement(user);
       const account = await accountFor(row, context, user);
-      const credentials = await request<SsoUserLoginCredentialsResponse>(context, 'sso',
+      const credentials = await request<SsoUserLoginCredentialsResponse>(row, context, 'sso',
         `/api/users/${encodeURIComponent(row.identity)}/login-credentials`, {
           expectedCreatedAt: row.sso_created_at, expectedEmail: email(row),
         });
@@ -290,8 +413,8 @@ export function realProvisioner(
       if (account.copilotOauthAttemptId !== row.oauth_attempt_id || account.copilotOauthStatus !== 'refreshing') {
         await mutate(row, context, { type: 'begin', oauthAttemptId: row.oauth_attempt_id });
       }
-      // Persist before POST, never after. Recovery only searches; the Login API does
-      // not deduplicate POSTs carrying the same oauthAttemptId.
+      // Persist dispatch before POST; recovery observes the bound attempt instead of
+      // replaying a request whose external outcome is still unknown.
       if (context.claimLoginDispatch) {
         const admitted = await context.claimLoginDispatch(options.loginMaxPending ?? 5);
         if (!admitted) return {};
@@ -300,8 +423,11 @@ export function realProvisioner(
         if (context.mutateCredentials) throw new ProvisionFailure('provision_storage_incompatible', true);
         row = await context.checkpoint({ stage: 'oauth-dispatch' });
       }
-      const task = checkTask(row, await request<LoginTaskDto>(context, 'login', '/api/tasks', {
-        identity: row.identity, ssoUser: row.identity, ghLogin: user.ghLogin,
+      const profile = profileFor(row);
+      const task = checkTask(row, await request<LoginTaskDto>(row, context, 'login', '/api/tasks', {
+        enterpriseId: profile.id, enterpriseRevision: profile.revision,
+        identity: row.identity, ssoUser: row.identity, expectedGhLogin: user.ghLogin,
+        accountIncarnation: account.accountIncarnation,
         ssoPassword: credentials.passwordForLogin, oauthAttemptId: row.oauth_attempt_id, ssoType: 'custom',
       }), user.ghLogin!);
       return { stage: 'oauth-wait', task_id: task.id };
@@ -312,16 +438,24 @@ export function realProvisioner(
       const user = await knownUser(row, context);
       checkEntitlement(user);
       const task = row.task_id
-        ? checkTask(row, await request<LoginTaskDto>(context, 'login', `/api/tasks/${encodeURIComponent(row.task_id)}`), user.ghLogin!)
+        ? checkTask(row, await request<LoginTaskDto>(row, context, 'login', `/api/tasks/${encodeURIComponent(row.task_id)}`), user.ghLogin!)
         : await findTask(row, context, user.ghLogin!);
       // A bounded read-only retry allows an accepted POST to become visible. It must
       // never convert an uncertain dispatch into a new OAuth attempt.
       if (!task) throw new ProvisionFailure('oauth_dispatch_unconfirmed');
+      const taskAccount=await accountFor(row,context,user);
+      if (task.accountIncarnation!==taskAccount.accountIncarnation) throw new ProvisionFailure('oauth_task_mismatch',true);
       const createdAt = Date.parse(task.createdAt);
       const now = await store.now();
       if (!Number.isFinite(createdAt) || createdAt > now + 60000) throw new ProvisionFailure('oauth_task_invalid', true);
+      if (task.status === 'cancelled') {
+        // Contract-2 cancellation is terminal only after Proxy authority closed
+        // the exact binding. Legacy task history must never release a live slot.
+        if (task.bindingVersion !== 2) throw new ProvisionFailure('oauth_task_cancelled_unconfirmed', true);
+        await context.checkpoint({ stage: 'synced', task_id: null, oauth_attempt_id: null });
+        throw new ProvisionFailure('oauth_login_cancelled');
+      }
       if (row.stage === 'oauth-dispatch') return { stage: 'oauth-wait', task_id: task.id };
-      if (task.status === 'cancelled') throw new ProvisionFailure('oauth_task_cancelled_unconfirmed', true);
       if (task.status === 'failed') {
         await context.checkpoint({ stage: 'synced', task_id: null, oauth_attempt_id: null });
         throw new ProvisionFailure('oauth_login_failed');
@@ -334,15 +468,16 @@ export function realProvisioner(
         return { stage: 'warmup' };
       }
       if (now - createdAt >= LOGIN_TASK_TIMEOUT_MS) {
-        // Login cancellation only marks its DB row, it does not stop Playwright. Do not
-        // create a concurrent replacement for a stalled task or reset its stage.
+        // Cancellation requests/uncertain closure are not terminal confirmation.
+        // Never create a replacement while the authority outcome is unknown.
         throw new ProvisionFailure('oauth_task_stalled', true);
       }
-      if (!['pending', 'running'].includes(task.status)) throw new ProvisionFailure('oauth_task_invalid', true);
+      if (!['pending', 'running', 'callback_pending', 'cancel_requested', 'uncertain'].includes(task.status)) throw new ProvisionFailure('oauth_task_invalid', true);
       return {};
     }
 
     if (row.stage === 'warmup' || row.stage === 'ready') {
+      await assertDispatch(row, context);
       const user = await knownUser(row, context);
       checkEntitlement(user);
       await context.pinCredentials();
@@ -406,6 +541,7 @@ export function realProvisioner(
 
   return {
     stepTimeoutMs: options.requestTimeoutMs,
+    ...(store.enterprisePolicies ? { eligibleEnterprises: readyForCreation } : {}),
     async reconcileLoginReservation(row, context) {
       if (!isExhaustedLoginReservation(row) || !row.oauth_attempt_id) return undefined;
       const signal = AbortSignal.any([context.signal, AbortSignal.timeout(options.requestTimeoutMs)]);
@@ -418,11 +554,14 @@ export function realProvisioner(
       const account = await accountFor(row, observation);
       if (!account.ghLogin) return undefined;
       const task = row.task_id
-        ? checkTask(row, await request<LoginTaskDto>(observation, 'login', `/api/tasks/${encodeURIComponent(row.task_id)}`), account.ghLogin)
+        ? checkTask(row, await request<LoginTaskDto>(row, observation, 'login', `/api/tasks/${encodeURIComponent(row.task_id)}`), account.ghLogin)
         : await findTask(row, observation, account.ghLogin);
       await observation.assertCurrent();
-      // cancelled is only a DB marker in Login, not proof that Playwright stopped.
-      // A successful task releases capacity, not the failed/disabled retry protection.
+      if (task && task.accountIncarnation!==account.accountIncarnation) throw new ProvisionFailure('oauth_task_mismatch',true);
+      // Contract-2 cancelled is an authority-confirmed terminal outcome; map it
+      // to the existing failed-release transition (preserves attempts/operator
+      // state). cancel_requested, uncertain and legacy cancellation retain slots.
+      if (task?.status === 'cancelled' && task.bindingVersion === 2) return 'failed';
       return task?.status === 'success' || task?.status === 'failed' ? task.status : undefined;
     },
     async step(row, context) {
@@ -472,6 +611,15 @@ function validWarmupResponse(value: unknown, path: CopilotApiPath): boolean {
   }
   return body.type === 'message' && body.role === 'assistant' && Array.isArray(body.content)
     && body.content.some((item) => item?.type === 'text' && nonempty(item.text));
+}
+
+function untilSignal<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const aborted = () => reject(signal.reason);
+    signal.addEventListener('abort', aborted, { once: true });
+    if (signal.aborted) aborted();
+    operation.then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted));
+  });
 }
 
 async function readJson(response: Response, signal: AbortSignal): Promise<unknown> {

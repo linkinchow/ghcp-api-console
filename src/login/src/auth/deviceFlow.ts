@@ -2,141 +2,75 @@ import { config } from '../config.js';
 import type { AccountLogger } from '../tasks/accountLogger.js';
 import type { AuthStrategy } from './types.js';
 
-type DeviceFlowLogger = Pick<AccountLogger, 'info' | 'warn'>;
-
+type DeviceFlowLogger = Pick<AccountLogger,'info' | 'warn'>;
 interface DeviceFlowRuntime {
   fetch: typeof globalThis.fetch;
-  sleep(ms: number): Promise<void>;
-  now(): number;
+  sleep(ms:number,signal?:AbortSignal):Promise<void>;
+  now():number;
 }
+const defaultRuntime: DeviceFlowRuntime = {fetch:(...args) => globalThis.fetch(...args),sleep,now:Date.now};
+export interface DeviceCodeResponse {device_code:string;user_code:string;verification_uri:string;expires_in:number;interval:number}
+interface AccessTokenResponse {access_token?:string;token_type?:string;scope?:string;error?:string;interval?:number}
 
-const defaultRuntime: DeviceFlowRuntime = {
-  fetch: globalThis.fetch,
-  sleep,
-  now: Date.now,
-};
-
-export interface DeviceCodeResponse {
-  device_code: string;
-  user_code: string;
-  verification_uri: string;
-  expires_in: number;
-  interval: number;
+export async function loginWithDeviceFlow(strategy:AuthStrategy,logger:DeviceFlowLogger,runtime:DeviceFlowRuntime = defaultRuntime,
+  signal?:AbortSignal):Promise<string> {
+  signal?.throwIfAborted();
+  const device = await requestDeviceCode(logger,runtime,signal);
+  logger.info('device-flow','Received GitHub device code',{expiresIn:device.expires_in,interval:device.interval});
+  signal?.throwIfAborted();
+  await strategy.authorize(device,signal);
+  signal?.throwIfAborted();
+  return pollAccessToken(device,logger,runtime,signal);
 }
-
-interface AccessTokenResponse {
-  access_token?: string;
-  token_type?: string;
-  scope?: string;
-  error?: string;
-  error_description?: string;
-  interval?: number;
-}
-
-export async function loginWithDeviceFlow(
-  strategy: AuthStrategy,
-  logger: DeviceFlowLogger,
-  runtime: DeviceFlowRuntime = defaultRuntime,
-): Promise<string> {
-  const device = await requestDeviceCode(logger, runtime);
-  logger.info('device-flow', 'Received GitHub device code', {
-    verificationUri: device.verification_uri,
-    expiresIn: device.expires_in,
-    interval: device.interval,
-  });
-  await strategy.authorize(device);
-  return pollAccessToken(device, logger, runtime);
-}
-
-async function requestDeviceCode(logger: DeviceFlowLogger, runtime: DeviceFlowRuntime): Promise<DeviceCodeResponse> {
-  const maxAttempts = 3;
-  let lastError = '';
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const res = await runtime.fetch(config.endpoints.deviceCode, {
-      method: 'POST',
-      headers: deviceFlowHeaders(),
-      body: JSON.stringify({ client_id: config.githubOauthClientId, scope: config.githubOauthScope }),
-    });
-
+async function requestDeviceCode(logger:DeviceFlowLogger,runtime:DeviceFlowRuntime,signal?:AbortSignal):Promise<DeviceCodeResponse> {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    signal?.throwIfAborted();
+    const res = await runtime.fetch(config.endpoints.deviceCode,{method:'POST',headers:deviceFlowHeaders(),
+      body:JSON.stringify({client_id:config.githubOauthClientId,scope:config.githubOauthScope}),signal,redirect:'error'});
     if (res.ok) {
-      logger.info('device-flow', 'Requested GitHub device code', { attempt });
-      return (await res.json()) as DeviceCodeResponse;
+      const body = await res.json() as DeviceCodeResponse;
+      if (!body || typeof body.device_code !== 'string' || !body.device_code || typeof body.user_code !== 'string' || !body.user_code
+        || body.verification_uri !== 'https://github.com/login/device' || !Number.isFinite(body.expires_in) || body.expires_in < 1 || body.expires_in > 1800
+        || !Number.isFinite(body.interval) || body.interval < 1 || body.interval > 120) throw new Error('device_code_response_invalid');
+      logger.info('device-flow','Requested GitHub device code',{attempt});
+      return body;
     }
-
-    lastError = `${res.status} ${await res.text()}`.trim();
-    if (attempt < maxAttempts) {
-      logger.warn('device-flow', 'Device code request failed; retrying', { attempt, error: lastError });
-      await runtime.sleep(1000 * attempt);
+    if (attempt < 3) {
+      logger.warn('device-flow','Device code request failed; retrying',{attempt,status:res.status});
+      await runtime.sleep(1000*attempt,signal);
     }
   }
-
-  throw new Error(`Device code request failed after ${maxAttempts} attempts: ${lastError}`);
+  throw new Error('device_code_request_failed');
 }
-
-async function pollAccessToken(device: DeviceCodeResponse, logger: DeviceFlowLogger, runtime: DeviceFlowRuntime): Promise<string> {
+async function pollAccessToken(device:DeviceCodeResponse,logger:DeviceFlowLogger,runtime:DeviceFlowRuntime,signal?:AbortSignal):Promise<string> {
   const started = runtime.now();
-  let interval = (Math.max(1, device.interval) + 3) * 1000;
-  let attempt = 0;
-  let lastPendingLogAt = 0;
-  logger.info('device-flow', 'Waiting for GitHub OAuth authorization', {
-    expiresIn: device.expires_in,
-    intervalMs: interval,
-  });
-  while (runtime.now() - started < device.expires_in * 1000) {
-    await runtime.sleep(interval);
-    attempt++;
-    const res = await runtime.fetch(config.endpoints.accessToken, {
-      method: 'POST',
-      headers: deviceFlowHeaders(),
-      body: JSON.stringify({
-        client_id: config.githubOauthClientId,
-        device_code: device.device_code,
-        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-      }),
-    });
-    if (!res.ok) throw new Error(`Access token poll failed: ${res.status} ${await res.text()}`);
-    const body = (await res.json()) as AccessTokenResponse;
-    if (body.access_token) {
-      logger.info('device-flow', 'GitHub OAuth authorization complete', {
-        attempt,
-        tokenType: body.token_type,
-        scope: body.scope,
-      });
-      return body.access_token;
-    }
-    if (body.error === 'authorization_pending') {
-      const now = runtime.now();
-      if (now - lastPendingLogAt >= 30_000) {
-        lastPendingLogAt = now;
-        logger.info('device-flow', 'Authorization is still pending', {
-          attempt,
-          elapsedSeconds: Math.round((now - started) / 1000),
-          intervalMs: interval,
-        });
-      }
-      continue;
-    }
+  let interval = (Math.max(1,device.interval)+3)*1000;
+  while (runtime.now()-started < device.expires_in*1000) {
+    signal?.throwIfAborted();
+    await runtime.sleep(interval,signal);
+    signal?.throwIfAborted();
+    const res = await runtime.fetch(config.endpoints.accessToken,{method:'POST',headers:deviceFlowHeaders(),
+      body:JSON.stringify({client_id:config.githubOauthClientId,device_code:device.device_code,grant_type:'urn:ietf:params:oauth:grant-type:device_code'}),signal,redirect:'error'});
+    if (!res.ok) throw new Error('access_token_poll_failed');
+    const body = await res.json() as AccessTokenResponse;
+    signal?.throwIfAborted();
+    if (typeof body.access_token === 'string' && body.access_token) { logger.info('device-flow','GitHub OAuth authorization complete'); return body.access_token; }
+    if (body.error === 'authorization_pending') continue;
     if (body.error === 'slow_down') {
-      interval = body.interval ? (Math.max(1, body.interval) + 3) * 1000 : interval + 5000;
-      logger.warn('device-flow', 'GitHub requested slower polling', { attempt, intervalMs: interval });
+      interval = typeof body.interval === 'number' && Number.isFinite(body.interval) ? (Math.max(1,body.interval)+3)*1000 : interval+5000;
+      logger.warn('device-flow','GitHub requested slower polling',{intervalMs:interval});
       continue;
     }
-    if (body.error === 'expired_token') throw new Error('Device code expired before authorization. Run login again.');
-    if (body.error === 'access_denied') throw new Error('Authorization was denied.');
-    logger.warn('device-flow', 'GitHub token poll returned an error', { error: body.error, description: body.error_description });
-    throw new Error(body.error_description || body.error || 'GitHub device-flow authorization failed.');
+    throw new Error('device_flow_authorization_failed');
   }
-  throw new Error('GitHub device-flow authorization timed out.');
+  throw new Error('device_flow_authorization_timed_out');
 }
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+export function sleep(ms:number,signal?:AbortSignal):Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve,reject) => {
+    const stop = () => { clearTimeout(timer); reject(signal?.reason ?? new Error('aborted')); };
+    const timer = setTimeout(() => {signal?.removeEventListener('abort',stop); resolve();},ms);
+    signal?.addEventListener('abort',stop,{once:true});
+  });
 }
-
-function deviceFlowHeaders(): Record<string, string> {
-  return {
-    Accept: 'application/json',
-    'Content-Type': 'application/json',
-    'User-Agent': config.opencodeUserAgent,
-  };
-}
+function deviceFlowHeaders():Record<string,string> {return {Accept:'application/json','Content-Type':'application/json','User-Agent':config.opencodeUserAgent};}

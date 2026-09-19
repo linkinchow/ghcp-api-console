@@ -1,9 +1,14 @@
+import { beginMysqlAttempt } from '../db/mysqlAuthorization.js';
 import { createHash, randomUUID } from 'node:crypto';
 import type { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql2/promise';
 import type { PoolConfig } from './config.js';
 import { normalizeCaller, normalizePoolConfig, UserPoolError } from './config.js';
 import { accountName, NAME_CAPACITY } from './names.js';
-import { runMysqlPoolMigrations } from './mysqlMigrations.js';
+import { validateEnterpriseMysqlV4 } from '@ghcp/shared/enterpriseMysqlV4';
+import { resolveEnterpriseScope, enterprisePoolPolicyDto,
+  type EnterpriseRegistryV3, type EnterprisePoolPolicyRecord, type EnterprisePoolPolicyChange,
+  type EnterprisePoolOverviewDto, type EnterprisePoolCountsDto } from '@ghcp/shared';
+import { loadProxyEnterpriseRegistry } from '../enterprise.js';
 import { leaseMysqlConnection, MysqlDeadline, MysqlDeadlineError } from './mysqlDeadline.js';
 import { acquireMysqlCaller, type MysqlCallerPermit } from './mysqlCallerGate.js';
 import type { HeldLease, Inventory, InventoryFence, Lease, PoolSettings } from './store.js';
@@ -11,6 +16,8 @@ import type { PoolStore, WorkerCredentialFence, WorkerCredentialMutation } from 
 import type { PoolList, PoolPage, PoolPageQuery } from './paging.js';
 import { LOGIN_CAPACITY_SQL, PendingSelection } from './scheduling.js';
 import { inferenceHoldTimeoutMs } from './inferenceTimeout.js';
+import { enterpriseScores, rankEnterprises, logicalSupplySql, enterprisePolicyBlockers, enterprisePolicyReady,
+  applyEnterprisePolicyChange, enterprisePolicyFromRow, DISPATCHED_POOL_STAGES, type EnterpriseSchedulingInput } from './enterpriseScheduling.js';
 
 type Connection = Pool | PoolConnection;
 interface Tx { connection: PoolConnection; credentials?: Map<string, Credential | undefined> }
@@ -20,6 +27,17 @@ interface SettingsRow extends PoolSettings {
 }
 interface Credential {
   identity: string; copilot_oauth_token: string | null; copilot_oauth_status: string;
+}
+interface PolicyRow {
+  enterprise_id: string; state: EnterprisePoolPolicyRecord['state']; policy_version: number;
+  identity_sha256: string; validation_kind: EnterprisePoolPolicyRecord['validationKind'];
+  validation_evidence_json: string | null; validated_at: number | null; updated_at: number;
+  max_accounts?: number;
+}
+interface EnterpriseSnapshot extends EnterpriseSchedulingInput {
+  policy: EnterprisePoolPolicyRecord;
+  counts: EnterprisePoolCountsDto;
+  blockedReasons: string[];
 }
 interface HoldRow {
   request_id: string; lease_id: string; member_identity: string; caller_id: string;
@@ -32,17 +50,17 @@ const REAUTH_WINDOW_MS = 3600000;
 const REAUTH_MAX_CYCLES = 3;
 // Bound lock duration even with a large target. The scheduler fills subsequent batches.
 const RESERVATION_BATCH = 32;
-const SETTING_KEYS = ['idle_target', 'max_accounts', 'lease_seconds', 'paused'];
+const SETTING_KEYS = ['idle_target', 'lease_seconds', 'paused'];
 const INVENTORY_KEYS = ['state', 'stage', 'attempt_id', 'oauth_attempt_id', 'sso_created_at', 'task_id',
   'attempts', 'retry_at', 'last_error', 'cooldown_until', 'verified_at'];
 const NUMERIC_KEYS = new Set(['id', 'at', 'n', 'total', 'version', 'idle_target', 'max_accounts', 'lease_seconds',
   'paused', 'owner_until', 'next_ordinal', 'ordinal', 'attempts', 'retry_at', 'updated_at',
   'cooldown_until', 'verified_at', 'generation', 'reauth_count', 'reauth_window_at', 'assigned_at',
-  'last_success_at', 'expires_at', 'deadline_at', 'active_requests', 'now']);
+  'last_success_at', 'expires_at', 'deadline_at', 'active_requests', 'now', 'enterprise_revision',
+  'active_max_accounts', 'policy_version', 'validated_at', 'inventory', 'eligible_idle', 'pending_supply',
+  'ready_idle', 'provisioning', 'failed', 'cooling', 'disabled', 'leased', 'provisional']);
 const DB_NOW = "(TIMESTAMPDIFF(MICROSECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP(3)) DIV 1000)";
 const OWNER_SQL = `EXISTS (SELECT 1 FROM user_pool_settings WHERE id=1 AND owner=? AND owner_until>${DB_NOW})`;
-const READY_SQL = `p.state = 'ready' AND p.verified_at IS NOT NULL
-  AND a.copilot_oauth_status = 'valid' AND LENGTH(a.copilot_oauth_token) > 0`;
 
 /** SQL is authoritative. No credential cache and no network work inside transactions. */
 export class MysqlPoolStore implements PoolStore {
@@ -50,29 +68,33 @@ export class MysqlPoolStore implements PoolStore {
   private reclaimCursor = '';
   private readonly pendingSelection = new PendingSelection();
 
-  constructor(private readonly pool: Pool, options: PoolConfig) {
+  private enterpriseId?: string;
+  private registry?: EnterpriseRegistryV3;
+
+  constructor(private readonly pool: Pool, options: PoolConfig, private readonly expectedRegistry?: EnterpriseRegistryV3) {
     this.options = normalizePoolConfig(options);
   }
 
   async initialize(): Promise<void> {
-    await runMysqlPoolMigrations(this.pool);
-    // Targets/cap/lease duration are initial seeds, subsequently shared mutable settings.
+    const expected = this.expectedRegistry ?? loadProxyEnterpriseRegistry();
+    // Targets/cap/lease duration remain mutable persisted settings, not configuration invariants.
     const { idleTarget: _idle, maxAccounts: _max, leaseSeconds: _lease, enabled: _enabled,
       callerDomain: _legacy, ...invariants } = this.options;
     const fingerprint = createHash('sha256')
       .update(JSON.stringify(Object.entries(invariants).sort(([a], [b]) => a.localeCompare(b))))
       .digest('hex');
-    await this.withConnection((connection) => connection.execute(`INSERT IGNORE INTO user_pool_settings
-      (id, idle_target, max_accounts, lease_seconds, account_domain, config_fingerprint)
-      VALUES (1, ?, ?, ?, ?, ?)`, [this.options.idleTarget, this.options.maxAccounts,
-      this.options.leaseSeconds, this.options.accountDomain, fingerprint]));
-    await this.tx(async (tx) => {
-      const settings = await this.settingsRow(tx.connection);
+    await this.withConnection(async (connection) => {
+      const state = await validateEnterpriseMysqlV4(connection, 'proxy', expected);
+      if (state.layout !== 'pool') throw new Error('enterprise_pool_layout_required');
+      this.enterpriseId = state.legacyEnterpriseId;
+      this.registry = state.registry;
+      const settings = await this.settingsRow(connection);
       if (settings.account_domain !== this.options.accountDomain) {
         throw new Error('Pool account email domain differs from persisted inventory');
       }
       if (settings.config_fingerprint !== fingerprint) throw new Error('Pool configuration differs between Proxy replicas');
-    });
+      this.enterpriseId = state.legacyEnterpriseId;
+    }, 30000);
   }
 
   async now(): Promise<number> { return this.time(this.pool); }
@@ -86,23 +108,107 @@ export class MysqlPoolStore implements PoolStore {
       const current = await this.readSettings(tx.connection);
       if (version !== current.version) throw new UserPoolError(409, 'settings_version_conflict');
       const next = { ...current, ...patch };
-      if (!Number.isInteger(next.idle_target) || next.idle_target < 0 || next.idle_target > next.max_accounts
-        || !Number.isInteger(next.max_accounts) || next.max_accounts < 1 || next.max_accounts > NAME_CAPACITY
+      if (!Number.isInteger(next.idle_target) || next.idle_target < 0 || next.idle_target > NAME_CAPACITY
         || !Number.isInteger(next.lease_seconds) || next.lease_seconds < 60 || next.lease_seconds > 2592000
         || ![0, 1].includes(next.paused)) throw new UserPoolError(400, 'invalid_pool_settings');
-      await this.exec(tx, `UPDATE user_pool_settings SET idle_target=?, max_accounts=?, lease_seconds=?,
-        paused=?, version=version+1 WHERE id=1`, [next.idle_target, next.max_accounts, next.lease_seconds, next.paused]);
+      await this.exec(tx, `UPDATE user_pool_settings SET idle_target=?, lease_seconds=?,
+        paused=?, version=version+1 WHERE id=1 AND version=?`, [next.idle_target, next.lease_seconds, next.paused, version]);
       await this.addEvent(tx, 'settings_updated');
       return this.readSettings(tx.connection);
+    });
+  }
+
+  async enterprisePolicies(): Promise<EnterprisePoolPolicyRecord[]> {
+    return this.readPolicies(this.pool);
+  }
+
+  async enterprisePolicy(id: string): Promise<EnterprisePoolPolicyRecord | undefined> {
+    return (await this.readPolicies(this.pool, id))[0];
+  }
+
+  async updateEnterprisePolicy(id: string, expectedVersion: number,
+    change: EnterprisePoolPolicyChange): Promise<EnterprisePoolPolicyRecord> {
+    return this.tx(async tx => {
+      if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) throw new UserPoolError(400, 'invalid_enterprise_policy');
+      // Every exclusive policy writer first holds settings X. This locking query
+      // MUST remain policy-only: joining profiles would invert admission's locks.
+      const row = await this.one<PolicyRow>(tx.connection,
+        'SELECT * FROM enterprise_pool_policy WHERE enterprise_id=? FOR UPDATE', [id]);
+      if (!row) throw new UserPoolError(404, 'enterprise_not_found');
+      if (row.policy_version !== expectedVersion) throw new UserPoolError(409, 'policy_version_conflict');
+      const profile = await this.one<{ max_accounts: number }>(tx.connection,
+        'SELECT max_accounts FROM enterprise_profiles WHERE id=?', [id]);
+      if (!profile) throw new UserPoolError(404, 'enterprise_not_found');
+      const current = this.policyRecord({ ...row, max_accounts: profile.max_accounts });
+      const next = applyEnterprisePolicyChange(this.currentRegistry(), current, change, await this.time(tx.connection));
+      if (change.type === 'cap') {
+        const caps = await this.one<{ n: number }>(tx.connection,
+          'SELECT COALESCE(SUM(max_accounts),0) n FROM enterprise_profiles WHERE id<>?', [id]);
+        if (caps!.n + next.maxAccounts > NAME_CAPACITY) throw new UserPoolError(400, 'invalid_enterprise_policy');
+        await this.exec(tx, 'UPDATE enterprise_profiles SET max_accounts=? WHERE id=?', [next.maxAccounts, id]);
+      }
+      await this.exec(tx, `UPDATE enterprise_pool_policy SET state=?, policy_version=?, identity_sha256=?,
+        validation_kind=?, validation_evidence_json=?, validated_at=?, updated_at=? WHERE enterprise_id=? AND policy_version=?`,
+      [next.state, next.policyVersion, next.identitySha256, next.validationKind,
+        next.validationEvidence === null ? null : JSON.stringify(next.validationEvidence), next.validatedAt, next.updatedAt,
+        id, expectedVersion]);
+      // Policy row version/timestamp is the audit trail. NEVER add/prune pool
+      // events or touch member/lease/hold rows while this policy X is held.
+      return next;
+    });
+  }
+
+  async enterpriseOverview(): Promise<EnterprisePoolOverviewDto> {
+    return this.tx(async tx => {
+      const observedAt = await this.time(tx.connection);
+      const settings = await this.readSettings(tx.connection);
+      const state = await this.settingsRow(tx.connection);
+      const snapshots = await this.enterpriseSnapshot(tx.connection, observedAt);
+      const scores = new Map(enterpriseScores(snapshots).map(row => [row.enterpriseId, row]));
+      const eligibleIdle = snapshots.reduce((sum, row) => sum + row.eligibleIdle, 0);
+      const pendingSupply = snapshots.reduce((sum, row) => sum + row.pendingSupply, 0);
+      const deficit = Math.max(0, settings.idle_target - eligibleIdle - pendingSupply);
+      const blockedReasons: string[] = [];
+      if (settings.paused) blockedReasons.push('pool_paused');
+      if (!snapshots.some(row => row.state === 'active')) blockedReasons.push('no_active_enterprises');
+      if (settings.idle_target > settings.active_max_accounts) blockedReasons.push('idle_target_above_active_capacity');
+      if (state.next_ordinal >= NAME_CAPACITY) blockedReasons.push('name_catalog_exhausted');
+      if (deficit > 0 && !rankEnterprises(snapshots, { kind: 'creation', ordinal: state.next_ordinal }).length) {
+        blockedReasons.push('enterprise_capacity_exhausted');
+      }
+      return {
+        enabled: this.options.enabled, legacyEnterpriseId: this.currentRegistry().legacyEnterpriseId, observedAt,
+        settings: { ...settings, paused: settings.paused as 0 | 1 },
+        enterprises: snapshots.map(row => {
+          const score = scores.get(row.enterpriseId)!;
+          return { ...enterprisePoolPolicyDto(resolveEnterpriseScope(this.currentRegistry(), row.enterpriseId).profile, row.policy),
+            counts: row.counts, eligibleIdle: row.eligibleIdle, pendingSupply: row.pendingSupply,
+            targetShare: score.targetShare, actualShare: score.actualShare, shareDeficit: score.shareDeficit,
+            score: score.score, overCap: row.inventory > row.maxAccounts, blockedReasons: row.blockedReasons };
+        }),
+        supply: { eligibleIdle, pendingSupply, deficit },
+        names: { capacity: NAME_CAPACITY, nextOrdinal: state.next_ordinal,
+          remainingPositions: Math.max(0, NAME_CAPACITY - state.next_ordinal) }, blockedReasons,
+      };
+    }, false);
+  }
+
+  async canProvision(identity: string, mode: 'advance' | 'observe' = 'advance'): Promise<boolean> {
+    return this.withConnection(async connection => {
+      const row = await this.readInventory(connection, identity);
+      return Boolean(row && await this.canProvisionTx({ connection }, row, mode));
     });
   }
 
   async claimLoginDispatch(identity: string, fence: WorkerCredentialFence, owner: string, limit: number): Promise<boolean> {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new UserPoolError(400, 'invalid_login_limit');
     return this.tx(async (tx) => {
+      const candidate = await this.readInventory(tx.connection, identity);
+      if (!candidate || !await this.canProvisionTx(tx, candidate, 'advance', true)) return false;
       await this.lockCredential(tx, identity);
       const row = await this.readInventory(tx.connection, identity);
       if (!row || row.state !== 'provisioning' || row.stage !== 'oauth-starting' || !this.matchesFence(row, fence)
+        || !await this.canProvisionTx(tx, row, 'advance')
         || !await this.matchesOwner(tx, owner) || await this.hasHoldsTx(tx.connection, identity)) return false;
       const occupied = await this.one<{ n: number }>(tx.connection,
         "SELECT COUNT(*) n FROM user_pool_accounts WHERE stage IN ('oauth-dispatch', 'oauth-wait')");
@@ -112,8 +218,10 @@ export class MysqlPoolStore implements PoolStore {
   }
 
   async listLoginReservations(): Promise<Inventory[]> {
-    return this.rows<Inventory>(this.pool, `SELECT * FROM user_pool_accounts WHERE stage IN ('oauth-dispatch', 'oauth-wait')
-      AND (state='disabled' OR (state='failed' AND attempts>=3)) ORDER BY ordinal LIMIT 100`);
+    return this.rows<Inventory>(this.pool, `SELECT p.*, a.enterprise_id, e.revision enterprise_revision
+      FROM user_pool_accounts p JOIN proxy_accounts a ON a.identity=p.identity
+      JOIN enterprise_profiles e ON e.id=a.enterprise_id WHERE p.stage IN ('oauth-dispatch', 'oauth-wait')
+      AND (p.state='disabled' OR (p.state='failed' AND p.attempts>=3)) ORDER BY p.ordinal LIMIT 100`);
   }
 
   async releaseLoginReservation(identity: string, fence: Inventory, owner: string, outcome: 'success' | 'failed'): Promise<boolean> {
@@ -165,39 +273,47 @@ export class MysqlPoolStore implements PoolStore {
       const items = await this.rows(tx.connection, sql.itemsSql,
         [...sql.values, query.pageSize, (query.page - 1) * query.pageSize]);
       return { items, total: Number(count!.total), page: query.page, pageSize: query.pageSize };
-    });
+    }, false);
   }
 
-  async events(): Promise<unknown[]> {
-    return this.rows(this.pool, 'SELECT * FROM user_pool_events ORDER BY id DESC LIMIT 200');
+  async events(enterpriseId?: string): Promise<unknown[]> {
+    return this.rows(this.pool, `SELECT * FROM user_pool_events ${enterpriseId === undefined ? '' : 'WHERE enterprise_id=?'}
+      ORDER BY id DESC LIMIT 200`, enterpriseId === undefined ? [] : [enterpriseId]);
   }
 
-  async accounts(): Promise<unknown[]> {
+  async accounts(enterpriseId?: string): Promise<unknown[]> {
     return this.withConnection(async (connection) => {
       const now = await this.time(connection);
-      return this.rows(connection, `SELECT p.*, a.gh_login, a.copilot_oauth_status, l.caller_id, l.phase, l.expires_at,
+      return this.rows(connection, `SELECT p.*, a.enterprise_id, a.gh_login, a.copilot_oauth_status, l.caller_id, l.phase, l.expires_at,
         (SELECT COUNT(*) FROM user_pool_holds h WHERE h.lease_id=l.lease_id AND h.expires_at>?)
         + (SELECT COUNT(*) FROM user_pool_catalog_holds h WHERE h.member_identity=p.identity AND h.expires_at>?) AS active_requests
         FROM user_pool_accounts p JOIN proxy_accounts a ON a.identity=p.identity
-        LEFT JOIN user_pool_leases l ON l.member_identity=p.identity ORDER BY p.ordinal LIMIT 1000`, [now, now]);
+        LEFT JOIN user_pool_leases l ON l.member_identity=p.identity
+        ${enterpriseId === undefined ? '' : 'WHERE a.enterprise_id=?'} ORDER BY p.ordinal LIMIT 1000`,
+      [now, now, ...(enterpriseId === undefined ? [] : [enterpriseId])]);
     });
   }
 
-  async leases(): Promise<Array<Lease & { active_requests: number }>> {
-    return this.rows<Lease & { active_requests: number }>(this.pool, `SELECT l.*,
+  async leases(enterpriseId?: string): Promise<Array<Lease & { active_requests: number }>> {
+    return this.rows<Lease & { active_requests: number }>(this.pool, `SELECT l.*, a.enterprise_id,
       (SELECT COUNT(*) FROM user_pool_holds h WHERE h.lease_id=l.lease_id AND h.expires_at>${DB_NOW})
       + (SELECT COUNT(*) FROM user_pool_catalog_holds h WHERE h.member_identity=l.member_identity AND h.expires_at>${DB_NOW}) AS active_requests
-      FROM user_pool_leases l ORDER BY assigned_at DESC, lease_id LIMIT 1000`);
+      FROM user_pool_leases l JOIN proxy_accounts a ON a.identity=l.member_identity
+      ${enterpriseId === undefined ? '' : 'WHERE a.enterprise_id=?'} ORDER BY assigned_at DESC, lease_id LIMIT 1000`,
+    enterpriseId === undefined ? [] : [enterpriseId]);
   }
 
   async inventory(identity: string): Promise<Inventory | undefined> { return this.readInventory(this.pool, identity); }
 
-  async managesSsoUser(ssoUser: string): Promise<boolean> {
+  async managesSsoUser(ssoUser: string, enterpriseId = this.enterpriseId): Promise<boolean> {
+    if (!enterpriseId) throw new Error('MySQL pool storage has not been initialized.');
     return Boolean(await this.one(this.pool, `SELECT 1 FROM user_pool_accounts p JOIN proxy_accounts a ON a.identity=p.identity
-      WHERE LOWER(a.sso_user)=LOWER(?) LIMIT 1`, [ssoUser]));
+      WHERE a.enterprise_id=? AND LOWER(a.sso_user)=LOWER(?) LIMIT 1`, [enterpriseId, ssoUser]));
   }
 
-  async counts(): Promise<Record<string, number>> { return this.tx((tx) => this.readCounts(tx)); }
+  async counts(enterpriseId?: string): Promise<Record<string, number>> {
+    return this.tx((tx) => this.readCounts(tx, enterpriseId), false);
+  }
   async reclaim(): Promise<void> { await this.tx((tx) => this.reclaimTx(tx)); }
 
   async acquire(caller: string, signal?: AbortSignal, requestTimeoutMs?: number): Promise<HeldLease> {
@@ -206,6 +322,8 @@ export class MysqlPoolStore implements PoolStore {
     return this.admit(caller, async (tx, identity, current) => {
       let lease = current;
       if (!lease) {
+        const member = (await this.readInventory(tx.connection, identity))!;
+        await this.assertActivePolicy(tx, member.enterprise_id);
         const now = await this.time(tx.connection);
         lease = { caller_id: caller, member_identity: identity, lease_id: randomUUID(), phase: 'provisional',
           assigned_at: now, last_success_at: null, expires_at: now + this.options.provisionalSeconds * 1000 };
@@ -222,6 +340,8 @@ export class MysqlPoolStore implements PoolStore {
   async acquireCatalog(caller: string, signal?: AbortSignal): Promise<HeldLease> {
     normalizeCaller(caller);
     return this.admit(caller, async (tx, identity) => {
+      const member = (await this.readInventory(tx.connection, identity))!;
+      await this.assertActivePolicy(tx, member.enterprise_id);
       const now = await this.time(tx.connection);
       return this.hold(tx, { caller_id: caller, member_identity: identity, lease_id: randomUUID(), phase: 'provisional',
         assigned_at: now, last_success_at: null, expires_at: now + this.options.requestTimeoutMs }, 'catalog');
@@ -237,10 +357,11 @@ export class MysqlPoolStore implements PoolStore {
     const caller = held.kind === 'catalog' ? 'h.caller_id' : 'l.caller_id';
     return Boolean(await this.one(this.pool, `SELECT 1 FROM ${from}
       JOIN user_pool_accounts p ON p.identity=${member} JOIN proxy_accounts a ON a.identity=p.identity
-      WHERE h.request_id=? AND h.lease_id=? AND ${member}=? AND ${caller}=?
+      JOIN enterprise_profiles e ON e.id=a.enterprise_id
+      WHERE h.request_id=? AND h.lease_id=? AND ${member}=? AND ${caller}=? AND a.enterprise_id=? AND e.revision=?
         AND h.deadline_at>${DB_NOW} AND h.expires_at>${DB_NOW} AND h.generation=p.generation
         AND p.state IN ('ready','cooling') AND a.copilot_oauth_status='valid' AND LENGTH(a.copilot_oauth_token)>0`,
-    [held.request_id, held.lease_id, held.member_identity, held.caller_id]));
+    [held.request_id, held.lease_id, held.member_identity, held.caller_id, held.enterprise_id, held.enterprise_revision]));
   }
 
   async recoverUnauthorized(held: HeldLease, expectedToken: string): Promise<boolean> {
@@ -323,13 +444,15 @@ export class MysqlPoolStore implements PoolStore {
     }, false);
   }
 
-  async release(leaseId: string): Promise<void> {
+  async release(leaseId: string, enterpriseId?: string): Promise<void> {
     await this.tx(async (tx) => {
       let lease = await this.one<Lease>(tx.connection, 'SELECT * FROM user_pool_leases WHERE lease_id=?', [leaseId]);
       if (!lease) throw new UserPoolError(404, 'lease_not_found');
       await this.lockCredential(tx, lease.member_identity);
       lease = await this.one<Lease>(tx.connection, 'SELECT * FROM user_pool_leases WHERE lease_id=?', [leaseId]);
       if (!lease) throw new UserPoolError(404, 'lease_not_found');
+      const member = await this.readInventory(tx.connection, lease.member_identity);
+      if (!member || enterpriseId !== undefined && member.enterprise_id !== enterpriseId) throw new UserPoolError(404, 'lease_not_found');
       if (await this.hasHoldsTx(tx.connection, lease.member_identity)) throw new UserPoolError(409, 'lease_in_use');
       await this.exec(tx, 'DELETE FROM user_pool_leases WHERE lease_id=?', [leaseId]);
       await this.addEvent(tx, 'lease_released', lease.member_identity, lease.caller_id, lease.lease_id);
@@ -347,14 +470,15 @@ export class MysqlPoolStore implements PoolStore {
     return result;
   }
 
-  async reserveDeficit(owner: string): Promise<number> {
+  async reserveDeficit(owner: string, eligibleEnterpriseIds?: readonly string[]): Promise<number> {
+    const eligible = this.creationEligibility(eligibleEnterpriseIds);
     return this.tx(async (tx) => {
       if (!await this.matchesOwner(tx, owner)) return 0;
-      const deficit = Math.min(RESERVATION_BATCH, await this.reservationDeficit(tx));
       let reserved = 0;
-      for (; reserved < deficit; reserved++) {
-        if (!await this.matchesOwner(tx, owner)) break;
-        if (await this.reserveCandidate(tx, owner) instanceof UserPoolError) break;
+      for (; reserved < RESERVATION_BATCH; reserved++) {
+        if (!await this.matchesOwner(tx, owner) || await this.reservationDeficit(tx) === 0) break;
+        const row = await this.reserveCandidate(tx, owner, eligible);
+        if (!row || row instanceof UserPoolError) break;
       }
       return reserved;
     });
@@ -364,22 +488,52 @@ export class MysqlPoolStore implements PoolStore {
     const row = await this.tx(async (tx) => {
       await this.reclaimTx(tx);
       if ((await this.readSettings(tx.connection)).paused) return undefined;
+      const registry = this.currentRegistry();
+      const policies = (await this.readPolicies(tx.connection)).filter(policy => {
+        const profile = registry.profiles.find(profile => profile.id === policy.enterpriseId);
+        return profile && enterprisePolicyReady(policy, profile, registry.legacyEnterpriseId);
+      });
+      const active = policies.filter(policy => policy.state === 'active').map(policy => policy.enterpriseId);
+      const draining = policies.filter(policy => ['validated', 'draining'].includes(policy.state)).map(policy => policy.enterpriseId);
+      if (!active.length && !draining.length) return undefined;
+      const inIds = (ids: string[]) => ids.length ? `a.enterprise_id IN (${ids.map(() => '?').join(',')})` : '0=1';
+      const policySql = `(${inIds(active)} OR (${inIds(draining)} AND (p.stage IN (${DISPATCHED_POOL_STAGES.map(() => '?').join(',')})
+        OR EXISTS (SELECT 1 FROM user_pool_leases obligation WHERE obligation.member_identity=p.identity AND obligation.expires_at>${DB_NOW}))))`;
       const exclusion = excluded.length ? `AND p.identity NOT IN (${excluded.map(() => '?').join(',')})` : '';
-      return this.one<Inventory>(tx.connection, `SELECT p.* FROM user_pool_accounts p WHERE retry_at<=? AND (
-        state='provisioning' OR (state='failed' AND attempts<3 AND COALESCE(last_error, '') NOT IN (${MANUAL_SQL})))
-        ${exclusion} AND NOT EXISTS (SELECT 1 FROM user_pool_holds h JOIN user_pool_leases l ON l.lease_id=h.lease_id
+      return this.one<Inventory>(tx.connection, `SELECT p.*, a.enterprise_id, e.revision enterprise_revision
+        FROM user_pool_accounts p JOIN proxy_accounts a ON a.identity=p.identity
+        JOIN enterprise_profiles e ON e.id=a.enterprise_id WHERE p.retry_at<=? AND (
+        p.state='provisioning' OR (p.state='failed' AND p.attempts<3 AND COALESCE(p.last_error, '') NOT IN (${MANUAL_SQL})))
+        AND p.cooldown_until<=${DB_NOW} AND ${policySql} ${exclusion} AND NOT EXISTS (SELECT 1 FROM user_pool_holds h JOIN user_pool_leases l ON l.lease_id=h.lease_id
           WHERE l.member_identity=p.identity)
         AND NOT EXISTS (SELECT 1 FROM user_pool_catalog_holds h WHERE h.member_identity=p.identity)
         AND ${LOGIN_CAPACITY_SQL}
         ORDER BY ${this.pendingSelection.orderSql()} LIMIT 1`,
-      [await this.time(tx.connection), ...MANUAL_ERRORS, ...excluded, this.options.loginMaxPending ?? 5]);
+      [await this.time(tx.connection), ...MANUAL_ERRORS, ...active, ...draining, ...DISPATCHED_POOL_STAGES,
+        ...excluded, this.options.loginMaxPending ?? 5]);
     });
     if (row) this.pendingSelection.selected();
     return row;
   }
 
   async update(identity: string, patch: Partial<Inventory>, expected?: InventoryFence, owner?: string): Promise<boolean> {
-    return this.tx((tx) => this.updateTx(tx, identity, patch, expected, owner));
+    return this.tx(async tx => {
+      if (['sso-creating', 'scim-syncing', 'seat-assigning'].includes(patch.stage ?? '')) {
+        const candidate = await this.readInventory(tx.connection, identity);
+        const dispatchIntent = candidate?.stage === 'new' && patch.stage === 'sso-creating'
+          || candidate?.stage === 'sso-created' && patch.stage === 'scim-syncing'
+          || candidate?.stage === 'scim-synced' && patch.stage === 'seat-assigning';
+        if (dispatchIntent) {
+          // Settings X -> chosen policy S -> account. The persisted intent is
+          // the admission boundary; never hold these locks across provider I/O.
+          if (!await this.canProvisionTx(tx, candidate!, 'advance', true)) return false;
+          await this.lockCredential(tx, identity);
+          const current = await this.readInventory(tx.connection, identity);
+          if (!current || !await this.canProvisionTx(tx, current, 'advance')) return false;
+        }
+      }
+      return this.updateTx(tx, identity, patch, expected, owner);
+    });
   }
 
   async fail(identity: string, code: string, expected?: InventoryFence, owner?: string, terminal = false): Promise<void> {
@@ -394,11 +548,11 @@ export class MysqlPoolStore implements PoolStore {
     });
   }
 
-  async disable(identity: string): Promise<void> {
+  async disable(identity: string, enterpriseId?: string): Promise<void> {
     await this.tx(async (tx) => {
       await this.lockCredential(tx, identity);
       const row = await this.readInventory(tx.connection, identity);
-      if (!row) throw new UserPoolError(404, 'member_not_found');
+      if (!row || enterpriseId !== undefined && row.enterprise_id !== enterpriseId) throw new UserPoolError(404, 'member_not_found');
       if (row.state === 'disabled') return;
       await this.updateTx(tx, identity, { state: 'disabled', attempt_id: randomUUID() });
       await this.releaseInactiveTx(tx, identity);
@@ -406,11 +560,11 @@ export class MysqlPoolStore implements PoolStore {
     });
   }
 
-  async retry(identity: string): Promise<void> {
+  async retry(identity: string, enterpriseId?: string): Promise<void> {
     await this.tx(async (tx) => {
       await this.lockCredential(tx, identity);
       const row = await this.readInventory(tx.connection, identity);
-      if (!row) throw new UserPoolError(404, 'member_not_found');
+      if (!row || enterpriseId !== undefined && row.enterprise_id !== enterpriseId) throw new UserPoolError(404, 'member_not_found');
       if (await this.hasHoldsTx(tx.connection, identity) || !['failed', 'disabled'].includes(row.state)) {
         throw new UserPoolError(409, 'member_in_use');
       }
@@ -427,9 +581,14 @@ export class MysqlPoolStore implements PoolStore {
   async mutateWorkerCredential(identity: string, fence: WorkerCredentialFence, owner: string,
     mutation: WorkerCredentialMutation): Promise<boolean> {
     return this.tx(async (tx) => {
+      if (mutation.type === 'begin') {
+        const candidate = await this.readInventory(tx.connection, identity);
+        if (!candidate || !await this.canProvisionTx(tx, candidate, 'advance', true)) return false;
+      }
       await this.lockCredential(tx, identity);
       const row = await this.readInventory(tx.connection, identity);
       if (!row || row.state !== 'provisioning' || row.stage !== fence.stage || !this.matchesFence(row, fence)
+        || mutation.type === 'begin' && !await this.canProvisionTx(tx, row, 'advance')
         || !await this.matchesOwner(tx, owner) || await this.hasHoldsTx(tx.connection, identity)) return false;
       const now = await this.time(tx.connection);
       const timestamp = mysqlTimestamp(now);
@@ -440,10 +599,13 @@ export class MysqlPoolStore implements PoolStore {
         [mutation.ghLogin, timestamp, identity, identity, mutation.ghLogin, owner])).affectedRows === 1;
       }
       if (mutation.type === 'begin') {
-        return (await this.exec(tx, `UPDATE proxy_accounts SET copilot_oauth_status='refreshing',
-          copilot_oauth_attempt_id=?, updated_at=? WHERE identity=? AND CAST(sso_user AS BINARY)=CAST(? AS BINARY)
-          AND ${OWNER_SQL}`,
-        [mutation.oauthAttemptId, timestamp, identity, identity, owner])).affectedRows === 1;
+        const account=await this.one<{account_incarnation:string;gh_login:string|null}>(tx.connection,
+          'SELECT account_incarnation,gh_login FROM proxy_accounts WHERE enterprise_id=? AND identity=? AND CAST(sso_user AS BINARY)=CAST(? AS BINARY)',
+          [row.enterprise_id,identity,identity]);
+        if (!account?.gh_login) return false;
+        await beginMysqlAttempt(tx.connection,{enterpriseId:row.enterprise_id,enterpriseRevision:row.enterprise_revision,
+          identity,accountIncarnation:account.account_incarnation,oauthAttemptId:mutation.oauthAttemptId,expectedGhLogin:account.gh_login});
+        return true;
       }
       return this.invalidate(tx, identity, mutation.expectedToken, now, owner);
     });
@@ -558,19 +720,102 @@ export class MysqlPoolStore implements PoolStore {
       "SELECT TIMESTAMPDIFF(MICROSECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP(3)) DIV 1000 AS now"))!.now;
   }
 
+  private currentRegistry(): EnterpriseRegistryV3 {
+    const registry = this.registry ?? this.expectedRegistry;
+    if (!registry) throw new Error('MySQL pool storage has not been initialized.');
+    return registry;
+  }
+
+  private policyRecord(row: PolicyRow): EnterprisePoolPolicyRecord {
+    return enterprisePolicyFromRow({ ...row });
+  }
+
+  private async readPolicies(connection: Connection, id?: string): Promise<EnterprisePoolPolicyRecord[]> {
+    const rows = await this.rows<PolicyRow>(connection, `SELECT policy.*, e.max_accounts FROM enterprise_pool_policy policy
+      JOIN enterprise_profiles e ON e.id=policy.enterprise_id ${id === undefined ? '' : 'WHERE policy.enterprise_id=?'}
+      ORDER BY policy.enterprise_id`, id === undefined ? [] : [id]);
+    return rows.map(row => this.policyRecord(row));
+  }
+
+  /** Lock only the chosen policy, after admission owns every needed credential row. */
+  private async assertActivePolicy(tx: Tx, enterpriseId: string): Promise<void> {
+    const row = await this.one<PolicyRow>(tx.connection,
+      'SELECT * FROM enterprise_pool_policy WHERE enterprise_id=? FOR SHARE', [enterpriseId]);
+    const profile = resolveEnterpriseScope(this.currentRegistry(), enterpriseId).profile;
+    if (!row || row.state !== 'active'
+      || !enterprisePolicyReady(this.policyRecord({ ...row, max_accounts: profile.maxAccounts }), profile,
+        this.currentRegistry().legacyEnterpriseId)) throw new UserPoolError(503, 'enterprise_not_active', 1);
+  }
+
+  private async canProvisionTx(tx: Tx, row: Inventory, mode: 'advance' | 'observe', lock = false): Promise<boolean> {
+    const policyRow = await this.one<PolicyRow>(tx.connection,
+      `SELECT * FROM enterprise_pool_policy WHERE enterprise_id=?${lock ? ' FOR SHARE' : ''}`, [row.enterprise_id]);
+    const registry = this.currentRegistry();
+    const profile = registry.profiles.find(profile => profile.id === row.enterprise_id);
+    if (!policyRow || !profile || !enterprisePolicyReady(
+      this.policyRecord({ ...policyRow, max_accounts: profile.maxAccounts }), profile, registry.legacyEnterpriseId)) return false;
+    if (policyRow.state === 'active') return true;
+    if (!['validated', 'draining'].includes(policyRow.state)) return false;
+    if (mode === 'observe' && (DISPATCHED_POOL_STAGES as readonly string[]).includes(row.stage)) return true;
+    return Boolean(await this.one(tx.connection,
+      `SELECT 1 FROM user_pool_leases WHERE member_identity=? AND expires_at>${DB_NOW}`, [row.identity]));
+  }
+
+  private async enterpriseSnapshot(connection: Connection, now: number): Promise<EnterpriseSnapshot[]> {
+    const supply = logicalSupplySql(String(now));
+    const leaseLive = `(l.expires_at>${now} OR p.cooldown_until>${now}
+      OR EXISTS (SELECT 1 FROM user_pool_holds h WHERE h.lease_id=l.lease_id AND h.expires_at>${now})
+      OR EXISTS (SELECT 1 FROM user_pool_catalog_holds h WHERE h.member_identity=p.identity AND h.expires_at>${now}))`;
+    type CountRow = EnterprisePoolCountsDto & { enterprise_id: string; eligible_idle: number; pending_supply: number };
+    // One grouped inventory snapshot, all states included; no per-enterprise
+    // inventory/count queries and no cleanup side effects in a summary.
+    const counts = await this.rows<CountRow>(connection, `SELECT a.enterprise_id, COUNT(*) total,
+      SUM(CASE WHEN ${supply.eligibleIdle} THEN 1 ELSE 0 END) ready_idle,
+      SUM(CASE WHEN p.state='provisioning' THEN 1 ELSE 0 END) provisioning,
+      SUM(CASE WHEN p.state='failed' THEN 1 ELSE 0 END) failed,
+      SUM(CASE WHEN p.state='cooling' THEN 1 ELSE 0 END) cooling,
+      SUM(CASE WHEN p.state='disabled' THEN 1 ELSE 0 END) disabled,
+      SUM(CASE WHEN l.phase='active' AND ${leaseLive} THEN 1 ELSE 0 END) leased,
+      SUM(CASE WHEN l.phase='provisional' AND ${leaseLive} THEN 1 ELSE 0 END) provisional,
+      SUM(CASE WHEN ${supply.eligibleIdle} THEN 1 ELSE 0 END) eligible_idle,
+      SUM(CASE WHEN ${supply.pendingSupply} THEN 1 ELSE 0 END) pending_supply
+      FROM user_pool_accounts p JOIN proxy_accounts a ON a.identity=p.identity
+      LEFT JOIN user_pool_leases l ON l.member_identity=p.identity GROUP BY a.enterprise_id`);
+    const byEnterprise = new Map(counts.map(row => [row.enterprise_id, row]));
+    return (await this.readPolicies(connection)).map(policy => {
+      const row = byEnterprise.get(policy.enterpriseId);
+      const blockedReasons = enterprisePolicyBlockers(this.currentRegistry(), policy);
+      const eligible = blockedReasons.length === 0;
+      const inventory = Number(row?.total ?? 0);
+      const logicalCounts: EnterprisePoolCountsDto = { total: inventory, ready_idle: Number(row?.ready_idle ?? 0),
+        provisioning: Number(row?.provisioning ?? 0), failed: Number(row?.failed ?? 0), cooling: Number(row?.cooling ?? 0),
+        disabled: Number(row?.disabled ?? 0), leased: Number(row?.leased ?? 0), provisional: Number(row?.provisional ?? 0) };
+      if (inventory >= policy.maxAccounts) blockedReasons.push('enterprise_cap_reached');
+      return { enterpriseId: policy.enterpriseId, state: policy.state, maxAccounts: policy.maxAccounts,
+        inventory, eligible, eligibleIdle: eligible ? Number(row?.eligible_idle ?? 0) : 0,
+        pendingSupply: eligible ? Number(row?.pending_supply ?? 0) : 0, counts: logicalCounts, policy, blockedReasons };
+    });
+  }
+
   private async settingsRow(connection: Connection): Promise<SettingsRow> {
-    const row = await this.one<SettingsRow>(connection, 'SELECT * FROM user_pool_settings WHERE id=1');
+    const row = await this.one<SettingsRow>(connection, `SELECT s.*,
+      (SELECT COALESCE(SUM(max_accounts),0) FROM enterprise_profiles) max_accounts,
+      (SELECT COALESCE(SUM(e.max_accounts),0) FROM enterprise_profiles e JOIN enterprise_pool_policy policy
+        ON policy.enterprise_id=e.id WHERE policy.state='active') active_max_accounts
+      FROM user_pool_settings s WHERE s.id=1`);
     if (!row) throw new Error('User pool settings have not been initialized');
     return row;
   }
 
   private async readSettings(connection: Connection): Promise<PoolSettings> {
-    const { version, idle_target, max_accounts, lease_seconds, paused } = await this.settingsRow(connection);
-    return { version, idle_target, max_accounts, lease_seconds, paused };
+    const { version, idle_target, max_accounts, active_max_accounts, lease_seconds, paused } = await this.settingsRow(connection);
+    return { version, idle_target, max_accounts, active_max_accounts, lease_seconds, paused };
   }
 
   private readInventory(connection: Connection, identity: string): Promise<Inventory | undefined> {
-    return this.one<Inventory>(connection, 'SELECT * FROM user_pool_accounts WHERE identity=?', [identity]);
+    return this.one<Inventory>(connection, `SELECT p.*, a.enterprise_id, e.revision enterprise_revision
+      FROM user_pool_accounts p JOIN proxy_accounts a ON a.identity=p.identity
+      JOIN enterprise_profiles e ON e.id=a.enterprise_id WHERE p.identity=?`, [identity]);
   }
 
   private async lockCredential(tx: Tx, identity: string, skipLocked = false): Promise<Credential | undefined> {
@@ -584,29 +829,27 @@ export class MysqlPoolStore implements PoolStore {
   }
 
   private async addEvent(tx: Tx, action: string, identity?: string, caller?: string, leaseId?: string, detail?: string): Promise<void> {
-    await this.exec(tx, `INSERT INTO user_pool_events(at, action, identity, caller_id, lease_id, detail) VALUES (?, ?, ?, ?, ?, ?)`,
-      [await this.time(tx.connection), action, identity ?? null, caller ?? null, leaseId ?? null, detail ?? null]);
+    await this.exec(tx, `INSERT INTO user_pool_events(at, action, identity, caller_id, lease_id, detail, enterprise_id)
+      VALUES (?, ?, ?, ?, ?, ?, (SELECT enterprise_id FROM proxy_accounts WHERE identity=?))`,
+    [await this.time(tx.connection), action, identity ?? null, caller ?? null, leaseId ?? null, detail ?? null, identity ?? null]);
     // MySQL forbids directly selecting a DELETE target in its scalar subquery.
     const cutoff = (await this.one<{ n: number }>(tx.connection, 'SELECT CAST(COALESCE(MAX(id), 0) AS SIGNED)-10000 AS n FROM user_pool_events'))!.n;
     if (cutoff > 0) await this.exec(tx, 'DELETE FROM user_pool_events WHERE id<=?', [cutoff]);
   }
 
-  private async readCounts(tx: Tx): Promise<Record<string, number>> {
-    await this.reclaimTx(tx);
+  private async readCounts(tx: Tx, enterpriseId?: string): Promise<Record<string, number>> {
+    const now = await this.time(tx.connection);
+    const snapshots = await this.enterpriseSnapshot(tx.connection, now);
     const result: Record<string, number> = { total: 0, ready_idle: 0, provisioning: 0, failed: 0,
       cooling: 0, disabled: 0, leased: 0, provisional: 0, catalog_requests: 0 };
-    for (const row of await this.rows<{ state: string; n: number }>(tx.connection,
-      'SELECT state, COUNT(*) n FROM user_pool_accounts GROUP BY state')) {
-      result[row.state] = row.n;
-      result.total += row.n;
+    for (const row of snapshots) {
+      if (enterpriseId !== undefined && row.enterpriseId !== enterpriseId) continue;
+      for (const [key, value] of Object.entries(row.counts)) result[key] += value;
     }
-    for (const row of await this.rows<{ phase: string; n: number }>(tx.connection,
-      'SELECT phase, COUNT(*) n FROM user_pool_leases GROUP BY phase')) result[row.phase === 'active' ? 'leased' : 'provisional'] = row.n;
-    result.ready_idle = (await this.one<{ n: number }>(tx.connection, `SELECT COUNT(*) n FROM user_pool_accounts p
-      JOIN proxy_accounts a ON a.identity=p.identity WHERE ${READY_SQL}
-      AND NOT EXISTS (SELECT 1 FROM user_pool_leases l WHERE l.member_identity=p.identity)
-      AND NOT EXISTS (SELECT 1 FROM user_pool_catalog_holds h WHERE h.member_identity=p.identity)`))!.n;
-    result.catalog_requests = (await this.one<{ n: number }>(tx.connection, 'SELECT COUNT(*) n FROM user_pool_catalog_holds'))!.n;
+    result.catalog_requests = (await this.one<{ n: number }>(tx.connection, `SELECT COUNT(*) n
+      FROM user_pool_catalog_holds h JOIN proxy_accounts a ON a.identity=h.member_identity
+      WHERE h.expires_at>? ${enterpriseId === undefined ? '' : 'AND a.enterprise_id=?'}`,
+    [now, ...(enterpriseId === undefined ? [] : [enterpriseId])]))!.n;
     return result;
   }
 
@@ -729,20 +972,21 @@ export class MysqlPoolStore implements PoolStore {
       'SELECT member_identity FROM user_pool_catalog_holds WHERE caller_id=? ORDER BY assigned_at LIMIT 1', [caller]);
     if (catalog) return catalog.member_identity; // Target caller cleanup already owns its credential lock.
     const excluded: string[] = [];
+    const ranked = rankEnterprises(await this.enterpriseSnapshot(tx.connection, await this.time(tx.connection)),
+      { kind: 'admission', caller });
+    const supply = logicalSupplySql(DB_NOW);
     for (let attempt = 0; attempt < 128; attempt++) {
-      // Candidate discovery must NOT lock inventory before Proxy. Include idle
-      // expired bindings/cooldowns so admission does not depend on a sweep worker.
-      const selectCandidate = (state: 'ready' | 'cooling') => this.one<{ identity: string }>(tx.connection, `SELECT p.identity
+      if (!ranked.length) break;
+      const enterprise = ranked[0];
+      // Discovery never locks inventory. All states/enterprises remain in the
+      // score denominator; candidate filtering is separate from that arithmetic.
+      const member = await this.one<{ identity: string }>(tx.connection, `SELECT p.identity
         FROM user_pool_accounts p FORCE INDEX (idx_user_pool_available)
-        WHERE p.state=? ${state === 'cooling' ? `AND p.cooldown_until<=${DB_NOW}` : ''}
+        JOIN proxy_accounts a ON a.identity=p.identity WHERE a.enterprise_id=? AND ${supply.eligibleIdle}
         ${excluded.length ? `AND p.identity NOT IN (${excluded.map(() => '?').join(',')})` : ''}
-        AND NOT EXISTS (SELECT 1 FROM user_pool_leases l WHERE l.member_identity=p.identity AND
-          (l.expires_at>${DB_NOW} OR EXISTS (SELECT 1 FROM user_pool_holds h WHERE h.lease_id=l.lease_id AND h.expires_at>${DB_NOW})))
-        AND NOT EXISTS (SELECT 1 FROM user_pool_catalog_holds h WHERE h.member_identity=p.identity AND h.expires_at>${DB_NOW})
-        ORDER BY p.updated_at, p.ordinal LIMIT 1`, [state, ...excluded]);
-      // Equality on the leading index column preserves the ordered LIMIT scan.
-      const member = await selectCandidate('ready') ?? await selectCandidate('cooling');
-      if (!member) break;
+        ORDER BY CASE WHEN p.state='ready' THEN 0 ELSE 1 END, p.updated_at, p.ordinal LIMIT 1`,
+      [enterprise.enterpriseId, ...excluded]);
+      if (!member) { ranked.shift(); continue; }
       excluded.push(member.identity);
       if (!await this.lockCredential(tx, member.identity, true)) continue;
       await this.reclaimMemberTx(tx, member.identity);
@@ -771,7 +1015,8 @@ export class MysqlPoolStore implements PoolStore {
   private async hold(tx: Tx, lease: Lease, kind: 'lease' | 'catalog', timeoutMs = this.options.requestTimeoutMs): Promise<HeldLease> {
     const requestId = randomUUID();
     const deadline = await this.time(tx.connection) + timeoutMs;
-    const generation = (await this.readInventory(tx.connection, lease.member_identity))!.generation;
+    const member = (await this.readInventory(tx.connection, lease.member_identity))!;
+    const generation = member.generation;
     if (kind === 'catalog') {
       await this.exec(tx, `INSERT INTO user_pool_catalog_holds
         (request_id, lease_id, caller_id, member_identity, assigned_at, expires_at, deadline_at, generation)
@@ -781,7 +1026,8 @@ export class MysqlPoolStore implements PoolStore {
       await this.exec(tx, 'INSERT INTO user_pool_holds(request_id, lease_id, expires_at, deadline_at, generation) VALUES (?, ?, ?, ?, ?)',
         [requestId, lease.lease_id, deadline + HOLD_DRAIN_MS, deadline, generation]);
     }
-    return { ...lease, request_id: requestId, kind, deadline_at: deadline };
+    return { ...lease, enterprise_id: member.enterprise_id, enterprise_revision: member.enterprise_revision,
+      request_id: requestId, kind, deadline_at: deadline };
   }
 
   private async heldRow(tx: Tx, held: HeldLease): Promise<HoldRow | undefined> {
@@ -789,7 +1035,9 @@ export class MysqlPoolStore implements PoolStore {
       ? 'SELECT * FROM user_pool_catalog_holds WHERE request_id=? AND lease_id=?'
       : `SELECT h.*, l.member_identity, l.caller_id FROM user_pool_holds h
         JOIN user_pool_leases l ON l.lease_id=h.lease_id WHERE h.request_id=? AND h.lease_id=?`, [held.request_id, held.lease_id]);
-    return row?.member_identity === held.member_identity && row.caller_id === held.caller_id ? row : undefined;
+    if (row?.member_identity !== held.member_identity || row.caller_id !== held.caller_id) return undefined;
+    const member = await this.readInventory(tx.connection, row.member_identity);
+    return member?.enterprise_id === held.enterprise_id && member?.enterprise_revision === held.enterprise_revision ? row : undefined;
   }
 
   private async currentHold(tx: Tx, held: HeldLease): Promise<HoldRow | undefined> {
@@ -832,25 +1080,32 @@ export class MysqlPoolStore implements PoolStore {
 
   private async reservationDeficit(tx: Tx): Promise<number> {
     const settings = await this.readSettings(tx.connection);
-    const counts = await this.readCounts(tx);
     if (settings.paused) return 0;
-    const retrying = (await this.one<{ n: number }>(tx.connection, `SELECT COUNT(*) n FROM user_pool_accounts
-      WHERE state='failed' AND attempts<3 AND COALESCE(last_error, '') NOT IN (${MANUAL_SQL})`, MANUAL_ERRORS))!.n;
-    const reusable = (await this.one<{ n: number }>(tx.connection, `SELECT COUNT(*) n FROM user_pool_accounts p
-      JOIN proxy_accounts a ON a.identity=p.identity WHERE p.state IN ('ready','cooling')
-      AND (p.state='ready' OR p.cooldown_until<=${DB_NOW}) AND p.verified_at IS NOT NULL
-      AND a.copilot_oauth_status='valid' AND LENGTH(a.copilot_oauth_token)>0
-      AND NOT EXISTS (SELECT 1 FROM user_pool_leases l WHERE l.member_identity=p.identity AND
-        (l.expires_at>${DB_NOW} OR EXISTS (SELECT 1 FROM user_pool_holds h WHERE h.lease_id=l.lease_id AND h.expires_at>${DB_NOW})))
-      AND NOT EXISTS (SELECT 1 FROM user_pool_catalog_holds h WHERE h.member_identity=p.identity AND h.expires_at>${DB_NOW})`))!.n;
-    const awaitingRepair = (await this.one<{ n: number }>(tx.connection, `SELECT COUNT(*) n FROM user_pool_accounts
-      WHERE state IN ('ready','cooling') AND verified_at IS NULL`))!.n;
-    return Math.max(0, Math.min(settings.max_accounts - counts.total,
-      settings.idle_target - reusable - counts.provisioning - retrying - awaitingRepair));
+    const snapshot = await this.enterpriseSnapshot(tx.connection, await this.time(tx.connection));
+    return Math.max(0, settings.idle_target - snapshot.reduce((sum, row) => sum + row.eligibleIdle + row.pendingSupply, 0));
   }
 
-  private async reserveCandidate(tx: Tx, owner?: string): Promise<Inventory | UserPoolError> {
+  private creationEligibility(ids?: readonly string[]): ReadonlySet<string> | undefined {
+    if (ids === undefined) return undefined;
+    if (!Array.isArray(ids) || new Set(ids).size !== ids.length
+      || ids.some(id => typeof id !== 'string' || !this.currentRegistry().profiles.some(profile => profile.id === id))) {
+      throw new UserPoolError(400, 'invalid_enterprise_eligibility');
+    }
+    return new Set(ids);
+  }
+
+  private async reserveCandidate(tx: Tx, owner?: string, eligible?: ReadonlySet<string>): Promise<Inventory | UserPoolError | undefined> {
     let ordinal = (await this.settingsRow(tx.connection)).next_ordinal;
+    // Health filters candidates only: score against ALL active registered
+    // inventory, including unhealthy/cap-full enterprises, on every insertion.
+    const snapshot = (await this.enterpriseSnapshot(tx.connection, await this.time(tx.connection))).map(row => ({ ...row,
+      eligible: row.eligible !== false && (eligible === undefined || eligible.has(row.enterpriseId)) }));
+    const ranked = rankEnterprises(snapshot, { kind: 'creation', ordinal });
+    if (!ranked.length) return undefined;
+    const enterpriseId = ranked[0].enterpriseId;
+    // Creation holds settings X before policy S, and only then locks/inserts
+    // accounts. No policy upgrades and no admission-style account-first inversion.
+    await this.assertActivePolicy(tx, enterpriseId);
     // A bounded scan also prevents a populated direct-mode namespace monopolizing the gate.
     const end = Math.min(NAME_CAPACITY, ordinal + 128);
     while (ordinal < end) {
@@ -865,8 +1120,8 @@ export class MysqlPoolStore implements PoolStore {
       // The savepoint also discards a newly inserted Proxy row if ownership expires while waiting.
       await this.exec(tx, 'SAVEPOINT pool_reservation');
       try {
-        await this.exec(tx, `INSERT INTO proxy_accounts(identity, sso_user, copilot_oauth_status, created_at, updated_at)
-          VALUES (?, ?, 'missing', ?, ?)`, [identity, identity, timestamp, timestamp]);
+        await this.exec(tx, `INSERT INTO proxy_accounts(enterprise_id, account_incarnation, identity, sso_user, copilot_oauth_status, created_at, updated_at)
+          VALUES (?, ?, ?, ?, 'missing', ?, ?)`, [enterpriseId, randomUUID(), identity, identity, timestamp, timestamp]);
       } catch (error) {
         if (mysqlCode(error) === 'ER_DUP_ENTRY') {
           await this.exec(tx, 'ROLLBACK TO SAVEPOINT pool_reservation');

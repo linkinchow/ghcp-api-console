@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import { createPool, type RowDataPacket } from 'mysql2/promise';
-import { runMigrations } from '../../src/proxy/src/db/migrations.js';
+import { runMigrations } from '../v1-frozen/db/migrations.js';
 import { migrateSqliteToMysql } from './migrate.js';
 
 const mysqlUrl = process.env.MYSQL_TEST_URL;

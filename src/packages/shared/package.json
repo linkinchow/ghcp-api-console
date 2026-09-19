@@ -9,6 +9,58 @@
     ".": {
       "types": "./src/index.ts",
       "import": "./dist/index.js"
+    },
+    "./poolNames": {
+      "types": "./src/poolNames.ts",
+      "import": "./dist/poolNames.js"
+    },
+    "./enterprisePoolV4": {
+      "types": "./src/enterprisePoolV4.ts",
+      "import": "./dist/enterprisePoolV4.js"
+    },
+    "./enterpriseRuntimeV4": {
+      "types": "./src/enterpriseRuntimeV4.ts",
+      "import": "./dist/enterpriseRuntimeV4.js"
+    },
+    "./enterpriseStorageV4": {
+      "types": "./src/enterpriseStorageV4.ts",
+      "import": "./dist/enterpriseStorageV4.js"
+    },
+    "./enterpriseMysqlV4": {
+      "types": "./src/enterpriseMysqlV4.ts",
+      "import": "./dist/enterpriseMysqlV4.js"
+    },
+    "./enterpriseMysqlSchemaV4": {
+      "types": "./src/enterpriseMysqlSchemaV4.ts",
+      "import": "./dist/enterpriseMysqlSchemaV4.js"
+    },
+    "./enterpriseStorage": {
+      "types": "./src/enterpriseStorage.ts",
+      "import": "./dist/enterpriseStorage.js"
+    },
+    "./enterpriseMysql": {
+      "types": "./src/enterpriseMysql.ts",
+      "import": "./dist/enterpriseMysql.js"
+    },
+    "./enterpriseV3": {
+      "types": "./src/enterpriseV3.ts",
+      "import": "./dist/enterpriseV3.js"
+    },
+    "./enterpriseRuntimeV3": {
+      "types": "./src/enterpriseRuntimeV3.ts",
+      "import": "./dist/enterpriseRuntimeV3.js"
+    },
+    "./enterpriseSqliteReadiness": {
+      "types": "./src/enterpriseSqliteReadiness.ts",
+      "import": "./dist/enterpriseSqliteReadiness.js"
+    },
+    "./enterpriseStorageV3": {
+      "types": "./src/enterpriseStorageV3.ts",
+      "import": "./dist/enterpriseStorageV3.js"
+    },
+    "./enterpriseMysqlV3": {
+      "types": "./src/enterpriseMysqlV3.ts",
+      "import": "./dist/enterpriseMysqlV3.js"
     }
   },
   "scripts": {

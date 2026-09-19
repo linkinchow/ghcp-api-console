@@ -13,6 +13,7 @@ import { resolveClaudeCodeOptimized } from './routes/claudeCodeMode.js';
 import { adminApiRouter } from './routes/adminApi.js';
 import { internalApiRouter } from './routes/internalApi.js';
 import { userPoolApiRouter } from './routes/userPoolApi.js';
+import { enterpriseManagementRouter } from './routes/enterpriseManagement.js';
 import { assertUserPoolOwner, getUserPool, routeUserPool, startUserPool, stopUserPool } from './userPool/runtime.js';
 import { readPoolConfig } from './userPool/config.js';
 
@@ -38,7 +39,7 @@ export function buildApp(): express.Express {
       res.status(503).json({ status: 'unavailable', service: 'proxy' });
     }
   });
-  app.use('/api', requireInternalToken, adminApiRouter, userPoolApiRouter);
+  app.use('/api', requireInternalToken, enterpriseManagementRouter, adminApiRouter, userPoolApiRouter);
   app.use('/internal', requireInternalToken, internalApiRouter);
   app.use(requireApiKey, requireIdentityHeader, routeUserPool, compatibleRouter);
   app.use((req, res) => {

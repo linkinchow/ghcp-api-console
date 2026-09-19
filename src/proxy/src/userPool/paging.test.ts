@@ -1,15 +1,16 @@
+import { randomUUID } from 'node:crypto';
+import { createSqlitePoolFixture } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import Database from 'better-sqlite3';
-import { runMigrations } from '../db/migrations.js';
 import { readPoolConfig } from './config.js';
 import { UserPoolStore } from './store.js';
 
 function fixture() {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
-  runMigrations(db);
-  const store = new UserPoolStore(db, readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease',
+
+  const store = createSqlitePoolFixture(db, readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease',
     POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test', POOL_WARMUP_MODEL: 'mock', READY_IDLE_TARGET: '2000', POOL_MAX_ACCOUNTS: '2000' }));
   return { db, store };
 }
@@ -37,12 +38,12 @@ test('SQLite dispatch slots are atomic, fenced and retained for uncertain Login 
 test('SQLite pagination reaches beyond 1000 members and escapes wildcard searches', () => {
   const { db, store } = fixture();
   try {
-    const account = db.prepare("INSERT INTO proxy_accounts(identity,sso_user,copilot_oauth_status,created_at,updated_at) VALUES (?,?,'missing',?,?)");
+    const account = db.prepare("INSERT INTO proxy_accounts(enterprise_id,account_incarnation,identity,sso_user,copilot_oauth_status,created_at,updated_at) VALUES ('86e2ee02-223a-45ea-8c26-bdd1c570a4ee',?,?,?,'missing',?,?)");
     const inventory = db.prepare("INSERT INTO user_pool_accounts(identity,ordinal,state,stage,attempt_id,updated_at) VALUES (?,?,'provisioning','new',?,?)");
     db.transaction(() => {
       for (let n = 0; n < 2000; n++) {
         const identity = `synthetic-${n.toString().padStart(4, '0')}`;
-        account.run(identity, identity, '2026-09-12T00:00:00.000Z', '2026-09-12T00:00:00.000Z');
+        account.run(randomUUID(), identity, identity, '2026-09-12T00:00:00.000Z', '2026-09-12T00:00:00.000Z');
         inventory.run(identity, n, `attempt-${n}`, 1);
       }
     })();

@@ -2,9 +2,8 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
-import { runMysqlMigrations } from '../db/mysqlMigrations.js';
 import { readPoolConfig, UserPoolError } from './config.js';
-import { MysqlPoolStore } from './mysqlStore.js';
+import { FixtureMysqlPoolStore as MysqlPoolStore, initMysqlFixture } from '../test/enterpriseFixtures.js';
 
 const env = {
   ACCOUNT_ROUTING_MODE: 'caller-lease', STORAGE_DRIVER: 'mysql',
@@ -40,7 +39,7 @@ async function withDatabase(run: (f: Fixture) => Promise<void>) {
     for (let i = 0; i < 2; i++) pools.push(createPool({ uri: url.toString(), connectionLimit: 4,
       connectTimeout: 5000, timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true }));
     const [db, other] = pools;
-    await runMysqlMigrations(db);
+    await initMysqlFixture(db, options);
     assert.equal(options.requestTimeoutMs, 120000);
     const extendedConfig = readPoolConfig({ ...env, POOL_INFERENCE_TIMEOUT_SECONDS: '600' });
     assert.deepEqual(extendedConfig, options, 'runtime-only setting cannot alter fingerprint inputs');

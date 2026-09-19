@@ -79,6 +79,7 @@ test('integer options reject coercion and respect all bounds', () => {
     assert.throws(() => readPoolConfig({ ...env, [key]: String(min - 1) }), new RegExp(key));
     assert.throws(() => readPoolConfig({ ...env, [key]: String(max + 1) }), new RegExp(key));
   }
-  assert.throws(() => readPoolConfig({ ...enabledEnv, READY_IDLE_TARGET: '11', POOL_MAX_ACCOUNTS: '10' }),
-    /Idle target exceeds/);
+  const targetAboveCapacity = readPoolConfig({ ...enabledEnv, READY_IDLE_TARGET: '11', POOL_MAX_ACCOUNTS: '10' });
+  assert.equal(targetAboveCapacity.idleTarget, 11, 'global target is independent of enterprise capacity');
+  assert.equal(targetAboveCapacity.maxAccounts, 10);
 });

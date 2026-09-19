@@ -2,8 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createPool, type RowDataPacket } from 'mysql2/promise';
-import { runMysqlMigrations } from '../db/mysqlMigrations.js';
-import { MysqlPoolStore } from './mysqlStore.js';
+import { FixtureMysqlPoolStore as MysqlPoolStore, initMysqlFixture, TEST_ENTERPRISE } from '../test/enterpriseFixtures.js';
 import { normalizePoolConfig, readPoolConfig } from './config.js';
 import { PrewarmWorker } from './worker.js';
 import { ProvisionFailure } from './provisioner.js';
@@ -25,7 +24,7 @@ test('MySQL production regressions: bounded backlog, defaults and terminal callb
   url.pathname = '/' + database;
   const db = createPool({ uri: url.toString(), connectionLimit: 4, dateStrings: true, timezone: 'Z', supportBigNumbers: true, bigNumberStrings: true });
   try {
-    await runMysqlMigrations(db);
+    await initMysqlFixture(db, options);
     const { loginMaxPending: _login, prewarmConcurrency: _prewarm, ...omitted } = options;
     const store = new MysqlPoolStore(db, omitted);
     await store.initialize();
@@ -65,11 +64,11 @@ test('MySQL production regressions: bounded backlog, defaults and terminal callb
         const accounts: unknown[][] = [], members: unknown[][] = [], leases: unknown[][] = [];
         for (let n = start; n < start + 100; n++) {
           const identity = `synthetic-expiry-${String(n).padStart(4, '0')}`;
-          accounts.push([identity, identity, 'synthetic-token', 'valid']);
+          accounts.push([identity, identity, randomUUID(), 'synthetic-token', 'valid']);
           members.push([identity, n, 'ready', 'ready', randomUUID(), 1, 1]);
           leases.push([`sha256:${n.toString(16).padStart(64, '0')}`, identity, randomUUID(), 'active', 1, 1, 1]);
         }
-        await db.query(`INSERT INTO proxy_accounts(identity,sso_user,copilot_oauth_token,copilot_oauth_status,created_at,updated_at) VALUES ${accounts.map(() => '(?,?,?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))').join(',')}`, accounts.flat());
+        await db.query(`INSERT INTO proxy_accounts(enterprise_id,identity,sso_user,account_incarnation,copilot_oauth_token,copilot_oauth_status,created_at,updated_at) VALUES ${accounts.map(() => "('86e2ee02-223a-45ea-8c26-bdd1c570a4ee',?,?,?,?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))").join(',')}`, accounts.flat());
         await db.query(`INSERT INTO user_pool_accounts(identity,ordinal,state,stage,attempt_id,updated_at,verified_at) VALUES ${members.map(() => '(?,?,?,?,?,?,?)').join(',')}`, members.flat());
         await db.query(`INSERT INTO user_pool_leases(caller_id,member_identity,lease_id,phase,assigned_at,last_success_at,expires_at) VALUES ${leases.map(() => '(?,?,?,?,?,?,?)').join(',')}`, leases.flat());
       }
@@ -90,7 +89,10 @@ test('MySQL production regressions: bounded backlog, defaults and terminal callb
       assert.equal(await remaining(), 32);
       await db.execute('UPDATE user_pool_leases SET expires_at=1');
       await db.query('DELETE FROM user_pool_holds');
-      await db.execute('UPDATE user_pool_settings SET max_accounts=2100,idle_target=100 WHERE id=1');
+      await db.execute('UPDATE user_pool_settings SET idle_target=100 WHERE id=1');
+      const policy = await store.enterprisePolicy(TEST_ENTERPRISE.id);
+      assert.ok(policy);
+      await store.updateEnterprisePolicy(TEST_ENTERPRISE.id, policy.policyVersion, { type: 'cap', maxAccounts: 2100 });
       assert.equal(await store.reserve(), undefined, 'Expired reusable inventory prevents unnecessary provisioning before all batches drain');
       for (let pass = 0; pass < 10 && await remaining(); pass++) await store.reclaim();
       assert.equal(await remaining(), 0);

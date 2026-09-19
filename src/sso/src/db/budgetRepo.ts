@@ -1,4 +1,5 @@
-import type { AiCreditsPeriodUsageDto } from '@ghcp/shared';
+import type { EnterpriseScope, AiCreditsPeriodUsageDto } from '@ghcp/shared';
+import { getScopeProfile } from '../enterprise.js';
 import { getDb } from './connection.js';
 
 interface AiCreditsUsageRow {
@@ -15,18 +16,20 @@ export interface AiCreditsUsageCacheRecord extends AiCreditsPeriodUsageDto {
   rawJson: unknown;
 }
 
-export function getAiCreditsUsagePeriod(year: number, month: number): AiCreditsUsageCacheRecord | undefined {
-  const row = getDb().prepare('SELECT * FROM sso_budget_cache WHERE period_key = ?').get(periodKey(year, month)) as AiCreditsUsageRow | undefined;
+export function getAiCreditsUsagePeriod(year: number, month: number, scope: EnterpriseScope): AiCreditsUsageCacheRecord | undefined {
+  getScopeProfile(scope);
+  const row = getDb().prepare('SELECT * FROM sso_budget_cache WHERE enterprise_id = ? AND period_key = ?').get(scope.enterpriseId, periodKey(year, month)) as AiCreditsUsageRow | undefined;
   return row ? mapRow(row) : undefined;
 }
 
-export function saveAiCreditsUsagePeriod(input: AiCreditsUsageCacheRecord): AiCreditsUsageCacheRecord {
+export function saveAiCreditsUsagePeriod(input: AiCreditsUsageCacheRecord, scope: EnterpriseScope): AiCreditsUsageCacheRecord {
+  getScopeProfile(scope);
   getDb()
     .prepare(`
       INSERT INTO sso_budget_cache (
-        period_key, year, month, quantity, unit_type, raw_json, fetched_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(period_key) DO UPDATE SET
+        enterprise_id, period_key, year, month, quantity, unit_type, raw_json, fetched_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(enterprise_id, period_key) DO UPDATE SET
         year = excluded.year,
         month = excluded.month,
         quantity = excluded.quantity,
@@ -35,6 +38,7 @@ export function saveAiCreditsUsagePeriod(input: AiCreditsUsageCacheRecord): AiCr
         fetched_at = excluded.fetched_at
     `)
     .run(
+      scope.enterpriseId,
       periodKey(input.year, input.month),
       input.year,
       input.month,
@@ -46,8 +50,9 @@ export function saveAiCreditsUsagePeriod(input: AiCreditsUsageCacheRecord): AiCr
   return input;
 }
 
-export function countAssignedCopilotSeats(): number {
-  return (getDb().prepare("SELECT COUNT(*) AS count FROM sso_users WHERE copilot_seat_status = 'assigned'").get() as { count: number }).count;
+export function countAssignedCopilotSeats(scope: EnterpriseScope): number {
+  getScopeProfile(scope);
+  return (getDb().prepare("SELECT COUNT(*) AS count FROM sso_users WHERE enterprise_id = ? AND copilot_seat_status = 'assigned'").get(scope.enterpriseId) as { count: number }).count;
 }
 
 function mapRow(row: AiCreditsUsageRow): AiCreditsUsageCacheRecord {

@@ -4,10 +4,9 @@ import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { createConnection, createPool, type Connection, type Pool, type PoolConnection, type RowDataPacket } from 'mysql2/promise';
-import { runMysqlMigrations } from '../db/mysqlMigrations.js';
 import type { PoolConfig } from './config.js';
 import { MysqlDeadlineError } from './mysqlDeadline.js';
-import { MysqlPoolStore } from './mysqlStore.js';
+import { FixtureMysqlPoolStore as MysqlPoolStore, initMysqlFixture } from '../test/enterpriseFixtures.js';
 import type { HeldLease } from './store.js';
 
 const options: PoolConfig = {
@@ -101,7 +100,7 @@ test('MySQL caller isolation: local FIFO protects unrelated callers and shares t
     first = new MysqlPoolStore(firstPool, options);
     const store = first;
     const second = new MysqlPoolStore(secondPool, options);
-    await runMysqlMigrations(pool);
+    await initMysqlFixture(pool, options);
     await store.initialize();
     await second.initialize();
 

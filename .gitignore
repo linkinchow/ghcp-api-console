@@ -15,6 +15,7 @@ AGENTS.md
 node_modules
 src/**/dist/
 src/**/data/
+/data/error-diagnostics/
 src/**/logs/
 *.sqlite
 .env
@@ -31,6 +32,7 @@ curl.http
 !docs/codebase-overview.md
 !docs/repo-map.md
 !docs/user-pool-*.md
+!docs/pool-name-catalog-provenance.md
 **/__pycache__/
 **/*.pyc
 .local-sso/

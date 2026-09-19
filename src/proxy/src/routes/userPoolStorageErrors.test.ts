@@ -1,3 +1,4 @@
+import { configureProxyFixture, fixtureRegistry, TEST_ENTERPRISE } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import type { Server } from 'node:http';
@@ -72,6 +73,7 @@ async function fixture(t: TestContext, stage: FailureStage, code: ConnectivityCo
   Object.assign(config, { apiKey: 'pool-storage-errors-test-key', storageDriver: 'sqlite',
     dbPath: ':memory:', requestStatsPerAccountLimit: 100, claudeCodeOptimized: true });
   const driver = failingDriver(code);
+  config.dbPath = configureProxyFixture();
   const storage = getStorage();
   if (stage === 'admission') {
     // Only startup/migrations are bypassed. Admission runs the real MySQL
@@ -90,6 +92,9 @@ async function fixture(t: TestContext, stage: FailureStage, code: ConnectivityCo
     await importCopilotOauthToken({ identity: member, ssoUser: member, ghLogin: 'synthetic', copilotOauthToken: 'synthetic-token' });
     store.update(member, { state: 'ready', stage: 'ready', verified_at: store.now() });
     const mysqlStorage = new MysqlStorage(driver.pool, 100);
+    // Isolate the failing driver boundary with a parsed test registry; do not run
+    // startup SQL against the deliberately unavailable connection or bypass a route.
+    assert.equal(Reflect.set(mysqlStorage, 'registry', fixtureRegistry()), true);
     t.mock.method(storage, 'getAccount', async (identity: string) => {
       accountLookups++;
       assert.equal(identity, member, 'Credential lookup must target the admitted member, not the caller hash');
@@ -156,7 +161,7 @@ for (const stage of ['admission', 'credential lookup'] as const) {
           assert.equal(f.driver.calls.query.length, 1, 'The reset must originate in admission SQL');
           assert.equal(f.driver.calls.execute.length, 0);
         } else {
-          assert.deepEqual(f.driver.calls.execute, [{ sql: 'SELECT * FROM proxy_accounts WHERE identity = ?', values: [f.member] }]);
+          assert.deepEqual(f.driver.calls.execute, [{ sql: 'SELECT * FROM proxy_accounts WHERE enterprise_id=? AND identity=?', values: [TEST_ENTERPRISE.id, f.member] }]);
           assert.equal(f.driver.calls.query.length, 0);
         }
       } else {

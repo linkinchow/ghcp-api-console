@@ -16,7 +16,9 @@
     "build:deploy": "npm --workspace @ghcp/shared run build && npm --workspace @ghcp/proxy run build && npm --workspace @ghcp/sso run build && npm --workspace @ghcp/login run build && npm --workspace @ghcp/console run build",
     "typecheck": "npm run typecheck --workspaces --if-present && npm run typecheck:upgrade",
     "typecheck:deploy": "npm --workspace @ghcp/shared run typecheck && npm --workspace @ghcp/proxy run typecheck && npm --workspace @ghcp/sso run typecheck && npm --workspace @ghcp/login run typecheck && npm --workspace @ghcp/console run typecheck && npm run typecheck:upgrade",
-    "typecheck:upgrade": "tsc -p upgrade/sqlite-to-mysql/tsconfig.json && tsc -p upgrade/user-pool-mysql/tsconfig.json",
+    "typecheck:upgrade": "tsc -p upgrade/sqlite-to-mysql/tsconfig.json && tsc -p upgrade/user-pool-mysql/tsconfig.json && tsc -p upgrade/default-enterprise/tsconfig.json && tsc -p upgrade/multi-enterprise/tsconfig.json && tsc -p upgrade/multi-enterprise-pool/tsconfig.json",
+    "upgrade:default-enterprise": "tsx upgrade/default-enterprise/index.ts",
+    "test:upgrade:default-enterprise": "tsx --test upgrade/default-enterprise/*.test.ts",
     "upgrade:user-pool-mysql": "tsx upgrade/user-pool-mysql/index.ts",
     "test:upgrade:user-pool-mysql": "tsx --test upgrade/user-pool-mysql/migrate.test.ts",
     "start:proxy": "npm --workspace @ghcp/proxy run start",
@@ -37,7 +39,11 @@
     "test:mysql": "npm --workspace @ghcp/proxy run test:mysql",
     "test:upgrade:mysql": "tsx --test upgrade/sqlite-to-mysql/migrate.integration.test.ts",
     "upgrade:sqlite-to-mysql": "tsx upgrade/sqlite-to-mysql/index.ts",
-    "validate:health": "bash scripts/validate-health.sh"
+    "validate:health": "bash scripts/validate-health.sh",
+    "upgrade:multi-enterprise": "tsx upgrade/multi-enterprise/index.ts",
+    "test:upgrade:multi-enterprise": "tsx --test --test-concurrency=1 upgrade/multi-enterprise/*.test.ts",
+    "upgrade:multi-enterprise-pool": "tsx upgrade/multi-enterprise-pool/index.ts",
+    "test:upgrade:multi-enterprise-pool": "tsx --test --test-concurrency=1 upgrade/multi-enterprise-pool/*.test.ts"
   },
   "dependencies": {
     "@authenio/samlify-node-xmllint": "^2.0.0",
@@ -52,7 +58,8 @@
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "samlify": "^2.13.1"
+    "samlify": "^2.13.1",
+    "@xmldom/xmldom": "0.8.15"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

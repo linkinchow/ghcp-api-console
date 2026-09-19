@@ -3,9 +3,9 @@ import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, writeFileSync 
 import { isAbsolute, resolve } from 'node:path';
 import { serialize } from 'node:v8';
 import Database from 'better-sqlite3';
-import { runMigrations } from '../../src/proxy/src/db/migrations.js';
-import { canonicalSql } from '../../src/proxy/src/db/mysqlSchema.js';
-import { UserPoolStore } from '../../src/proxy/src/userPool/store.js';
+import { runMigrations } from '../v1-frozen/db/migrations.js';
+import { canonicalSql } from '../v1-frozen/db/mysqlSchema.js';
+import { UserPoolStore } from '../v1-frozen/userPool/store.js';
 import { preflightSqlite, type MigrationResult } from './migrate.js';
 
 const COOLDOWN_DDL = `CREATE TABLE user_pool_catalog_cooldowns (

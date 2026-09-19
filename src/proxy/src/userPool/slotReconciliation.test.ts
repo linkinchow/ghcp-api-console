@@ -1,3 +1,4 @@
+import { TEST_ENTERPRISE, fixtureProfile } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { LoginTaskDto } from '@ghcp/shared';
@@ -22,14 +23,19 @@ function deferred<T>() {
 /** Async contract fixture; no real Login, SSO, credentials, database or model calls. */
 function fixture(count = 5) {
   let now = Date.parse(createdAt), monotonic = 0, owner: string | undefined;
-  let paused = 0, held = false;
+  let paused: 0 | 1 = 0;
+  let held = false;
   const rows: ProvisionInventory[] = Array.from({ length: count }, (_, i) => ({
+    enterprise_id: TEST_ENTERPRISE.id, enterprise_revision: TEST_ENTERPRISE.revision,
     identity: `pool${i}`, ordinal: i, state: 'failed', stage: 'oauth-wait', attempt_id: `worker${i}`,
     oauth_attempt_id: `nonce${i}`, sso_created_at: createdAt, task_id: `task${i}`,
     attempts: 3, retry_at: now + 30000, last_error: 'sso_http_503', updated_at: now,
     cooldown_until: 0, verified_at: null, generation: 9,
   }));
   const tasks: LoginTaskDto[] = rows.map(row => ({
+    enterpriseId:TEST_ENTERPRISE.id,enterpriseRevision:TEST_ENTERPRISE.revision,
+    accountIncarnation:'11111111-1111-4111-8111-111111111111',expectedGhLogin:`${row.identity}_emu`,
+    bindingVersion: 2,
     id: row.task_id!, identity: row.identity, ssoUser: row.identity, ghLogin: `${row.identity}_emu`,
     oauthAttemptId: row.oauth_attempt_id!, ssoType: 'custom', status: 'running', attempts: 1, createdAt,
   }));
@@ -48,7 +54,7 @@ function fixture(count = 5) {
     async renewOwner(expected) { return live(expected); },
     async releaseOwner(expected) { if (live(expected)) owner = undefined; },
     async reclaim() {},
-    async settings() { return { version: 1, idle_target: 5, max_accounts: 100, lease_seconds: 600, paused }; },
+    async settings() { return { version: 1, idle_target: 5, max_accounts: 100, active_max_accounts: 100, lease_seconds: 600, paused }; },
     async reserveDeficit() { return 0; },
     async pending(excluded = []) {
       const row = rows.find(row => row.state === 'provisioning' && row.retry_at <= now && !excluded.includes(row.identity));
@@ -78,10 +84,12 @@ function fixture(count = 5) {
   };
   const adapter: ProvisionAdapter = {
     ...realProvisioner(store, options, {
-      getAccount: async identity => ({ identity, ssoUser: identity, ghLogin: `${identity}_emu`, copilotOauthStatus: 'missing', createdAt, updatedAt: createdAt }),
+      enterpriseProfile: id => { assert.equal(id, TEST_ENTERPRISE.id); return fixtureProfile(options); },
+      verifyReadiness: async () => {},
+      getAccount: async identity => ({ accountIncarnation: "11111111-1111-4111-8111-111111111111", enterpriseId: TEST_ENTERPRISE.id, identity, ssoUser: identity, ghLogin: `${identity}_emu`, copilotOauthStatus: 'missing', createdAt, updatedAt: createdAt }),
       fetch: async (input, init) => {
         assert.equal(init?.method, 'GET', 'only read-only Login requests are allowed');
-        const url = new URL(String(input));
+        const url = new URL(String(input)); url.pathname=url.pathname.replace(`/api/profiles/${TEST_ENTERPRISE.id}`, '/api');
         assert.ok(url.pathname.startsWith('/api/tasks'));
         requests.push(url.pathname + url.search);
         signals.push(init!.signal!);
@@ -142,7 +150,7 @@ test('five exhausted reservations block dispatch until positively completed; rel
 });
 
 for (const state of ['failed', 'disabled']) {
-  for (const status of ['success', 'failed', 'cancelled', 'pending', 'running', 'unknown']) {
+  for (const status of ['success', 'failed', 'cancelled', 'pending', 'running', 'cancel_requested', 'uncertain', 'unknown']) {
     test(`${state} reservation observes ${status} without changing operator state or retry count`, async t => {
       const f = fixture(1); t.after(() => f.worker.stop());
       f.rows[0]!.state = state;
@@ -150,7 +158,7 @@ for (const state of ['failed', 'disabled']) {
       f.tasks[0]!.status = status as LoginTaskDto['status'];
       const before = { ...f.rows[0]! };
       await f.tick();
-      const completed = status === 'success' || status === 'failed';
+      const completed = status === 'success' || status === 'failed' || status === 'cancelled';
       assert.equal(f.releases.length, completed ? 1 : 0);
       assert.deepEqual(f.rows[0], completed ? {
         ...before, stage: status === 'success' ? 'warmup' : 'synced', task_id: null, oauth_attempt_id: null, generation: 10,
@@ -168,12 +176,22 @@ for (const status of [404, 503]) {
   });
 }
 
-for (const field of ['identity', 'ssoUser', 'ghLogin', 'oauthAttemptId', 'ssoType', 'id'] as const) {
-  test(`terminal task with mismatched ${field} cannot release the reservation`, async t => {
+test('legacy cancellation without contract-2 binding retains a reservation', async t => {
+  for (const bindingVersion of [undefined, 1] as const) {
     const f = fixture(1); t.after(() => f.worker.stop());
-    f.tasks[0]!.status = 'success';
-    Object.assign(f.tasks[0]!, { [field]: 'different' });
+    f.tasks[0]!.status = 'cancelled'; f.tasks[0]!.bindingVersion = bindingVersion;
     await f.tick(); assert.deepEqual(f.releases, []);
+  }
+});
+
+for (const field of ['enterpriseId', 'enterpriseRevision', 'accountIncarnation', 'expectedGhLogin', 'identity', 'ssoUser', 'ghLogin', 'oauthAttemptId', 'ssoType', 'id'] as const) {
+  test(`terminal task with mismatched ${field} cannot release the reservation`, async t => {
+    for (const status of ['success', 'cancelled'] as const) {
+      const f = fixture(1); t.after(() => f.worker.stop());
+      f.tasks[0]!.status = status;
+      Object.assign(f.tasks[0]!, { [field]: 'different' });
+      await f.tick(); assert.deepEqual(f.releases, []);
+    }
   });
 }
 

@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
 import type { PoolConnection } from 'mysql2/promise';
-import { MYSQL_SCHEMA, MYSQL_CREDENTIAL_FENCE_BODY } from '../../src/proxy/src/db/mysqlSchema.js';
-import { readPoolConfig } from '../../src/proxy/src/userPool/config.js';
+import { MYSQL_SCHEMA, MYSQL_CREDENTIAL_FENCE_BODY } from '../v1-frozen/db/mysqlSchema.js';
+import { readPoolConfig } from '../v1-frozen/userPool/config.js';
 import { concurrencyConfigFingerprint, reconfigureConcurrency, type ExpectedPoolSettings,
   type ReconfigureConcurrencyOptions } from './reconfigure-concurrency.js';
 

@@ -10,6 +10,15 @@ export class ConsoleApiError extends Error {
   }
 }
 
+// Only expose bounded machine codes, never raw probe details, paths, URLs or
+// Secret references. Backend readiness errors place these in error.details.
+export function safeErrorBlockers(error: unknown): string[] {
+  if (!(error instanceof ConsoleApiError) || !error.details || typeof error.details !== 'object' || Array.isArray(error.details)) return [];
+  const blockers = (error.details as Record<string, unknown>).blockers;
+  if (!Array.isArray(blockers) || blockers.length > 32) return [];
+  return [...new Set(blockers.filter((value): value is string => typeof value === 'string' && /^[a-z][a-z0-9_]{0,95}$/.test(value)))];
+}
+
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const res = await fetch(path, {
     ...options,

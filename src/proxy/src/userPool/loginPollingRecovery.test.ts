@@ -1,3 +1,5 @@
+import { completeFixtureAttempt, failFixtureAttempt } from '../test/enterpriseFixtures.js';
+import { createSqliteStorageFixture, initMysqlFixture, TEST_ENTERPRISE, fixtureRegistry, fixtureProfile } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -70,7 +72,7 @@ async function fixture(t: TestContext, driver: Driver) {
   let mysqlDb: ReturnType<typeof createPool> | undefined;
   let storage: InstanceType<typeof SqliteStorage> | InstanceType<typeof MysqlStorage>;
   if (driver === 'sqlite') {
-    storage = new SqliteStorage(':memory:', 100);
+    storage = createSqliteStorageFixture(options);
     cleanup.push(() => storage.close());
   } else {
     // No default DB, remote address, URL options, or caller-named database is ever used.
@@ -89,7 +91,8 @@ async function fixture(t: TestContext, driver: Driver) {
     url.pathname = '/' + database;
     mysqlDb = createPool({ uri: url.toString(), connectionLimit: 4, connectTimeout: 5000,
       dateStrings: true, timezone: 'Z', supportBigNumbers: true, bigNumberStrings: true });
-    storage = new MysqlStorage(mysqlDb, 100);
+    await initMysqlFixture(mysqlDb, options);
+    storage = new MysqlStorage(mysqlDb, 100, fixtureRegistry(options));
     cleanup.push(async () => {
       try { await storage.close(); }
       finally { await admin.query(`DROP DATABASE \`${database}\``); }
@@ -113,6 +116,7 @@ async function fixture(t: TestContext, driver: Driver) {
     reserveDeficit: owner => later(() => store.reserveDeficit(owner)),
     pending: excluded => later(() => store.pending(excluded)),
     hasHolds: id => later(() => store.hasHolds(id)),
+    canProvision: id => later(() => store.canProvision(id)),
     inventory: id => later(() => store.inventory(id)),
     update: (...args) => later(() => store.update(...args)),
     fail: (...args) => later(() => store.fail(...args)),
@@ -144,11 +148,13 @@ async function fixture(t: TestContext, driver: Driver) {
   let worker: Worker;
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
   const adapter = realProvisioner(asyncStore, options, {
+    enterpriseProfile: id => { assert.equal(id, TEST_ENTERPRISE.id); const profile = fixtureProfile(options); return {...profile,routes:{...profile.routes,ssoInternalUrl:'http://sso.polling-recovery.invalid',loginInternalUrl:'http://login.polling-recovery.invalid'}}; },
+    verifyReadiness: async (profile, signal) => { assert.equal(profile.id, TEST_ENTERPRISE.id); signal.throwIfAborted(); },
     getAccount: id => storage.getAccount(id),
     fetch: (input, init) => recordMock(async () => {
       // All transport is synthetic; there is no delegation to global fetch.
       await yieldTurn();
-      const url = new URL(String(input)), method = init?.method ?? 'GET';
+      const url = new URL(String(input)); url.pathname=url.pathname.replace(`/api/profiles/${TEST_ENTERPRISE.id}`, '/api'); const method = init?.method ?? 'GET';
       requests.push(`${method} ${url.pathname}`);
       const body = () => JSON.parse(String(init?.body));
       if (url.pathname === '/api/users' && method === 'POST') {
@@ -158,7 +164,7 @@ async function fixture(t: TestContext, driver: Driver) {
         assert.deepEqual(request, { ssoUser: request.ssoUser, email: `${request.ssoUser}@${options.accountDomain}`,
           role: 'user', poolManaged: true });
         const stamp = new Date(await store.now()).toISOString();
-        const user: SsoUserDto = { ssoUser: request.ssoUser, email: `${request.ssoUser}@${options.accountDomain}`,
+        const user: SsoUserDto = { enterpriseId: TEST_ENTERPRISE.id, userIncarnation: randomUUID(), ssoUser: request.ssoUser, email: `${request.ssoUser}@${options.accountDomain}`,
           role: 'user', emuStatus: 'not_synced', copilotSeatStatus: 'unassigned', createdAt: stamp, updatedAt: stamp };
         users.set(user.ssoUser, user);
         return json(user);
@@ -170,7 +176,7 @@ async function fixture(t: TestContext, driver: Driver) {
         assert.ok(user);
         assert.equal(user.emuStatus, 'not_synced', 'never repeat SCIM create');
         assert.deepEqual(request, { operation: 'sync_emu', ssoUsers: [user.ssoUser], assignCopilotSeat: false, createOnly: true });
-        Object.assign(user, { ghLogin: `${user.ssoUser}_emu`, ghScimId: `synthetic-${user.ssoUser}`, emuStatus: 'active' });
+        Object.assign(user, { ghLogin: `${user.ssoUser.replaceAll('.', '-')}_emu`, ghScimId: `synthetic-${user.ssoUser}`, emuStatus: 'active' });
         return json({ rows: [{ ssoUser: user.ssoUser, status: 'success', user }] });
       }
       if (url.pathname.startsWith('/api/users/')) {
@@ -192,7 +198,8 @@ async function fixture(t: TestContext, driver: Driver) {
         const request = body() as { identity: string; oauthAttemptId: string };
         const row = (await store.inventory(request.identity))!, user = users.get(row.identity)!;
         assert.equal(row.stage, 'oauth-dispatch', 'real capacity transaction precedes Login POST');
-        assert.deepEqual(request, { identity: row.identity, ssoUser: row.identity, ghLogin: user.ghLogin,
+        assert.deepEqual(request, { enterpriseId: TEST_ENTERPRISE.id, enterpriseRevision: TEST_ENTERPRISE.revision,
+          identity: row.identity, ssoUser: row.identity, expectedGhLogin: user.ghLogin, accountIncarnation:(await storage.getAccount(row.identity))!.accountIncarnation,
           oauthAttemptId: row.oauth_attempt_id, ssoType: 'custom', ssoPassword: 'synthetic-password' });
         const account = await storage.getAccount(row.identity);
         assert.equal(account?.copilotOauthAttemptId, request.oauthAttemptId);
@@ -200,7 +207,7 @@ async function fixture(t: TestContext, driver: Driver) {
         const count = (postsPerAttempt.get(request.oauthAttemptId) ?? 0) + 1;
         postsPerAttempt.set(request.oauthAttemptId, count);
         assert.equal(count, 1, 'Login POST is not idempotent: never repeat a nonce');
-        const task: LoginTaskDto = { id: randomUUID(), identity: row.identity, ssoUser: row.identity,
+        const task: LoginTaskDto = { enterpriseId:TEST_ENTERPRISE.id,enterpriseRevision:TEST_ENTERPRISE.revision,accountIncarnation:account!.accountIncarnation,expectedGhLogin:user.ghLogin, id: randomUUID(), identity: row.identity, ssoUser: row.identity,
           ghLogin: user.ghLogin, oauthAttemptId: request.oauthAttemptId, ssoType: 'custom', status: 'running',
           attempts: 1, createdAt: new Date(await store.now()).toISOString() };
         tasks.set(task.id, task); posted.push(task);
@@ -441,8 +448,8 @@ for (const driver of ['sqlite', 'mysql'] as const) {
           const racing = f.advance();
           await until(() => f.reads.length > count, 'observer must capture the pre-callback generation');
           const task = f.posted[0]!;
-          assert.equal(await f.storage.saveCopilotOauthToken(task.identity, randomUUID(), 'synthetic-stale-token', task.ghLogin), undefined);
-          assert.ok(await f.storage.saveCopilotOauthToken(task.identity, task.oauthAttemptId!, 'synthetic-success-token', task.ghLogin));
+          assert.equal(await completeFixtureAttempt(f.storage,task.identity, randomUUID(), 'synthetic-stale-token', task.ghLogin), undefined);
+          assert.ok(await completeFixtureAttempt(f.storage,task.identity, task.oauthAttemptId!, 'synthetic-success-token', task.ghLogin));
           const callbackRow = await f.row();
           assert.equal(callbackRow.generation, protectedRow.generation + 1, 'real storage callback activates the credential fence');
           assert.deepEqual(f.protectedFields(callbackRow), f.protectedFields(protectedRow), 'callback cannot reset exhausted retry budget');
@@ -451,7 +458,7 @@ for (const driver of ['sqlite', 'mysql'] as const) {
           await racing;
           assert.deepEqual(await f.row(), callbackRow, 'stale observer response cannot release the new generation');
           assert.equal(f.posted.length, 1);
-          assert.equal(await f.storage.saveCopilotOauthToken(task.identity, task.oauthAttemptId!, 'synthetic-replay-token', task.ghLogin), undefined);
+          assert.equal(await completeFixtureAttempt(f.storage,task.identity, task.oauthAttemptId!, 'synthetic-replay-token', task.ghLogin), undefined);
         }
         await f.advance();
         await f.drive(() => f.posted.length === 2, 'exact terminal task frees one slot for a different pending starter');

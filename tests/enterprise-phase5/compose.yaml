@@ -1,0 +1,259 @@
+# Always invoked with an explicit --project-name and --env-file by run.mjs.
+# No .env defaults, existing external volumes, host Docker socket, or public ports.
+x-labels: &labels
+  io.ghcp.phase5.run-id: ${PHASE5_RUN_ID:?explicit run required}
+  io.ghcp.phase5.synthetic: "true"
+x-health: &health
+  interval: 3s
+  timeout: 3s
+  retries: 80
+  start_period: 15s
+x-common-env: &common-env
+  INTERNAL_API_TOKEN: ${PHASE5_INTERNAL_TOKEN:?}
+  ENTERPRISE_REGISTRY_FILE: /fixture/registry.json
+  LOG_LEVEL: warn
+x-registry: &registry
+  type: bind
+  source: ${PHASE5_FIXTURE_DIR:?}/registry.json
+  target: /fixture/registry.json
+  read_only: true
+  bind: {create_host_path: false}
+x-secrets: &secrets
+  type: bind
+  source: ${PHASE5_FIXTURE_DIR:?}/secrets
+  target: /fixture/secrets
+  read_only: true
+  bind: {create_host_path: false}
+x-fixture: &fixture
+  type: bind
+  source: ${PHASE5_FIXTURE_DIR:?}
+  target: /fixture
+  read_only: true
+  bind: {create_host_path: false}
+x-proxy-env: &proxy-env
+  <<: *common-env
+  PORT: "3000"
+  STORAGE_DRIVER: mysql
+  MYSQL_URL: ${PHASE5_RUNTIME_MYSQL_URL:?}
+  MYSQL_SSL_MODE: disabled
+  MYSQL_CONNECTION_LIMIT: "8"
+  ACCOUNT_ROUTING_MODE: caller-lease
+  API_KEY: ${PHASE5_API_KEY:?}
+  SSO_BASE_URL: http://sso:7001
+  LOGIN_BASE_URL: http://login:7003
+  COPILOT_API_BASE_URL: http://provider:8000
+  POOL_ACCOUNT_EMAIL_DOMAIN: pool-a.invalid
+  ENTERPRISE_SHORTCODE: p5aa
+  READY_IDLE_TARGET: "0"
+  POOL_MAX_ACCOUNTS: "12"
+  CALLER_LEASE_TTL_SECONDS: "120"
+  PROVISIONAL_LEASE_TTL_SECONDS: "20"
+  PREWARM_POLL_SECONDS: "1"
+  PREWARM_CONCURRENCY: "2"
+  POOL_REQUEST_TIMEOUT_SECONDS: "30"
+  POOL_WARMUP_MODEL: phase5-synthetic
+  POOL_EXHAUSTED_RETRY_AFTER_SECONDS: "2"
+  REQUEST_STATS_PER_ACCOUNT_LIMIT: "100"
+  PROXY_ERROR_DIAGNOSTICS_ENABLED: "false"
+  PROXY_ERROR_DIAGNOSTICS_REDACT: "true"
+x-proxy: &proxy
+  image: ${PHASE5_PROXY_IMAGE:?}
+  labels: *labels
+  restart: "no"
+  working_dir: /app/src/proxy
+  command: ["node", "dist/index.js"]
+  environment: *proxy-env
+  volumes: [*registry, *secrets]
+  networks: [isolated]
+  healthcheck:
+    <<: *health
+    test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  depends_on:
+    mysql: {condition: service_healthy}
+    provider: {condition: service_healthy}
+    sso: {condition: service_healthy}
+    login: {condition: service_healthy}
+
+services:
+  mysql:
+    image: ${PHASE5_MYSQL_IMAGE:?}
+    labels: *labels
+    restart: "no"
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_bin", "--max-connections=100", "--log-bin-trust-function-creators=1"]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${PHASE5_MYSQL_ROOT_PASSWORD:?}
+      MYSQL_ROOT_HOST: "%"
+    volumes: ["mysql-data:/var/lib/mysql"]
+    ports: ["127.0.0.1:${PHASE5_MYSQL_PORT:?}:3306"]
+    networks: [isolated, database-access]
+    healthcheck:
+      <<: *health
+      test: ["CMD-SHELL", "MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysql --protocol=tcp -h 127.0.0.1 -uroot -Nse 'SELECT 1' >/dev/null 2>&1"]
+  mysql-restore:
+    profiles: [restore]
+    image: ${PHASE5_MYSQL_IMAGE:?}
+    labels: *labels
+    restart: "no"
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_bin", "--max-connections=60", "--log-bin-trust-function-creators=1"]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${PHASE5_MYSQL_ROOT_PASSWORD:?}
+      MYSQL_ROOT_HOST: "%"
+    volumes: ["mysql-restore-data:/var/lib/mysql"]
+    ports: ["127.0.0.1:${PHASE5_RESTORE_PORT:?}:3306"]
+    networks: [isolated, database-access]
+    healthcheck:
+      <<: *health
+      test: ["CMD-SHELL", "MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysql --protocol=tcp -h 127.0.0.1 -uroot -Nse 'SELECT 1' >/dev/null 2>&1"]
+  provider:
+    image: ${PHASE5_TOOLING_IMAGE:?}
+    labels: *labels
+    restart: "no"
+    command: ["node", "/app/tests/enterprise-phase5/mock-provider.mjs"]
+    environment: {PHASE5_SYNTHETIC_ONLY: "1", PHASE5_FIXTURE_DIR: /fixture, PHASE5_STATE_FILE: /fixture/state.json, PORT: "8000"}
+    volumes: [*fixture]
+    networks: [isolated]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  sso:
+    image: ${PHASE5_SSO_IMAGE:?}
+    labels: *labels
+    restart: "no"
+    working_dir: /app/src/sso
+    command: ["node", "dist/index.js"]
+    environment:
+      <<: *common-env
+      PORT: "7001"
+      DB_PATH: /data/sso.sqlite
+      BASE_URL: http://sso:7001
+      PROXY_BASE_URL: http://proxy-lb:3000
+      SESSION_SECRET: ${PHASE5_SESSION_SECRET:?}
+      SSO_DEFAULT_USER_PASSWORD: ${PHASE5_DEFAULT_PASSWORD:?}
+      SSO_USER_EVENTS_LOG: /data/sso-user-events.log
+    volumes:
+      - *registry
+      - *secrets
+      - type: bind
+        source: ${PHASE5_FIXTURE_DIR:?}/data/sso
+        target: /data
+        bind: {create_host_path: false}
+    networks: [isolated]
+    depends_on: {provider: {condition: service_healthy}}
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7001/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  # Test-only authorize injection; the real Login queue/runner/callback are used.
+  # The normal production Login Dockerfile must still be built separately.
+  login:
+    image: ${PHASE5_TOOLING_IMAGE:?}
+    labels: *labels
+    restart: "no"
+    command: ["node", "--import", "tsx", "/app/tests/enterprise-phase5/login-test-entry.ts"]
+    environment:
+      <<: *common-env
+      PHASE5_SYNTHETIC_ONLY: "1"
+      PHASE5_FIXTURE_DIR: /fixture
+      PHASE5_STATE_FILE: /fixture/state.json
+      PORT: "7003"
+      DB_PATH: /data/login.sqlite
+      PROXY_BASE_URL: http://proxy-lb:3000
+      LOG_DIR: /data/logs
+      SSO_URL: http://sso:7001/login
+      SSO_PROVIDER: custom
+      AUTH_HEADLESS: "true"
+      GITHUB_OAUTH_CLIENT_ID: phase5-synthetic-only
+    volumes:
+      - *fixture
+      - type: bind
+        source: ${PHASE5_FIXTURE_DIR:?}/data/login
+        target: /data
+        bind: {create_host_path: false}
+    networks: [isolated]
+    depends_on: {provider: {condition: service_healthy}}
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7003/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  proxy-1: *proxy
+  proxy-2: *proxy
+  proxy-3: *proxy
+  proxy-lb:
+    image: ${PHASE5_HAPROXY_IMAGE:?}
+    labels: *labels
+    restart: "no"
+    volumes:
+      - type: bind
+        source: ${PHASE5_SOURCE_DIR:?}/tests/enterprise-phase5/haproxy.cfg
+        target: /usr/local/etc/haproxy/haproxy.cfg
+        read_only: true
+        bind: {create_host_path: false}
+    networks: [isolated]
+    depends_on:
+      proxy-1: {condition: service_healthy}
+      proxy-2: {condition: service_healthy}
+      proxy-3: {condition: service_healthy}
+  console:
+    image: ${PHASE5_CONSOLE_IMAGE:?}
+    labels: *labels
+    restart: "no"
+    working_dir: /app/src/console
+    command: ["node", "dist/server/index.js"]
+    environment:
+      <<: *common-env
+      PORT: "7004"
+      ADMINS_FILE: /data/admins.json
+      SESSION_SECRET: ${PHASE5_SESSION_SECRET:?}
+      PROXY_BASE_URL: http://proxy-lb:3000
+      SSO_BASE_URL: http://sso:7001
+      LOGIN_BASE_URL: http://login:7003
+    volumes:
+      - type: bind
+        source: ${PHASE5_FIXTURE_DIR:?}/data/console
+        target: /data
+        bind: {create_host_path: false}
+    networks: [isolated]
+    depends_on: {proxy-lb: {condition: service_started}}
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:7004/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  # No generic HTTP proxy: fixed Console target, Host/Origin untouched, no retries.
+  console-bridge:
+    image: ${PHASE5_TOOLING_IMAGE:?}
+    labels: *labels
+    restart: "no"
+    command: ["node", "/app/tests/enterprise-phase5/run.mjs", "console-bridge", "--state", "/fixture/state.json"]
+    environment: {PHASE5_SYNTHETIC_ONLY: "1"}
+    volumes: [*fixture]
+    ports: ["127.0.0.1:${PHASE5_UI_PORT:?}:18195"]
+    networks: [isolated, preview]
+    depends_on: {console: {condition: service_healthy}}
+  tooling:
+    profiles: [tools]
+    image: ${PHASE5_TOOLING_IMAGE:?}
+    labels: *labels
+    environment: {PHASE5_SYNTHETIC_ONLY: "1", PHASE5_FIXTURE_DIR: /fixture, PHASE5_STATE_FILE: /fixture/state.json}
+    volumes:
+      - *fixture
+      - type: bind
+        source: ${PHASE5_RESULTS_DIR:?}
+        target: /results
+        bind: {create_host_path: false}
+    networks: [isolated]
+
+networks:
+  isolated:
+    internal: true
+    labels: *labels
+  # Docker 29 needs a non-internal bridge for active loopback port publication.
+  # ONLY MySQL instances join this network. Applications/provider remain internal;
+  # numeric-loopback bindings and the actual TCP peer gate are still mandatory.
+  database-access:
+    driver: bridge
+    internal: false
+    labels: *labels
+  preview:
+    labels: *labels
+volumes:
+  mysql-data:
+    labels: *labels
+  mysql-restore-data:
+    labels: *labels

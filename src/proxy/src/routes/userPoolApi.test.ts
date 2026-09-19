@@ -1,3 +1,4 @@
+import { configureProxyFixture, createSqlitePoolFixture, TEST_ENTERPRISE } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -6,7 +7,6 @@ import express from 'express';
 import BetterSqlite3 from 'better-sqlite3';
 import { INTERNAL_AUTH_HEADER } from '@ghcp/shared';
 import { config } from '../config.js';
-import { runMigrations } from '../db/migrations.js';
 import { UserPoolStore } from '../userPool/store.js';
 import { readPoolConfig, UserPoolError } from '../userPool/config.js';
 import { createUserPoolApiRouter } from './userPoolApi.js';
@@ -17,10 +17,11 @@ const TOKEN = 'local-pool-admin-test';
 async function fixture() {
   const db = new BetterSqlite3(':memory:');
   db.pragma('foreign_keys = ON');
-  runMigrations(db);
-  const store = new UserPoolStore(db, {
-    ...readPoolConfig({}), enabled: true, accountDomain: 'example.test', idleTarget: 3, maxAccounts: 10,
-  });
+
+  const options = { ...readPoolConfig({}), enabled: true, accountDomain: 'example.test', idleTarget: 3, maxAccounts: 10 };
+  // The router validates trusted registry configuration even when its store is injected.
+  configureProxyFixture(undefined, options);
+  const store = createSqlitePoolFixture(db, options);
   let enabled = true;
   let failure: Error | undefined;
   let wakeFailure = false;
@@ -103,7 +104,7 @@ test('overview explicitly selects safe DTOs, validates caller hashes, and saniti
     const live = await f.request();
     assert.equal(live.status, 200);
     assert.equal(live.headers.get('cache-control'), 'no-store');
-    assert.equal(live.body.poolId, 'default');
+    assert.equal(live.body.poolId, TEST_ENTERPRISE.id);
     assert.equal(live.body.counts.ready_idle, 0);
     assert.equal(live.body.counts.provisional, 1);
     assert.equal(live.body.accounts[0].callerKeyHash, HASH);
@@ -135,7 +136,27 @@ test('overview explicitly selects safe DTOs, validates caller hashes, and saniti
   } finally { await f.close(); }
 });
 
-test('settings enforce strict values, known fields, cross-field limits, and optimistic version checks', async () => {
+test('pool account and event DTOs expose only exact safe readiness/capacity/cancellation codes', async () => {
+  const f = await fixture();
+  try {
+    const identity = f.ready();
+    for (const code of ['enterprise_readiness_unavailable', 'sso_user_limit_reached', 'oauth_login_cancelled']) {
+      f.store.update(identity, { last_error: code });
+      f.store.event('provision_failed', identity, undefined, undefined, code);
+      const result = await f.request();
+      assert.equal(result.body.accounts[0].lastError, code);
+      assert.equal(result.body.events[0].detail, code);
+      f.store.update(identity, { last_error: `${code}: https://private.invalid token=secret` });
+      f.store.event('provision_failed', identity, undefined, undefined, `${code}: token=secret`);
+      const redacted = await f.request();
+      assert.equal(redacted.body.accounts[0].lastError, 'details_redacted');
+      assert.equal(redacted.body.events[0].detail, 'details_redacted');
+      assert.equal(JSON.stringify(redacted.body).includes('token=secret'), false);
+    }
+  } finally { await f.close(); }
+});
+
+test('global settings reject cap writes, enforce bounds and optimistic versions', async () => {
   const f = await fixture();
   try {
     const bad = [
@@ -149,7 +170,8 @@ test('settings enforce strict values, known fields, cross-field limits, and opti
       { expectedVersion: 1, changes: { max_accounts: 99999999 } },
       { expectedVersion: 1, changes: { lease_seconds: 59 } },
       { expectedVersion: 1, changes: { lease_seconds: 2592001 } },
-      { expectedVersion: 1, changes: { idle_target: 11 } },
+      { expectedVersion: 1, changes: { idle_target: 10001 } },
+      { expectedVersion: 1, changes: { max_accounts: 20 } },
       { expectedVersion: 1, changes: { owner: 'attacker' } },
       { expectedVersion: 1, changes: { version: 8 } },
       { expectedVersion: 1, changes: { paused: 1 }, extra: true },
@@ -161,10 +183,10 @@ test('settings enforce strict values, known fields, cross-field limits, and opti
     }
     assert.equal(f.store.settings().version, 1);
     const saved = await f.request('/settings', 'PATCH', {
-      expectedVersion: 1, changes: { idle_target: 5, max_accounts: 20, lease_seconds: 120, paused: 1 },
+      expectedVersion: 1, changes: { idle_target: 20, lease_seconds: 120, paused: 1 },
     });
     assert.equal(saved.status, 200);
-    assert.deepEqual(saved.body, { version: 2, idle_target: 5, max_accounts: 20, lease_seconds: 120, paused: 1 });
+    assert.deepEqual(saved.body, { version: 2, idle_target: 20, max_accounts: 10, active_max_accounts: 10, lease_seconds: 120, paused: 1 });
     const stale = await f.request('/settings', 'PATCH', { expectedVersion: 1, changes: { paused: 0 } });
     assert.equal(stale.status, 409);
     assert.equal(stale.body.error.code, 'settings_version_conflict');

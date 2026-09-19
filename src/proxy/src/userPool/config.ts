@@ -57,7 +57,6 @@ export function readPoolConfig(env: NodeJS.ProcessEnv): PoolConfig {
   }
   const idleTarget = integer('READY_IDLE_TARGET', defaults.idleTarget, 0, NAME_CAPACITY);
   const maxAccounts = integer('POOL_MAX_ACCOUNTS', defaults.maxAccounts, 1, NAME_CAPACITY);
-  if (idleTarget > maxAccounts) throw new Error('Idle target exceeds pool account cap');
   const warmupModel = env.POOL_WARMUP_MODEL?.trim() ?? '';
   if (!warmupModel) throw new Error('POOL_WARMUP_MODEL is required in caller-lease mode');
 

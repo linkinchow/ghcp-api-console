@@ -1,4 +1,5 @@
-import type { SsoRuntimeSettingsDto, SsoRuntimeSettingsValues, UpdateSsoRuntimeSettingsRequest } from '@ghcp/shared';
+import type { EnterpriseScope, SsoRuntimeSettingsDto, SsoRuntimeSettingsValues, UpdateSsoRuntimeSettingsRequest } from '@ghcp/shared';
+import { getScopeProfile } from '../enterprise.js';
 import type Database from 'better-sqlite3';
 import { nowIso } from '@ghcp/shared';
 import { getDb } from './connection.js';
@@ -42,23 +43,28 @@ export class SsoSettingsVersionConflictError extends Error {
   }
 }
 
-let snapshot: Readonly<SsoRuntimeSettingsDto> | undefined;
+const snapshots = new Map<string, Readonly<SsoRuntimeSettingsDto>>();
 
-export function getSsoRuntimeSettings(): Readonly<SsoRuntimeSettingsDto> {
-  if (!snapshot) snapshot = Object.freeze(readSettings(getDb()));
+export function getSsoRuntimeSettings(scope: EnterpriseScope): Readonly<SsoRuntimeSettingsDto> {
+  getScopeProfile(scope);
+  const key = `${scope.enterpriseId}:${scope.enterpriseRevision}:${scope.registryRevision}`;
+  let snapshot = snapshots.get(key);
+  if (!snapshot) { snapshot = Object.freeze(readSettings(getDb(), scope)); snapshots.set(key, snapshot); }
   return snapshot;
 }
 
-export function readMaxSsoUsers(db: Database.Database = getDb()): number | null {
-  const row = db.prepare('SELECT max_sso_users FROM sso_runtime_settings WHERE id = 1').get() as { max_sso_users: number | null } | undefined;
+export function readMaxSsoUsers(db: Database.Database, scope: EnterpriseScope): number | null {
+  getScopeProfile(scope);
+  const row = db.prepare('SELECT max_sso_users FROM sso_runtime_settings WHERE enterprise_id = ? AND id = 1').get(scope.enterpriseId) as { max_sso_users: number | null } | undefined;
   if (!row) throw new Error('SSO runtime settings row is missing.');
   return row.max_sso_users;
 }
 
-export function updateSsoRuntimeSettings(request: UpdateSsoRuntimeSettingsRequest): SsoRuntimeSettingsDto {
+export function updateSsoRuntimeSettings(request: UpdateSsoRuntimeSettingsRequest, scope: EnterpriseScope): SsoRuntimeSettingsDto {
+  getScopeProfile(scope);
   const db = getDb();
   const next = db.transaction(() => {
-    const current = readSettings(db);
+    const current = readSettings(db, scope);
     if (!Number.isInteger(request.expectedVersion) || request.expectedVersion !== current.version) {
       throw new SsoSettingsVersionConflictError(request.expectedVersion, current.version);
     }
@@ -79,7 +85,7 @@ export function updateSsoRuntimeSettings(request: UpdateSsoRuntimeSettingsReques
       SET max_sso_users = ?, user_prefix = ?, email_domain = ?, bulk_sync_concurrency = ?,
           scim_request_delay_ms = ?, scim_max_retries = ?, scim_retry_base_delay_ms = ?,
           version = version + 1, updated_at = ?
-      WHERE id = 1 AND version = ?
+      WHERE enterprise_id = ? AND id = 1 AND version = ?
     `).run(
       values.maxSsoUsers,
       values.userPrefix,
@@ -89,26 +95,28 @@ export function updateSsoRuntimeSettings(request: UpdateSsoRuntimeSettingsReques
       values.scimMaxRetries,
       values.scimRetryBaseDelayMs,
       updatedAt,
+      scope.enterpriseId,
       current.version,
     );
     if (result.changes !== 1) {
-      const latest = readSettings(db);
+      const latest = readSettings(db, scope);
       throw new SsoSettingsVersionConflictError(current.version, latest.version);
     }
-    return readSettings(db);
+    return readSettings(db, scope);
   }).immediate();
-  snapshot = Object.freeze(next);
+  snapshots.set(`${scope.enterpriseId}:${scope.enterpriseRevision}:${scope.registryRevision}`, Object.freeze(next));
   return next;
 }
 
 export function resetSsoRuntimeSettingsCacheForTests(): void {
-  snapshot = undefined;
+  snapshots.clear();
 }
 
-function readSettings(db: Database.Database): SsoRuntimeSettingsDto {
-  const row = db.prepare('SELECT * FROM sso_runtime_settings WHERE id = 1').get() as SsoRuntimeSettingsRow | undefined;
+function readSettings(db: Database.Database, scope: EnterpriseScope): SsoRuntimeSettingsDto {
+  const row = db.prepare('SELECT * FROM sso_runtime_settings WHERE enterprise_id = ? AND id = 1').get(scope.enterpriseId) as SsoRuntimeSettingsRow | undefined;
   if (!row) throw new Error('SSO runtime settings row is missing.');
   return {
+    enterpriseId: scope.enterpriseId,
     maxSsoUsers: row.max_sso_users,
     userPrefix: row.user_prefix,
     emailDomain: row.email_domain,

@@ -1,3 +1,4 @@
+import { TEST_ENTERPRISE, fixtureProfile } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { LoginTaskDto, SsoUserDto } from '@ghcp/shared';
@@ -22,6 +23,7 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
 
 function fixture(stage = 'new') {
   let row: ProvisionInventory = {
+    enterprise_id: TEST_ENTERPRISE.id, enterprise_revision: TEST_ENTERPRISE.revision,
     identity: 'alex001', ordinal: 0, state: 'provisioning', stage, attempt_id: 'worker-attempt',
     task_id: null, attempts: 0, retry_at: 0, last_error: null, updated_at: Date.now(),
     cooldown_until: 0, verified_at: null, generation: 0,
@@ -29,11 +31,13 @@ function fixture(stage = 'new') {
     oauth_attempt_id: ['oauth-starting', 'oauth-dispatch', 'oauth-wait', 'warmup'].includes(stage) ? 'oauth-attempt' : null,
   };
   let user: SsoUserDto | undefined = stage === 'new' ? undefined : {
+    enterpriseId: TEST_ENTERPRISE.id, userIncarnation: '22222222-2222-4222-8222-222222222222',
     ssoUser: row.identity, email: `${row.identity}@${options.accountDomain}`, role: 'user',
     emuStatus: 'active', copilotSeatStatus: 'assigned', ghLogin: 'alex001_emu', ghScimId: 'scim-1',
     createdAt, updatedAt: createdAt,
   };
   let account: ProxyAccountRecord = {
+    accountIncarnation: "11111111-1111-4111-8111-111111111111", enterpriseId: TEST_ENTERPRISE.id,
     identity: row.identity, ssoUser: row.identity, ghLogin: user?.ghLogin,
     copilotOauthStatus: stage === 'warmup' ? 'valid' : 'missing',
     copilotOauthToken: stage === 'warmup' ? 'test-oauth-token' : undefined,
@@ -69,7 +73,7 @@ function fixture(stage = 'new') {
     },
   };
   const fetchMock: typeof fetch = async (input, init) => {
-    const path = new URL(String(input)).pathname;
+    const path = new URL(String(input)).pathname.replace(`/api/profiles/${TEST_ENTERPRISE.id}`, '/api');
     const method = init?.method ?? 'GET';
     const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
     requests.push({ path, method, body });
@@ -82,6 +86,7 @@ function fixture(stage = 'new') {
       assert.equal(row.stage, 'sso-creating');
       assert.equal(body?.email, `${row.identity}@${options.accountDomain}`);
       user = {
+        enterpriseId: TEST_ENTERPRISE.id, userIncarnation: '22222222-2222-4222-8222-222222222222',
         ssoUser: row.identity, email: String(body.email), role: 'user', emuStatus: 'not_synced',
         copilotSeatStatus: 'unassigned', createdAt, updatedAt: createdAt,
       };
@@ -115,6 +120,8 @@ function fixture(stage = 'new') {
     assert.fail(`Unexpected mock request ${method} ${path}`);
   };
   const adapter = realProvisioner({ now: () => Date.now() }, options, {
+    enterpriseProfile: id => { assert.equal(id, TEST_ENTERPRISE.id); return fixtureProfile(options); },
+    verifyReadiness: async (profile, signal) => { assert.equal(profile.id, TEST_ENTERPRISE.id); signal.throwIfAborted(); },
     fetch: fetchMock,
     getAccount: async () => ({ ...account }),
     createAccount: async (input) => { account = { ...account, ...input }; return { ...account }; },
@@ -160,6 +167,7 @@ function fixture(stage = 'new') {
 
 function makeTask(patch: Partial<LoginTaskDto> = {}): LoginTaskDto {
   return {
+    enterpriseId:TEST_ENTERPRISE.id,enterpriseRevision:TEST_ENTERPRISE.revision,accountIncarnation:'11111111-1111-4111-8111-111111111111',expectedGhLogin:'alex001_emu',
     id: 'task-1', identity: 'alex001', ssoUser: 'alex001', ghLogin: 'alex001_emu', oauthAttemptId: 'oauth-attempt',
     ssoType: 'custom', status: 'pending', attempts: 1, createdAt: new Date().toISOString(), ...patch,
   };
@@ -223,6 +231,29 @@ test('never adopts an existing same-name SSO user, even with the expected email'
   f.patch({ stage: 'new' });
   await rejectsCode(f.advance(), 'sso_name_conflict');
   assert.equal(f.requests.some((request) => request.method === 'POST'), false);
+});
+
+test('definite SSO capacity race is safely retryable using the same reserved identity, not ambiguous', async () => {
+  const f = fixture();
+  f.fail((path, method) => path === '/api/users' && method === 'POST'
+    ? json({ error: { code: 'sso_user_limit_reached', message: 'private diagnostic', details: { current: 3, limit: 3 } } }, 409) : undefined);
+  await assert.rejects(f.advance(), error => error instanceof ProvisionFailure
+    && error.code === 'sso_user_limit_reached' && error.terminal);
+  assert.equal(f.row().stage, 'new'); assert.equal(f.row().identity, 'alex001'); assert.equal(f.row().ordinal, 0);
+  assert.equal(JSON.stringify(f.checkpoints).includes('private diagnostic'), false);
+  f.fail(() => undefined); await f.advance(); assert.equal(f.row().stage, 'sso-created');
+});
+
+test('unknown conflict/error bodies remain ambiguous and cannot reset creation intent', async () => {
+  for (const response of [json({ error: { code: 'different_conflict' } }, 409), new Response('not-json', { status: 409 }),
+    json({ error: { code: 'sso_user_limit_reached' } }, 503)]) {
+    const f = fixture();
+    f.fail((path, method) => path === '/api/users' && method === 'POST' ? response : undefined);
+    await rejectsCode(f.advance(), 'sso_creation_ambiguous');
+    assert.equal(f.row().stage, 'sso-creating');
+    const count = f.requests.length;
+    await rejectsCode(f.advance(), 'sso_creation_ambiguous'); assert.equal(f.requests.length, count);
+  }
 });
 
 test('uncertain SSO create is persisted and never replayed or adopted on restart', async () => {
@@ -359,7 +390,33 @@ test('failed Login retries use a new OAuth nonce, stalled tasks never dispatch c
   assert.equal(stalled.requests.some((request) => request.method === 'POST'), false);
 });
 
-test('cancelled Login may still be running and never dispatches a concurrent replacement', async () => {
+test('contract-2 confirmed cancellation releases ordinary wait/dispatch only for exact task and incarnation', async () => {
+  for (const stage of ['oauth-wait', 'oauth-dispatch']) {
+    const f = fixture(stage);
+    if (stage === 'oauth-wait') f.patch({ task_id: 'task-1' });
+    f.tasks.push(makeTask({ status: 'cancelled', bindingVersion: 2 }));
+    await rejectsCode(f.advance(), 'oauth_login_cancelled');
+    assert.equal(f.row().stage, 'synced'); assert.equal(f.row().task_id, null); assert.equal(f.row().oauth_attempt_id, null);
+    assert.equal(f.begins(), 0); assert.equal(f.requests.every(request => request.method === 'GET'), true);
+  }
+  for (const field of ['id', 'enterpriseId', 'enterpriseRevision', 'identity', 'ssoUser', 'ghLogin', 'expectedGhLogin', 'accountIncarnation', 'oauthAttemptId'] as const) {
+    const f = fixture('oauth-wait'); f.patch({ task_id: 'task-1' });
+    f.tasks.push(makeTask({ status: 'cancelled', bindingVersion: 2, [field]: 'different' }));
+    // A different id is returned by an injected endpoint, not a 404 fixture lookup.
+    f.fail(path => path === '/api/tasks/task-1' ? json(f.tasks[0]) : undefined);
+    await rejectsCode(f.advance(), 'oauth_task_mismatch'); assert.equal(f.row().stage, 'oauth-wait');
+  }
+});
+
+test('cancel_requested and uncertain authority retain ordinary Login slots', async () => {
+  for (const status of ['cancel_requested', 'uncertain'] as const) {
+    const f = fixture('oauth-wait'); f.patch({ task_id: 'task-1' });
+    f.tasks.push(makeTask({ status, bindingVersion: 2 }));
+    await f.advance(); assert.equal(f.row().stage, 'oauth-wait'); assert.equal(f.row().task_id, 'task-1');
+  }
+});
+
+test('legacy cancelled Login without contract-2 binding never dispatches a concurrent replacement', async () => {
   const f = fixture('oauth-wait');
   f.patch({ task_id: 'task-1' });
   f.tasks.push(makeTask({ status: 'cancelled' }));
@@ -443,6 +500,8 @@ test('step deadline aborts an external request and never records a successful ch
   const f = fixture('sso-created');
   let observed: AbortSignal | undefined;
   const adapter = realProvisioner({ now: () => Date.now() }, { ...options, requestTimeoutMs: 15 }, {
+    enterpriseProfile: id => { assert.equal(id, TEST_ENTERPRISE.id); return fixtureProfile(options); },
+    verifyReadiness: async (profile, signal) => { assert.equal(profile.id, TEST_ENTERPRISE.id); signal.throwIfAborted(); },
     fetch: async (_input, init) => new Promise<Response>((_resolve, reject) => {
       observed = init!.signal as AbortSignal;
       observed.addEventListener('abort', () => reject(observed!.reason), { once: true });
@@ -542,7 +601,10 @@ test('task age validation uses awaited database time', async () => {
   f.patch({ task_id: 'task-1' });
   const task = makeTask({ createdAt, status: 'running' });
   const adapter = realProvisioner({ now: async () => Date.parse(createdAt) + 15 * 60 * 1000 }, options, {
-    fetch: async input => String(input).includes('/api/tasks/') ? json(task) : json(f.user()),
+    enterpriseProfile: id => { assert.equal(id, TEST_ENTERPRISE.id); return fixtureProfile(options); },
+    verifyReadiness: async (profile, signal) => { assert.equal(profile.id, TEST_ENTERPRISE.id); signal.throwIfAborted(); },
+    getAccount:async()=>f.account(),
+    fetch: async input => new URL(String(input)).pathname === `/api/profiles/${TEST_ENTERPRISE.id}/tasks/task-1` ? json(task) : json(f.user()),
   });
   await rejectsCode(adapter.step(f.row(), f.context), 'oauth_task_stalled');
 });

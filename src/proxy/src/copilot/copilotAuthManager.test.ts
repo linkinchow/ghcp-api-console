@@ -1,8 +1,9 @@
+import { configureProxyFixture } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import test from 'node:test';
 
-test('returns a stable account limit error when SSO rejects automatic creation', async () => {
+test('returns a stable account limit error when SSO rejects automatic creation', async t => {
   let requestCount = 0;
   const server = createServer((_req, res) => {
     requestCount += 1;
@@ -19,10 +20,10 @@ test('returns a stable account limit error when SSO rejects automatic creation',
   const address = server.address();
   assert.ok(address && typeof address === 'object');
 
-  process.env.DB_PATH = ':memory:';
   process.env.SSO_BASE_URL = `http://127.0.0.1:${address.port}`;
   process.env.INTERNAL_API_TOKEN = 'test-token';
   process.env.LOG_LEVEL = 'error';
+  configureProxyFixture(t);
 
   try {
     const { copilotAuthManager, CopilotAuthNotReadyError } = await import('./copilotAuthManager.js');

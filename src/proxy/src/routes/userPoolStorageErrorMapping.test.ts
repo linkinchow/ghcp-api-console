@@ -1,3 +1,4 @@
+import { configureProxyFixture, fixtureRegistry } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
@@ -25,7 +26,11 @@ function failingStorage(cause: unknown) {
     async execute() { throw cause; }, release() {}, destroy() {},
   } as unknown as PoolConnection;
   const pool = { async getConnection() { calls++; return connection; } } as unknown as Pool;
-  return { storage: new MysqlStorage(pool, 100), calls: () => calls };
+  const storage = new MysqlStorage(pool, 100);
+  // Test-only parsed registry gets credential reads to the injected driver error;
+  // initialization itself is intentionally not under test on this failing socket.
+  assert.equal(Reflect.set(storage, 'registry', fixtureRegistry()), true);
+  return { storage, calls: () => calls };
 }
 
 async function fixture(t: TestContext, direct = false) {
@@ -39,6 +44,7 @@ async function fixture(t: TestContext, direct = false) {
   Object.assign(process.env, env);
   Object.assign(config, { apiKey: 'storage-error-mapping-test', storageDriver: 'sqlite',
     dbPath: ':memory:', claudeCodeOptimized: true, requestStatsPerAccountLimit: 100 });
+  config.dbPath = configureProxyFixture();
   const pool = await getUserPool();
   let member = 'direct-storage-mapping';
   if (!direct) {

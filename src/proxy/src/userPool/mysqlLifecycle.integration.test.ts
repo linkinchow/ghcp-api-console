@@ -2,9 +2,8 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
-import { runMysqlMigrations } from '../db/mysqlMigrations.js';
 import { UserPoolError, type PoolConfig } from './config.js';
-import { MysqlPoolStore } from './mysqlStore.js';
+import { FixtureMysqlPoolStore as MysqlPoolStore, initMysqlFixture, TEST_ENTERPRISE } from '../test/enterpriseFixtures.js';
 import type { Inventory } from './store.js';
 
 const options: PoolConfig = {
@@ -49,7 +48,7 @@ async function withDatabase(config: PoolConfig, run: (fixture: Fixture) => Promi
     for (let i = 0; i < 2; i++) pools.push(createPool({ uri: url.toString(), connectionLimit: 4,
       connectTimeout: 5000, timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true }));
     const [db, otherDb] = pools;
-    await runMysqlMigrations(db);
+    await initMysqlFixture(db, config);
     const first = new MysqlPoolStore(db, config), second = new MysqlPoolStore(otherDb, config);
     await Promise.all([first.initialize(), second.initialize()]);
     await run({ database, db, otherDb, first, second });
@@ -140,8 +139,8 @@ test('MySQL lifecycle: racing settings CAS and deficit batches honor shrink, pau
     assert.equal(await f.first.claimOwner(owner), true);
     const initial = await f.first.settings();
     const patches = [
-      { paused: 1, idle_target: 1, max_accounts: 2 },
-      { paused: 1, idle_target: 0, max_accounts: 1 },
+      { paused: 1 as const, idle_target: 1 },
+      { paused: 1 as const, idle_target: 0 },
     ];
     const [writes, batches] = await atSettingsGate(f, 4, () => Promise.all([
       Promise.allSettled([f.first.updateSettings(initial.version, patches[0]), f.second.updateSettings(initial.version, patches[1])]),
@@ -159,8 +158,8 @@ test('MySQL lifecycle: racing settings CAS and deficit batches honor shrink, pau
       assert.ok(loser.reason instanceof UserPoolError);
       assert.equal(loser.reason.code, 'settings_version_conflict');
     }
-    const shrunk = { ...initial, ...patches[winner], version: initial.version + 1 };
-    assert.deepEqual(await f.first.settings(), shrunk);
+    const paused = { ...initial, ...patches[winner], version: initial.version + 1 };
+    assert.deepEqual(await f.first.settings(), paused);
     // Either a batch fills the OLD deficit of two before the pause commits, or
     // the pause wins first. A partial budget, double-fill or post-pause fill is illegal.
     assert.ok(reservations.every(n => n === 0 || n === 2));
@@ -168,12 +167,29 @@ test('MySQL lifecycle: racing settings CAS and deficit batches honor shrink, pau
     assert.ok(added === 0 || added === 2);
     const total = original.length + added;
     await assertBudget(f, total);
-    assert.ok(total > shrunk.max_accounts, 'lowering cap below existing inventory is explicitly allowed');
+    // Cap now has its own enterprise-policy CAS, not a second global writable
+    // setting. It shares the settings gate and must not touch inventory/events.
+    const policy = (await f.first.enterprisePolicy(TEST_ENTERPRISE.id))!;
+    const capWrites = await atSettingsGate(f, 2, () => Promise.allSettled([
+      f.first.updateEnterprisePolicy(TEST_ENTERPRISE.id, policy.policyVersion, { type: 'cap', maxAccounts: 2 }),
+      f.second.updateEnterprisePolicy(TEST_ENTERPRISE.id, policy.policyVersion, { type: 'cap', maxAccounts: 1 }),
+    ]));
+    assert.equal(capWrites.filter(result => result.status === 'fulfilled').length, 1);
+    const capWinner = capWrites.find(result => result.status === 'fulfilled');
+    assert.ok(capWinner?.status === 'fulfilled');
+    const capLoser = capWrites.find(result => result.status === 'rejected');
+    assert.ok(capLoser?.status === 'rejected');
+    assert.equal(capLoser.reason.code, 'policy_version_conflict');
+    const cap = capWinner.value.maxAccounts;
+    const shrunk = { ...paused, max_accounts: cap, active_max_accounts: cap };
+    assert.deepEqual(await f.second.settings(), shrunk, 'global total/active caps are read-only derived values');
+    assert.ok(total > cap, 'lowering cap below existing inventory is explicitly allowed');
     assert.deepEqual((await inventory(f)).slice(0, original.length), original, 'shrink neither deletes nor rewrites existing jobs');
     const [[events]] = await f.db.query<RowDataPacket[]>("SELECT COUNT(*) n FROM user_pool_events WHERE action='settings_updated'");
-    assert.equal(Number(events.n), 1, 'losing CAS cannot leave an audit event');
-    await rejectCode(f.second.updateSettings(initial.version, { paused: 0, idle_target: 6, max_accounts: 6 }), 'settings_version_conflict');
-    await rejectCode(f.first.updateSettings(shrunk.version, { idle_target: shrunk.max_accounts + 1 }), 'invalid_pool_settings');
+    assert.equal(Number(events.n), 1, 'losing settings CAS and policy writes cannot leave extra pool audit events');
+    await rejectCode(f.second.updateSettings(initial.version, { paused: 0, idle_target: 6 }), 'settings_version_conflict');
+    await rejectCode(f.first.updateSettings(shrunk.version, { max_accounts: 6 }), 'invalid_pool_settings');
+    await rejectCode(f.first.updateSettings(shrunk.version, { idle_target: 10001 }), 'invalid_pool_settings');
     assert.deepEqual(await f.second.settings(), shrunk);
     assert.deepEqual(await Promise.all([f.first.reserveDeficit(owner), f.second.reserveDeficit(owner)]), [0, 0]);
     assert.equal(await f.first.reserve(), undefined);
@@ -191,9 +207,10 @@ test('MySQL lifecycle: racing settings CAS and deficit batches honor shrink, pau
     await assertBudget(f, total);
     // Headroom alone does not create demand. Raising the idle target later adds
     // exactly two jobs: the existing caller's member is not ready-idle supply.
-    const expanded = await f.first.updateSettings(resumed.version, { max_accounts: total + 3 });
+    await f.first.updateEnterprisePolicy(TEST_ENTERPRISE.id, capWinner.value.policyVersion, { type: 'cap', maxAccounts: total + 3 });
+    assert.equal((await f.second.settings()).version, resumed.version, 'policy cap CAS does not forge a global settings version');
     assert.deepEqual(await Promise.all([f.first.reserveDeficit(owner), f.second.reserveDeficit(owner)]), [0, 0]);
-    await f.second.updateSettings(expanded.version, { idle_target: total + 1 });
+    await f.second.updateSettings(resumed.version, { idle_target: total + 1 });
     const replenished = await Promise.all([f.first.reserveDeficit(owner), f.second.reserveDeficit(owner)]);
     assert.equal(replenished.reduce((sum, n) => sum + n, 0), 2);
     assert.deepEqual(await Promise.all([f.first.reserveDeficit(owner), f.second.reserveDeficit(owner)]), [0, 0]);

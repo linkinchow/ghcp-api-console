@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import test from 'node:test';
 import { chromium } from 'playwright';
 
+const enterpriseId = 'aaaaaaaa-1111-4111-8111-111111111111';
 const reference = '[ref: 11111111-2222-4333-8444-555555555555]';
 const longReason = `HTTP 400: legacy upstream error <img src=x onerror="window.injected=true"> & payload\n${'long legacy detail '.repeat(180)}END`;
 const reasons = [longReason, `HTTP 502: upstream unavailable ${reference}`, 'HTTP 400: Bad request', undefined];
@@ -98,13 +99,10 @@ async function offlineStats(clipboard: 'success' | 'reject' | 'absent') {
     if (url.origin !== 'http://request-console.test') { unexpected.push(url.href); return json({}, 404); }
     if (url.pathname === '/api/console/setup') return json({ initialized: true });
     if (url.pathname === '/api/console/me') return json({ username: 'offline-admin', role: 'admin' });
-    if (url.pathname === '/api/console/login-service/tasks') return json([]);
-    if (url.pathname === '/api/console/proxy/accounts' || url.pathname === '/api/console/sso/users') {
-      return json({ items: [], total: 0, page: 1, pageSize: 100 });
-    }
-    if (url.pathname === '/api/console/proxy/request-stats') {
+    if (url.pathname === '/api/console/proxy/management/enterprises') return json({ enabled: true, legacyEnterpriseId: enterpriseId, enterprises: [{ enterpriseId, enterpriseRevision: 1, slug: 'legacy-slug', shortcode: 'leg', state: 'active', policyVersion: 1, maxAccounts: 20, validationKind: 'migration_preserved_v3', validatedAt: 1, updatedAt: 1 }] });
+    if (url.pathname === `/api/console/proxy/profiles/${enterpriseId}/request-stats/page`) {
       if (fixture.fail) return json({ error: { code: 'service_proxy_failed', message: 'Stats unavailable.' } }, 502);
-      return json(reasons.map((failureReason, index) => ({ id: index + 1, identity: `fixture-${index}`, path: '/v1/chat/completions', model: 'fixture-model', success: false, requestedAt: '2026-09-18T12:00:00Z', inputTokens: 1, outputTokens: 0, failureReason })));
+      return json({ total: reasons.length, page: 1, pageSize: 25, items: reasons.map((failureReason, index) => ({ id: index + 1, identity: `fixture-${index}`, path: '/v1/chat/completions', model: 'fixture-model', success: false, requestedAt: '2026-09-18T12:00:00Z', inputTokens: 1, outputTokens: 0, failureReason })) });
     }
     if (url.pathname === '/' || /^\/assets\/[\w.-]+$/.test(url.pathname)) {
       const file = resolve(process.cwd(), 'dist/web', url.pathname === '/' ? 'index.html' : url.pathname.slice(1));

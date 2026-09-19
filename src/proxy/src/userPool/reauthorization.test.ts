@@ -1,15 +1,15 @@
+import { createSqlitePoolFixture } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
 import Database from 'better-sqlite3';
-import { runMigrations } from '../db/migrations.js';
 import { readPoolConfig } from './config.js';
 import { UserPoolStore } from './store.js';
 
 function fixture(t: TestContext) {
   const db = new Database(':memory:');
   db.pragma('foreign_keys=ON');
-  runMigrations(db);
-  const store = new UserPoolStore(db, readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease',
+
+  const store = createSqlitePoolFixture(db, readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease',
     POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test', POOL_WARMUP_MODEL: 'test-model', READY_IDLE_TARGET: '1', POOL_MAX_ACCOUNTS: '1' }));
   let now = 1800000000000;
   store.now = () => now;
@@ -91,7 +91,7 @@ test('repeated invalid-token cycles persist a three-per-hour automatic repair ce
       assert.equal(f.store.pending(), undefined);
     }
   }
-  const reopened = new UserPoolStore(f.db, readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease',
+  const reopened = createSqlitePoolFixture(f.db, readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease',
     POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test', POOL_WARMUP_MODEL: 'test-model' }));
   assert.equal(reopened.inventory(f.identity)!.reauth_count, 3);
   assert.equal(reopened.inventory(f.identity)!.attempts, 3);

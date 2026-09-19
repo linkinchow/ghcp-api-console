@@ -5,9 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
-import { runMigrations } from '../../src/proxy/src/db/migrations.js';
-import { UserPoolStore } from '../../src/proxy/src/userPool/store.js';
-import { accountName } from '../../src/proxy/src/userPool/names.js';
+import { runMigrations } from '../v1-frozen/db/migrations.js';
+import { UserPoolStore } from '../v1-frozen/userPool/store.js';
+import { accountName } from '../v1-frozen/userPool/names.js';
 import { prepareLegacySqliteCopy } from './legacy-copy.js';
 import { preflightSqlite } from './migrate.js';
 

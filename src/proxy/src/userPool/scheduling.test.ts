@@ -1,12 +1,11 @@
+import { createSqlitePoolFixture } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import { createPool } from 'mysql2/promise';
-import { runMigrations } from '../db/migrations.js';
-import { runMysqlMigrations } from '../db/mysqlMigrations.js';
 import { UserPoolStore } from './store.js';
-import { MysqlPoolStore } from './mysqlStore.js';
+import { FixtureMysqlPoolStore as MysqlPoolStore, initMysqlFixture } from '../test/enterpriseFixtures.js';
 import { readPoolConfig } from './config.js';
 import type { PoolStore } from './storage.js';
 
@@ -21,12 +20,12 @@ async function contract(store: PoolStore, query: Query) {
     const accounts: unknown[][] = [], members: unknown[][] = [];
     for (let i = start; i < Math.min(start + 100, 2011); i++) {
       const identity = `synthetic-scheduler-${String(i).padStart(4, '0')}`;
-      accounts.push([identity, identity, 'synthetic-token', 'valid', '2026-01-01 00:00:00', '2026-01-01 00:00:00']);
+      accounts.push([randomUUID(),identity, identity, 'synthetic-token', 'valid', '2026-01-01 00:00:00', '2026-01-01 00:00:00']);
       const stage = i < 2000 ? 'oauth-starting' : i < 2005 ? 'oauth-wait' : i < 2010 ? 'warmup' : 'new';
       members.push([identity, i, 'provisioning', stage, randomUUID(), i === 2010 ? 0 : i < 2000 ? 1 : 2, now]);
     }
-    await query(`INSERT INTO proxy_accounts(identity,sso_user,copilot_oauth_token,copilot_oauth_status,created_at,updated_at)
-      VALUES ${accounts.map(() => '(?,?,?,?,?,?)').join(',')}`, accounts.flat());
+    await query(`INSERT INTO proxy_accounts(enterprise_id,account_incarnation,identity,sso_user,copilot_oauth_token,copilot_oauth_status,created_at,updated_at)
+      VALUES ${accounts.map(() => "('86e2ee02-223a-45ea-8c26-bdd1c570a4ee',?,?,?,?,?,?,?)").join(',')}`, accounts.flat());
     await query(`INSERT INTO user_pool_accounts(identity,ordinal,state,stage,attempt_id,retry_at,updated_at)
       VALUES ${members.map(() => '(?,?,?,?,?,?,?)').join(',')}`, members.flat());
   }
@@ -69,9 +68,9 @@ async function contract(store: PoolStore, query: Query) {
 }
 
 test('SQLite capacity-aware fair scheduling advances downstream work past 2000 starters', async () => {
-  const db = new Database(':memory:'); db.pragma('foreign_keys=ON'); runMigrations(db);
+  const db = new Database(':memory:'); db.pragma('foreign_keys=ON');
   try {
-    const store = new UserPoolStore(db, options);
+    const store = createSqlitePoolFixture(db, options);
     await contract(store, async (sql, values = []) => db.prepare(sql).run(...values));
   } finally { db.close(); }
 });
@@ -88,7 +87,7 @@ test('MySQL capacity-aware fair scheduling preserves holds and final claim under
   url.pathname = '/' + name;
   const db = createPool({ uri: url.toString(), connectionLimit: 3, dateStrings: true, timezone: 'Z' });
   try {
-    await runMysqlMigrations(db); const store = new MysqlPoolStore(db, options); await store.initialize();
+    await initMysqlFixture(db, options); const store = new MysqlPoolStore(db, options); await store.initialize();
     await contract(store, async (sql, values = []) => db.query(sql, values));
   } finally { await db.end(); await admin.query(`DROP DATABASE \`${name}\``); await admin.end(); }
 });

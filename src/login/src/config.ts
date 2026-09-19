@@ -1,8 +1,13 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
+import type { EnterpriseRegistryV3 } from '@ghcp/shared';
+import { readEnterpriseRegistryFile } from '@ghcp/shared/enterpriseRuntimeV3';
+
+if (process.env.NODE_ENV !== 'test' && !process.env.NODE_TEST_CONTEXT) dotenv.config({ path: process.env.DOTENV_CONFIG_PATH });
 
 export interface LoginConfig {
   port: number;
   dbPath: string;
+  enterpriseRegistryFile?: string;
   internalApiToken: string;
   proxyBaseUrl: string;
   logDir: string;
@@ -28,6 +33,8 @@ export interface AuthConfig {
 }
 
 export interface RuntimeAuthConfig extends AuthConfig {
+  allowedLoginUrls?: readonly string[];
+  artifactScope?: { enterpriseId: string; taskId: string; oauthAttemptId: string };
   timeoutMs: number;
   debugLogs: boolean;
   debugArtifacts: boolean;
@@ -36,6 +43,7 @@ export interface RuntimeAuthConfig extends AuthConfig {
 export const config: LoginConfig = {
   port: readPort(process.env.PORT, 7003),
   dbPath: process.env.DB_PATH ?? './data/login.sqlite',
+  enterpriseRegistryFile: process.env.ENTERPRISE_REGISTRY_FILE,
   internalApiToken: process.env.INTERNAL_API_TOKEN ?? '',
   proxyBaseUrl: process.env.PROXY_BASE_URL ?? 'http://localhost:3000',
   logDir: process.env.LOG_DIR ?? './logs/login',
@@ -72,6 +80,10 @@ export const config: LoginConfig = {
     },
   },
 };
+
+export function readConfiguredEnterpriseRegistry(): EnterpriseRegistryV3 {
+  return readEnterpriseRegistryFile(config.enterpriseRegistryFile);
+}
 
 function readPort(value: string | undefined, defaultValue: number): number {
   const parsed = Number(value ?? defaultValue);

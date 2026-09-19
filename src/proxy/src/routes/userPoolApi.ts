@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from 'express';
+import { requestEnterpriseProfile, requireEnterpriseRequest } from '../enterprise.js';
 import { requireInternalToken } from '../auth/internalAuth.js';
 import { getLocalUserPoolSchedulerSnapshot, getUserPool, wakePool } from '../userPool/runtime.js';
 import { readPoolConfig, UserPoolError } from '../userPool/config.js';
@@ -39,10 +40,11 @@ const SAFE_DETAILS = new Set([
   'oauth_attempt_missing', 'oauth_dispatch_unconfirmed', 'oauth_callback_unconfirmed', 'oauth_task_invalid',
   'warmup_invalid_response', 'warmup_credential_changed', 'warmup_model_unavailable', 'service_invalid_response', 'service_response_too_large',
   'service_invalid_json', 'upstream_unauthorized', 'entitlement_denied', 'oauth_reauth_limit_reached',
+  'enterprise_readiness_unavailable', 'sso_user_limit_reached', 'oauth_login_cancelled',
 ]);
 const ERROR_MESSAGES: Record<string, string> = {
   pool_mode_disabled: 'User pool is disabled. Configure ACCOUNT_ROUTING_MODE=caller-lease on the Proxy to use it.',
-  invalid_pool_settings: 'Provide valid pool settings: idle target must not exceed the account cap; TTL must be 60–2592000 seconds; paused must be 0 or 1.',
+  invalid_pool_settings: 'Provide valid pool settings: idle target must be 0–10000; use enterprise controls to change account caps; TTL must be 60–2592000 seconds; paused must be 0 or 1.',
   settings_version_conflict: 'Pool settings changed in another session. Reload the latest values before saving.',
   invalid_request: 'The request contains unsupported fields or invalid values.',
   invalid_member_identity: 'Provide a valid pool account identity.',
@@ -67,7 +69,8 @@ export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}
     ...dependencies,
   };
   const router = Router();
-  router.use('/user-pool', requireInternalToken, (_req, res, next) => {
+  const paths = (suffix = '') => [`/user-pool${suffix}`, `/profiles/:enterpriseId/user-pool${suffix}`];
+  router.use(paths(), requireInternalToken, requireEnterpriseRequest, (_req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
     next();
   });
@@ -84,41 +87,41 @@ export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}
       }
     };
 
-  router.get('/user-pool', handle(async (_req, res, store) => {
-    const counts = countsDto(await store.counts());
-    const accounts = (await store.accounts()).slice(0, LIST_LIMITS.accounts).map(accountDto);
-    const leases = (await store.leases()).slice(0, LIST_LIMITS.leases)
+  router.get(paths(''), handle(async (req, res, store) => {
+    const counts = countsDto(await store.counts(requestEnterpriseProfile(req).id));
+    const accounts = (await store.accounts(requestEnterpriseProfile(req).id)).slice(0, LIST_LIMITS.accounts).map(accountDto);
+    const leases = (await store.leases(requestEnterpriseProfile(req).id)).slice(0, LIST_LIMITS.leases)
       .map((lease) => leaseDto(lease, number(lease.active_requests) > 0));
     res.json({
       enabled: true,
-      poolId: 'default',
+      poolId: requestEnterpriseProfile(req).id, enterpriseId: requestEnterpriseProfile(req).id,
       observedAt: Date.now(),
       settings: settingsDto(await store.settings()),
       counts,
       accounts,
       leases,
-      events: (await store.events()).slice(0, LIST_LIMITS.events).map(eventDto),
+      events: (await store.events(requestEnterpriseProfile(req).id)).slice(0, LIST_LIMITS.events).map(eventDto),
       limits: SETTINGS_LIMITS,
       listLimits: LIST_LIMITS,
     });
   }));
 
   // Local diagnostics must remain readable without initializing or querying storage.
-  router.get('/user-pool/diagnostics/local', (req, res) => {
+  router.get(paths('/diagnostics/local'), (req, res) => {
     try {
       if (Object.keys(req.query).length) throw new UserPoolError(400, 'invalid_request');
       if (!isPoolEnabled()) throw new UserPoolError(409, 'pool_mode_disabled');
-      res.json({ enabled: true, poolId: 'default', observedAt: Date.now(), scope: 'local_process',
+      res.json({ enabled: true, poolId: requestEnterpriseProfile(req).id, enterpriseId: requestEnterpriseProfile(req).id, observedAt: Date.now(), scope: 'local_process',
         localScheduler: schedulerDto(localScheduler()) });
     } catch (error) { sendError(res, error); }
   });
 
-  router.get('/user-pool/summary', handle(async (_req, res, store) => {
-    res.json({ enabled: true, poolId: 'default', observedAt: Date.now(),
-      settings: settingsDto(await store.settings()), counts: countsDto(await store.counts()),
+  router.get(paths('/summary'), handle(async (req, res, store) => {
+    res.json({ enabled: true, poolId: requestEnterpriseProfile(req).id, enterpriseId: requestEnterpriseProfile(req).id, observedAt: Date.now(),
+      settings: settingsDto(await store.settings()), counts: countsDto(await store.counts(requestEnterpriseProfile(req).id)),
       limits: SETTINGS_LIMITS, listLimits: LIST_LIMITS, accounts: [], leases: [], events: [] });
   }));
-  router.get('/user-pool/page/:kind', async (req, res) => {
+  router.get(paths('/page/:kind'), async (req, res) => {
     try {
       const kind = req.params.kind as PoolList;
       if (!['accounts', 'leases', 'events'].includes(kind)
@@ -133,7 +136,7 @@ export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}
       };
       if (req.query.q !== undefined && typeof req.query.q !== 'string'
         || req.query.state !== undefined && typeof req.query.state !== 'string') throw new UserPoolError(400, 'invalid_request');
-      const query: PoolPageQuery = { page: integerQuery('page', 1), pageSize: integerQuery('pageSize', 25),
+      const query: PoolPageQuery = { enterpriseId: requestEnterpriseProfile(req).id, page: integerQuery('page', 1), pageSize: integerQuery('pageSize', 25),
         q: req.query.q as string | undefined, state: req.query.state as string | undefined };
       try { poolPageSql(kind, query, 0); } catch { throw new UserPoolError(400, 'invalid_request'); }
       const store = await getStore();
@@ -145,18 +148,18 @@ export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}
     } catch (error) { sendError(res, error); }
   });
 
-  router.get('/user-pool/accounts', handle(async (_req, res, store) => {
-    const counts = countsDto(await store.counts());
-    res.json({ items: (await store.accounts()).slice(0, LIST_LIMITS.accounts).map(accountDto), total: counts.total, limit: LIST_LIMITS.accounts });
+  router.get(paths('/accounts'), handle(async (req, res, store) => {
+    const counts = countsDto(await store.counts(requestEnterpriseProfile(req).id));
+    res.json({ items: (await store.accounts(requestEnterpriseProfile(req).id)).slice(0, LIST_LIMITS.accounts).map(accountDto), total: counts.total, limit: LIST_LIMITS.accounts });
   }));
-  router.get('/user-pool/leases', handle(async (_req, res, store) => {
-    const counts = countsDto(await store.counts());
-    const items = (await store.leases()).slice(0, LIST_LIMITS.leases)
+  router.get(paths('/leases'), handle(async (req, res, store) => {
+    const counts = countsDto(await store.counts(requestEnterpriseProfile(req).id));
+    const items = (await store.leases(requestEnterpriseProfile(req).id)).slice(0, LIST_LIMITS.leases)
       .map((lease) => leaseDto(lease, number(lease.active_requests) > 0));
     res.json({ items, total: counts.leased + counts.provisional, limit: LIST_LIMITS.leases });
   }));
-  router.get('/user-pool/events', handle(async (_req, res, store) => {
-    res.json({ items: (await store.events()).slice(0, LIST_LIMITS.events).map(eventDto), limit: LIST_LIMITS.events });
+  router.get(paths('/events'), handle(async (req, res, store) => {
+    res.json({ items: (await store.events(requestEnterpriseProfile(req).id)).slice(0, LIST_LIMITS.events).map(eventDto), limit: LIST_LIMITS.events });
   }));
 
   router.patch('/user-pool/settings', handle(async (req, res, store) => {
@@ -170,34 +173,34 @@ export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}
     await wake();
     res.status(202).json({ scheduled: true });
   }));
-  router.post('/user-pool/accounts/:identity/:action', handle(async (req, res, store) => {
+  router.post(paths('/accounts/:identity/:action'), handle(async (req, res, store) => {
     requireEmptyBody(req.body);
     const identity = String(req.params.identity);
     const action = String(req.params.action);
     if (identity !== identity.trim() || !/^[a-zA-Z0-9][a-zA-Z0-9._@+-]{0,253}$/.test(identity)) throw new UserPoolError(400, 'invalid_member_identity');
     if (!['disable', 'resume', 'retry'].includes(action)) throw new UserPoolError(404, 'action_not_found');
     const account = await store.inventory(identity);
-    if (!account) throw new UserPoolError(404, 'member_not_found');
+    if (!account || account.enterprise_id !== requestEnterpriseProfile(req).id) throw new UserPoolError(404, 'member_not_found');
     if (action === 'disable') {
-      await store.disable(identity);
+      await store.disable(identity, requestEnterpriseProfile(req).id);
     } else {
       if (account.state !== (action === 'resume' ? 'disabled' : 'failed')) throw new UserPoolError(409, 'invalid_member_state');
       // Retry revalidates entitlement and credentials; a resumed account is not immediately ready.
-      await store.retry(identity);
+      await store.retry(identity, requestEnterpriseProfile(req).id);
     }
     await wake();
     res.json({ accepted: true });
   }));
-  router.post('/user-pool/leases/:id/release', handle(async (req, res, store) => {
+  router.post(paths('/leases/:id/release'), handle(async (req, res, store) => {
     if (!isRecord(req.body) || req.body.confirm !== true) throw new UserPoolError(400, 'confirmation_required');
     if (Object.keys(req.body).some((key) => key !== 'confirm')) throw new UserPoolError(400, 'invalid_request');
     const id = String(req.params.id);
     if (id.length !== 36 || !UUID.test(id)) throw new UserPoolError(400, 'invalid_lease_id');
-    await store.release(id);
+    await store.release(id, requestEnterpriseProfile(req).id);
     await wake();
     res.json({ released: true });
   }));
-  router.use('/user-pool', (_req, res) => {
+  router.use(paths(), (_req, res) => {
     res.status(404).json({ error: { code: 'action_not_found', message: ERROR_MESSAGES.action_not_found } });
   });
   return router;
@@ -229,7 +232,7 @@ function readSettingsPatch(body: unknown): { expectedVersion: number; changes: P
   if (!isRecord(body) || Object.keys(body).some((key) => !['expectedVersion', 'changes'].includes(key))
     || !integerInRange(body.expectedVersion, 1, Number.MAX_SAFE_INTEGER) || !isRecord(body.changes)) throw invalid();
   const changes = body.changes;
-  if (!Object.keys(changes).length || Object.keys(changes).some((key) => !['idle_target', 'max_accounts', 'lease_seconds', 'paused'].includes(key))) throw invalid();
+  if (!Object.keys(changes).length || Object.keys(changes).some((key) => !['idle_target', 'lease_seconds', 'paused'].includes(key))) throw invalid();
   if (('idle_target' in changes && !integerInRange(changes.idle_target, 0, NAME_CAPACITY))
     || ('max_accounts' in changes && !integerInRange(changes.max_accounts, 1, NAME_CAPACITY))
     || ('lease_seconds' in changes && !integerInRange(changes.lease_seconds, SETTINGS_LIMITS.minLeaseSeconds, SETTINGS_LIMITS.maxLeaseSeconds))
@@ -261,6 +264,7 @@ function settingsDto(settings: PoolSettings) {
     version: settings.version,
     idle_target: settings.idle_target,
     max_accounts: settings.max_accounts,
+    active_max_accounts: settings.active_max_accounts,
     lease_seconds: settings.lease_seconds,
     paused: settings.paused,
   };
@@ -275,7 +279,7 @@ function countsDto(counts: Record<string, number>) {
 function accountDto(value: unknown) {
   const row = isRecord(value) ? value : {};
   return {
-    identity: text(row.identity) ?? '', ordinal: number(row.ordinal),
+    enterpriseId: text(row.enterprise_id), identity: text(row.identity) ?? '', ordinal: number(row.ordinal),
     state: enumValue(row.state, ACCOUNT_STATES), stage: enumValue(row.stage, STAGES),
     ghLogin: text(row.gh_login), oauthStatus: enumValue(row.copilot_oauth_status, ['valid', 'missing', 'refreshing', 'expired', 'failed']),
     attempts: number(row.attempts), retryAt: timestamp(row.retry_at), lastError: safeDetail(row.last_error),
@@ -287,7 +291,7 @@ function accountDto(value: unknown) {
 function leaseDto(value: unknown, inUse: boolean) {
   const row = isRecord(value) ? value : {};
   return {
-    leaseId: text(row.lease_id) ?? '', memberIdentity: text(row.member_identity) ?? '',
+    enterpriseId: text(row.enterprise_id), leaseId: text(row.lease_id) ?? '', memberIdentity: text(row.member_identity) ?? '',
     callerKeyHash: callerHash(row.caller_id), phase: enumValue(row.phase, ['active', 'provisional']),
     assignedAt: timestamp(row.assigned_at), lastSuccessAt: timestamp(row.last_success_at), expiresAt: timestamp(row.expires_at),
     inUse,
@@ -296,7 +300,7 @@ function leaseDto(value: unknown, inUse: boolean) {
 function eventDto(value: unknown) {
   const row = isRecord(value) ? value : {};
   return {
-    id: number(row.id), at: timestamp(row.at), action: typeof row.action === 'string' && EVENT_ACTIONS.has(row.action) ? row.action : 'other',
+    enterpriseId: text(row.enterprise_id), id: number(row.id), at: timestamp(row.at), action: typeof row.action === 'string' && EVENT_ACTIONS.has(row.action) ? row.action : 'other',
     identity: text(row.identity), callerKeyHash: callerHash(row.caller_id), leaseId: text(row.lease_id), detail: safeDetail(row.detail),
   };
 }

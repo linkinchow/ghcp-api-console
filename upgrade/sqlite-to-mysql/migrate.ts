@@ -5,7 +5,7 @@ import {
   type PoolConnection,
   type RowDataPacket,
 } from 'mysql2/promise';
-import { runMysqlMigrations } from '../../src/proxy/src/db/mysqlMigrations.js';
+import { runMysqlMigrations } from '../v1-frozen/db/mysqlMigrations.js';
 
 interface SqliteAccountRow {
   identity: string;

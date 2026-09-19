@@ -18,6 +18,7 @@ export interface PrewarmStore extends Pick<PoolStore,
   'now' | 'claimOwner' | 'releaseOwner' | 'reclaim' | 'settings' | 'pending' | 'reserveDeficit' | 'hasHolds'
   | 'event' | 'inventory' | 'update' | 'fail' | 'mutateWorkerCredential'> {
   claimLoginDispatch?: PoolStore['claimLoginDispatch'];
+  canProvision?: PoolStore['canProvision'];
   /** At most 100 rows, ordered stably; only exhausted failed/disabled dispatch/wait rows. */
   listLoginReservations?(): Awaitable<ProvisionInventory[]>;
   /** Atomic owner/expiry, full row fence, unpaused and no-holds check. Preserve state,
@@ -66,6 +67,7 @@ export class PrewarmWorker {
   private timer?: ReturnType<typeof setInterval>;
   private heartbeat?: ReturnType<typeof setInterval>;
   private readonly active = new Map<string, { controller: AbortController; promise: Promise<void> }>();
+  private eligibilityController?: AbortController;
   private reservationController?: AbortController;
   private reservationTask?: Promise<void>;
   private lastReservationPoll = -Infinity;
@@ -188,7 +190,28 @@ export class PrewarmWorker {
     // Login GETs can take the full request deadline. They must not hold the ordinary
     // scheduler single-flight or consume its provisioning concurrency slots.
     this.observeLoginReservations(tenure);
-    await storage(() => this.store.reserveDeficit(tenure.id));
+    let eligible: readonly string[] | undefined;
+    if (this.adapter.eligibleEnterprises) {
+      const controller = new AbortController();
+      this.eligibilityController = controller;
+      // Real probes have shorter independent deadlines and return partial results.
+      // This is only an outer watchdog; tenure loss and stop cancel the whole scan.
+      const deadline = setTimeout(() => controller.abort(), 5000);
+      deadline.unref();
+      try { eligible = await untilAborted(this.adapter.eligibleEnterprises(controller.signal, tenure.id), controller.signal); }
+      catch { eligible = []; }
+      finally {
+        clearTimeout(deadline);
+        controller.abort();
+        this.eligibilityController = undefined;
+      }
+      if (!this.isCurrentTenure(tenure)) return [];
+    }
+    // A live SSO-create intent is deliberately unknown to persisted logical P.
+    // Defer only new candidates until local steps settle. Keep the normal fenced
+    // reservation transaction/await and existing pending/observation scheduling;
+    // inherited uncertain operations remain excluded from logical supply.
+    await storage(() => this.store.reserveDeficit(tenure.id, this.active.size > 0 ? [] : eligible));
     const launched: Promise<void>[] = [];
     const excluded = [...this.active.keys()];
     while (this.isCurrentTenure(tenure) && this.active.size < this.concurrency) {
@@ -367,6 +390,7 @@ export class PrewarmWorker {
       this.clearTimers();
     }
     for (const { controller } of this.active.values()) controller.abort(new ProvisionFailure('provision_fenced'));
+    this.eligibilityController?.abort(new ProvisionFailure('provision_fenced'));
     this.reservationController?.abort(new ProvisionFailure('provision_fenced'));
     // One log per lost local tenure, never per failed standby poll. No error objects,
     // messages, SQL operations, identities or owner UUIDs enter diagnostic fields.
@@ -392,6 +416,7 @@ export class PrewarmWorker {
     let current = await storage(() => this.store.inventory(row.identity));
     if (!current || current.attempt_id !== row.attempt_id || current.stage !== row.stage
       || current.generation !== row.generation || await storage(() => this.store.hasHolds(row.identity))) return;
+    if (this.store.canProvision && !await storage(() => this.store.canProvision!(row.identity, 'observe'))) return;
     const identity = current.identity;
     const attempt = current.attempt_id;
     if (!this.isCurrentTenure(tenure)) return;
@@ -423,6 +448,12 @@ export class PrewarmWorker {
     const context: ProvisionContext = {
       signal: controller.signal,
       assertCurrent: async () => { await readCurrent(); },
+      assertCanAdvance: async () => {
+        await readCurrent();
+        if (this.store.canProvision && !await storage(() => this.store.canProvision!(identity, 'advance'))) {
+          throw new ProvisionFailure('enterprise_not_active');
+        }
+      },
       pinCredentials: async () => { credentialGeneration = (await readCurrent()).generation; },
       credentialsInvalidated: async () => {
         if (credentialGeneration === undefined) throw new ProvisionFailure('provision_fenced');
@@ -479,7 +510,8 @@ export class PrewarmWorker {
       if (patch.state === 'ready') await storage(() => this.store.event('account_ready', identity));
     } catch (error) {
       // Never let a late callback elect a new owner or charge another attempt/generation.
-      if (!this.isCurrentTenure(tenure) || error instanceof ProvisionFailure && error.code === 'provision_fenced') return;
+      if (!this.isCurrentTenure(tenure) || error instanceof ProvisionFailure
+        && ['provision_fenced', 'enterprise_not_active'].includes(error.code)) return;
       let latest: ProvisionInventory;
       try { latest = await readCurrent(false); } catch { return; }
       const code = failureCode(error);
@@ -510,6 +542,7 @@ export class PrewarmWorker {
     const tenure = this.tenure;
     this.tenure = undefined;
     for (const { controller } of this.active.values()) controller.abort();
+    this.eligibilityController?.abort();
     this.reservationController?.abort();
     this.stopping = (async () => {
       // Pending elections clean up their own UUID. Awaiting them prevents shutdown from

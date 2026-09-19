@@ -52,6 +52,9 @@ export function statusTone(status?: CopilotOauthStatus | CopilotSeatStatus | Emu
     case 'missing':
     case 'not_synced':
     case 'unknown':
+    case 'callback_pending':
+    case 'cancel_requested':
+    case 'uncertain':
       return 'warning';
     case 'failed':
     case 'assign_failed':

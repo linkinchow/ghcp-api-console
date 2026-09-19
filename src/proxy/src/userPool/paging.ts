@@ -4,6 +4,8 @@ export interface PoolPageQuery {
   pageSize: number;
   q?: string;
   state?: string;
+  /** Omission is explicit internal/global access; public legacy routes supply their pinned UUID. */
+  enterpriseId?: string;
 }
 export interface PoolPage {
   items: unknown[];
@@ -15,7 +17,8 @@ export interface PoolPage {
 export function poolPageSql(kind: PoolList, input: PoolPageQuery, now: number): {
   countSql: string; itemsSql: string; values: unknown[];
 } {
-  const { page, pageSize, q = '', state = '' } = input;
+  const { page, pageSize, q = '', state = '', enterpriseId } = input;
+  if (enterpriseId !== undefined && (typeof enterpriseId !== 'string' || !enterpriseId || enterpriseId.length > 128)) throw new Error('Invalid pool enterprise');
   if (!Number.isSafeInteger(page) || page < 1 || page > 1000000
     || !Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 100 || q.length > 255) {
     throw new Error('Invalid pool pagination');
@@ -26,14 +29,14 @@ export function poolPageSql(kind: PoolList, input: PoolPageQuery, now: number): 
     WHEN (${held}) > 0 THEN 'catalog' ELSE 'ready_idle' END`;
   const definitions = {
     accounts: {
-      from: 'user_pool_accounts p JOIN proxy_accounts a ON a.identity=p.identity LEFT JOIN user_pool_leases l ON l.member_identity=p.identity',
-      select: `p.*, a.gh_login, a.copilot_oauth_status, l.caller_id, l.phase, l.expires_at, (${held}) AS active_requests`,
+      from: 'user_pool_accounts p JOIN proxy_accounts a ON a.identity=p.identity JOIN enterprise_profiles profile ON profile.id=a.enterprise_id LEFT JOIN user_pool_leases l ON l.member_identity=p.identity',
+      select: `p.*, a.enterprise_id, profile.revision AS enterprise_revision, a.gh_login, a.copilot_oauth_status, l.caller_id, l.phase, l.expires_at, (${held}) AS active_requests`,
       search: ['p.identity', 'a.gh_login', 'l.caller_id'], state: displayState, order: 'p.ordinal',
       states: ['ready_idle', 'active', 'provisional', 'provisioning', 'cooling', 'failed', 'disabled', 'catalog'],
     },
     leases: {
-      from: 'user_pool_leases l JOIN user_pool_accounts p ON p.identity=l.member_identity',
-      select: `l.*, (${held}) AS active_requests`, search: ['l.member_identity', 'l.caller_id', 'l.lease_id'],
+      from: 'user_pool_leases l JOIN user_pool_accounts p ON p.identity=l.member_identity JOIN proxy_accounts a ON a.identity=p.identity JOIN enterprise_profiles profile ON profile.id=a.enterprise_id',
+      select: `l.*, a.enterprise_id, profile.revision AS enterprise_revision, (${held}) AS active_requests`, search: ['l.member_identity', 'l.caller_id', 'l.lease_id'],
       state: 'l.phase', order: 'l.assigned_at DESC, l.lease_id', states: ['active', 'provisional'],
     },
     events: {
@@ -46,6 +49,10 @@ export function poolPageSql(kind: PoolList, input: PoolPageQuery, now: number): 
   if (!d || state && !(d.states as string[]).includes(state)) throw new Error('Invalid pool state');
   const conditions: string[] = [];
   const values: unknown[] = [];
+  if (enterpriseId !== undefined) {
+    conditions.push(`${kind === 'events' ? 'e' : 'a'}.enterprise_id = ?`);
+    values.push(enterpriseId);
+  }
   if (q) {
     const pattern = `%${q.replace(/[!%_]/g, '!$&')}%`;
     conditions.push(`(${d.search.map(column => `LOWER(${column}) LIKE LOWER(?) ESCAPE '!'`).join(' OR ')})`);

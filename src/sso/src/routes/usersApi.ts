@@ -1,6 +1,8 @@
+import type { EnterpriseScope } from '@ghcp/shared';
 import { Router } from 'express';
-import { apiError, errorFields, loggerFor } from '@ghcp/shared';
-import { getUser, listUsers, PoolMemberManagedError, SsoUserLimitReachedError, toDto } from '../db/usersRepo.js';
+import { requireEnterpriseRequest } from '../enterprise.js';
+import { apiError, enterpriseId, errorFields, loggerFor } from '@ghcp/shared';
+import { getUser, listUsers, PoolMemberManagedError, SsoUserLimitReachedError, UserIncarnationConflictError, toDto } from '../db/usersRepo.js';
 import { PoolMembershipUnavailableError } from '../clients/proxyClient.js';
 import type { ScimEnterpriseRole } from '../scim/scimClient.js';
 import type { ImportEmuUserStatus, SsoUserBatchOperation, SsoUserLoginCredentialsResponse } from '@ghcp/shared';
@@ -22,7 +24,9 @@ import {
   runSsoUserBatch,
 } from '../users/service.js';
 
-export const usersApiRouter = Router();
+export function createUsersApiRouter(scope: EnterpriseScope): Router {
+const usersApiRouter = Router();
+usersApiRouter.use(requireEnterpriseRequest(scope));
 const SCIM_ENTERPRISE_ROLES = new Set<ScimEnterpriseRole>(['user', 'enterprise_owner']);
 const EMU_IMPORT_ROW_STATUSES = new Set(['pending_create', 'pending_update', 'created', 'updated', 'skipped', 'conflict', 'failed']);
 const SSO_USER_BATCH_OPERATIONS = new Set(['sync_emu', 'suspend_emu', 'delete_emu', 'delete_sso', 'assign_copilot', 'remove_copilot']);
@@ -35,9 +39,9 @@ usersApiRouter.post('/users/ensure', (req, res) => {
     return;
   }
   try {
-    res.json(ensureUser(identity, typeof preferredSsoUser === 'string' ? preferredSsoUser : undefined));
+    res.json(ensureUser(identity, typeof preferredSsoUser === 'string' ? preferredSsoUser : undefined, scope));
   } catch (err) {
-    sendCreateUserError(res, err, 'ensure_user_failed');
+    sendCreateUserError(res, err, 'ensure_user_failed', scope);
   }
 });
 
@@ -49,12 +53,12 @@ usersApiRouter.get('/users', (req, res) => {
       pageSize: numberQuery(req.query.pageSize),
       sort: stringQuery(req.query.sort) as never,
       dir: stringQuery(req.query.dir) as never,
-    }),
+    }, scope),
   );
 });
 
 usersApiRouter.get('/users/capacity', (_req, res) => {
-  res.json(getSsoUserCapacity());
+  res.json(getSsoUserCapacity(scope));
 });
 
 usersApiRouter.post('/users', (req, res) => {
@@ -63,9 +67,9 @@ usersApiRouter.post('/users', (req, res) => {
     return;
   }
   try {
-    res.status(201).json(createSsoUser(req.body as Parameters<typeof createSsoUser>[0]));
+    res.status(201).json(createSsoUser(req.body as Parameters<typeof createSsoUser>[0], scope));
   } catch (err) {
-    sendCreateUserError(res, err, 'create_user_failed');
+    sendCreateUserError(res, err, 'create_user_failed', scope);
   }
 });
 
@@ -75,11 +79,11 @@ usersApiRouter.post('/users/import', (req, res) => {
     res.status(400).json(apiError('invalid_import', 'csvText is required.'));
     return;
   }
-  res.json(importUsers(csvText));
+  res.json(importUsers(csvText, scope));
 });
 
 usersApiRouter.post('/users/batch', async (req, res) => {
-  const body = req.body as { operation?: unknown; ssoUsers?: unknown; enterpriseRole?: unknown; assignCopilotSeat?: unknown; createOnly?: unknown };
+  const body = req.body as { operation?: unknown; ssoUsers?: unknown; enterpriseRole?: unknown; assignCopilotSeat?: unknown; createOnly?: unknown; expectedIncarnations?: unknown };
   if (typeof body.operation !== 'string' || !SSO_USER_BATCH_OPERATIONS.has(body.operation)) {
     res.status(400).json(apiError('invalid_operation', 'operation must be one of sync_emu, suspend_emu, delete_emu, delete_sso, assign_copilot, remove_copilot.'));
     return;
@@ -104,6 +108,15 @@ usersApiRouter.post('/users/batch', async (req, res) => {
     res.status(400).json(apiError('invalid_create_only', 'createOnly must be a boolean and is only supported for sync_emu.'));
     return;
   }
+  let expectedIncarnations: Record<string, string> | undefined;
+  if (body.expectedIncarnations !== undefined) {
+    try {
+      const value = body.expectedIncarnations;
+      if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > 10000) throw new Error();
+      expectedIncarnations = Object.fromEntries(Object.entries(value).map(([name, id]) => [name, enterpriseId(id)]));
+      if ((body.ssoUsers as string[]).some(name => !Object.hasOwn(expectedIncarnations!, name))) throw new Error();
+    } catch { res.status(400).json(apiError('invalid_user_incarnations', 'Each selected user requires its expected incarnation.')); return; }
+  }
   const operation = body.operation as SsoUserBatchOperation;
   const enterpriseRole = body.enterpriseRole as ScimEnterpriseRole | undefined;
   const assignCopilotSeat = body.assignCopilotSeat as boolean | undefined;
@@ -117,10 +130,11 @@ usersApiRouter.post('/users/batch', async (req, res) => {
   }, () => runSsoUserBatch({
     operation,
     ssoUsers: body.ssoUsers as string[],
+    expectedIncarnations,
     enterpriseRole,
     assignCopilotSeat,
     createOnly,
-  }));
+  }, scope), undefined, scope);
 });
 
 usersApiRouter.post('/users/emu/import', async (req, res) => {
@@ -136,7 +150,7 @@ usersApiRouter.post('/users/emu/import', async (req, res) => {
   await sendAsync(res, 'import-emu-users', { ssoUser, dryRun }, () => importEmuUsers({
     ssoUser: typeof ssoUser === 'string' ? ssoUser : undefined,
     dryRun: typeof dryRun === 'boolean' ? dryRun : undefined,
-  }));
+  }, scope), undefined, scope);
 });
 
 usersApiRouter.post('/users/emu/import/plans', async (req, res) => {
@@ -145,11 +159,11 @@ usersApiRouter.post('/users/emu/import/plans', async (req, res) => {
     res.status(400).json(apiError('invalid_sso_user', 'ssoUser must be a string when provided.'));
     return;
   }
-  await sendAsync(res, 'create-emu-import-plan', { ssoUser }, () => createEmuImportPlan({ ssoUser: typeof ssoUser === 'string' ? ssoUser : undefined }));
+  await sendAsync(res, 'create-emu-import-plan', { ssoUser }, () => createEmuImportPlan({ ssoUser: typeof ssoUser === 'string' ? ssoUser : undefined }, scope), undefined, scope);
 });
 
 usersApiRouter.get('/users/emu/import/plans/:planId', async (req, res) => {
-  await sendAsync(res, 'get-emu-import-plan', { planId: req.params.planId }, () => Promise.resolve(getEmuImportPlan(req.params.planId)));
+  await sendAsync(res, 'get-emu-import-plan', { planId: req.params.planId }, () => Promise.resolve(getEmuImportPlan(req.params.planId, scope)), undefined, scope);
 });
 
 usersApiRouter.get('/users/emu/import/plans/:planId/rows', async (req, res) => {
@@ -163,22 +177,22 @@ usersApiRouter.get('/users/emu/import/plans/:planId/rows', async (req, res) => {
     status: rowStatus,
     page: numberQuery(req.query.page),
     pageSize: numberQuery(req.query.pageSize),
-  })));
+  }, scope)), undefined, scope);
 });
 
 usersApiRouter.post('/users/emu/import/plans/:planId/apply', async (req, res) => {
-  await sendAsync(res, 'apply-emu-import-plan', { planId: req.params.planId }, () => Promise.resolve(applyEmuImportPlan(req.params.planId)));
+  await sendAsync(res, 'apply-emu-import-plan', { planId: req.params.planId }, () => Promise.resolve(applyEmuImportPlan(req.params.planId, scope)), undefined, scope);
 });
 
 usersApiRouter.delete('/users/emu/import/plans/:planId', async (req, res) => {
   await sendAsync(res, 'delete-emu-import-plan', { planId: req.params.planId }, () => {
-    deleteEmuImportPlan(req.params.planId);
+    deleteEmuImportPlan(req.params.planId, scope);
     return Promise.resolve(undefined);
-  }, 204);
+  }, 204, scope);
 });
 
 usersApiRouter.get('/users/:ssoUser', (req, res) => {
-  const user = getUser(req.params.ssoUser);
+  const user = getUser(req.params.ssoUser, scope);
   if (!user) {
     res.status(404).json(apiError('user_not_found', 'SSO user was not found.'));
     return;
@@ -196,7 +210,7 @@ usersApiRouter.post('/users/:ssoUser/login-credentials', (req, res) => {
     res.status(400).json(apiError('invalid_ownership', 'expectedCreatedAt and expectedEmail are required; expectedCreatedAt must be a timestamp.'));
     return;
   }
-  const user = getUser(req.params.ssoUser);
+  const user = getUser(req.params.ssoUser, scope);
   if (!user) {
     res.status(404).json(apiError('user_not_found', 'SSO user was not found.'));
     return;
@@ -206,7 +220,7 @@ usersApiRouter.post('/users/:ssoUser/login-credentials', (req, res) => {
     res.status(409).json(apiError('user_ownership_mismatch', 'SSO user no longer matches the expected ownership or is not eligible for login.'));
     return;
   }
-  const passwordForLogin = knownDefaultPasswordForUser(user);
+  const passwordForLogin = knownDefaultPasswordForUser(user, scope);
   if (passwordForLogin === undefined) {
     res.status(409).json(apiError('login_credentials_unavailable', 'The existing SSO user password is not available for automatic login.'));
     return;
@@ -216,14 +230,15 @@ usersApiRouter.post('/users/:ssoUser/login-credentials', (req, res) => {
 
 usersApiRouter.patch('/users/:ssoUser', (req, res, next) => {
   try {
-    const user = patchSsoUser(req.params.ssoUser, req.body as { password?: string; email?: string; role?: 'user' | 'admin' });
+    if (req.body?.expectedUserIncarnation !== undefined) enterpriseId(req.body.expectedUserIncarnation);
+    const user = patchSsoUser(req.params.ssoUser, req.body as Parameters<typeof patchSsoUser>[1], scope);
     if (!user) {
       res.status(404).json(apiError('user_not_found', 'SSO user was not found.'));
       return;
     }
     res.json(user);
   } catch (err) {
-    if (err instanceof PoolMemberManagedError) {
+    if (err instanceof PoolMemberManagedError || err instanceof UserIncarnationConflictError) {
       res.status(409).json(apiError(err.code, err.message));
       return;
     }
@@ -232,17 +247,17 @@ usersApiRouter.patch('/users/:ssoUser', (req, res, next) => {
 });
 
 usersApiRouter.post('/users/:ssoUser/copilot-seat', async (req, res) => {
-  await sendAsync(res, 'assign-copilot-seat', { ssoUser: req.params.ssoUser }, () => assignCopilotSeatForSsoUser(req.params.ssoUser));
+  await sendAsync(res, 'assign-copilot-seat', { ssoUser: req.params.ssoUser }, () => assignCopilotSeatForSsoUser(req.params.ssoUser, scope), undefined, scope);
 });
 
 usersApiRouter.delete('/users/:ssoUser/copilot-seat', async (req, res) => {
   await sendAsync(res, 'remove-copilot-seat', { ssoUser: req.params.ssoUser }, async () => {
-    const result = await removeCopilotSeatForSsoUser(req.params.ssoUser);
+    const result = await removeCopilotSeatForSsoUser(req.params.ssoUser, scope);
     return result.user;
-  });
+  }, undefined, scope);
 });
 
-async function sendAsync(res: import('express').Response, operation: string, fields: Record<string, unknown>, fn: () => Promise<unknown>, successStatus = 200): Promise<void> {
+async function sendAsync(res: import('express').Response, operation: string, fields: Record<string, unknown>, fn: () => Promise<unknown>, successStatus = 200, scope: EnterpriseScope): Promise<void> {
   try {
     const result = await fn();
     if (successStatus === 204) {
@@ -251,7 +266,7 @@ async function sendAsync(res: import('express').Response, operation: string, fie
     }
     res.status(successStatus).json(result);
   } catch (err) {
-    logger.error(`${operation}-failed`, 'SSO user operation failed', { ...fields, ...errorFields(err) });
+    logger.error(`${operation}-failed`, 'SSO user operation failed', { ...fields, ...errorFields(err), enterpriseId: scope.enterpriseId, enterpriseRevision: scope.enterpriseRevision });
     if (err instanceof PoolMemberManagedError || err instanceof PoolMembershipUnavailableError) {
       res.status(err instanceof PoolMemberManagedError ? 409 : 503).json(apiError(err.code, err.message));
       return;
@@ -271,8 +286,8 @@ function numberQuery(value: unknown): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function sendCreateUserError(res: import('express').Response, err: unknown, fallbackCode: string): void {
-  logger.error(fallbackCode, 'Create SSO user failed', { ...errorFields(err) });
+function sendCreateUserError(res: import('express').Response, err: unknown, fallbackCode: string, scope: EnterpriseScope): void {
+  logger.error(fallbackCode, 'Create SSO user failed', { ...errorFields(err), enterpriseId: scope.enterpriseId, enterpriseRevision: scope.enterpriseRevision });
   if (err instanceof PoolPasswordPolicyError) {
     res.status(400).json(apiError(err.code, err.message));
     return;
@@ -285,4 +300,7 @@ function sendCreateUserError(res: import('express').Response, err: unknown, fall
     return;
   }
   res.status(400).json(apiError(fallbackCode, err instanceof Error ? err.message : String(err)));
+}
+
+return usersApiRouter;
 }

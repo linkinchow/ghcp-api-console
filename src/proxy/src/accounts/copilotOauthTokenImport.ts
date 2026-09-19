@@ -2,7 +2,9 @@ import type { BatchResult, ImportCopilotOauthTokenRow } from '@ghcp/shared';
 import { HttpApiError, newBatchId, nowIso } from '@ghcp/shared';
 import { getSsoUser } from '../clients/ssoClient.js';
 import { clearModelsCache, CopilotApiError, validateCopilotOauthToken } from '../copilot/copilotClient.js';
-import { importCopilotOauthToken, toAccountDto } from '../db/accountsRepo.js';
+import { getCopilotOauthTokenImportFence, importCopilotOauthToken, toAccountDto } from '../db/accountsRepo.js';
+import { loadProxyEnterpriseProfile } from '../enterprise.js';
+import { verifyGithubSubject } from './authorization.js';
 
 interface ImportRow {
   line: number;
@@ -16,12 +18,12 @@ interface ParseError {
   error: string;
 }
 
-export async function importCopilotOauthTokens(csvText: string): Promise<BatchResult<ImportCopilotOauthTokenRow>> {
+export async function importCopilotOauthTokens(csvText: string,enterpriseId?:string): Promise<BatchResult<ImportCopilotOauthTokenRow>> {
   const startedAt = nowIso();
   const parsed = parseCopilotOauthTokenCsv(csvText);
   const rows: ImportCopilotOauthTokenRow[] = [];
   for (const row of parsed.rows) {
-    rows.push(await importCopilotOauthTokenRow(row));
+    rows.push(await importCopilotOauthTokenRow(row,enterpriseId));
   }
   for (const error of parsed.errors) {
     rows.push({
@@ -42,14 +44,22 @@ export async function importCopilotOauthTokens(csvText: string): Promise<BatchRe
   };
 }
 
-async function importCopilotOauthTokenRow(row: ImportRow): Promise<ImportCopilotOauthTokenRow> {
+async function importCopilotOauthTokenRow(row: ImportRow,enterpriseId?:string): Promise<ImportCopilotOauthTokenRow> {
   try {
-    const ssoUser = await getSsoUser(row.name);
+    const profile = loadProxyEnterpriseProfile(enterpriseId);
+    // Capture before SSO lookup as well as GitHub/Copilot validation. No lock spans I/O.
+    const expectedAccount = await getCopilotOauthTokenImportFence(row.name,profile.id);
+    const ssoUser = await getSsoUser(row.name,profile.id);
+    if (!ssoUser.ghLogin) throw new Error('expected_github_subject_required');
+    const subject=await verifyGithubSubject(profile,row.copilotOauthToken);
+    if (subject.login!==ssoUser.ghLogin) throw new Error('oauth_subject_mismatch');
     await validateCopilotOauthToken(row.name, row.copilotOauthToken);
     const account = await importCopilotOauthToken({
+      enterpriseId:profile.id,
+      expectedAccount,
       identity: row.name,
       ssoUser: ssoUser.ssoUser,
-      ghLogin: ssoUser.ghLogin ?? row.name,
+      ghLogin: ssoUser.ghLogin,
       copilotOauthToken: row.copilotOauthToken,
     });
     clearModelsCache(row.name);
@@ -57,9 +67,7 @@ async function importCopilotOauthTokenRow(row: ImportRow): Promise<ImportCopilot
       line: row.line,
       name: row.name,
       status: 'success',
-      detail: ssoUser.ghLogin
-        ? 'Copilot OAuth token was validated and imported.'
-        : 'Copilot OAuth token was validated and imported with name as GH login fallback; sync SSO to GH to confirm ghLogin.',
+      detail: 'Copilot OAuth token subject was verified and imported.',
       account: toAccountDto(account),
     };
   } catch (err) {

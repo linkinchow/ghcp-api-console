@@ -11,6 +11,7 @@ import type {
   SsoType,
 } from '@ghcp/shared';
 import { api, downloadApi } from './client.js';
+import { profilePath, requireIncarnation } from './enterprises.js';
 
 export interface ListProxyAccountsQuery {
   q?: string;
@@ -20,52 +21,31 @@ export interface ListProxyAccountsQuery {
   dir?: 'asc' | 'desc';
 }
 
-export function listProxyAccounts(params: ListProxyAccountsQuery = {}): Promise<PageResponse<ProxyAccountDto>> {
+export function listProxyAccounts(enterpriseId: string, params: ListProxyAccountsQuery = {}, signal?: AbortSignal): Promise<PageResponse<ProxyAccountDto>> {
   const search = new URLSearchParams();
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== '') search.set(key, String(value));
-  }
-  const queryString = search.toString();
-  return api<PageResponse<ProxyAccountDto> | ProxyAccountDto[]>(`/api/console/proxy/accounts${queryString ? `?${queryString}` : ''}`)
-    .then((result) => {
-      if (!Array.isArray(result)) return result;
-      const page = Math.max(1, Math.trunc(params.page ?? 1));
-      const pageSize = Math.max(1, Math.trunc(params.pageSize ?? (result.length || 25)));
-      return {
-        items: result,
-        total: result.length,
-        page,
-        pageSize,
-      };
-    });
+  for (const [key, value] of Object.entries(params)) if (value !== undefined && value !== '') search.set(key, String(value));
+  return api(`${profilePath('proxy', enterpriseId)}/accounts${query(search)}`, { signal, cache: 'no-store' });
 }
-
-export function getProxyAccount(identity: string): Promise<ProxyAccountDto> {
-  return api<ProxyAccountDto>(`/api/console/proxy/accounts/${encodeURIComponent(identity)}`);
+export function getProxyAccount(enterpriseId: string, identity: string, signal?: AbortSignal): Promise<ProxyAccountDto> {
+  return api(`${profilePath('proxy', enterpriseId)}/accounts/${encodeURIComponent(identity)}`, { signal, cache: 'no-store' });
 }
-
-export function deleteProxyAccount(identity: string): Promise<DeleteProxyAccountResult> {
-  return api<DeleteProxyAccountResult>(`/api/console/proxy/accounts/${encodeURIComponent(identity)}`, { method: 'DELETE' });
-}
-
-export function listRequestStats(params: { identity?: string; limit?: number } = {}): Promise<ProxyRequestStatDto[]> {
-  const search = new URLSearchParams();
-  if (params.limit) search.set('limit', String(params.limit));
-  if (params.identity) {
-    return api<ProxyRequestStatDto[]>(`/api/console/proxy/accounts/${encodeURIComponent(params.identity)}/request-stats${query(search)}`);
-  }
-  return api<ProxyRequestStatDto[]>(`/api/console/proxy/request-stats${query(search)}`);
-}
-
-export function reauthorizeCopilotOauth(identity: string, body: { ssoPassword: string; ssoType: SsoType }): Promise<ProxyAccountDto | undefined> {
-  return api<ProxyAccountDto | undefined>(`/api/console/proxy/accounts/${encodeURIComponent(identity)}/copilot-oauth/reauthorize`, { method: 'POST', body: JSON.stringify(body) });
-}
-
-export function importCopilotOauthTokens(csvText: string): Promise<BatchResult<ImportCopilotOauthTokenRow>> {
-  return api<BatchResult<ImportCopilotOauthTokenRow>>('/api/console/proxy/accounts/copilot-oauth-token/import', {
-    method: 'POST',
-    body: JSON.stringify({ csvText }),
+export function deleteProxyAccount(enterpriseId: string, identity: string, expectedAccountIncarnation: string): Promise<DeleteProxyAccountResult> {
+  return api(`${profilePath('proxy', enterpriseId)}/accounts/${encodeURIComponent(identity)}`, {
+    method: 'DELETE', body: JSON.stringify({ expectedAccountIncarnation: requireIncarnation(expectedAccountIncarnation) }),
   });
+}
+export interface RequestStatsQuery { page?: number; pageSize?: number; q?: string; success?: string; model?: string; identity?: string }
+export function listRequestStatsPage(enterpriseId: string, params: RequestStatsQuery = {}, signal?: AbortSignal): Promise<PageResponse<ProxyRequestStatDto>> {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) if (value !== undefined && value !== '') search.set(key, String(value));
+  return api(`${profilePath('proxy', enterpriseId)}/request-stats/page${query(search)}`, { signal, cache: 'no-store' });
+}
+export function reauthorizeCopilotOauth(enterpriseId: string, identity: string, body: { ssoPassword: string; ssoType: SsoType; expectedAccountIncarnation: string }): Promise<ProxyAccountDto | undefined> {
+  requireIncarnation(body.expectedAccountIncarnation);
+  return api(`${profilePath('proxy', enterpriseId)}/accounts/${encodeURIComponent(identity)}/copilot-oauth/reauthorize`, { method: 'POST', body: JSON.stringify(body) });
+}
+export function importCopilotOauthTokens(enterpriseId: string, csvText: string): Promise<BatchResult<ImportCopilotOauthTokenRow>> {
+  return api(`${profilePath('proxy', enterpriseId)}/accounts/copilot-oauth-token/import`, { method: 'POST', body: JSON.stringify({ csvText }) });
 }
 
 export function listErrorDiagnostics(params: { page?: number; pageSize?: number } = {}): Promise<ProxyErrorDiagnosticsListResponse> {

@@ -24,7 +24,7 @@ function fixture(multiReplica = true) {
     async renewOwner() { calls.push('renew'); return renew; },
     async releaseOwner() { calls.push('release'); },
     async reclaim() { calls.push('reclaim'); },
-    async settings() { calls.push('settings'); return { version: 1, idle_target: 0, max_accounts: 1, lease_seconds: 600, paused: 0 }; },
+    async settings() { calls.push('settings'); return { version: 1, idle_target: 0, max_accounts: 1, active_max_accounts: 1, lease_seconds: 600, paused: 0 }; },
     async reserveDeficit() { calls.push('reserve'); return 0; },
     async pending() { calls.push('pending'); return undefined; },
     async hasHolds() { calls.push('holds'); return false; },
@@ -96,6 +96,7 @@ test('expired snapshot never fences work, logs, claims, or records a loss; execu
   let context!: ProvisionContext;
   const external = deferred<{}>();
   const row: ProvisionInventory = {
+    enterprise_id: '86e2ee02-223a-45ea-8c26-bdd1c570a4ee', enterprise_revision: 1,
     identity: 'sensitive-identity', ordinal: 1, state: 'provisioning', stage: 'new', attempt_id: 'attempt',
     task_id: null, attempts: 0, retry_at: 0, last_error: null, updated_at: 0, cooldown_until: 0,
     verified_at: null, generation: 0, sso_created_at: null, oauth_attempt_id: null,

@@ -11,6 +11,8 @@ export interface JsonRequestOptions {
   body?: unknown;
   headers?: Record<string, string>;
   timeoutMs?: number;
+  signal?: AbortSignal;
+  redirect?: 'follow' | 'error' | 'manual';
 }
 
 export class JsonHttpClient {
@@ -21,7 +23,10 @@ export class JsonHttpClient {
       method: options.method ?? (options.body === undefined ? 'GET' : 'POST'),
       headers: this.headers(options),
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
-      signal: AbortSignal.timeout(options.timeoutMs ?? this.options.timeoutMs ?? 30_000),
+      signal: options.signal
+        ? AbortSignal.any([options.signal, AbortSignal.timeout(options.timeoutMs ?? this.options.timeoutMs ?? 30_000)])
+        : AbortSignal.timeout(options.timeoutMs ?? this.options.timeoutMs ?? 30_000),
+      ...(options.redirect === undefined ? {} : { redirect: options.redirect }),
     });
     if (!res.ok) {
       throw await errorFromResponse(res);

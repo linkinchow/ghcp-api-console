@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { initSsoFixture } from '../db/enterpriseFixture.js';
 
 test('sync_emu assigns a Copilot seat only when explicitly requested', async () => {
-  process.env.DB_PATH = ':memory:';
   process.env.SSO_USER_EVENTS_LOG = '/dev/null';
   process.env.SCIM_BASE_URL = 'https://scim.test/scim/v2/enterprises/test';
   process.env.SCIM_TOKEN = 'test-scim-token';
@@ -10,6 +10,7 @@ test('sync_emu assigns a Copilot seat only when explicitly requested', async () 
   process.env.ENTERPRISE_SLUG = 'test-enterprise';
   process.env.GITHUB_COPILOT_SEAT_PAT = 'test-seat-token';
   process.env.LOG_LEVEL = 'error';
+  const scope = initSsoFixture();
 
   const originalFetch = globalThis.fetch;
   const seatAssignments: string[] = [];
@@ -36,24 +37,24 @@ test('sync_emu assigns a Copilot seat only when explicitly requested', async () 
     const { updateSsoRuntimeSettings } = await import('../db/runtimeSettingsRepo.js');
     const { runSsoUserBatch } = await import('./service.js');
     for (const ssoUser of ['login-only', 'login-with-seat']) {
-      createUser({ ssoUser, passwordHash: 'hash', salt: 'salt', email: `${ssoUser}@example.com` });
+      createUser({ ssoUser, passwordHash: 'hash', salt: 'salt', email: `${ssoUser}@example.com` }, scope);
     }
-    updateSsoRuntimeSettings({ expectedVersion: 1, changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 } });
+    updateSsoRuntimeSettings({ expectedVersion: 1, changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 } }, scope);
 
     const loginOnly = await runSsoUserBatch({
       operation: 'sync_emu',
       ssoUsers: ['login-only'],
       assignCopilotSeat: false,
-    });
+    }, scope);
     const loginWithSeat = await runSsoUserBatch({
       operation: 'sync_emu',
       ssoUsers: ['login-with-seat'],
       assignCopilotSeat: true,
-    });
+    }, scope);
 
     assert.equal(loginOnly.rows[0]?.detail, 'Synced to EMU.');
     assert.equal(loginOnly.rows[0]?.user?.copilotSeatStatus, 'unknown');
-    assert.equal(getUser('login-only')?.copilotSeatStatus, 'unknown');
+    assert.equal(getUser('login-only', scope)?.copilotSeatStatus, 'unknown');
     assert.equal(loginWithSeat.rows[0]?.detail, 'Synced to EMU and assigned Copilot seat.');
     assert.equal(loginWithSeat.rows[0]?.user?.copilotSeatStatus, 'assigned');
     assert.deepEqual(seatAssignments, ['login-with-seat_emu']);

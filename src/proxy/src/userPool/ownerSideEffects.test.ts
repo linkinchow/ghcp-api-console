@@ -1,10 +1,12 @@
+import { completeFixtureAttempt, failFixtureAttempt } from '../test/enterpriseFixtures.js';
+import { TEST_ENTERPRISE, initSqliteFixture, initMysqlFixture, fixtureRegistry, fixtureProfile } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import type Database from 'better-sqlite3';
+import Database from 'better-sqlite3';
 import { createPool, type Pool, type PoolConnection, type RowDataPacket } from 'mysql2/promise';
 import type { LoginTaskDto, SsoUserDto } from '@ghcp/shared';
 import type { ProxyStorage } from '../db/storageTypes.js';
@@ -103,7 +105,10 @@ async function withDatabase(driver: 'SQLite' | 'MySQL', run: (f: Fixture) => Pro
   if (driver === 'SQLite') {
     const directory = mkdtempSync(join(tmpdir(), 'owner-side-effects-'));
     const path = join(directory, 'test.sqlite');
-    const storage = new SqliteStorage(path, 10), other = new SqliteStorage(path, 10);
+    const initialized = new Database(path);
+    initSqliteFixture(initialized, options);
+    initialized.close();
+    const storage = new SqliteStorage(path, 10, fixtureRegistry(options)), other = new SqliteStorage(path, 10, fixtureRegistry(options));
     try {
       await storage.initialize(); await other.initialize();
       const first = storage.userPool(options), second = other.userPool(options);
@@ -159,7 +164,8 @@ async function withDatabase(driver: 'SQLite' | 'MySQL', run: (f: Fixture) => Pro
     for (let i = 0; i < 2; i++) pools.push(createPool({ uri: url.toString(), connectionLimit: 4,
       connectTimeout: 5000, timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true }));
     const [db, otherDb] = pools;
-    const storage = new MysqlStorage(tracedPool(db, writes), 10), other = new MysqlStorage(otherDb, 10);
+    await initMysqlFixture(db, options);
+    const storage = new MysqlStorage(tracedPool(db, writes), 10, fixtureRegistry(options)), other = new MysqlStorage(otherDb, 10, fixtureRegistry(options));
     await storage.initialize();
     const first = await storage.userPool(options), second = await other.userPool(options);
     await run({ first, second, storage, writes,
@@ -206,10 +212,13 @@ function services(f: Fixture, target: Stage, timing: Timing, observable: boolean
   };
   const adapter = (store: PoolStore): ProvisionAdapter => {
     const real = realProvisioner(store, options, {
+      enterpriseProfile: id => { assert.equal(id, TEST_ENTERPRISE.id); const profile = fixtureProfile(options); return {...profile,routes:{...profile.routes,ssoInternalUrl:'http://sso.synthetic.test',loginInternalUrl:'http://login.synthetic.test'}}; },
+      verifyReadiness: async (profile, signal) => { assert.equal(profile.id, TEST_ENTERPRISE.id); signal.throwIfAborted(); },
+      creationCapacity: async () => true,
       getAccount: id => f.storage.getAccount(id),
       async fetch(input, init) {
         try {
-          const url = new URL(String(input)), path = url.pathname, method = init?.method ?? 'GET';
+          const url = new URL(String(input)); url.pathname=url.pathname.replace(`/api/profiles/${TEST_ENTERPRISE.id}`, '/api'); const path = url.pathname, method = init?.method ?? 'GET';
           assert.equal(url.origin, path.startsWith('/api/tasks') ? 'http://login.synthetic.test' : 'http://sso.synthetic.test');
           assert.equal(new Headers(init?.headers).get('x-internal-token'), 'synthetic-internal');
           assert.equal(init?.redirect, 'error'); assert.ok(init?.signal);
@@ -220,7 +229,7 @@ function services(f: Fixture, target: Stage, timing: Timing, observable: boolean
             assert.equal(++posts.sso, 1, 'count POST attempts, not deduplicated identities');
             assert.equal(row.stage, 'sso-creating'); assert.equal(row.sso_created_at, null);
             assert.deepEqual(body, { ssoUser: row.identity, email: `${row.identity}@${options.accountDomain}`, role: 'user', poolManaged: true });
-            user = { ssoUser: row.identity, email: body.email, role: 'user', emuStatus: 'not_synced',
+            user = { enterpriseId: TEST_ENTERPRISE.id, userIncarnation: randomUUID(), ssoUser: row.identity, email: body.email, role: 'user', emuStatus: 'not_synced',
               copilotSeatStatus: 'unassigned', createdAt, updatedAt: createdAt };
             visible = { ...user! };
             return effect('sso', json(user, 201));
@@ -230,7 +239,7 @@ function services(f: Fixture, target: Stage, timing: Timing, observable: boolean
           if (method === 'POST' && path === '/api/users/batch') {
             assert.equal(++posts.scim, 1); assert.equal(row.stage, 'scim-syncing');
             assert.deepEqual(body, { operation: 'sync_emu', ssoUsers: [row.identity], assignCopilotSeat: false, createOnly: true });
-            user = { ...user, emuStatus: 'active', ghLogin: `${row.identity}_emu`, ghScimId: 'synthetic-scim-original' };
+            user = { ...user, emuStatus: 'active', ghLogin: `${row.identity.replaceAll('.', '-')}_emu`, ghScimId: 'synthetic-scim-original' };
             if (target !== 'scim' || observable) visible = { ...user };
             return effect('scim', json({ rows: [{ ssoUser: row.identity, status: 'success', user }] }));
           }
@@ -248,12 +257,12 @@ function services(f: Fixture, target: Stage, timing: Timing, observable: boolean
           if (method === 'POST' && path === '/api/tasks') {
             assert.equal(++posts.login, 1, 'Login POST is NOT idempotent, even for the same nonce');
             assert.equal(row.stage, 'oauth-dispatch'); assert.ok(row.oauth_attempt_id);
-            assert.deepEqual(body, { identity: row.identity, ssoUser: row.identity, ghLogin: user.ghLogin,
+            assert.deepEqual(body, { enterpriseId: TEST_ENTERPRISE.id, enterpriseRevision: TEST_ENTERPRISE.revision, identity: row.identity, ssoUser: row.identity, expectedGhLogin: user.ghLogin, accountIncarnation:(await f.storage.getAccount(row.identity))!.accountIncarnation,
               oauthAttemptId: row.oauth_attempt_id, ssoPassword: 'synthetic-password', ssoType: 'custom' });
             const account = await f.storage.getAccount(row.identity);
             assert.equal(account?.copilotOauthStatus, 'refreshing');
             assert.equal(account.copilotOauthAttemptId, row.oauth_attempt_id);
-            const task: LoginTaskDto = { id: 'synthetic-original-task', identity: row.identity, ssoUser: row.identity,
+            const task: LoginTaskDto = { enterpriseId:TEST_ENTERPRISE.id,enterpriseRevision:TEST_ENTERPRISE.revision,accountIncarnation:account!.accountIncarnation,expectedGhLogin:user.ghLogin, id: 'synthetic-original-task', identity: row.identity, ssoUser: row.identity,
               ghLogin: user.ghLogin, oauthAttemptId: row.oauth_attempt_id, ssoType: 'custom', status: 'running',
               attempts: 1, createdAt: new Date(await store.now()).toISOString() };
             tasks.push(task);
@@ -367,7 +376,7 @@ async function contract(f: Fixture, target: Stage, timing: Timing, observable = 
     } else {
       assert.equal(recovered.stage, stages[target].after); assert.equal(recovered.state, 'provisioning');
       assert.equal(recovered.attempts, 0); assert.equal(recovered.last_error, null);
-      if (target === 'seat') assert.equal((await f.storage.getAccount(held.identity))?.ghLogin, `${held.identity}_emu`);
+      if (target === 'seat') assert.equal((await f.storage.getAccount(held.identity))?.ghLogin, `${held.identity.replaceAll('.', '-')}_emu`);
       if (target === 'login') {
         assert.equal(recovered.task_id, service.tasks[0].id);
         assert.equal((await f.storage.getAccount(held.identity))?.copilotOauthAttemptId, held.oauth_attempt_id);
@@ -405,9 +414,9 @@ async function contract(f: Fixture, target: Stage, timing: Timing, observable = 
       const task = service.tasks[0]; assert.ok(task.oauthAttemptId);
       assert.equal(task.oauthAttemptId, waiting.oauth_attempt_id);
       const beforeCallback = await f.snapshot();
-      assert.equal(await f.storage.saveCopilotOauthToken(waiting.identity, 'wrong-synthetic-nonce', 'bad-token'), undefined);
+      assert.equal(await completeFixtureAttempt(f.storage,waiting.identity, 'wrong-synthetic-nonce', 'bad-token'), undefined);
       assert.deepEqual(await f.snapshot(), beforeCallback);
-      assert.ok(await f.storage.saveCopilotOauthToken(waiting.identity, task.oauthAttemptId, 'synthetic-original-token', task.ghLogin));
+      assert.ok(await completeFixtureAttempt(f.storage,waiting.identity, task.oauthAttemptId, 'synthetic-original-token', task.ghLogin));
       task.status = 'success';
       await tick(successor); assert.equal((await service.read()).stage, 'warmup');
       await tick(successor);
@@ -417,8 +426,8 @@ async function contract(f: Fixture, target: Stage, timing: Timing, observable = 
       assert.equal(ready.oauth_attempt_id, task.oauthAttemptId); assert.equal(account?.copilotOauthAttemptId, undefined);
       assert.equal(account?.copilotOauthToken, 'synthetic-original-token'); assert.equal(account.copilotOauthStatus, 'valid');
       const completed = await f.snapshot();
-      assert.equal(await f.storage.saveCopilotOauthToken(ready.identity, task.oauthAttemptId, 'late-duplicate-token'), undefined);
-      assert.equal(await f.storage.failCopilotOauthAuthorization(ready.identity, task.oauthAttemptId), false);
+      assert.equal(await completeFixtureAttempt(f.storage,ready.identity, task.oauthAttemptId, 'late-duplicate-token'), undefined);
+      assert.equal(await failFixtureAttempt(f.storage,ready.identity, task.oauthAttemptId), false);
       assert.deepEqual(await f.snapshot(), completed);
       assert.equal(service.warms(), 1); assert.equal((await f.first.counts()).ready_idle, 1);
       assert.deepEqual(service.posts, { sso: 1, scim: 1, seat: 1, login: 1, credentials: 1 });

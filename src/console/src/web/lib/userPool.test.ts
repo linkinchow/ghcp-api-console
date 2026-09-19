@@ -3,17 +3,17 @@ import test from 'node:test';
 import { formatCallerKeyHash, parsePoolSettingsDraft, poolSettingsDraft, poolWarnings } from './userPool.js';
 
 const limits = { maxAccounts: 10000, minLeaseSeconds: 60, maxLeaseSeconds: 2592000 };
-const settings = { version: 4, idle_target: 5, max_accounts: 20, lease_seconds: 172800, paused: 0 };
+const settings = { version: 4, idle_target: 5, max_accounts: 20, active_max_accounts: 20, lease_seconds: 172800, paused: 0 as const };
 
 test('pool settings draft preserves zero and validates whole numbers without coercing empty fields', () => {
   const draft = poolSettingsDraft(settings);
-  assert.deepEqual(parsePoolSettingsDraft(draft, limits), { idle_target: 5, max_accounts: 20, lease_seconds: 172800, paused: 0 });
+  assert.deepEqual(parsePoolSettingsDraft(draft, limits), { idle_target: 5, lease_seconds: 172800, paused: 0 });
   assert.equal(parsePoolSettingsDraft({ ...draft, idleTarget: '0', paused: true }, limits).paused, 1);
   for (const value of ['', ' ', '-1', '1.5', '1e2', 'NaN', '10001']) {
     assert.throws(() => parsePoolSettingsDraft({ ...draft, idleTarget: value }, limits));
   }
-  assert.throws(() => parsePoolSettingsDraft({ ...draft, idleTarget: '21' }, limits), /cannot exceed/);
-  assert.throws(() => parsePoolSettingsDraft({ ...draft, maxAccounts: '0' }, limits));
+  assert.equal(parsePoolSettingsDraft({ ...draft, idleTarget: '21' }, limits).idle_target, 21, 'global idle target may exceed current caps');
+  assert.equal('maxAccounts' in draft, false, 'derived cap must never become a writable field');
   assert.throws(() => parsePoolSettingsDraft({ ...draft, leaseSeconds: '59' }, limits));
 });
 

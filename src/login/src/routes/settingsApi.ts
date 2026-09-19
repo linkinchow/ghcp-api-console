@@ -9,9 +9,8 @@ import {
   RuntimeSettingsValidationError,
   RuntimeSettingsVersionConflictError,
 } from '../db/runtimeSettingsRepo.js';
-import { loginQueue } from '../tasks/queue.js';
+import { loginQueue, type LoginQueue } from '../tasks/queue.js';
 
-export const settingsApiRouter = Router();
 const ROOT_KEYS = new Set(['expectedVersion', 'changes']);
 const SETTINGS_KEYS = new Set<keyof LoginRuntimeSettingsValues>([
   'concurrency',
@@ -20,31 +19,36 @@ const SETTINGS_KEYS = new Set<keyof LoginRuntimeSettingsValues>([
   'authDebugArtifacts',
 ]);
 
-settingsApiRouter.get('/settings/runtime', (_req, res) => {
-  res.json(loginRuntimeSettings.getSnapshot());
-});
+export function createSettingsApiRouter(queue: Pick<LoginQueue, 'onRuntimeSettingsUpdated'> = loginQueue): Router {
+  const router = Router();
+  router.get('/settings/runtime', (_req, res) => {
+    res.json(loginRuntimeSettings.getSnapshot());
+  });
 
-settingsApiRouter.patch('/settings/runtime', (req, res) => {
-  try {
-    const request = readUpdateRequest(req.body);
-    const updated = loginRuntimeSettings.update(request);
-    loginQueue.onRuntimeSettingsUpdated();
-    res.json(updated);
-  } catch (error) {
-    if (error instanceof RuntimeSettingsValidationError) {
-      res.status(400).json(apiError('invalid_runtime_settings', error.message, { issues: error.issues }));
-      return;
+  router.patch('/settings/runtime', (req, res) => {
+    try {
+      const request = readUpdateRequest(req.body);
+      const updated = loginRuntimeSettings.update(request);
+      queue.onRuntimeSettingsUpdated();
+      res.json(updated);
+    } catch (error) {
+      if (error instanceof RuntimeSettingsValidationError) {
+        res.status(400).json(apiError('invalid_runtime_settings', error.message, { issues: error.issues }));
+        return;
+      }
+      if (error instanceof RuntimeSettingsVersionConflictError) {
+        res.status(409).json(apiError('settings_version_conflict', error.message, {
+          expectedVersion: error.expectedVersion,
+          currentVersion: error.currentVersion,
+        }));
+        return;
+      }
+      throw error;
     }
-    if (error instanceof RuntimeSettingsVersionConflictError) {
-      res.status(409).json(apiError('settings_version_conflict', error.message, {
-        expectedVersion: error.expectedVersion,
-        currentVersion: error.currentVersion,
-      }));
-      return;
-    }
-    throw error;
-  }
-});
+  });
+  return router;
+}
+export const settingsApiRouter = createSettingsApiRouter();
 
 function readUpdateRequest(body: unknown): UpdateLoginRuntimeSettingsRequest {
   const issues: string[] = [];

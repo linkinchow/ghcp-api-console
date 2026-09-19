@@ -1,10 +1,11 @@
-import { mkdir } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import type { Browser, BrowserContext, Locator, Page } from 'playwright';
 import { chromium } from 'playwright-extra';
 import stealthPlugin from 'puppeteer-extra-plugin-stealth';
 import type { RuntimeAuthConfig } from '../config.js';
 import type { AccountLogger } from '../tasks/accountLogger.js';
+import { pathSegment } from '../tasks/accountLogger.js';
 import type { AccountCredentials, AuthStrategy } from './types.js';
 import type { DeviceCodeResponse } from './deviceFlow.js';
 
@@ -30,18 +31,25 @@ let stealthRegistered = false;
 export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
   readonly name = 'headless-playwright';
 
+  private signal?: AbortSignal;
+
   constructor(
     private readonly options: RuntimeAuthConfig,
     private readonly account: AccountCredentials,
     private readonly logger: AccountLogger,
+    private readonly browserDriver: Pick<typeof chromium, 'launch'> = chromium,
   ) {}
 
-  async authorize(device: DeviceCodeResponse): Promise<void> {
+  async authorize(device: DeviceCodeResponse, signal?: AbortSignal): Promise<void> {
+    this.signal = signal;
+    signal?.throwIfAborted();
     let stage = 'launch-browser';
     let browser: Browser | undefined;
     let context: BrowserContext | undefined;
     let page: Page | undefined;
     let traceStarted = false;
+    const abortBrowser = () => { void browser?.close().catch(() => undefined); };
+    signal?.addEventListener('abort', abortBrowser, { once: true });
 
     try {
       registerStealth(this.logger);
@@ -54,10 +62,11 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
         ssoUrl: this.options.ssoUrl ? safeUrl(this.options.ssoUrl) : undefined,
       });
 
-      browser = await chromium.launch({
+      browser = await this.browserDriver.launch({
         headless: this.options.headless,
         args: ['--disable-blink-features=AutomationControlled'],
       });
+      signal?.throwIfAborted();
       context = await browser.newContext({
         locale: 'en-US',
         viewport: { width: 1365, height: 768 },
@@ -66,7 +75,7 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       });
 
-      if (this.options.debugArtifacts) {
+      if (this.options.debugArtifacts && !this.options.artifactScope) {
         await mkdir(this.artifactDir(), { recursive: true });
         await context.tracing.start({ screenshots: true, snapshots: true });
         traceStarted = true;
@@ -99,25 +108,29 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
         url: safeUrl(page.url()),
       });
     } catch (err) {
+      if (signal?.aborted) throw signal.reason;
       const diagnostics = await this.captureFailure(stage, page, context, traceStarted);
       if (diagnostics.traceStopped) traceStarted = false;
       this.logger.error(stage, 'Automatic authorization failed', {
         url: page ? safeUrl(page.url()) : undefined,
-        error: errorMessage(err),
+        error: 'browser_authorization_failed',
         ...diagnostics.fields,
       });
-      throw new Error(`Automatic device-flow authorization failed during ${stage}: ${errorMessage(err)}`);
+      throw new Error(`Automatic device-flow authorization failed during ${stage}.`);
     } finally {
+      signal?.removeEventListener('abort', abortBrowser);
       if (context && traceStarted) {
         await context.tracing.stop().catch((err: unknown) => {
           this.logger.warn('debug-artifacts', 'Failed to stop tracing cleanly', { error: errorMessage(err) });
         });
       }
-      if (browser) await browser.close();
+      if (browser) await browser.close().catch(() => undefined);
     }
   }
 
   private async openDevicePage(page: Page, device: DeviceCodeResponse): Promise<void> {
+    this.signal?.throwIfAborted();
+    if (device.verification_uri !== 'https://github.com/login/device') throw new Error('untrusted_device_verification_url');
     this.logger.info('device-code', 'Opening GitHub device verification page', {
       url: safeUrl(device.verification_uri),
       expiresInSeconds: device.expires_in,
@@ -181,6 +194,8 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
       return false;
     }
 
+    this.signal?.throwIfAborted();
+    if (!isGitHubUrl(page.url())) throw new Error('untrusted_github_credential_url');
     await input.locator.fill(this.account.githubUsername);
     this.logger.info('github-login', 'Filled GitHub username', {
       candidate: input.description,
@@ -284,6 +299,8 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
       return;
     }
 
+    this.signal?.throwIfAborted();
+    if (!this.isSsoUrl(page.url())) throw new Error('untrusted_sso_submit_url');
     await control.locator.click();
     await waitForPageSettle(page);
     this.logger.info('sso-login', 'Handled Azure stay signed in prompt', {
@@ -367,6 +384,8 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
   ): Promise<void> {
     const element = await this.firstVisible(page, step, candidates, 2_000);
     if (!element) throw new Error(`Could not find ${label} input on ${safeUrl(page.url())}`);
+    this.signal?.throwIfAborted();
+    if (step === 'sso-login' && !this.isSsoUrl(page.url())) throw new Error('untrusted_sso_credential_url');
     await element.locator.fill(value);
     this.logger.debug(step, `Filled ${label}`, { candidate: element.description });
   }
@@ -379,6 +398,8 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
   ): Promise<void> {
     const element = await this.firstVisible(page, step, candidates, 2_000);
     if (!element) throw new Error(`Could not find ${label} control on ${safeUrl(page.url())}`);
+    this.signal?.throwIfAborted();
+    if (step === 'sso-login' && !this.isSsoUrl(page.url())) throw new Error('untrusted_sso_submit_url');
     await element.locator.click();
     this.logger.debug(step, `Clicked ${label}`, { candidate: element.description });
   }
@@ -390,12 +411,14 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
     timeoutMs: number,
   ): Promise<LocatedElement | undefined> {
     for (const candidate of candidates) {
+      this.signal?.throwIfAborted();
       const locator = candidate.create(page);
       try {
         await locator.waitFor({ state: 'visible', timeout: timeoutMs });
         this.logger.debug(step, 'Located visible element', { candidate: candidate.description });
         return { description: candidate.description, locator };
       } catch {
+        this.signal?.throwIfAborted();
         this.logger.debug(step, 'Element candidate not visible', { candidate: candidate.description });
       }
     }
@@ -408,11 +431,13 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
     predicate: (url: string) => boolean,
     timeoutMs: number,
   ): Promise<boolean> {
+    this.signal?.throwIfAborted();
     if (predicate(page.url())) return true;
     try {
       await page.waitForURL((url) => predicate(String(url)), { timeout: timeoutMs });
       return true;
     } catch {
+      this.signal?.throwIfAborted();
       this.logger.debug(step, 'Timed out waiting for URL transition', { url: safeUrl(page.url()) });
       return predicate(page.url());
     }
@@ -428,6 +453,8 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
   private async fillDeviceCode(page: Page, userCode: string): Promise<void> {
     const singleInput = await this.firstVisible(page, 'device-code', this.deviceCodeInputCandidates(), 1_000);
     if (singleInput) {
+      this.signal?.throwIfAborted();
+      if (!isGitHubUrl(page.url())) throw new Error('untrusted_device_code_url');
       await singleInput.locator.fill(userCode);
       this.logger.debug('device-code', 'Filled single device code input', { candidate: singleInput.description });
       return;
@@ -440,6 +467,8 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
     }
 
     for (let i = 0; i < code.length; i++) {
+      this.signal?.throwIfAborted();
+      if (!isGitHubUrl(page.url())) throw new Error('untrusted_device_code_url');
       await inputs[i].fill(code[i]);
     }
     this.logger.debug('device-code', 'Filled segmented device code inputs', { inputCount: inputs.length });
@@ -617,24 +646,12 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
   }
 
   private isSsoUrl(rawUrl: string): boolean {
-    if (!this.options.ssoUrl) return false;
-    try {
-      const current = new URL(rawUrl);
-      const expected = new URL(this.options.ssoUrl);
-      return current.origin === expected.origin && current.pathname.startsWith(expected.pathname);
-    } catch {
-      return false;
-    }
+    return isAllowedLoginUrl(rawUrl, this.options.allowedLoginUrls ?? (this.options.ssoUrl ? [this.options.ssoUrl] : []));
   }
 
   private hasKnownProviderUrl(rawUrl: string): boolean {
-    if (this.options.ssoProvider !== 'azure') return false;
-    try {
-      const hostname = new URL(rawUrl).hostname.toLowerCase();
-      return hostname === 'login.microsoftonline.com' || hostname.endsWith('.login.microsoftonline.com') || hostname === 'login.live.com';
-    } catch {
-      return false;
-    }
+    // Azure's generic domains never override the enterprise's exact allowlist.
+    return this.options.ssoProvider === 'azure' && this.isSsoUrl(rawUrl);
   }
 
   private logNavigations(page: Page): void {
@@ -658,6 +675,12 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
     const dir = this.artifactDir();
     await mkdir(dir, { recursive: true });
     const prefix = `${Date.now()}-${stage.replace(/[^a-z0-9-]/gi, '-')}`;
+    if (this.options.artifactScope) {
+      // Traces/DOM snapshots may contain credentials and tokens. Scoped tasks persist only safe metadata.
+      const metadataPath = resolve(dir, `${prefix}.json`);
+      await writeFile(metadataPath, JSON.stringify({ stage, url: page ? safeUrl(page.url()) : undefined }));
+      return { fields: { metadataPath }, traceStopped };
+    }
 
     if (page) {
       const screenshotPath = resolve(dir, `${prefix}.png`);
@@ -684,7 +707,9 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
   }
 
   private artifactDir(): string {
-    return resolve(process.cwd(), this.options.debugArtifactsDir, sanitizeFileName(this.account.ssoUsername || this.account.githubUsername));
+    const scope = this.options.artifactScope;
+    return scope ? resolve(process.cwd(),this.options.debugArtifactsDir,...[scope.enterpriseId,scope.taskId,scope.oauthAttemptId].map(pathSegment))
+      : resolve(process.cwd(),this.options.debugArtifactsDir,sanitizeFileName(this.account.ssoUsername || this.account.githubUsername));
   }
 }
 
@@ -742,10 +767,22 @@ function isGitHubSsoInterstitial(rawUrl: string): boolean {
   }
 }
 
+export function isAllowedLoginUrl(rawUrl: string, allowedUrls: readonly string[]): boolean {
+  try {
+    if (/\\|%(?:2e|2f|5c)/i.test(rawUrl) || /\/\.{1,2}(?:\/|$)/.test(rawUrl)) return false;
+    const current = new URL(rawUrl);
+    if (current.username || current.password || !['https:','http:'].includes(current.protocol)) return false;
+    return allowedUrls.some(value => {
+      const expected = new URL(value);
+      return current.origin === expected.origin && current.pathname === expected.pathname;
+    });
+  } catch { return false; }
+}
+
 function isGitHubUrl(rawUrl: string): boolean {
   try {
-    const hostname = new URL(rawUrl).hostname.toLowerCase();
-    return hostname === 'github.com' || hostname.endsWith('.github.com');
+    const url = new URL(rawUrl);
+    return url.origin === 'https://github.com' && !url.username && !url.password;
   } catch {
     return false;
   }
@@ -754,11 +791,13 @@ function isGitHubUrl(rawUrl: string): boolean {
 function safeUrl(rawUrl: string): string {
   try {
     const url = new URL(rawUrl);
+    url.username = '';
+    url.password = '';
     if (url.search) url.search = '?redacted';
     if (url.hash) url.hash = '#redacted';
     return url.toString();
   } catch {
-    return rawUrl;
+    return '[invalid-url]';
   }
 }
 

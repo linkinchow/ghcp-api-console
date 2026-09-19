@@ -9,18 +9,17 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Response as ExpressResponse } from 'express';
 import type { ErrorDiagnosticContext } from '../diagnostics/errorDiagnostics.js';
+import { configureProxyFixture } from '../test/enterpriseFixtures.js';
 
-const startup = { ...process.env };
 Object.assign(process.env, { DOTENV_CONFIG_PATH: join(tmpdir(), `missing-http-summary-${randomUUID()}`),
-  STORAGE_DRIVER: 'sqlite', DB_PATH: ':memory:', MYSQL_SSL_MODE: 'disabled', ACCOUNT_ROUTING_MODE: 'direct',
+  STORAGE_DRIVER: 'sqlite', MYSQL_SSL_MODE: 'disabled', ACCOUNT_ROUTING_MODE: 'direct',
   PROXY_ERROR_DIAGNOSTICS_ENABLED: 'false', REQUEST_STATS_PER_ACCOUNT_LIMIT: '20' });
+configureProxyFixture();
 const [{ pipeAndRecord, recordTokenCountFallbackFailure }, { errorDiagnosticsStore }, { config },
-  { listRequestStats }, { closeStorage }] = await Promise.all([
+  { listRequestStats }, { closeStorage }, { createAccount }] = await Promise.all([
   import('./compatible.js'), import('../diagnostics/errorDiagnostics.js'), import('../config.js'),
-  import('../db/requestStatsRepo.js'), import('../db/connection.js'),
+  import('../db/requestStatsRepo.js'), import('../db/connection.js'), import('../db/accountsRepo.js'),
 ]);
-for (const key of Object.keys(process.env)) if (!(key in startup)) delete process.env[key];
-Object.assign(process.env, startup);
 
 const upstreamSecret = 'synthetic-upstream-secret-value';
 const inboundSecret = 'synthetic-inbound-secret-value';
@@ -49,6 +48,7 @@ function responseRecorder() {
 
 async function record(status: number, body: string | null, contentType = 'application/json') {
   const identity = `summary-${randomUUID()}`;
+  await createAccount({ identity, ssoUser: identity });
   const recorded = responseRecorder();
   const headers = { 'Content-Type': contentType, 'Retry-After': '17' };
   await pipeAndRecord(new Response(body, { status, headers }), prepared, recorded.res,
@@ -152,6 +152,7 @@ test('real loopback HTTP preserves error responses and persists correlatable sta
   };
   const calls: Record<string, number> = {};
   const identityByShape = Object.fromEntries(Object.keys(bodies).map(shape => [shape, `wire-${shape}-${randomUUID()}`]));
+  for (const identity of Object.values(identityByShape)) await createAccount({ identity, ssoUser: identity });
   const upstream = createServer((req, res) => {
     const shape = req.url!.slice(1) as keyof typeof bodies;
     calls[shape] = (calls[shape] ?? 0) + 1;

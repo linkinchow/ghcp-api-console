@@ -1,8 +1,9 @@
+import { configureProxyFixture } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-test('deletes one Proxy account and its request stats without affecting other identities', async () => {
-  process.env.DB_PATH = ':memory:';
+test('deletes one Proxy account and its request stats without affecting other identities', async t => {
+  configureProxyFixture(t);
   const { createAccount, deleteAccount, getAccount } = await import('./accountsRepo.js');
   const { listRequestStats, recordRequestStat } = await import('./requestStatsRepo.js');
 

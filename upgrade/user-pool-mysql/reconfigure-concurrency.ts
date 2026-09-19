@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql2/promise';
-import { MYSQL_SCHEMA, validateMysqlCredentialFence, validateMysqlSchema } from '../../src/proxy/src/db/mysqlSchema.js';
-import { normalizePoolConfig, readPoolConfig, type PoolConfig } from '../../src/proxy/src/userPool/config.js';
-import { MysqlDeadline } from '../../src/proxy/src/userPool/mysqlDeadline.js';
-import { NAME_CAPACITY } from '../../src/proxy/src/userPool/names.js';
+import { MYSQL_SCHEMA, validateMysqlCredentialFence, validateMysqlSchema } from '../v1-frozen/db/mysqlSchema.js';
+import { normalizePoolConfig, readPoolConfig, type PoolConfig } from '../v1-frozen/userPool/config.js';
+import { MysqlDeadline } from '../v1-frozen/userPool/mysqlDeadline.js';
+import { NAME_CAPACITY } from '../v1-frozen/userPool/names.js';
 
 const ENV_KEYS = ['ACCOUNT_ROUTING_MODE', 'STORAGE_DRIVER', 'POOL_ACCOUNT_EMAIL_DOMAIN', 'READY_IDLE_TARGET',
   'POOL_MAX_ACCOUNTS', 'CALLER_LEASE_TTL_SECONDS', 'PROVISIONAL_LEASE_TTL_SECONDS', 'PREWARM_POLL_SECONDS',

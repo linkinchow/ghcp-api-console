@@ -1,3 +1,6 @@
+import { configureProxyFixture, fixtureOptions, fixtureReadinessEvidence } from '../test/enterpriseFixtures.js';
+import { initEnterpriseMysqlV4 } from '@ghcp/shared/enterpriseMysqlV4';
+import { loadProxyEnterpriseProfile, loadProxyEnterpriseRegistry } from '../enterprise.js';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
@@ -25,7 +28,7 @@ const modules = await (async () => {
       IDENTITY_HEADER: 'X-User-Identity', IDENTITY_HEADER_REQUIRED: 'true', CLAUDE_CODE_OPTIMIZED: 'false',
       INTERNAL_API_TOKEN: 'synthetic-credential-race-internal',
       SSO_BASE_URL: 'https://credential-race-sso.invalid', LOGIN_BASE_URL: 'https://credential-race-login.invalid',
-      ENTERPRISE_SHORTCODE: 'synthetic', REQUEST_STATS_PER_ACCOUNT_LIMIT: '100',
+      ENTERPRISE_SHORTCODE: 'synth', REQUEST_STATS_PER_ACCOUNT_LIMIT: '100',
       PROXY_ERROR_DIAGNOSTICS_ENABLED: 'false', PROXY_ERROR_DIAGNOSTICS_DIR: tmpdir(),
       PROXY_ERROR_DIAGNOSTICS_REDACT: 'true', PROXY_ERROR_DIAGNOSTICS_MAX_FILE_MB: '1',
       PROXY_ERROR_DIAGNOSTICS_MAX_FILES: '1', PROXY_ERROR_DIAGNOSTICS_SHARED: 'false', PROXY_INSTANCE_ID: 'credential-race',
@@ -109,6 +112,8 @@ async function race(engine: 'sqlite' | 'mysql', scenario: Scenario): Promise<voi
     PROVISIONAL_LEASE_TTL_SECONDS: '300', CALLER_LEASE_TTL_SECONDS: '600',
     PREWARM_POLL_SECONDS: '60', PREWARM_CONCURRENCY: '1', POOL_LOGIN_MAX_PENDING: '1',
     POOL_EXHAUSTED_RETRY_AFTER_SECONDS: '1',
+    SSO_BASE_URL: 'https://credential-race-sso.invalid', LOGIN_BASE_URL: 'https://credential-race-login.invalid',
+    ENTERPRISE_SHORTCODE: 'synth',
   };
   const savedEnv = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
   const servers: Server[] = [];
@@ -138,6 +143,7 @@ async function race(engine: 'sqlite' | 'mysql', scenario: Scenario): Promise<voi
       copilotApiBaseUrl: 'https://credential-race.invalid',
       ssoBaseUrl: 'https://credential-race-sso.invalid', loginBaseUrl: 'https://credential-race-login.invalid',
     });
+    configureProxyFixture();
     if (engine === 'mysql') {
       const url = mysqlFixtureUrl(mysqlTestUrl!);
       url.pathname = '/';
@@ -147,9 +153,22 @@ async function race(engine: 'sqlite' | 'mysql', scenario: Scenario): Promise<voi
       database = name;
       url.pathname = `/${name}`;
       config.mysqlUrl = url.toString();
+      const initialized = createPool({ uri: url.toString(), connectionLimit: 1 });
+      const conn = await initialized.getConnection();
+      try {
+        const registry = loadProxyEnterpriseRegistry();
+        await initEnterpriseMysqlV4(conn, 'proxy', registry, fixtureOptions(readPoolConfig(process.env)));
+        for (const profile of registry.profiles) {
+          const evidence = fixtureReadinessEvidence(registry, profile.id);
+          await conn.query("UPDATE enterprise_pool_policy SET state='active',policy_version=3,validation_kind='local_service_readiness_v1',validation_evidence_json=?,validated_at=?,updated_at=? WHERE enterprise_id=?",
+            [JSON.stringify(evidence), evidence.checkedAt, evidence.checkedAt, profile.id]);
+        }
+        await conn.query('UPDATE user_pool_settings SET paused=0 WHERE id=1');
+      }
+      finally { conn.release(); await initialized.end(); }
     } else {
       directory = await mkdtemp(join(tmpdir(), 'user-pool-credential-race-'));
-      config.dbPath = join(directory, 'pool.sqlite');
+      config.dbPath = process.env.DB_PATH!;
     }
     store = await getUserPool();
     assert.ok(store);
@@ -162,9 +181,11 @@ async function race(engine: 'sqlite' | 'mysql', scenario: Scenario): Promise<voi
     // Unexpected traffic (including Login or any real provider) fails closed.
     globalThis.fetch = async (input, init) => {
       const url = new URL(String(input));
+      url.pathname = url.pathname.replace(`/api/profiles/${loadProxyEnterpriseProfile().id}`, '/api');
       if (url.origin === config.ssoBaseUrl && url.pathname === `/api/users/${memberIdentity}`) {
         assert.equal(init?.method, 'GET');
-        return json({ ssoUser: memberIdentity, email: `${memberIdentity}@credential-race.test`, role: 'user',
+        return json({ enterpriseId: loadProxyEnterpriseProfile().id, userIncarnation: '22222222-2222-4222-8222-222222222222',
+          ssoUser: memberIdentity, email: `${memberIdentity}@credential-race.test`, role: 'user',
           createdAt, emuStatus: 'active', ghLogin: 'synthetic-gh-race', ghScimId: 'synthetic-scim', copilotSeatStatus: 'assigned' });
       }
       assert.equal(url.origin, config.copilotApiBaseUrl, 'No real services may be called');
@@ -194,7 +215,10 @@ async function race(engine: 'sqlite' | 'mysql', scenario: Scenario): Promise<voi
       return success();
     };
     const options = readPoolConfig(process.env);
-    worker = new PrewarmWorker(store, realProvisioner(store, options), 60000, 1, undefined, { multiReplica: engine === 'mysql' });
+    worker = new PrewarmWorker(store, realProvisioner(store, options, {
+      enterpriseProfile: id => { assert.equal(id, loadProxyEnterpriseRegistry().legacyEnterpriseId); return loadProxyEnterpriseProfile(id); },
+      verifyReadiness: async (profile, signal) => { assert.equal(profile.id, loadProxyEnterpriseRegistry().legacyEnterpriseId); signal.throwIfAborted(); },
+    }), 60000, 1, undefined, { multiReplica: engine === 'mysql' });
     await bounded(worker.tick(), 'initial production warmup');
     assert.equal((await store.inventory(identity))?.state, 'ready');
     assert.notEqual((await store.inventory(identity))?.verified_at, null);

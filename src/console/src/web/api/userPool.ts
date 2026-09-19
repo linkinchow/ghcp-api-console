@@ -1,23 +1,10 @@
 import { api } from './client.js';
+import { profilePath } from './enterprises.js';
+import type { EnterprisePoolCountsDto, GlobalPoolSettingsDto } from '@ghcp/shared';
 
-export interface UserPoolSettings {
-  version: number;
-  idle_target: number;
-  max_accounts: number;
-  lease_seconds: number;
-  paused: number;
-}
-export type UserPoolSettingsChanges = Omit<UserPoolSettings, 'version'>;
-export interface UserPoolCounts {
-  total: number;
-  ready_idle: number;
-  leased: number;
-  provisional: number;
-  provisioning: number;
-  cooling: number;
-  failed: number;
-  disabled: number;
-}
+export type UserPoolSettings = GlobalPoolSettingsDto;
+export type UserPoolSettingsChanges = Pick<GlobalPoolSettingsDto, 'idle_target' | 'lease_seconds' | 'paused'>;
+export type UserPoolCounts = EnterprisePoolCountsDto;
 export interface UserPoolAccount {
   identity: string;
   ordinal: number;
@@ -62,7 +49,8 @@ export interface UserPoolLimits {
 }
 export interface UserPoolOverview {
   enabled: true;
-  poolId: 'default';
+  poolId: string;
+  enterpriseId: string;
   observedAt: number;
   settings: UserPoolSettings;
   counts: UserPoolCounts;
@@ -73,10 +61,10 @@ export interface UserPoolOverview {
   listLimits: { accounts: number; leases: number; events: number };
 }
 export type UserPoolAccountAction = 'disable' | 'resume' | 'retry';
-const BASE = '/api/console/proxy/user-pool';
+const base = (enterpriseId: string) => `${profilePath('proxy', enterpriseId)}/user-pool`;
 
-export function getUserPoolSummary(signal?: AbortSignal): Promise<UserPoolOverview> {
-  return api<UserPoolOverview>(`${BASE}/summary`, { signal, cache: 'no-store' });
+export function getUserPoolSummary(enterpriseId: string, signal?: AbortSignal): Promise<UserPoolOverview> {
+  return api<UserPoolOverview>(`${base(enterpriseId)}/summary`, { signal, cache: 'no-store' });
 }
 export interface UserPoolPageResult {
   items: Array<UserPoolAccount | UserPoolLease | UserPoolEvent>;
@@ -84,23 +72,17 @@ export interface UserPoolPageResult {
   page: number;
   pageSize: number;
 }
-export function getUserPoolPage(kind: 'accounts' | 'leases' | 'events', page: number, pageSize: number,
+export function getUserPoolPage(enterpriseId: string, kind: 'accounts' | 'leases' | 'events', page: number, pageSize: number,
   q: string, state: string, signal?: AbortSignal): Promise<UserPoolPageResult> {
   const query = new URLSearchParams({ page: String(page), pageSize: String(pageSize), q, state });
-  return api(`${BASE}/page/${kind}?${query}`, { signal, cache: 'no-store' });
+  return api(`${base(enterpriseId)}/page/${kind}?${query}`, { signal, cache: 'no-store' });
 }
-export function getUserPoolOverview(signal?: AbortSignal): Promise<UserPoolOverview> {
-  return api<UserPoolOverview>(BASE, { signal, cache: 'no-store' });
+export function getUserPoolOverview(enterpriseId: string, signal?: AbortSignal): Promise<UserPoolOverview> {
+  return api<UserPoolOverview>(base(enterpriseId), { signal, cache: 'no-store' });
 }
-export function updateUserPoolSettings(expectedVersion: number, changes: Partial<UserPoolSettingsChanges>): Promise<UserPoolSettings> {
-  return api<UserPoolSettings>(`${BASE}/settings`, { method: 'PATCH', body: JSON.stringify({ expectedVersion, changes }) });
+export function updateUserPoolAccount(enterpriseId: string, identity: string, action: UserPoolAccountAction): Promise<{ accepted: true }> {
+  return api(`${base(enterpriseId)}/accounts/${encodeURIComponent(identity)}/${action}`, { method: 'POST', body: JSON.stringify({}) });
 }
-export function reconcileUserPool(): Promise<{ scheduled: true }> {
-  return api(`${BASE}/reconcile`, { method: 'POST' });
-}
-export function updateUserPoolAccount(identity: string, action: UserPoolAccountAction): Promise<{ accepted: true }> {
-  return api(`${BASE}/accounts/${encodeURIComponent(identity)}/${action}`, { method: 'POST' });
-}
-export function releaseUserPoolLease(leaseId: string): Promise<{ released: true }> {
-  return api(`${BASE}/leases/${encodeURIComponent(leaseId)}/release`, { method: 'POST', body: JSON.stringify({ confirm: true }) });
+export function releaseUserPoolLease(enterpriseId: string, leaseId: string): Promise<{ released: true }> {
+  return api(`${base(enterpriseId)}/leases/${encodeURIComponent(leaseId)}/release`, { method: 'POST', body: JSON.stringify({ confirm: true }) });
 }

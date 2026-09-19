@@ -1,3 +1,4 @@
+import type { EnterpriseScope } from '@ghcp/shared';
 import { Router } from 'express';
 import { apiError, errorFields, loggerFor, type UpdateSsoRuntimeSettingsRequest } from '@ghcp/shared';
 import {
@@ -7,12 +8,13 @@ import {
   updateSsoRuntimeSettings,
 } from '../db/runtimeSettingsRepo.js';
 
-export const settingsApiRouter = Router();
+export function createSettingsApiRouter(scope: EnterpriseScope): Router {
+const settingsApiRouter = Router();
 const logger = loggerFor('sso', 'settings-api');
 const ROOT_KEYS = new Set(['expectedVersion', 'changes']);
 
 settingsApiRouter.get('/settings/runtime', (_req, res) => {
-  res.json(getSsoRuntimeSettings());
+  res.json(getSsoRuntimeSettings(scope));
 });
 
 settingsApiRouter.patch('/settings/runtime', (req, res) => {
@@ -27,9 +29,9 @@ settingsApiRouter.patch('/settings/runtime', (req, res) => {
     return;
   }
   try {
-    res.json(updateSsoRuntimeSettings(body as UpdateSsoRuntimeSettingsRequest));
+    res.json(updateSsoRuntimeSettings(body as UpdateSsoRuntimeSettingsRequest, scope));
   } catch (err) {
-    logger.error('update-failed', 'Update SSO runtime settings failed', { ...errorFields(err) });
+    logger.error('update-failed', 'Update SSO runtime settings failed', { ...errorFields(err), enterpriseId: scope.enterpriseId, enterpriseRevision: scope.enterpriseRevision });
     if (err instanceof InvalidSsoRuntimeSettingsError) {
       res.status(400).json(apiError('invalid_runtime_settings', err.message, { fields: err.fields }));
       return;
@@ -44,3 +46,6 @@ settingsApiRouter.patch('/settings/runtime', (req, res) => {
     res.status(500).json(apiError('runtime_settings_update_failed', err instanceof Error ? err.message : String(err)));
   }
 });
+
+return settingsApiRouter;
+}

@@ -1,57 +1,89 @@
-import type { CreateLoginTaskRequest } from '@ghcp/shared';
-import { loggerFor } from '@ghcp/shared';
+import type { CreateLoginTaskV2, EnterpriseProfileV3 } from '@ghcp/shared';
+import { bindingKey, EnterpriseContractError, loggerFor } from '@ghcp/shared';
+import { bindingFromInput, requireEnterpriseInput } from '../enterprise.js';
 import { config, type RuntimeAuthConfig } from '../config.js';
 import { loginRuntimeSettings } from '../db/runtimeSettingsRepo.js';
 import { HeadlessPlaywrightAuthStrategy } from '../auth/HeadlessPlaywrightAuthStrategy.js';
 import { loginWithDeviceFlow } from '../auth/deviceFlow.js';
-import { saveCopilotOauthToken } from '../clients/proxyClient.js';
-import { markFailed, markRunning, markSuccess, type LoginTaskRecord } from '../db/tasksRepo.js';
+import { readAuthorizationAttempt, saveCopilotOauthToken, markCopilotOauthFailed } from '../clients/proxyClient.js';
+import { getTask, markAuthorityUncertain, markCallbackPending, resolveAuthority, setTaskLogPath, taskBinding, type LoginTaskRecord } from '../db/tasksRepo.js';
 import { AccountLogger } from './accountLogger.js';
 
-const stdoutLogger = loggerFor('login', 'runner');
-
-export interface RuntimeTaskPayload extends CreateLoginTaskRequest {
-  taskId: string;
+const stdoutLogger = loggerFor('login','runner');
+export interface RuntimeTaskPayload extends CreateLoginTaskV2 { taskId: string; profile: EnterpriseProfileV3 }
+interface RunnerDependencies {
+  authorize(options: RuntimeAuthConfig,payload: RuntimeTaskPayload,logger: AccountLogger,signal: AbortSignal): Promise<string>;
+  readAuthorizationAttempt: typeof readAuthorizationAttempt;
+  saveCopilotOauthToken: typeof saveCopilotOauthToken;
+  markCopilotOauthFailed: typeof markCopilotOauthFailed;
 }
-
-export async function runLoginTask(task: LoginTaskRecord, payload: RuntimeTaskPayload): Promise<void> {
-  const runtimeSettings = loginRuntimeSettings.getSnapshot();
-  const logger = AccountLogger.create(config.logDir, payload.ssoUser, runtimeSettings.authDebugLogs);
-  markRunning(task.id, logger.path);
-  stdoutLogger.info('running', 'Login task marked running', { taskId: task.id, identity: payload.identity, ssoUser: payload.ssoUser, ghLogin: payload.ghLogin, logPath: logger.path });
+const defaultDependencies: RunnerDependencies = {
+  authorize: (options,payload,logger,signal) => loginWithDeviceFlow(new HeadlessPlaywrightAuthStrategy(options,{
+    githubUsername:payload.expectedGhLogin,ssoUsername:payload.ssoUser,ssoPassword:payload.ssoPassword,
+  },logger),logger,undefined,signal),readAuthorizationAttempt,saveCopilotOauthToken,markCopilotOauthFailed,
+};
+export async function runLoginTask(task: LoginTaskRecord,payload: RuntimeTaskPayload,signal: AbortSignal = new AbortController().signal,
+  overrides: Partial<RunnerDependencies> = {}): Promise<void> {
+  const deps = {...defaultDependencies,...overrides};
+  const scope = requireEnterpriseInput(task),binding = taskBinding(task);
+  requireEnterpriseInput(payload);
+  if (payload.taskId !== task.id || bindingKey(bindingFromInput(payload)) !== bindingKey(binding)
+      || payload.ssoUser !== task.ssoUser || payload.ssoType !== task.ssoType
+      || payload.profile !== scope.profile || payload.profile.login.provider !== payload.ssoType) {
+    throw new EnterpriseContractError('enterprise_task_payload_mismatch');
+  }
+  if (getTask(task.enterpriseId,task.id)?.status !== 'running') return;
+  signal.throwIfAborted();
+  const settings = loginRuntimeSettings.getSnapshot();
+  const runSignal = AbortSignal.any([signal,AbortSignal.timeout(settings.authTimeoutMs)]);
+  const logger = AccountLogger.createTask(config.logDir,{enterpriseId:task.enterpriseId,taskId:task.id,oauthAttemptId:binding.oauthAttemptId},settings.authDebugLogs);
+  setTaskLogPath(task.enterpriseId,task.id,logger.path);
   try {
-    if (!payload.ssoPassword) throw new Error('ssoPassword is required to run a login task.');
-    if (!payload.ghLogin.trim()) throw new Error('ghLogin is required to run a login task.');
-    const authConfig: RuntimeAuthConfig = {
-      ...config.auth,
-      ssoUrl: payload.ssoUrl ?? config.auth.ssoUrl,
-      ssoProvider: payload.ssoType === 'azure' ? 'azure' as const : 'custom' as const,
-      timeoutMs: runtimeSettings.authTimeoutMs,
-      debugLogs: runtimeSettings.authDebugLogs,
-      debugArtifacts: runtimeSettings.authDebugArtifacts,
-      selectors: { ...config.auth.selectors, ...payload.selectorOverrides },
-    };
-    const copilotOauthToken = await loginWithDeviceFlow(
-      new HeadlessPlaywrightAuthStrategy(
-        authConfig,
-        {
-          githubUsername: payload.ghLogin,
-          ssoUsername: payload.ssoUser,
-          ssoPassword: payload.ssoPassword,
-        },
-        logger,
-      ),
-      logger,
-    );
-    await saveCopilotOauthToken(payload.identity, payload.oauthAttemptId, copilotOauthToken, payload.ghLogin);
-    markSuccess(task.id);
-    logger.info('complete', 'Login task completed and Copilot OAuth token was written back to Proxy');
-    stdoutLogger.info('success', 'Login task completed and Copilot OAuth token was written back to Proxy', { taskId: task.id, identity: payload.identity, ssoUser: payload.ssoUser, ghLogin: payload.ghLogin, logPath: logger.path });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    markFailed(task.id, message);
-    logger.error('failed', 'Login task failed', { error: message });
-    stdoutLogger.error('failed', 'Login task failed', { taskId: task.id, identity: payload.identity, ssoUser: payload.ssoUser, ghLogin: payload.ghLogin, error: message, logPath: logger.path });
-    throw err;
+    if (!payload.ssoPassword) throw new EnterpriseContractError('login_password_required');
+    const authority = await deps.readAuthorizationAttempt(binding,runSignal);
+    if (authority.status !== 'active') {
+      if (markCallbackPending(task.enterpriseId,task.id,'fail','authorization_attempt_closed')) {
+        resolveAuthority(task.enterpriseId,task.id,authority.status);
+      }
+      return;
+    }
+    runSignal.throwIfAborted();
+    const options: RuntimeAuthConfig = Object.freeze({
+      ...config.auth,ssoUrl:payload.profile.sso.loginUrl,ssoProvider:payload.profile.login.provider,
+      allowedLoginUrls:payload.profile.login.allowedLoginUrls,selectors:payload.profile.login.selectors,
+      timeoutMs:settings.authTimeoutMs,debugLogs:settings.authDebugLogs,debugArtifacts:settings.authDebugArtifacts,
+      artifactScope:{enterpriseId:task.enterpriseId,taskId:task.id,oauthAttemptId:binding.oauthAttemptId},
+    });
+    const token = await deps.authorize(options,payload,logger,runSignal);
+    runSignal.throwIfAborted();
+    if (!markCallbackPending(task.enterpriseId,task.id,'success')) return; // Cancellation won CAS.
+    try {
+      // Proxy revalidates the token via its own GET /user. Never reassign expected subject from browser/request data.
+      const state = await deps.saveCopilotOauthToken(task.enterpriseId,task.id,token,runSignal);
+      if (state.status === 'succeeded') resolveAuthority(task.enterpriseId,task.id,state.status);
+      else markAuthorityUncertain(task.enterpriseId,task.id);
+    } catch {
+      // Ambiguous callback is not a browser failure. Read-only resolution, no new login or failure callback.
+      markAuthorityUncertain(task.enterpriseId,task.id);
+      if (!signal.aborted) {
+        try {
+          const state = await deps.readAuthorizationAttempt(binding,signal);
+          resolveAuthority(task.enterpriseId,task.id,state.status);
+        } catch { /* durable uncertain; bounded reconcile closes after restart/operator request */ }
+      }
+    }
+  } catch {
+    if (signal.aborted) return; // Cancel path owns closure/ack; cannot overwrite it.
+    if (markCallbackPending(task.enterpriseId,task.id,'fail','login_authorization_failed')) {
+      try {
+        const state = await deps.markCopilotOauthFailed(task.enterpriseId,task.id,'login_authorization_failed',signal);
+        if (state.status === 'failed') resolveAuthority(task.enterpriseId,task.id,state.status);
+        else markAuthorityUncertain(task.enterpriseId,task.id);
+      } catch { markAuthorityUncertain(task.enterpriseId,task.id); }
+    }
+  } finally {
+    const status = getTask(task.enterpriseId,task.id)?.status;
+    logger.info('complete','Login execution stopped',{status});
+    stdoutLogger.info('complete','Login execution stopped',{enterpriseId:task.enterpriseId,taskId:task.id,oauthAttemptId:task.oauthAttemptId,status});
   }
 }

@@ -1,3 +1,4 @@
+import { createSqlitePoolFixture, TEST_ENTERPRISE } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -5,7 +6,6 @@ import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import BetterSqlite3 from 'better-sqlite3';
-import { runMigrations } from '../db/migrations.js';
 import { readPoolConfig, UserPoolError, type PoolConfig } from './config.js';
 import { accountName, NAME_CAPACITY } from './names.js';
 import { UserPoolStore, type HeldLease } from './store.js';
@@ -28,8 +28,8 @@ function fixture(t: TestContext, patch: Partial<PoolConfig> = {}) {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
     db.pragma('busy_timeout = 5000');
-    runMigrations(db);
-    const store = new UserPoolStore(db, config);
+
+    const store = createSqlitePoolFixture(db, config);
     store.now = () => clock.now;
     return { db, store };
   }
@@ -69,7 +69,7 @@ if (!isMainThread) {
   const db = new BetterSqlite3(data.path);
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 10000');
-  const store = new UserPoolStore(db, options);
+  const store = createSqlitePoolFixture(db, options);
   store.now = () => data.now;
   parentPort!.postMessage({ ready: true });
   const barrier = new Int32Array(data.barrier);
@@ -97,70 +97,6 @@ if (!isMainThread) {
     assert.equal((f.db.prepare('SELECT COUNT(*) n FROM user_pool_catalog_holds').get() as { n: number }).n, 0);
   });
 
-  test('initial pool schema upgrades preserve inventory and drain unfenced legacy holds', (t) => {
-    const dir = mkdtempSync(join(tmpdir(), 'user-pool-migration-'));
-    const db = new BetterSqlite3(join(dir, 'legacy.sqlite'));
-    t.after(() => {
-      db.close();
-      rmSync(dir, { recursive: true, force: true });
-    });
-    db.pragma('foreign_keys = ON');
-    runMigrations(db);
-    db.exec(`
-      CREATE TABLE user_pool_settings (
-        id INTEGER PRIMARY KEY, version INTEGER NOT NULL DEFAULT 1, idle_target INTEGER NOT NULL,
-        max_accounts INTEGER NOT NULL, lease_seconds INTEGER NOT NULL, paused INTEGER NOT NULL DEFAULT 0,
-        next_ordinal INTEGER NOT NULL DEFAULT 0, account_domain TEXT NOT NULL,
-        owner TEXT, owner_until INTEGER NOT NULL DEFAULT 0
-      );
-      CREATE TABLE user_pool_accounts (
-        identity TEXT PRIMARY KEY REFERENCES proxy_accounts(identity), ordinal INTEGER UNIQUE NOT NULL,
-        state TEXT NOT NULL, stage TEXT NOT NULL DEFAULT 'new', attempt_id TEXT NOT NULL, task_id TEXT,
-        attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0, last_error TEXT,
-        updated_at INTEGER NOT NULL, cooldown_until INTEGER NOT NULL DEFAULT 0, verified_at INTEGER
-      );
-      CREATE TABLE user_pool_leases (
-        caller_id TEXT PRIMARY KEY, member_identity TEXT UNIQUE NOT NULL REFERENCES user_pool_accounts(identity),
-        lease_id TEXT UNIQUE NOT NULL, phase TEXT NOT NULL, assigned_at INTEGER NOT NULL,
-        last_success_at INTEGER, expires_at INTEGER NOT NULL
-      );
-      CREATE TABLE user_pool_holds (
-        request_id TEXT PRIMARY KEY, lease_id TEXT NOT NULL REFERENCES user_pool_leases(lease_id) ON DELETE CASCADE,
-        expires_at INTEGER NOT NULL
-      );
-    `);
-    let now = 1_800_000_000_000;
-    const member = accountName(0);
-    db.prepare(`INSERT INTO user_pool_settings
-      (id, idle_target, max_accounts, lease_seconds, account_domain, next_ordinal) VALUES (1, 10, 100, 172800, ?, 1)`)
-      .run(options.accountDomain);
-    db.prepare(`INSERT INTO proxy_accounts
-      (identity, sso_user, copilot_oauth_status, copilot_oauth_token, created_at, updated_at)
-      VALUES (?, ?, 'valid', 'old-token', 'old', 'old')`).run(member, member);
-    db.prepare(`INSERT INTO user_pool_accounts(identity, ordinal, state, stage, attempt_id, updated_at, verified_at)
-      VALUES (?, 0, 'ready', 'ready', 'old-attempt', ?, ?)`).run(member, now, now);
-    db.prepare('INSERT INTO user_pool_leases VALUES (?, ?, ?, ?, ?, NULL, ?)')
-      .run(caller(1), member, 'legacy-lease', 'provisional', now, now + 1000);
-    db.prepare('INSERT INTO user_pool_holds VALUES (?, ?, ?)').run('legacy-request', 'legacy-lease', now + 5000);
-    const store = new UserPoolStore(db, options);
-    store.now = () => now;
-    const held: HeldLease = { ...store.leases()[0], request_id: 'legacy-request' };
-    assert.equal(store.inventory(member)!.generation, 0);
-    assert.equal(store.inventory(member)!.oauth_attempt_id, null);
-    assert.equal(store.heartbeat(held), false);
-    now += 2000;
-    store.reclaim();
-    errorCode(() => store.acquire(caller(2)), 'pool_exhausted');
-    assert.equal(store.hasHolds(member), true);
-    now += 3000;
-    store.reclaim();
-    assert.equal(store.hasHolds(member), false);
-    const replacement = store.acquire(caller(2));
-    store.finish(held, true);
-    assert.equal(store.leases()[0].lease_id, replacement.lease_id);
-    assert.equal(store.leases()[0].phase, 'provisional');
-  });
-
   test('valid replacement credentials require fresh warmup before new admissions', (t) => {
     const f = fixture(t);
     const [identity] = f.ready(1);
@@ -169,6 +105,8 @@ if (!isMainThread) {
     f.db.prepare('UPDATE proxy_accounts SET copilot_oauth_token = ? WHERE identity = ?').run('new-token', identity);
     assert.equal(f.store.inventory(identity)!.verified_at, null);
     assert.equal(f.store.counts().ready_idle, 0);
+    assert.equal(f.store.inventory(identity)!.stage, 'ready', 'logical counts must not mutate stale physical state');
+    f.store.reclaim();
     assert.equal(f.store.inventory(identity)!.stage, 'warmup');
     errorCode(() => f.store.acquire(caller(2)), 'pool_exhausted');
     f.store.update(identity, { state: 'ready', verified_at: f.clock.now });
@@ -491,7 +429,13 @@ if (!isMainThread) {
     const held = f.store.acquire(caller(1));
     const other = f.connect();
     const initial = f.store.settings();
-    const updated = other.store.updateSettings(initial.version, { idle_target: 0, max_accounts: 1, paused: 1 });
+    const initialPolicy = other.store.enterprisePolicy(TEST_ENTERPRISE.id)!;
+    const changedPolicy = other.store.updateEnterprisePolicy(TEST_ENTERPRISE.id, initialPolicy.policyVersion, { type: 'cap', maxAccounts: 1 });
+    assert.equal(changedPolicy.policyVersion, initialPolicy.policyVersion + 1);
+    errorCode(() => f.store.updateEnterprisePolicy(TEST_ENTERPRISE.id, initialPolicy.policyVersion, { type: 'cap', maxAccounts: 2 }), 'policy_version_conflict', 409);
+    const updated = other.store.updateSettings(initial.version, { idle_target: 2, paused: 1 });
+    assert.equal(updated.max_accounts, 1);
+    assert.equal(updated.idle_target, 2, 'global target above lowered cap is valid without eviction');
     assert.equal(updated.version, initial.version + 1);
     errorCode(() => f.store.updateSettings(initial.version, { paused: 0 }), 'settings_version_conflict', 409);
     assert.equal(f.store.reserve(), undefined);
@@ -499,21 +443,21 @@ if (!isMainThread) {
     assert.equal(f.store.leases()[0].lease_id, held.lease_id);
     assert.equal(f.store.acquire(caller(2)).phase, 'provisional', 'pause only stops provisioning');
     for (const patch of [
-      { version: 10 }, { other: 1 }, { idle_target: -1 }, { idle_target: 2 }, { max_accounts: 0 },
-      { max_accounts: 10001 }, { lease_seconds: 59 }, { lease_seconds: 2592001 }, { lease_seconds: 1.5 },
+      { version: 10 }, { other: 1 }, { idle_target: -1 }, { idle_target: 10001 }, { max_accounts: 0 },
+      { max_accounts: 1 }, { max_accounts: 10001 }, { lease_seconds: 59 }, { lease_seconds: 2592001 }, { lease_seconds: 1.5 },
       { paused: true }, { paused: 2 }, { idle_target: undefined }, null, [],
     ]) {
       errorCode(() => f.store.updateSettings(updated.version, patch as never), 'invalid_pool_settings', 400);
     }
-    assert.deepEqual(new UserPoolStore(other.db, { ...f.config, idleTarget: 99, leaseSeconds: 60 }).settings(), updated);
-    assert.throws(() => new UserPoolStore(other.db, { ...f.config, accountDomain: 'other.test' }), /domain differs/);
+    assert.deepEqual(createSqlitePoolFixture(other.db, { ...f.config, idleTarget: 99, leaseSeconds: 60 }).settings(), updated);
+    assert.throws(() => createSqlitePoolFixture(other.db, { ...f.config, accountDomain: 'other.test' }), /domain differs|enterprise_v4_registry/);
   });
 
   test('reservation counts provisioning and leased capacity and safely skips existing aliases', (t) => {
     const f = fixture(t, { idleTarget: 2, maxAccounts: 3 });
     const timestamp = new Date(f.clock.now).toISOString();
     f.db.prepare(`
-      INSERT INTO proxy_accounts(identity, sso_user, created_at, updated_at) VALUES (?, ?, ?, ?), (?, ?, ?, ?)
+      INSERT INTO proxy_accounts(enterprise_id,account_incarnation,identity, sso_user, created_at, updated_at) VALUES ('86e2ee02-223a-45ea-8c26-bdd1c570a4ee', '11111111-1111-4111-8111-111111111111', ?, ?, ?, ?), ('86e2ee02-223a-45ea-8c26-bdd1c570a4ee', '22222222-2222-4222-8222-222222222222', ?, ?, ?, ?)
     `).run(accountName(0).toUpperCase(), 'direct', timestamp, timestamp,
       'another-direct-account', accountName(1).toUpperCase(), timestamp, timestamp);
     const first = f.store.reserve()!;

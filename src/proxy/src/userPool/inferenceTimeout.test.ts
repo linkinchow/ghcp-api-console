@@ -1,10 +1,10 @@
+import { createSqlitePoolFixture } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import BetterSqlite3 from 'better-sqlite3';
-import { runMigrations } from '../db/migrations.js';
 import { readPoolConfig, UserPoolError } from './config.js';
 import { inferenceHoldTimeoutMs, readInferenceTimeoutMs } from './inferenceTimeout.js';
 import { UserPoolStore } from './store.js';
@@ -29,8 +29,8 @@ function fixture(t: TestContext) {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
     db.pragma('busy_timeout = 5000');
-    runMigrations(db);
-    const store = new UserPoolStore(db, { ...options });
+
+    const store = createSqlitePoolFixture(db, { ...options });
     store.now = () => clock.now;
     return { db, store };
   }

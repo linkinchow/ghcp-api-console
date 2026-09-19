@@ -2,9 +2,8 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
-import { runMysqlMigrations } from '../db/mysqlMigrations.js';
 import { type PoolConfig, UserPoolError } from './config.js';
-import { MysqlPoolStore } from './mysqlStore.js';
+import { FixtureMysqlPoolStore as MysqlPoolStore, initMysqlFixture } from '../test/enterpriseFixtures.js';
 
 const options: PoolConfig = {
   enabled: true, accountDomain: 'synthetic.example.test', idleTarget: 16, maxAccounts: 16,
@@ -39,7 +38,7 @@ test('MySQL admission: caller locks and member-first allocation across replicas'
       timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true }));
     const [db, other] = pools;
     const first = new MysqlPoolStore(db, options), second = new MysqlPoolStore(other, options);
-    await runMysqlMigrations(db);
+    await initMysqlFixture(db, options);
     await Promise.all([first.initialize(), second.initialize()]);
     const reset = async (count = 2) => {
       for (const table of ['user_pool_holds', 'user_pool_catalog_holds', 'user_pool_catalog_cooldowns',

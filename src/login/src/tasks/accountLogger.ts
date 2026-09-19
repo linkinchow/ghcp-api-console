@@ -22,6 +22,15 @@ export class AccountLogger {
     return logger;
   }
 
+  static createTask(logDir: string, scope: {enterpriseId:string;taskId:string;oauthAttemptId:string},debugEnabled: boolean): AccountLogger {
+    const dir = join(logDir,...[scope.enterpriseId,scope.taskId,scope.oauthAttemptId].map(pathSegment));
+    mkdirSync(dir,{recursive:true});
+    const filePath = join(dir,'task.log');
+    const logger = new AccountLogger(scope.taskId,filePath,debugEnabled);
+    writeLine(filePath,'a',logger.format('info','start','Starting login task log',scope));
+    return logger;
+  }
+
   get path(): string {
     return this.filePath;
   }
@@ -50,6 +59,11 @@ export class AccountLogger {
     const suffix = fields ? ` ${JSON.stringify(redactFields(fields))}` : '';
     return `${new Date().toISOString()} [${this.accountName}] ${level.toUpperCase()} ${step}: ${message}${suffix}\n`;
   }
+}
+
+export function pathSegment(value: string): string {
+  if (!/^[a-zA-Z0-9_-]+$/.test(value)) throw new Error('invalid_artifact_scope');
+  return value;
 }
 
 function sanitizeFileName(name: string): string {

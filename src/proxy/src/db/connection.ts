@@ -4,12 +4,14 @@ import { config } from '../config.js';
 import { MysqlStorage } from './mysqlStorage.js';
 import { SqliteStorage } from './sqliteStorage.js';
 import type { ProxyStorage } from './storageTypes.js';
+import { assertProxyEnterpriseConfig, loadProxyEnterpriseProfile } from '../enterprise.js';
 
 let storage: ProxyStorage | undefined;
 let initialization: Promise<void> | undefined;
 
 export function getStorage(): ProxyStorage {
   if (!storage) {
+    assertProxyEnterpriseConfig(loadProxyEnterpriseProfile(), config);
     storage = config.storageDriver === 'mysql'
       ? createMysqlStorage()
       : new SqliteStorage(config.dbPath, config.requestStatsPerAccountLimit);

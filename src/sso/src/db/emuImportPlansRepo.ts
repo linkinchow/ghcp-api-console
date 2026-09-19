@@ -1,5 +1,6 @@
-import type { ImportEmuPlanDto, ImportEmuPlanStatus, ImportEmuPlanSummary, ImportEmuUserRow, ImportEmuUserStatus, PageResponse } from '@ghcp/shared';
+import type { EnterpriseScope, ImportEmuPlanDto, ImportEmuPlanStatus, ImportEmuPlanSummary, ImportEmuUserRow, ImportEmuUserStatus, PageResponse } from '@ghcp/shared';
 import { nowIso, pageResponse } from '@ghcp/shared';
+import { getScopeProfile } from '../enterprise.js';
 import { getDb } from './connection.js';
 
 export type EmuImportAction = 'create' | 'update' | 'skip';
@@ -7,6 +8,7 @@ export type EmuImportAction = 'create' | 'update' | 'skip';
 export interface EmuImportPlanRowRecord extends ImportEmuUserRow {
   rowIndex: number;
   action?: EmuImportAction;
+  expectedUserIncarnation?: string;
 }
 
 interface PlanRow {
@@ -19,6 +21,7 @@ interface PlanRow {
 }
 
 interface RowRecord {
+  expected_user_incarnation?: string;
   plan_id: string;
   row_index: number;
   sso_user: string;
@@ -32,20 +35,22 @@ interface RowRecord {
   action?: EmuImportAction;
 }
 
-export function createEmuImportPlanRecord(input: { id: string; ssoUser?: string; rows: Omit<EmuImportPlanRowRecord, 'rowIndex'>[] }): ImportEmuPlanDto {
+export function createEmuImportPlanRecord(input: { id: string; ssoUser?: string; rows: Omit<EmuImportPlanRowRecord, 'rowIndex'>[] }, scope: EnterpriseScope): ImportEmuPlanDto {
+  getScopeProfile(scope);
   const now = nowIso();
   getDb().transaction(() => {
     getDb()
-      .prepare('INSERT INTO sso_emu_import_plans (id, sso_user, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
-      .run(input.id, input.ssoUser, 'planned', now, now);
+      .prepare('INSERT INTO sso_emu_import_plans (enterprise_id, id, sso_user, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(scope.enterpriseId, input.id, input.ssoUser, 'planned', now, now);
     const insertRow = getDb().prepare(`
       INSERT INTO sso_emu_import_plan_rows (
-        plan_id, row_index, sso_user, email, gh_login, gh_scim_id, emu_status, copilot_seat_status,
-        status, detail, action, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        enterprise_id, plan_id, row_index, sso_user, email, gh_login, gh_scim_id, emu_status, copilot_seat_status,
+        status, detail, action, expected_user_incarnation, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     input.rows.forEach((row, index) => {
       insertRow.run(
+        scope.enterpriseId,
         input.id,
         index + 1,
         row.ssoUser,
@@ -57,26 +62,28 @@ export function createEmuImportPlanRecord(input: { id: string; ssoUser?: string;
         row.status,
         row.detail,
         row.action,
+        row.expectedUserIncarnation,
         now,
         now,
       );
     });
   })();
-  return requireEmuImportPlan(input.id);
+  return requireEmuImportPlan(input.id, scope);
 }
 
-export function requireEmuImportPlan(planId: string): ImportEmuPlanDto {
-  const row = getDb().prepare('SELECT * FROM sso_emu_import_plans WHERE id = ?').get(planId) as PlanRow | undefined;
+export function requireEmuImportPlan(planId: string, scope: EnterpriseScope): ImportEmuPlanDto {
+  getScopeProfile(scope);
+  const row = getDb().prepare('SELECT * FROM sso_emu_import_plans WHERE enterprise_id = ? AND id = ?').get(scope.enterpriseId, planId) as PlanRow | undefined;
   if (!row) throw new Error(`EMU import plan "${planId}" was not found.`);
-  return toPlanDto(row);
+  return toPlanDto(row, scope);
 }
 
-export function listEmuImportPlanRows(planId: string, query: { status?: ImportEmuUserStatus; page?: number; pageSize?: number } = {}): PageResponse<ImportEmuUserRow> {
-  requireEmuImportPlan(planId);
+export function listEmuImportPlanRows(planId: string, query: { status?: ImportEmuUserStatus; page?: number; pageSize?: number }, scope: EnterpriseScope): PageResponse<ImportEmuUserRow> {
+  requireEmuImportPlan(planId, scope);
   const page = Math.max(1, Math.trunc(query.page ?? 1));
   const pageSize = Math.max(1, Math.min(Math.trunc(query.pageSize ?? 100), 500));
-  const where = query.status ? 'WHERE plan_id = ? AND status = ?' : 'WHERE plan_id = ?';
-  const args = query.status ? [planId, query.status] : [planId];
+  const where = query.status ? 'WHERE enterprise_id = ? AND plan_id = ? AND status = ?' : 'WHERE enterprise_id = ? AND plan_id = ?';
+  const args = query.status ? [scope.enterpriseId, planId, query.status] : [scope.enterpriseId, planId];
   const total = (getDb().prepare(`SELECT COUNT(*) AS count FROM sso_emu_import_plan_rows ${where}`).get(...args) as { count: number }).count;
   const rows = getDb()
     .prepare(`SELECT * FROM sso_emu_import_plan_rows ${where} ORDER BY row_index ASC LIMIT ? OFFSET ?`)
@@ -84,25 +91,26 @@ export function listEmuImportPlanRows(planId: string, query: { status?: ImportEm
   return pageResponse(rows.map(toImportRow), total, page, pageSize);
 }
 
-export function listPendingEmuImportPlanRows(planId: string): EmuImportPlanRowRecord[] {
-  requireEmuImportPlan(planId);
+export function listPendingEmuImportPlanRows(planId: string, scope: EnterpriseScope): EmuImportPlanRowRecord[] {
+  requireEmuImportPlan(planId, scope);
   const rows = getDb()
     .prepare(`
       SELECT * FROM sso_emu_import_plan_rows
-      WHERE plan_id = ? AND status IN ('pending_create', 'pending_update')
+      WHERE enterprise_id = ? AND plan_id = ? AND status IN ('pending_create', 'pending_update')
       ORDER BY row_index ASC
     `)
-    .all(planId) as RowRecord[];
+    .all(scope.enterpriseId, planId) as RowRecord[];
   return rows.map(toPlanRowRecord);
 }
 
-export function updateEmuImportPlanRow(planId: string, row: EmuImportPlanRowRecord): void {
+export function updateEmuImportPlanRow(planId: string, row: EmuImportPlanRowRecord, scope: EnterpriseScope): void {
+  getScopeProfile(scope);
   getDb()
     .prepare(`
       UPDATE sso_emu_import_plan_rows
       SET email = ?, gh_login = ?, gh_scim_id = ?, emu_status = ?, copilot_seat_status = ?,
           status = ?, detail = ?, action = ?, updated_at = ?
-      WHERE plan_id = ? AND row_index = ?
+      WHERE enterprise_id = ? AND plan_id = ? AND row_index = ?
     `)
     .run(
       row.email,
@@ -114,44 +122,48 @@ export function updateEmuImportPlanRow(planId: string, row: EmuImportPlanRowReco
       row.detail,
       row.action,
       nowIso(),
+      scope.enterpriseId,
       planId,
       row.rowIndex,
     );
 }
 
-export function markEmuImportPlanApplied(planId: string): ImportEmuPlanDto {
+export function markEmuImportPlanApplied(planId: string, scope: EnterpriseScope): ImportEmuPlanDto {
+  getScopeProfile(scope);
   const now = nowIso();
   getDb()
-    .prepare("UPDATE sso_emu_import_plans SET status = 'applied', applied_at = COALESCE(applied_at, ?), updated_at = ? WHERE id = ?")
-    .run(now, now, planId);
-  return requireEmuImportPlan(planId);
+    .prepare("UPDATE sso_emu_import_plans SET status = 'applied', applied_at = COALESCE(applied_at, ?), updated_at = ? WHERE enterprise_id = ? AND id = ?")
+    .run(now, now, scope.enterpriseId, planId);
+  return requireEmuImportPlan(planId, scope);
 }
 
-export function deleteEmuImportPlanRecord(planId: string): boolean {
-  requireEmuImportPlan(planId);
+export function deleteEmuImportPlanRecord(planId: string, scope: EnterpriseScope): boolean {
+  requireEmuImportPlan(planId, scope);
   return getDb().transaction(() => {
-    getDb().prepare('DELETE FROM sso_emu_import_plan_rows WHERE plan_id = ?').run(planId);
-    const result = getDb().prepare('DELETE FROM sso_emu_import_plans WHERE id = ?').run(planId);
+    getDb().prepare('DELETE FROM sso_emu_import_plan_rows WHERE enterprise_id = ? AND plan_id = ?').run(scope.enterpriseId, planId);
+    const result = getDb().prepare('DELETE FROM sso_emu_import_plans WHERE enterprise_id = ? AND id = ?').run(scope.enterpriseId, planId);
     return result.changes > 0;
   })();
 }
 
-function toPlanDto(row: PlanRow): ImportEmuPlanDto {
+function toPlanDto(row: PlanRow, scope: EnterpriseScope): ImportEmuPlanDto {
   return {
+    enterpriseId: scope.enterpriseId,
+    enterpriseRevision: scope.enterpriseRevision,
     planId: row.id,
     ssoUser: row.sso_user,
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     appliedAt: row.applied_at,
-    summary: summarizeEmuImportPlan(row.id),
+    summary: summarizeEmuImportPlan(row.id, scope),
   };
 }
 
-function summarizeEmuImportPlan(planId: string): ImportEmuPlanSummary {
+function summarizeEmuImportPlan(planId: string, scope: EnterpriseScope): ImportEmuPlanSummary {
   const rows = getDb()
-    .prepare('SELECT status, COUNT(*) AS count FROM sso_emu_import_plan_rows WHERE plan_id = ? GROUP BY status')
-    .all(planId) as { status: ImportEmuUserStatus; count: number }[];
+    .prepare('SELECT status, COUNT(*) AS count FROM sso_emu_import_plan_rows WHERE enterprise_id = ? AND plan_id = ? GROUP BY status')
+    .all(scope.enterpriseId, planId) as { status: ImportEmuUserStatus; count: number }[];
   const counts = new Map(rows.map((row) => [row.status, row.count]));
   const pendingCreate = counts.get('pending_create') ?? 0;
   const pendingUpdate = counts.get('pending_update') ?? 0;
@@ -187,5 +199,6 @@ function toPlanRowRecord(row: RowRecord): EmuImportPlanRowRecord {
     ...toImportRow(row),
     rowIndex: row.row_index,
     action: row.action,
+    expectedUserIncarnation: row.expected_user_incarnation,
   };
 }

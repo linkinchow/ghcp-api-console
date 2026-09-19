@@ -1,13 +1,15 @@
-import { config } from '../config.js';
+import type { EnterpriseScope } from '@ghcp/shared';
+import { getScopeProfile } from '../enterprise.js';
+import { readEnterpriseSecret } from '@ghcp/shared/enterpriseRuntimeV3';
 import { verifyPassword } from '../auth/password.js';
 import type { SsoUserRecord } from '../db/usersRepo.js';
 
-export function resolveInitialPassword(ssoUser: string, explicitPassword?: string): string {
+export function resolveInitialPassword(ssoUser: string, explicitPassword: string | undefined, scope: EnterpriseScope): string {
   if (explicitPassword !== undefined) {
     if (!explicitPassword) throw new Error('Password must not be empty.');
     return explicitPassword;
   }
-  return config.defaultUserPassword ?? ssoUser;
+  return (getScopeProfile(scope).sso.defaultPasswordRef ? readEnterpriseSecret(getScopeProfile(scope).sso.defaultPasswordRef) : undefined) ?? ssoUser;
 }
 
 export class PoolPasswordPolicyError extends Error {
@@ -19,8 +21,10 @@ export class PoolPasswordPolicyError extends Error {
   }
 }
 
-export function resolvePoolManagedPassword(ssoUser: string, explicitPassword?: string): string {
-  const password = config.defaultUserPassword;
+export function resolvePoolManagedPassword(ssoUser: string, explicitPassword: string | undefined, scope: EnterpriseScope): string {
+  let password: string | undefined;
+  try { password = getScopeProfile(scope).sso.defaultPasswordRef ? readEnterpriseSecret(getScopeProfile(scope).sso.defaultPasswordRef) : undefined; }
+  catch { throw new PoolPasswordPolicyError(); }
   if (!password || password.trim().length < 16 || password.trim().toLowerCase() === ssoUser.toLowerCase()
     || (explicitPassword !== undefined && explicitPassword !== password)) {
     throw new PoolPasswordPolicyError();
@@ -28,7 +32,7 @@ export function resolvePoolManagedPassword(ssoUser: string, explicitPassword?: s
   return password;
 }
 
-export function knownDefaultPasswordForUser(user: SsoUserRecord): string | undefined {
-  const candidates = [...new Set([config.defaultUserPassword, user.ssoUser].filter((value): value is string => Boolean(value)))];
+export function knownDefaultPasswordForUser(user: SsoUserRecord, scope: EnterpriseScope): string | undefined {
+  const candidates = [...new Set([(getScopeProfile(scope).sso.defaultPasswordRef ? readEnterpriseSecret(getScopeProfile(scope).sso.defaultPasswordRef) : undefined), user.ssoUser].filter((value): value is string => Boolean(value)))];
   return candidates.find((candidate) => verifyPassword(candidate, user.passwordHash, user.salt));
 }

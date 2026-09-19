@@ -20,6 +20,7 @@ function fixture(stage = 'new') {
   let held = false;
   let token: string | undefined = 'synthetic-token';
   const row: ProvisionInventory = {
+    enterprise_id: '86e2ee02-223a-45ea-8c26-bdd1c570a4ee', enterprise_revision: 1,
     identity: 'synthetic001', ordinal: 0, state: 'provisioning', stage, attempt_id: 'attempt-1', generation: 0,
     task_id: null, attempts: 0, retry_at: 0, last_error: null, updated_at: now, cooldown_until: 0,
     verified_at: null, sso_created_at: null, oauth_attempt_id: null,
@@ -57,7 +58,7 @@ function fixture(stage = 'new') {
     },
     async releaseOwner(expected) { if (owner === expected) { owner = undefined; ownerUntil = 0; } },
     async reclaim() {},
-    async settings() { return { version: 1, idle_target: 1, max_accounts: 1, lease_seconds: 600, paused: 0 }; },
+    async settings() { return { version: 1, idle_target: 1, max_accounts: 1, active_max_accounts: 1, lease_seconds: 600, paused: 0 }; },
     async reserveDeficit() { return 0; },
     async pending(excluded = []) {
       return !excluded.includes(row.identity) && row.retry_at <= now && (row.state === 'provisioning'

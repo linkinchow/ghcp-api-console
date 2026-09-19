@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { ConsoleApiError } from '../api/client.js';
 import {
-  getUserPoolSummary, getUserPoolPage, reconcileUserPool, releaseUserPoolLease, updateUserPoolAccount, updateUserPoolSettings,
+  getUserPoolSummary, getUserPoolPage, releaseUserPoolLease, updateUserPoolAccount,
   type UserPoolAccount, type UserPoolAccountAction, type UserPoolEvent, type UserPoolLease,
-  type UserPoolLimits, type UserPoolOverview, type UserPoolSettings,
+  type UserPoolOverview,
 } from '../api/userPool.js';
 import { Button } from '../components/ui/button.js';
 import { Card, CardDescription, CardTitle } from '../components/ui/card.js';
 import { Input } from '../components/ui/input.js';
-import { formatCallerKeyHash, parsePoolSettingsDraft, poolDate, poolSettingsDraft, poolWarnings } from '../lib/userPool.js';
+import { formatCallerKeyHash, poolDate } from '../lib/userPool.js';
 
 type Notify = (message: string, tone?: 'success' | 'warning' | 'error') => void;
 type Tab = 'accounts' | 'leases' | 'events';
@@ -20,7 +20,7 @@ const stateLabels: Record<string, string> = {
   provisioning: 'Provisioning', cooling: 'Cooling', failed: 'Failed', disabled: 'Disabled', catalog: 'Catalog request',
 };
 
-export function UserPoolPage({ notify }: { notify: Notify }) {
+export function UserPoolPage({ enterpriseId, slug, notify }: { enterpriseId: string; slug: string; notify: Notify }) {
   const [data, setData] = useState<UserPoolOverview>();
   const [loading, setLoading] = useState(true);
   const [disabled, setDisabled] = useState(false);
@@ -50,8 +50,8 @@ export function UserPoolPage({ notify }: { notify: Notify }) {
     if (!background) setLoading(true);
     try {
       const [next, list] = await Promise.all([
-        getUserPoolSummary(controller.signal),
-        getUserPoolPage(tab, page, PAGE_SIZE, query.trim(), state, controller.signal),
+        getUserPoolSummary(enterpriseId, controller.signal),
+        getUserPoolPage(enterpriseId, tab, page, PAGE_SIZE, query.trim(), state, controller.signal),
       ]);
       if (controller.signal.aborted) return;
       const last = Math.max(1, Math.ceil(list.total / PAGE_SIZE));
@@ -75,7 +75,7 @@ export function UserPoolPage({ notify }: { notify: Notify }) {
     } finally {
       if (!controller.signal.aborted) setLoading(false);
     }
-  }, [tab, page, query, state]);
+  }, [enterpriseId, tab, page, query, state]);
 
   useEffect(() => {
     void load();
@@ -112,10 +112,9 @@ export function UserPoolPage({ notify }: { notify: Notify }) {
     }
   };
   const accountAction = (account: UserPoolAccount, action: UserPoolAccountAction) => {
-    void perform(`${action}:${account.identity}`, () => updateUserPoolAccount(account.identity, action),
+    void perform(`${action}:${account.identity}`, () => updateUserPoolAccount(enterpriseId, account.identity, action),
       action === 'disable' ? `${account.identity} disabled. No new requests will use this account.` : `${account.identity} queued for revalidation.`);
   };
-  const warnings = data ? poolWarnings(data.counts, data.settings) : [];
   const accounts = data?.accounts ?? [];
   const leases = data?.leases ?? [];
   const events = data?.events ?? [];
@@ -131,7 +130,7 @@ export function UserPoolPage({ notify }: { notify: Notify }) {
       <Card>
         <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
           <div className="max-w-3xl">
-            <CardTitle className="mb-1">Default user pool</CardTitle>
+            <CardTitle className="mb-1">{slug} user pool</CardTitle>
             <CardDescription className="mb-0">
               One exclusive account per authenticated LiteLLM caller key. Caller key hashes use <code>sha256:&lt;64 hex characters&gt;</code>, never an alias or email.
             </CardDescription>
@@ -142,12 +141,10 @@ export function UserPoolPage({ notify }: { notify: Notify }) {
               Refresh every 10s
             </label>
             <Button variant="secondary" disabled={loading || Boolean(busy)} onClick={() => void load()}>{loading ? 'Refreshing…' : 'Refresh'}</Button>
-            <Button disabled={!data || controlsDisabled} onClick={() => void perform('reconcile', reconcileUserPool, 'Reconciliation scheduled. The worker still respects pause and account limits.')}>
-              {busy === 'reconcile' ? 'Scheduling…' : 'Reconcile now'}
-            </Button>
+
           </div>
         </div>
-        {data ? <p className="mt-3 text-xs text-slate-500">Snapshot {poolDate(data.observedAt)}. Reconcile requests a worker pass; it does not wait for provisioning to finish.</p> : null}
+        {data ? <p className="mt-3 text-xs text-slate-500">Enterprise snapshot {poolDate(data.observedAt)}. Supply scheduling and shared settings are shown on the Global pool page.</p> : null}
       </Card>
 
       {disabled ? (
@@ -162,16 +159,10 @@ export function UserPoolPage({ notify }: { notify: Notify }) {
 
       {data ? (
         <>
-          {warnings.length ? (
-            <section aria-label="Pool warnings" className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-slate-800">
-              <h3 className="font-semibold">Attention needed</h3>
-              <ul className="mt-2 list-disc space-y-1 pl-5">{warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
-            </section>
-          ) : null}
           <section aria-label="Pool overview" className="overflow-hidden rounded-lg border border-slate-200 bg-white">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-4 py-3 text-sm">
-              <h3 className="font-semibold text-slate-950">Account capacity</h3>
-              <span>{data.counts.total.toLocaleString()} / {data.settings.max_accounts.toLocaleString()} accounts · Idle target {data.settings.idle_target.toLocaleString()}</span>
+              <h3 className="font-semibold text-slate-950">Enterprise inventory</h3>
+              <span>{data.counts.total.toLocaleString()} registered accounts · Inventory, not billing</span>
             </div>
             <dl className="grid grid-cols-2 divide-x divide-slate-200 sm:grid-cols-4 xl:grid-cols-7">
               {([
@@ -191,13 +182,6 @@ export function UserPoolPage({ notify }: { notify: Notify }) {
             </dl>
             <p className="border-t border-slate-200 px-4 py-2 text-xs text-slate-500">Lease counts can overlap cooling or disabled accounts while requests finish; these counts are not a sum of total inventory.</p>
           </section>
-
-          <PoolSettingsEditor settings={data.settings} limits={data.limits} disabled={controlsDisabled} notify={notify}
-            onBusy={(saving) => {
-              if (!mounted.current) return;
-              if (saving) request.current?.abort();
-              setBusy(saving ? 'settings' : undefined);
-            }} onRefresh={() => load()} />
 
           <Card className="min-w-0">
             <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
@@ -239,102 +223,11 @@ export function UserPoolPage({ notify }: { notify: Notify }) {
           </Card>
         </>
       ) : null}
-      {confirmation ? <PoolConfirmation value={confirmation} busy={Boolean(busy)} error={actionError}
+      {confirmation ? <PoolConfirmation enterpriseLabel={`${slug} (${enterpriseId})`} value={confirmation} busy={Boolean(busy)} error={actionError}
         onClose={() => { if (!busy) { setConfirmation(undefined); setActionError(undefined); } }}
         onConfirm={() => confirmation.kind === 'disable' ? accountAction(confirmation.account, 'disable')
-          : void perform(`release:${confirmation.lease.leaseId}`, () => releaseUserPoolLease(confirmation.lease.leaseId), 'Lease released. The caller key may acquire a different account on its next request.')} /> : null}
+          : void perform(`release:${confirmation.lease.leaseId}`, () => releaseUserPoolLease(enterpriseId, confirmation.lease.leaseId), 'Lease released. The caller key may acquire a different account on its next request.')} /> : null}
     </div>
-  );
-}
-
-function PoolSettingsEditor(props: {
-  settings: UserPoolSettings; limits: UserPoolLimits; disabled: boolean; notify: Notify;
-  onBusy: (saving: boolean) => void; onRefresh: () => Promise<void>;
-}) {
-  const [base, setBase] = useState(props.settings);
-  const [draft, setDraft] = useState(() => poolSettingsDraft(props.settings));
-  const [dirty, setDirty] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string>();
-  const mounted = useRef(false);
-  useEffect(() => {
-    mounted.current = true;
-    return () => { mounted.current = false; };
-  }, []);
-  useEffect(() => {
-    if (!dirty) {
-      setBase(props.settings);
-      setDraft(poolSettingsDraft(props.settings));
-    }
-  }, [props.settings, dirty]);
-
-  const reload = () => { setBase(props.settings); setDraft(poolSettingsDraft(props.settings)); setDirty(false); setError(undefined); };
-  const save = async () => {
-    if (saving || props.disabled) return;
-    setError(undefined);
-    let changes;
-    try { changes = parsePoolSettingsDraft(draft, props.limits); }
-    catch (err) { setError(errorMessage(err)); return; }
-    setSaving(true);
-    props.onBusy(true);
-    try {
-      const next = await updateUserPoolSettings(base.version, changes);
-      if (!mounted.current) return;
-      setBase(next);
-      setDraft(poolSettingsDraft(next));
-      setDirty(false);
-      props.notify('Pool settings saved. Changes apply to future provisioning and lease renewals.');
-      await props.onRefresh();
-    } catch (err) {
-      if (!mounted.current) return;
-      if (err instanceof ConsoleApiError && err.code === 'settings_version_conflict') {
-        await props.onRefresh();
-        if (!mounted.current) return;
-        setError('Settings changed in another session. Your draft was not saved. Use “Reload latest settings” to discard it and review the current values.');
-      } else setError(errorMessage(err));
-    } finally {
-      if (mounted.current) setSaving(false);
-      props.onBusy(false);
-    }
-  };
-  return (
-    <Card>
-      <CardTitle>Pool settings</CardTitle>
-      <CardDescription>Keep an idle reserve without exceeding the account cap. Lowering limits never deletes accounts. Lease TTL is renewed only after successful inference.</CardDescription>
-      <form onSubmit={(event) => { event.preventDefault(); void save(); }}>
-        <fieldset disabled={props.disabled || saving} className="space-y-4">
-          <legend className="sr-only">Capacity and lease settings</legend>
-          <div className="grid gap-4 md:grid-cols-3">
-            <label className="flex flex-col gap-1 text-sm font-medium text-slate-700">Ready idle target
-              <Input type="number" min={0} max={props.limits.maxAccounts} step={1} required value={draft.idleTarget}
-                onChange={(event) => { setDraft({ ...draft, idleTarget: event.target.value }); setDirty(true); }} />
-            </label>
-            <label className="flex flex-col gap-1 text-sm font-medium text-slate-700">Maximum accounts
-              <Input type="number" min={1} max={props.limits.maxAccounts} step={1} required value={draft.maxAccounts}
-                onChange={(event) => { setDraft({ ...draft, maxAccounts: event.target.value }); setDirty(true); }} />
-            </label>
-            <label className="flex flex-col gap-1 text-sm font-medium text-slate-700">Lease TTL (seconds)
-              <Input type="number" min={props.limits.minLeaseSeconds} max={props.limits.maxLeaseSeconds} step={1} required value={draft.leaseSeconds}
-                onChange={(event) => { setDraft({ ...draft, leaseSeconds: event.target.value }); setDirty(true); }} />
-              <span className="text-xs font-normal text-slate-500">{props.limits.minLeaseSeconds}–{props.limits.maxLeaseSeconds.toLocaleString()} seconds</span>
-            </label>
-          </div>
-          <label className="flex items-start gap-2 text-sm text-slate-700">
-            <input type="checkbox" className="mt-1" checked={draft.paused} onChange={(event) => { setDraft({ ...draft, paused: event.target.checked }); setDirty(true); }} />
-            <span>Pause prewarming<span className="block text-xs text-slate-500">Stops new provisioning work, not caller traffic. In-flight provisioning may finish its current step.</span></span>
-          </label>
-        </fieldset>
-        {error ? <div className="mt-3"><ErrorNotice>{error}</ErrorNotice></div> : null}
-        {dirty && base.version !== props.settings.version ? <p className="mt-3 text-sm text-amber-800">Newer settings are available (version {props.settings.version}). Your draft still uses version {base.version}.</p> : null}
-        <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 pt-4">
-          <p className="text-xs text-slate-500">Editing version {base.version}{dirty ? ' · Unsaved changes' : ''}</p>
-          <div className="flex flex-wrap gap-2">
-            <Button type="button" variant="secondary" onClick={reload} disabled={!dirty || props.disabled || saving}>Reload latest settings</Button>
-            <Button type="submit" disabled={!dirty || props.disabled || saving}>{saving ? 'Saving…' : 'Save and apply'}</Button>
-          </div>
-        </div>
-      </form>
-    </Card>
   );
 }
 
@@ -473,7 +366,7 @@ function accountState(account: UserPoolAccount): string {
 function ErrorNotice({ children }: { children: ReactNode }) { return <p role="alert" className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-800">{children}</p>; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : 'The pool request failed. Refresh and try again.'; }
 
-function PoolConfirmation(props: { value: Confirmation; busy: boolean; error?: string; onClose: () => void; onConfirm: () => void }) {
+function PoolConfirmation(props: { enterpriseLabel: string; value: Confirmation; busy: boolean; error?: string; onClose: () => void; onConfirm: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     const element = dialog.current;
@@ -486,6 +379,7 @@ function PoolConfirmation(props: { value: Confirmation; busy: boolean; error?: s
     className="m-auto max-h-[90vh] w-[calc(100%_-_2rem)] max-w-xl overflow-auto rounded-xl border border-slate-200 bg-white p-5 text-slate-900 shadow-xl backdrop:bg-slate-950/40">
     <h2 id="pool-confirm-title" className="text-lg font-semibold">{release ? 'Release caller lease?' : 'Disable pool account?'}</h2>
     <div id="pool-confirm-description" className="mt-3 space-y-3 text-sm text-slate-600">
+      <p>Enterprise: <strong>{props.enterpriseLabel}</strong></p>
       {props.value.kind === 'release' ? <>
         <p>Release the exclusive lease for <strong>{props.value.lease.memberIdentity}</strong>. The caller key may receive a different account on its next request. This operation is rejected while requests are in flight.</p>
         <p>Caller key hash: <CallerHash value={props.value.lease.callerKeyHash} missing="Hash unavailable" /></p>

@@ -1,0 +1,5 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "noEmit": true, "rootDir": "../..", "module": "NodeNext", "moduleResolution": "NodeNext", "resolveJsonModule": true, "allowImportingTsExtensions": true },
+  "include": ["db-*.ts", "migration-chain.ts", "migration-faults.ts", "compatibility.ts"]
+}

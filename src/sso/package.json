@@ -6,7 +6,7 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "start:prod": "node dist/index.js",
-    "test": "tsx --test src/copilot/*.test.ts src/db/*.test.ts src/users/*.test.ts",
+    "test": "node --import tsx --experimental-test-module-mocks --test --test-concurrency=1 src/copilot/*.test.ts src/db/*.test.ts src/users/*.test.ts src/saml/*.test.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc"
   },

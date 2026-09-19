@@ -1,3 +1,8 @@
+import { TEST_ENTERPRISE } from '../test/enterpriseFixtures.js';
+import { loadProxyEnterpriseProfile } from '../enterprise.js';
+import { randomUUID } from 'node:crypto';
+import { completeFixtureAttempt, failFixtureAttempt } from '../test/enterpriseFixtures.js';
+import { configureProxyFixture } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { once } from 'node:events';
@@ -16,6 +21,7 @@ test('empty SQLite prewarms, serves exclusive HTTP callers, replenishes idle inv
   const settings = {
     ACCOUNT_ROUTING_MODE: 'caller-lease', STORAGE_DRIVER: 'sqlite', POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test',
     POOL_WARMUP_MODEL: 'claude-test-5-2', READY_IDLE_TARGET: '2', POOL_MAX_ACCOUNTS: '5', CALLER_LEASE_TTL_SECONDS: '60',
+    SSO_BASE_URL: 'http://sso.mock.test', LOGIN_BASE_URL: 'http://login.mock.test', ENTERPRISE_SHORTCODE: config.enterpriseShortcode,
   };
   const savedEnv = Object.fromEntries(Object.keys(settings).map((key) => [key, process.env[key]]));
   const savedConfig = { ...config };
@@ -28,6 +34,7 @@ test('empty SQLite prewarms, serves exclusive HTTP callers, replenishes idle inv
   config.ssoBaseUrl = 'http://sso.mock.test';
   config.loginBaseUrl = 'http://login.mock.test';
   config.copilotApiBaseUrl = 'http://copilot.mock.test';
+  config.dbPath = configureProxyFixture();
   const store = await getUserPool();
   assert.ok(store instanceof UserPoolStore);
   let now = Date.now();
@@ -37,14 +44,18 @@ test('empty SQLite prewarms, serves exclusive HTTP callers, replenishes idle inv
   const inferenceTokens: string[] = [];
   const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
   globalThis.fetch = async (input, init) => {
-    const url = new URL(String(input));
+    const url = new URL(String(input)); url.pathname=url.pathname.replace(`/api/profiles/${TEST_ENTERPRISE.id}`, '/api');
     const body = init?.body ? JSON.parse(String(init.body)) : {};
     if (url.hostname !== 'copilot.mock.test') assert.equal(new Headers(init?.headers).get('x-internal-token'), config.internalApiToken);
     if (url.hostname === 'sso.mock.test') {
+      if (url.pathname === `/internal/profiles/${TEST_ENTERPRISE.id}/creation-capacity`) return json({
+        enterpriseId: TEST_ENTERPRISE.id, enterpriseRevision: TEST_ENTERPRISE.revision,
+        currentUsers: users.size, maxUsers: null, availableSlots: null, canCreate: true,
+      });
       if (url.pathname === '/api/users' && init?.method === 'POST') {
         assert.equal(body.role, 'user');
         const createdAt = new Date(now).toISOString();
-        const user: SsoUserDto = { ssoUser: body.ssoUser, email: body.email, role: 'user', emuStatus: 'not_synced', copilotSeatStatus: 'unassigned', createdAt, updatedAt: createdAt };
+        const user: SsoUserDto = { enterpriseId: TEST_ENTERPRISE.id, userIncarnation: randomUUID(), ssoUser: body.ssoUser, email: body.email, role: 'user', emuStatus: 'not_synced', copilotSeatStatus: 'unassigned', createdAt, updatedAt: createdAt };
         assert.equal(users.has(user.ssoUser), false);
         users.set(user.ssoUser, user);
         return json(user, 201);
@@ -53,7 +64,7 @@ test('empty SQLite prewarms, serves exclusive HTTP callers, replenishes idle inv
         assert.equal(body.createOnly, true);
         assert.equal(body.assignCopilotSeat, false);
         const user = users.get(body.ssoUsers[0])!;
-        user.emuStatus = 'active'; user.ghScimId = `scim-${user.ssoUser}`; user.ghLogin = `${user.ssoUser}_test`;
+        user.emuStatus = 'active'; user.ghScimId = `scim-${user.ssoUser}`; user.ghLogin = `${user.ssoUser.replaceAll('.', '-')}_test`;
         return json({ rows: [{ ssoUser: user.ssoUser, status: 'success', user }] });
       }
       const [, , , identity, action] = url.pathname.split('/');
@@ -72,9 +83,17 @@ test('empty SQLite prewarms, serves exclusive HTTP callers, replenishes idle inv
       if (init?.method === 'POST') {
         assert.equal(body.ssoPassword, 'mock-password');
         assert.equal(users.get(body.identity)?.copilotSeatStatus, 'assigned');
-        const task: LoginTaskDto = { id: `task-${body.identity}`, identity: body.identity, ssoUser: body.ssoUser, ghLogin: body.ghLogin, oauthAttemptId: body.oauthAttemptId, ssoType: 'custom', status: 'success', attempts: 1, createdAt: new Date(now).toISOString() };
+        const task: LoginTaskDto = {
+          enterpriseId:body.enterpriseId,enterpriseRevision:body.enterpriseRevision,accountIncarnation:body.accountIncarnation,
+          expectedGhLogin:body.expectedGhLogin,
+          id:`task-${body.identity}`,identity:body.identity,ssoUser:body.ssoUser,ghLogin:body.expectedGhLogin,
+          oauthAttemptId:body.oauthAttemptId,ssoType:'custom',status:'success',attempts:1,createdAt:new Date(now).toISOString(),
+        };
+        assert.equal(task.enterpriseId,TEST_ENTERPRISE.id);
+        assert.equal(task.expectedGhLogin,users.get(task.identity)?.ghLogin);
+        assert.equal(task.accountIncarnation,(await getStorage().getAccount(task.identity))?.accountIncarnation);
         assert.equal(tasks.has(task.id), false);
-        await getStorage().saveCopilotOauthToken(task.identity, body.oauthAttemptId, `mock-token-${task.identity}`, task.ghLogin);
+        await completeFixtureAttempt(getStorage(),task.identity, body.oauthAttemptId, `mock-token-${task.identity}`, task.ghLogin);
         tasks.set(task.id, task);
         return json(task, 202);
       }
@@ -87,7 +106,10 @@ test('empty SQLite prewarms, serves exclusive HTTP callers, replenishes idle inv
     if (body.messages[0].content !== 'Reply OK') inferenceTokens.push(new Headers(init?.headers).get('authorization')!);
     return json({ id: 'mock-message', model: body.model, type: 'message', role: 'assistant', content: [{ type: 'text', text: 'OK' }] });
   };
-  const worker = new PrewarmWorker(store, realProvisioner(store, readPoolConfig(process.env)), 5000);
+  const worker = new PrewarmWorker(store, realProvisioner(store, readPoolConfig(process.env), {
+    enterpriseProfile: id => { assert.equal(id, TEST_ENTERPRISE.id); return loadProxyEnterpriseProfile(id); },
+    verifyReadiness: async (profile, signal) => { assert.equal(profile.id, TEST_ENTERPRISE.id); signal.throwIfAborted(); },
+  }), 5000);
   const server = buildApp().listen(0, '127.0.0.1');
   await once(server, 'listening');
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;

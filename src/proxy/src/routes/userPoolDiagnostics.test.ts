@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import type { AddressInfo } from 'node:net';
 import test from 'node:test';
 import express from 'express';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { fixtureRegistry } from '../test/enterpriseFixtures.js';
 import type { PrewarmWorkerSnapshot } from '../userPool/worker.js';
 
 const saved = { ...process.env };
@@ -23,6 +25,17 @@ const sample = (): PrewarmWorkerSnapshot => ({ scope: 'local_process', state: 's
   lastOwnershipLoss: { reason: 'storage_unavailable', storageFailure: 'connection', atUnixMs: 195000 } });
 
 test('local scheduler diagnostics authenticate, remain storage-independent and expose only allowlisted state', async t => {
+  // Trusted registry is configuration, not storage: deliberately create no database.
+  const directory = mkdtempSync(join(tmpdir(), 'scheduler-registry-fixture-'));
+  const registryPath = join(directory, 'registry.json');
+  writeFileSync(registryPath, JSON.stringify(fixtureRegistry()));
+  const priorRegistry = process.env.ENTERPRISE_REGISTRY_FILE;
+  process.env.ENTERPRISE_REGISTRY_FILE = registryPath;
+  t.after(() => {
+    if (priorRegistry === undefined) delete process.env.ENTERPRISE_REGISTRY_FILE;
+    else process.env.ENTERPRISE_REGISTRY_FILE = priorRegistry;
+    rmSync(directory, { recursive: true, force: true });
+  });
   const prior = config.internalApiToken; config.internalApiToken = token;
   let enabled = true, reads = 0, storeReads = 0, wakes = 0, snapshot: PrewarmWorkerSnapshot | undefined = sample();
   let thrown: Error | undefined;

@@ -1,148 +1,85 @@
 import { Router, type Response } from 'express';
-import { apiError, type CreateLoginTaskRequest, type LoginTaskStatus } from '@ghcp/shared';
-import { deleteTask, getTask, listTasks, listTasksPage, type LoginTaskRecord } from '../db/tasksRepo.js';
+import { requireEnterpriseRequest, bindingFromInput } from '../enterprise.js';
+import { apiError, EnterpriseContractError, type CreateLoginTaskV2, type LoginTaskStatus, type EnterpriseScope } from '@ghcp/shared';
+import { deleteTask, getTask, isTerminalTask, listTasks, listTasksPage } from '../db/tasksRepo.js';
 import { getPoolTaskProtection } from '../clients/proxyClient.js';
-import { loginQueue } from '../tasks/queue.js';
+import { loginQueue, type LoginQueue } from '../tasks/queue.js';
 
-export const tasksApiRouter = Router();
-const LOGIN_TASK_STATUSES = new Set<LoginTaskStatus>(['pending', 'running', 'success', 'failed', 'cancelled']);
-
-tasksApiRouter.get('/tasks', (req, res) => {
-  if (req.query.page !== undefined || req.query.pageSize !== undefined || req.query.q !== undefined || req.query.status !== undefined) {
-    const status = stringQuery(req.query.status);
-    if (status && !LOGIN_TASK_STATUSES.has(status as LoginTaskStatus)) {
-      res.status(400).json(apiError('invalid_status', 'status is not a valid login task status.'));
-      return;
-    }
-    res.json(listTasksPage({
-      q: stringQuery(req.query.q),
-      status: status as LoginTaskStatus | undefined,
-      page: numberQuery(req.query.page),
-      pageSize: numberQuery(req.query.pageSize),
-    }));
-    return;
-  }
-  const limit = Number(req.query.limit ?? 100);
-  res.json(listTasks(Number.isInteger(limit) && limit > 0 ? limit : 100));
-});
-
-tasksApiRouter.post('/tasks', (req, res) => {
-  const parsed = readCreateTask(req.body);
-  if (!parsed.ok) {
-    res.status(400).json(apiError('invalid_login_task', parsed.error));
-    return;
-  }
-  res.status(202).json(loginQueue.enqueue(parsed.value));
-});
-
-tasksApiRouter.get('/tasks/:id', (req, res) => {
-  const task = getTask(req.params.id);
-  if (!task) {
-    res.status(404).json(apiError('task_not_found', 'Login task was not found.'));
-    return;
-  }
-  res.json(task);
-});
-
-tasksApiRouter.post('/tasks/:id/cancel', (req, res) => {
-  const task = loginQueue.cancel(req.params.id);
-  if (!task) {
-    res.status(404).json(apiError('task_not_found', 'Login task was not found.'));
-    return;
-  }
-  res.json(task);
-});
-
-tasksApiRouter.delete('/tasks/:id', async (req, res) => {
-  const task = getTask(req.params.id);
-  if (task && task.status !== 'pending' && task.status !== 'running'
-    && !await allowPoolTaskMutation(task, 'delete', res)) return;
-  const result = deleteTask(req.params.id);
-  if (result === 'not_found') {
-    res.status(404).json(apiError('task_not_found', 'Login task was not found.'));
-    return;
-  }
-  if (result === 'not_allowed') {
-    res.status(400).json(apiError('task_delete_not_allowed', 'Pending or running login tasks cannot be deleted.'));
-    return;
-  }
-  res.status(204).end();
-});
-
-tasksApiRouter.post('/tasks/:id/retry', async (req, res) => {
-  const task = getTask(req.params.id);
-  if (!task) {
-    res.status(404).json(apiError('task_not_found', 'Login task was not found.'));
-    return;
-  }
-  const parsed = readCreateTask({
-    ...req.body,
-    identity: task.identity,
-    ssoUser: task.ssoUser,
-    ghLogin: task.ghLogin,
-    oauthAttemptId: task.oauthAttemptId,
-    ssoType: task.ssoType,
+const STATUSES = new Set<LoginTaskStatus>(['pending','running','success','failed','cancelled','callback_pending','cancel_requested','uncertain']);
+const CREATE_KEYS = new Set(['enterpriseId','enterpriseRevision','identity','accountIncarnation','oauthAttemptId','expectedGhLogin','expectedGithubUserId','ssoUser','ssoPassword','ssoType']);
+const enterprise = (res: Response): string => (res.locals.enterpriseScope as EnterpriseScope).enterpriseId;
+export function createTasksApiRouter(queue: LoginQueue = loginQueue): Router {
+  const router = Router({mergeParams:true});
+  router.use(requireEnterpriseRequest);
+  router.get('/tasks',(req,res) => {
+    const id = enterprise(res);
+    if (['page','pageSize','q','status'].some(key => req.query[key] !== undefined)) {
+      const status = stringQuery(req.query.status);
+      if (status && !STATUSES.has(status as LoginTaskStatus)) { res.status(400).json(apiError('invalid_status','Invalid login task status.')); return; }
+      res.json(listTasksPage(id,{q:stringQuery(req.query.q),status:status as LoginTaskStatus | undefined,page:numberQuery(req.query.page),pageSize:numberQuery(req.query.pageSize)}));
+    } else res.json(listTasks(id,numberQuery(req.query.limit) ?? 100));
   });
-  if (!parsed.ok) {
-    res.status(400).json(apiError('invalid_login_task', parsed.error));
-    return;
-  }
-  if (!await allowPoolTaskMutation(task, 'retry', res)) return;
-  res.status(202).json(loginQueue.retry(task, parsed.value));
-});
-
-async function allowPoolTaskMutation(task: LoginTaskRecord, operation: 'delete' | 'retry', res: Response): Promise<boolean> {
-  try {
-    const protection = await getPoolTaskProtection(task.identity, task.id, task.oauthAttemptId);
-    if (operation === 'delete' ? protection.referenced : protection.managed) {
-      res.status(409).json(apiError('pool_task_managed', 'Use User pool recovery controls; this Login task is managed by the pool.'));
-      return false;
-    }
-    return true;
-  } catch {
-    res.status(503).json(apiError('pool_membership_unavailable', 'Cannot verify pool task ownership; no task was changed.'));
-    return false;
-  }
+  router.post('/tasks',async (req,res) => {
+    try {
+      const value = readCreateTask(req.body);
+      if (value.enterpriseId !== enterprise(res)) throw new EnterpriseContractError('enterprise_scope_mismatch');
+      res.status(202).json(await queue.enqueue(value));
+    } catch (error) { respondError(res,error); }
+  });
+  router.get('/tasks/:id',(req,res) => {
+    const task = getTask(enterprise(res),req.params.id);
+    if (!task) { missing(res); return; }
+    res.json(task);
+  });
+  router.post('/tasks/:id/cancel',async (req,res) => {
+    try {
+      const result = await queue.cancel(enterprise(res),req.params.id);
+      if (!result) { missing(res); return; }
+      res.status(result.outcome === 'unknown' ? 202 : 200).json(result);
+    } catch (error) { respondError(res,error); }
+  });
+  router.post('/tasks/:id/reconcile',async (req,res) => {
+    try {
+      const result = await queue.reconcile(enterprise(res),req.params.id);
+      if (!result) { missing(res); return; }
+      res.status(result.outcome === 'unknown' ? 202 : 200).json(result);
+    } catch (error) { respondError(res,error); }
+  });
+  router.delete('/tasks/:id',async (req,res) => {
+    const id = enterprise(res),task = getTask(id,req.params.id);
+    if (!task) { missing(res); return; }
+    if (!isTerminalTask(task)) { res.status(409).json(apiError('task_delete_not_allowed','Task closure is not confirmed.')); return; }
+    try {
+      const protection = await getPoolTaskProtection(task);
+      if (protection.referenced) { res.status(409).json(apiError('pool_task_managed','Pool recovery still references this task.')); return; }
+    } catch { res.status(503).json(apiError('pool_membership_unavailable','Cannot verify pool ownership; no task was changed.')); return; }
+    const result = deleteTask(id,task.id);
+    if (result === 'not_found') missing(res);
+    else if (result !== 'deleted') res.status(409).json(apiError('task_delete_not_allowed','Task closure is not confirmed.'));
+    else res.status(204).end();
+  });
+  router.post('/tasks/:id/retry',(req,res) => {
+    if (!getTask(enterprise(res),req.params.id)) { missing(res); return; }
+    try { queue.retry(enterprise(res),req.params.id); } catch (error) { respondError(res,error); }
+  });
+  return router;
 }
-
-type ParseResult = { ok: true; value: CreateLoginTaskRequest } | { ok: false; error: string };
-
-function readCreateTask(body: unknown): ParseResult {
-  const value = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
-  if (typeof value.identity !== 'string' || !value.identity.trim()) return { ok: false, error: 'identity is required.' };
-  if (typeof value.ssoUser !== 'string' || !value.ssoUser.trim()) return { ok: false, error: 'ssoUser is required.' };
-  if (typeof value.ghLogin !== 'string' || !value.ghLogin.trim()) return { ok: false, error: 'ghLogin is required.' };
-  if (typeof value.oauthAttemptId !== 'string' || !value.oauthAttemptId.trim()) {
-    return { ok: false, error: 'oauthAttemptId is required; start a new reauthorization for legacy tasks.' };
-  }
-  if (value.ssoType !== 'azure' && value.ssoType !== 'custom') return { ok: false, error: 'ssoType must be custom or azure.' };
-  return {
-    ok: true,
-    value: {
-      identity: value.identity.trim(),
-      ssoUser: value.ssoUser.trim(),
-      ssoPassword: typeof value.ssoPassword === 'string' ? value.ssoPassword : '',
-      ghLogin: value.ghLogin.trim(),
-      oauthAttemptId: value.oauthAttemptId.trim(),
-      ssoType: value.ssoType,
-      ssoUrl: typeof value.ssoUrl === 'string' && value.ssoUrl.trim() ? value.ssoUrl.trim() : undefined,
-      accountType: value.accountType === 'business' || value.accountType === 'enterprise' ? value.accountType : undefined,
-      selectorOverrides: isStringRecord(value.selectorOverrides) ? value.selectorOverrides : undefined,
-    },
-  };
+export const tasksApiRouter = createTasksApiRouter();
+function readCreateTask(body: unknown): CreateLoginTaskV2 {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new EnterpriseContractError('login_task_input_invalid');
+  const value = body as Record<string,unknown>;
+  if (Object.keys(value).some(key => !CREATE_KEYS.has(key)) || typeof value.ssoUser !== 'string' || !value.ssoUser.trim()
+    || value.ssoUser !== value.ssoUser.trim() || value.ssoUser.length > 255 || /[\x00-\x1f\x7f]/u.test(value.ssoUser)
+    || typeof value.ssoPassword !== 'string' || !value.ssoPassword || value.ssoPassword.length > 4096
+    || (value.ssoType !== 'custom' && value.ssoType !== 'azure')) throw new EnterpriseContractError('login_task_input_invalid');
+  return {...bindingFromInput(value),ssoUser:value.ssoUser,ssoPassword:value.ssoPassword,ssoType:value.ssoType};
 }
-
-function isStringRecord(value: unknown): value is Record<string, string> {
-  return value !== null && typeof value === 'object' && Object.values(value).every((v) => typeof v === 'string');
+function missing(res: Response): void { res.status(404).json(apiError('task_not_found','Login task was not found.')); }
+function respondError(res: Response,error: unknown): void {
+  if (error instanceof EnterpriseContractError) {
+    const status = ['authorization_nonce_conflict','authorization_nonce_consumed','authorization_attempt_not_active','new_proxy_attempt_required','legacy_task_history_only','task_reconcile_not_allowed','authorization_binding_mismatch'].includes(error.code) ? 409 : 400;
+    res.status(status).json(apiError(error.code,'Login task request was rejected.'));
+  } else res.status(503).json(apiError('authorization_authority_unavailable','Proxy authority could not be confirmed.'));
 }
-
-function stringQuery(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
-  const trimmed = value.trim();
-  return trimmed ? trimmed : undefined;
-}
-
-function numberQuery(value: unknown): number | undefined {
-  const raw = typeof value === 'string' ? Number(value) : undefined;
-  return Number.isFinite(raw) ? raw : undefined;
-}
+function stringQuery(value: unknown): string | undefined { return typeof value === 'string' ? value.trim() || undefined : undefined; }
+function numberQuery(value: unknown): number | undefined { const n = typeof value === 'string' ? Number(value) : NaN; return Number.isSafeInteger(n) && n > 0 ? n : undefined; }

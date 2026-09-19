@@ -1,3 +1,4 @@
+import { configureProxyFixture } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
@@ -27,6 +28,7 @@ async function fixture() {
     POOL_WARMUP_MODEL: 'test-model', READY_IDLE_TARGET: '1', POOL_MAX_ACCOUNTS: '2',
     POOL_REQUEST_TIMEOUT_SECONDS: '5', STORAGE_DRIVER: 'sqlite' });
   Object.assign(config, { apiKey: 'synthetic-review-key', storageDriver: 'sqlite', dbPath: ':memory:', requestStatsPerAccountLimit: 100 });
+  config.dbPath = configureProxyFixture();
   const store = await getUserPool();
   assert.ok(store instanceof UserPoolStore);
   let now = store.now(); store.now = () => now;
@@ -146,6 +148,7 @@ test('pool configuration rejection happens before shared retention pruning', asy
   Object.assign(config, { storageDriver: 'sqlite', dbPath: ':memory:', apiKey: 'synthetic', internalApiToken: 'synthetic' });
   Object.assign(process.env, { ACCOUNT_ROUTING_MODE: 'caller-lease', STORAGE_DRIVER: 'sqlite',
     POOL_ACCOUNT_EMAIL_DOMAIN: 'synthetic.test', POOL_WARMUP_MODEL: 'unused' });
+  config.dbPath = configureProxyFixture();
   const storage = getStorage(); let pruned = false;
   storage.userPool = () => { throw new Error('Pool configuration differs'); };
   storage.pruneAllRequestStats = async () => { pruned = true; };

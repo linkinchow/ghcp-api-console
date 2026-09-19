@@ -1,8 +1,10 @@
+import type { EnterpriseId } from './enterprise.js';
+
 export type CopilotOauthStatus = 'valid' | 'expired' | 'missing' | 'refreshing' | 'failed';
 export type EmuStatus = 'active' | 'suspended' | 'deleted' | 'not_synced';
 export type CopilotSeatStatus = 'unknown' | 'assigned' | 'unassigned' | 'assign_failed' | 'remove_failed';
 export type CopilotSeatOperation = 'assign' | 'remove';
-export type LoginTaskStatus = 'pending' | 'running' | 'success' | 'failed' | 'cancelled';
+export type LoginTaskStatus = 'pending' | 'running' | 'success' | 'failed' | 'cancelled' | 'callback_pending' | 'cancel_requested' | 'uncertain';
 export type SsoType = 'azure' | 'custom';
 export type AccountType = 'business' | 'enterprise';
 
@@ -12,6 +14,8 @@ export interface RequestIdentity {
 }
 
 export interface ProxyAccountDto {
+  enterpriseId?: EnterpriseId;
+  accountIncarnation?: string;
   identity: string;
   ssoUser: string;
   ghLogin?: string;
@@ -41,6 +45,7 @@ export interface ImportCopilotOauthTokenRow {
 }
 
 export interface ProxyRequestStatDto {
+  enterpriseId?: EnterpriseId;
   id: string;
   identity: string;
   callerId?: string;
@@ -146,6 +151,8 @@ export interface ClearProxyErrorDiagnosticsResponse {
 }
 
 export interface SsoUserDto {
+  enterpriseId?: EnterpriseId;
+  userIncarnation?: string;
   ssoUser: string;
   email: string;
   role: 'user' | 'admin';
@@ -199,6 +206,7 @@ export interface SsoRuntimeSettingsValues {
 }
 
 export interface SsoRuntimeSettingsDto extends SsoRuntimeSettingsValues {
+  enterpriseId?: EnterpriseId;
   version: number;
   updatedAt: string;
 }
@@ -231,6 +239,7 @@ export type SsoUserBatchRowStatus = 'success' | 'failed';
 export interface SsoUserBatchRequest {
   operation: SsoUserBatchOperation;
   ssoUsers: string[];
+  expectedIncarnations?: Record<string, string>;
   enterpriseRole?: 'user' | 'enterprise_owner';
   assignCopilotSeat?: boolean;
   /** For sync_emu only: fail on existing provisioning or SCIM conflict, never adopt or update. */
@@ -282,6 +291,8 @@ export interface ImportEmuPlanSummary {
 }
 
 export interface ImportEmuPlanDto {
+  enterpriseId?: EnterpriseId;
+  enterpriseRevision?: number;
   planId: string;
   ssoUser?: string;
   status: ImportEmuPlanStatus;
@@ -300,6 +311,7 @@ export interface AiCreditsPeriodUsageDto {
 }
 
 export interface AiCreditsUsageDto {
+  enterpriseId?: EnterpriseId;
   enterprise: string;
   lastMonth: AiCreditsPeriodUsageDto;
   currentMonth: AiCreditsPeriodUsageDto;
@@ -311,6 +323,8 @@ export interface AiCreditsUsageDto {
 }
 
 export interface CreateLoginTaskRequest {
+  enterpriseId?: EnterpriseId;
+  enterpriseRevision?: number;
   identity: string;
   ssoUser: string;
   ssoPassword: string;
@@ -323,6 +337,12 @@ export interface CreateLoginTaskRequest {
 }
 
 export interface LoginTaskDto {
+  enterpriseId?: EnterpriseId;
+  enterpriseRevision?: number;
+  bindingVersion?: 1 | 2;
+  accountIncarnation?: string;
+  expectedGhLogin?: string;
+  expectedGithubUserId?: string;
   id: string;
   identity: string;
   ssoUser: string;

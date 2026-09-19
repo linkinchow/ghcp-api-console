@@ -3,6 +3,7 @@ import test from 'node:test';
 import type { Pool, PoolConnection } from 'mysql2/promise';
 import { MysqlStorage } from './mysqlStorage.js';
 import { MysqlDeadlineError } from '../userPool/mysqlDeadline.js';
+import { fixtureRegistry } from '../test/enterpriseFixtures.js';
 
 function fixture(mode: 'execute' | 'commit' | 'rollback' = 'execute') {
   let destroyed = 0, released = 0, rollbacks = 0;
@@ -21,7 +22,11 @@ function fixture(mode: 'execute' | 'commit' | 'rollback' = 'execute') {
     destroy() { destroyed++; }, release() { released++; },
   } as unknown as PoolConnection;
   const pool = { async getConnection() { return connection; } } as unknown as Pool;
-  return { storage: new MysqlStorage(pool, 2), counts: () => ({ destroyed, released, rollbacks }), calls };
+  const storage = new MysqlStorage(pool, 2);
+  // Driver-boundary test only: install the parsed synthetic scope without running
+  // initialization SQL on the intentionally stalled/broken mysql2 connection.
+  assert.equal(Reflect.set(storage, 'registry', fixtureRegistry()), true);
+  return { storage, counts: () => ({ destroyed, released, rollbacks }), calls };
 }
 
 for (const operation of ['getAccount', 'recordRequestStat', 'ping'] as const) {

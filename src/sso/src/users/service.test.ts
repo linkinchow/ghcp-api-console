@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { initSsoFixture } from '../db/enterpriseFixture.js';
 
 test('continues deleting an SSO user when the GitHub user has no Copilot seat', async () => {
-  process.env.DB_PATH = ':memory:';
   process.env.SSO_USER_EVENTS_LOG = '/dev/null';
   process.env.SCIM_BASE_URL = 'https://scim.test/scim/v2/enterprises/test';
   process.env.SCIM_TOKEN = 'test-scim-token';
@@ -12,6 +12,8 @@ test('continues deleting an SSO user when the GitHub user has no Copilot seat', 
   process.env.ENTERPRISE_SLUG = 'test-enterprise';
   process.env.GITHUB_COPILOT_SEAT_PAT = 'test-seat-token';
   process.env.LOG_LEVEL = 'error';
+  const scope = initSsoFixture();
+  const { getUser: incarnationUser } = await import('../db/usersRepo.js');
 
   const originalFetch = globalThis.fetch;
   const requests: Array<{ url: string; method: string }> = [];
@@ -25,12 +27,13 @@ test('continues deleting an SSO user when the GitHub user has no Copilot seat', 
     if (url.startsWith('https://scim.test/')) {
       return jsonResponse(200, { Resources: [] });
     }
-    if (url === 'https://proxy.test/internal/accounts/by-sso-user/alice/pool-membership' && method === 'GET') {
+    if (url.endsWith('/accounts/by-sso-user/alice/pool-membership') && method === 'GET') {
       assert.equal(new Headers(init?.headers).get('X-Internal-Token'), 'test-internal-token');
-      return jsonResponse(200, { managed: false });
+      return jsonResponse(200, { managed: false, enterpriseId: scope.enterpriseId, enterpriseRevision: scope.enterpriseRevision, contractVersion: 2 });
     }
     if (url.startsWith('https://proxy.test/')) {
       return jsonResponse(200, {
+        enterpriseId: scope.enterpriseId, enterpriseRevision: scope.enterpriseRevision, contractVersion: 2,
         ssoUser: 'alice',
         matchedAccounts: 0,
         deletedAccounts: 0,
@@ -44,26 +47,26 @@ test('continues deleting an SSO user when the GitHub user has no Copilot seat', 
     const { createUser, getUser, updateEmu } = await import('../db/usersRepo.js');
     const { updateSsoRuntimeSettings } = await import('../db/runtimeSettingsRepo.js');
     const { runSsoUserBatch } = await import('./service.js');
-    updateSsoRuntimeSettings({ expectedVersion: 1, changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 } });
+    updateSsoRuntimeSettings({ expectedVersion: 1, changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 } }, scope);
     createUser({
       ssoUser: 'alice',
       passwordHash: 'hash',
       salt: 'salt',
       email: 'alice@example.com',
-    });
-    updateEmu('alice', { ghLogin: 'alice_emu', emuStatus: 'active' });
+    }, scope);
+    updateEmu('alice', { ghLogin: 'alice_emu', emuStatus: 'active' }, (incarnationUser('alice', scope)!.userIncarnation), scope);
 
     const result = await runSsoUserBatch({
       operation: 'delete_sso',
       ssoUsers: ['alice'],
-    });
+    }, scope);
 
     assert.equal(result.summary.success, 1);
     assert.equal(result.summary.failed, 0);
     assert.equal(result.summary.warnings, 1);
     assert.equal(result.rows[0]?.status, 'success');
     assert.match(result.rows[0]?.warning ?? '', /has no Copilot seat/);
-    assert.equal(getUser('alice'), undefined);
+    assert.equal(getUser('alice', scope), undefined);
     assert.deepEqual(requests.map(({ method }) => method), ['GET', 'DELETE', 'GET', 'DELETE']);
   } finally {
     globalThis.fetch = originalFetch;

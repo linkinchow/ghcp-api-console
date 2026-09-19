@@ -1,3 +1,4 @@
+import { configureProxyFixture, TEST_ENTERPRISE } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
@@ -42,10 +43,12 @@ test('runtime captures inference-only override without changing store config, ca
       READY_IDLE_TARGET: '0', POOL_MAX_ACCOUNTS: '4', POOL_REQUEST_TIMEOUT_SECONDS: '120',
       POOL_INFERENCE_TIMEOUT_SECONDS: '600' });
     await stopUserPool(); await closeStorage();
+    config.dbPath = configureProxyFixture();
     const store = (await getUserPool())!;
     const acquired: Array<{ kind: string; override?: number }> = [];
     const finished: boolean[] = [];
-    const held: HeldLease = { caller_id: caller, member_identity: 'synthetic-member', lease_id: 'synthetic-lease',
+    const held: HeldLease = { enterprise_id: TEST_ENTERPRISE.id, enterprise_revision: TEST_ENTERPRISE.revision,
+      caller_id: caller, member_identity: 'synthetic-member', lease_id: 'synthetic-lease',
       phase: 'active', assigned_at: 1, expires_at: 1000000, last_success_at: 1,
       request_id: 'synthetic-request', kind: 'lease', deadline_at: 600000 };
     store.acquire = (_caller, _signal, override) => { acquired.push({ kind: 'lease', override }); return held; };

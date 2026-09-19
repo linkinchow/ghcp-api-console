@@ -9,6 +9,14 @@
 
 > 管理员的通用配置手册：[guidance/guidance.md](./guidance/guidance.md) · 网络配置：[guidance/network-deployment.md](./guidance/network-deployment.md)
 
+## 多企业功能开发分支：启动前必读
+
+`feat/multi-sso-slug` 已实现第四阶段的 **多企业账号池调度与 Console 企业管理**：Proxy 使用 **schema4 / contract2 / `enterprise-multi-pool`**，SSO/Login 保持 **schema3 / contract2**，registry JSON 保持 version3。企业使用固定内部UUID主键及真实GitHub slug/EMU shortcode；每企业一个 `max_accounts`、全局一个 `idle_target`，按当前库存占比缺口调度，不增加独立权重。
+
+**本分支的Proxy、SSO、Login不在启动时自动建表或升级旧库。** 三服务使用同一可信registry的`ENTERPRISE_REGISTRY_FILE`；旧单企业schema先走v1→2，再执行schema2→3，最后显式升级Proxy3→4。新装使用v4工具（Proxy4＋SSO/Login3）；已有库按维护流程执行`preflight/apply/verify`，新增profile仍通过离线登记，默认draft，校验后由管理员显式启用。历史快速启动/滚动升级命令不能直接用于本分支的数据版本。
+
+参见：[第六阶段审查与修复](./docs/user-pool-multi-sso-slug-phase6-validation.md) · [候选发布说明](./docs/user-pool-multi-sso-slug-release-notes.md) · [客户多企业升级指南](./docs/user-pool-multi-sso-slug-upgrade-guide.md) · [第五阶段实库验收](./docs/user-pool-multi-sso-slug-phase5-validation.md) · [Proxy schema3→4工具](./upgrade/multi-enterprise-pool/README.md) · [第四阶段历史报告](./docs/user-pool-multi-sso-slug-phase4-validation.md) · [schema2→3工具](./upgrade/multi-enterprise/README.md) · [v1→2工具](./upgrade/default-enterprise/README.md)。客户路径仍为Proxy MySQL＋SSO/Login各自SQLite，Console管理员文件保持不变。第五阶段已在隔离Azure环境实际执行MySQL8.4.11、三Proxy全栈mock、迁移/恢复与有界稳定性验证；**不是客户生产升级批准，未执行真实GitHub多企业验收或客户部署**。运行账号的schema级TRIGGER权限及DDL能力、停旧writer边界须按升级指南由客户DBA评审。
+
 ## User Pool：多 Proxy＋MySQL
 
 当前 `ghcp-user-pool-ops-handoff` 分支支持 **MySQL 共享账号池和多个 Proxy 副本**，同时保留 SQLite 单 Proxy 和默认 `direct` 模式。已有 SQLite User Pool 升级时，请从下面的客户指南开始，不要直接照后文的新环境快速启动命令操作原数据。

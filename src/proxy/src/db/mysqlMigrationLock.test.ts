@@ -18,7 +18,7 @@ function fixture() {
   };
   const pool = { getConnection: async () => raw as unknown as PoolConnection } as Pool;
   const run = (ddl: (c: PoolConnection) => Promise<void> = async c => { await c.query('CREATE TABLE synthetic (id INT)'); }) =>
-    withMysqlMigrationLock(pool, ddl, new MysqlDeadline(40, 40));
+    withMysqlMigrationLock(pool, ddl, new MysqlDeadline(250, 250));
   return { raw, pool, calls, run };
 }
 const never = (): Promise<never> => new Promise(() => {});

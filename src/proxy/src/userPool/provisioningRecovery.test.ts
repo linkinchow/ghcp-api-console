@@ -1,3 +1,5 @@
+import { completeFixtureAttempt, failFixtureAttempt } from '../test/enterpriseFixtures.js';
+import { createSqliteStorageFixture, TEST_ENTERPRISE, fixtureProfile } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
@@ -10,13 +12,13 @@ import { PrewarmWorker, type PrewarmStore } from './worker.js';
 for (const fault of ['before-write', 'after-write-before-ack'] as const) {
   test(`terminal Login callback failure (${fault}) recovers with one new OAuth attempt, not new identities`,
     { timeout: 15000 }, async t => {
-      const storage = new SqliteStorage(':memory:', 100);
-      let worker: PrewarmWorker | undefined;
-      t.after(async () => { await worker?.stop(); await storage.close(); });
-      await storage.initialize();
       const options = readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease',
         POOL_ACCOUNT_EMAIL_DOMAIN: 'recovery.test', POOL_WARMUP_MODEL: 'synthetic',
         READY_IDLE_TARGET: '1', POOL_MAX_ACCOUNTS: '1', POOL_LOGIN_MAX_PENDING: '1' });
+      const storage = createSqliteStorageFixture(options);
+      let worker: PrewarmWorker | undefined;
+      t.after(async () => { await worker?.stop(); await storage.close(); });
+      await storage.initialize();
       const store = storage.userPool(options);
       let now = store.now(), monotonicNow = 0;
       store.now = () => now;
@@ -36,6 +38,7 @@ for (const fault of ['before-write', 'after-write-before-ack'] as const) {
         reserveDeficit: owner => later(() => store.reserveDeficit(owner)),
         pending: excluded => later(() => store.pending(excluded)),
         hasHolds: id => later(() => store.hasHolds(id)),
+        canProvision: id => later(() => store.canProvision(id)),
         inventory: id => later(() => store.inventory(id)),
         update: (...args) => later(() => store.update(...args)),
         fail: (...args) => later(() => store.fail(...args)),
@@ -54,13 +57,15 @@ for (const fault of ['before-write', 'after-write-before-ack'] as const) {
       let user: SsoUserDto | undefined;
       const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
       const adapter = realProvisioner(asyncStore, options, {
+        enterpriseProfile: id => { assert.equal(id, TEST_ENTERPRISE.id); const profile = fixtureProfile(options); return {...profile,routes:{...profile.routes,ssoInternalUrl:'http://sso.recovery.test',loginInternalUrl:'http://login.recovery.test'}}; },
+        verifyReadiness: async (profile, signal) => { assert.equal(profile.id, TEST_ENTERPRISE.id); signal.throwIfAborted(); },
         async getAccount(id) {
           await yieldTurn();
           return storage.getAccount(id);
         },
         async fetch(input, init) {
           await yieldTurn();
-          const url = new URL(String(input)), method = init?.method ?? 'GET';
+          const url = new URL(String(input)); url.pathname=url.pathname.replace(`/api/profiles/${TEST_ENTERPRISE.id}`, '/api'); const method = init?.method ?? 'GET';
           const body = () => JSON.parse(String(init?.body));
           if (url.pathname === '/api/users' && method === 'POST') {
             const request = body() as { ssoUser: string };
@@ -68,7 +73,7 @@ for (const fault of ['before-write', 'after-write-before-ack'] as const) {
             assert.equal(store.inventory(request.ssoUser)!.stage, 'sso-creating');
             assert.deepEqual(request, { ssoUser: request.ssoUser,
               email: `${request.ssoUser}@recovery.test`, role: 'user', poolManaged: true });
-            user = { ssoUser: request.ssoUser, email: `${request.ssoUser}@recovery.test`, role: 'user',
+            user = { enterpriseId: TEST_ENTERPRISE.id, userIncarnation: '22222222-2222-4222-8222-222222222222', ssoUser: request.ssoUser, email: `${request.ssoUser}@recovery.test`, role: 'user',
               emuStatus: 'not_synced', copilotSeatStatus: 'unassigned',
               createdAt: new Date(now).toISOString(), updatedAt: new Date(now).toISOString() };
             return json(user);
@@ -79,7 +84,7 @@ for (const fault of ['before-write', 'after-write-before-ack'] as const) {
             assert.equal(store.inventory(user.ssoUser)!.stage, 'scim-syncing');
             assert.deepEqual(body(), { operation: 'sync_emu', ssoUsers: [user.ssoUser],
               assignCopilotSeat: false, createOnly: true });
-            user = { ...user, ghLogin: `${user.ssoUser}_emu`, ghScimId: 'synthetic-scim-original', emuStatus: 'active' };
+            user = { ...user, ghLogin: `${user.ssoUser.replaceAll('.', '-')}_emu`, ghScimId: 'synthetic-scim-original', emuStatus: 'active' };
             return json({ rows: [{ ssoUser: user.ssoUser, status: 'success', user }] });
           }
           if (url.pathname.startsWith('/api/users/')) {
@@ -107,7 +112,8 @@ for (const fault of ['before-write', 'after-write-before-ack'] as const) {
             const row = store.inventory(request.identity)!;
             assert.equal(row.stage, 'oauth-dispatch', 'Login POST requires the real persisted dispatch claim');
             assert.ok(row.oauth_attempt_id);
-            assert.deepEqual(request, { identity: user.ssoUser, ssoUser: user.ssoUser, ghLogin: user.ghLogin,
+            assert.deepEqual(request, { enterpriseId: TEST_ENTERPRISE.id, enterpriseRevision: TEST_ENTERPRISE.revision,
+              identity: user.ssoUser, ssoUser: user.ssoUser, expectedGhLogin: user.ghLogin, accountIncarnation:(await storage.getAccount(row.identity))!.accountIncarnation,
               oauthAttemptId: row.oauth_attempt_id, ssoType: 'custom', ssoPassword: 'synthetic-password' });
             const count = (postsPerAttempt.get(request.oauthAttemptId) ?? 0) + 1;
             postsPerAttempt.set(request.oauthAttemptId, count);
@@ -115,7 +121,7 @@ for (const fault of ['before-write', 'after-write-before-ack'] as const) {
             const account = await storage.getAccount(row.identity);
             assert.equal(account?.copilotOauthAttemptId, row.oauth_attempt_id);
             assert.equal(account?.copilotOauthStatus, 'refreshing');
-            const task: LoginTaskDto = { id: `synthetic-task-${posted.length + 1}`, identity: row.identity,
+            const task: LoginTaskDto = { enterpriseId:TEST_ENTERPRISE.id,enterpriseRevision:TEST_ENTERPRISE.revision,accountIncarnation:account!.accountIncarnation,expectedGhLogin:user.ghLogin, id: `synthetic-task-${posted.length + 1}`, identity: row.identity,
               ssoUser: row.identity, ghLogin: user.ghLogin, oauthAttemptId: request.oauthAttemptId,
               ssoType: 'custom', status: 'running', attempts: 1, createdAt: new Date(now).toISOString() };
             tasks.set(task.id, task); posted.push(task);
@@ -197,7 +203,7 @@ for (const fault of ['before-write', 'after-write-before-ack'] as const) {
         try {
           await yieldTurn();
           if (fault === 'before-write') throw callbackError;
-          assert.ok(await storage.saveCopilotOauthToken(identity, first.oauthAttemptId!,
+          assert.ok(await completeFixtureAttempt(storage,identity, first.oauthAttemptId!,
             'synthetic-unacknowledged-token', first.ghLogin));
           throw callbackError;
         } catch (error) {
@@ -252,16 +258,16 @@ for (const fault of ['before-write', 'after-write-before-ack'] as const) {
         const row = store.inventory(identity)!;
         // These are the production SQLite methods called by the internal callback API,
         // not SQL approximations: stale success must not overwrite and failure must not revoke.
-        assert.equal(await storage.saveCopilotOauthToken(identity, first.oauthAttemptId!,
+        assert.equal(await completeFixtureAttempt(storage,identity, first.oauthAttemptId!,
           'synthetic-stale-token', first.ghLogin), undefined, 'reject stale success callback');
-        assert.equal(await storage.failCopilotOauthAuthorization(identity, first.oauthAttemptId!), false,
+        assert.equal(await failFixtureAttempt(storage,identity, first.oauthAttemptId!), false,
           'reject stale failure callback');
         assert.deepEqual(await storage.getAccount(identity), account);
         assert.deepEqual(store.inventory(identity), row, 'stale callbacks must not alter generation or verification');
       };
       await rejectOldCallbacks(); // Fence the old nonce while the replacement is still refreshing.
       const replacementGeneration = store.inventory(identity)!.generation;
-      const saved = await storage.saveCopilotOauthToken(identity, replacement.oauthAttemptId!,
+      const saved = await completeFixtureAttempt(storage,identity, replacement.oauthAttemptId!,
         'synthetic-replacement-token', replacement.ghLogin);
       assert.equal(saved?.copilotOauthStatus, 'valid');
       assert.equal(saved?.copilotOauthAttemptId, undefined);

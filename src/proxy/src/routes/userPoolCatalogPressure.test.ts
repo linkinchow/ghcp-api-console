@@ -1,3 +1,4 @@
+import { configureProxyFixture } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import { EventEmitter, once } from 'node:events';
 import { randomUUID } from 'node:crypto';
@@ -46,7 +47,7 @@ before(async () => {
   Object.assign(process.env, safeEnv);
   modules = await loadModules();
   savedConfig = { ...modules.config };
-  Object.assign(modules.config, { storageDriver: 'sqlite', dbPath: ':memory:', apiKey: safeEnv.API_KEY,
+  Object.assign(modules.config, { storageDriver: 'sqlite', dbPath: process.env.DB_PATH!, apiKey: safeEnv.API_KEY,
     copilotApiBaseUrl: safeEnv.COPILOT_API_BASE_URL, errorDiagnosticsEnabled: false, claudeCodeOptimized: true,
     requestStatsPerAccountLimit: 100 });
 });
@@ -78,6 +79,9 @@ type RequestResult = { status: number; text: string; bytes: number; method: stri
 
 async function fixture(t: TestContext) {
   const { config, getUserPool, UserPoolStore, importCopilotOauthToken, clearModelsCache } = modules;
+  // Each scenario previously relied on a new :memory: DB. Explicit file initialization
+  // must preserve that isolation rather than reopen a cap-filled prior scenario.
+  config.dbPath = configureProxyFixture();
   const pool = await getUserPool();
   assert.ok(pool instanceof UserPoolStore);
   const store: UserPoolStore = pool;

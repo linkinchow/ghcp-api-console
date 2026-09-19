@@ -7,7 +7,7 @@
     "start": "tsx src/server/index.ts",
     "start:prod": "node dist/server/index.js",
     "pretest": "npm --workspace @ghcp/shared run build",
-    "test": "tsx --test src/server/*.test.ts src/web/lib/*.test.ts",
+    "test": "tsx --test src/server/*.test.ts src/web/lib/*.test.ts src/web/api/*.test.ts",
     "test:browser": "npm run build && tsx --test src/web/pages/*.browser.test.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc && vite build"

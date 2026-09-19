@@ -1,5 +1,6 @@
 import type {
   CopilotOauthStatus,
+  AuthorizationBinding,
   DeleteProxyAccountResult,
   PageResponse,
   ProxyAccountDto,
@@ -24,19 +25,19 @@ export async function listAccounts(query: AccountListQuery = {}): Promise<PageRe
   return getStorage().listAccounts(query);
 }
 
-export async function getAccount(identity: string): Promise<ProxyAccountRecord | undefined> {
+export async function getAccount(identity: string, enterpriseId?: string): Promise<ProxyAccountRecord | undefined> {
   await initializeStorage();
-  return getStorage().getAccount(identity);
+  return getStorage().getAccount(identity, enterpriseId);
 }
 
-export async function deleteAccount(identity: string): Promise<DeleteProxyAccountResult | undefined> {
+export async function deleteAccount(identity: string, enterpriseId?: string, expectedAccountIncarnation?: string): Promise<DeleteProxyAccountResult | undefined> {
   await initializeStorage();
-  return getStorage().deleteAccount(identity);
+  return getStorage().deleteAccount(identity, enterpriseId, expectedAccountIncarnation);
 }
 
-export async function deleteAccountsBySsoUser(ssoUser: string): Promise<DeleteAccountsBySsoUserResult> {
+export async function deleteAccountsBySsoUser(ssoUser: string, enterpriseId?: string): Promise<DeleteAccountsBySsoUserResult> {
   await initializeStorage();
-  return getStorage().deleteAccountsBySsoUser(ssoUser);
+  return getStorage().deleteAccountsBySsoUser(ssoUser, enterpriseId);
 }
 
 export async function createAccount(input: CreateAccountInput): Promise<ProxyAccountRecord> {
@@ -44,9 +45,18 @@ export async function createAccount(input: CreateAccountInput): Promise<ProxyAcc
   return getStorage().createAccount(input);
 }
 
-export async function importCopilotOauthToken(input: ImportCopilotOauthTokenInput): Promise<ProxyAccountRecord> {
+export async function getCopilotOauthTokenImportFence(identity: string, enterpriseId?: string) {
   await initializeStorage();
-  return getStorage().importCopilotOauthToken(input);
+  return getStorage().getCopilotOauthTokenImportFence(identity,enterpriseId);
+}
+
+export async function importCopilotOauthToken(input: Omit<ImportCopilotOauthTokenInput,'expectedAccount'> & Partial<Pick<ImportCopilotOauthTokenInput,'expectedAccount'>>): Promise<ProxyAccountRecord> {
+  await initializeStorage();
+  // Trusted in-process callers have no external validation gap. CSV validators
+  // must pass their earlier snapshot instead of recapturing at write time.
+  const storage = getStorage();
+  const expectedAccount = input.expectedAccount ?? await storage.getCopilotOauthTokenImportFence(input.identity,input.enterpriseId);
+  return storage.importCopilotOauthToken({...input,expectedAccount});
 }
 
 export async function saveCopilotOauthToken(
@@ -64,14 +74,14 @@ export async function markCopilotOauthStatus(identity: string, status: CopilotOa
   await getStorage().markCopilotOauthStatus(identity, status);
 }
 
-export async function beginCopilotOauthAuthorization(identity: string, oauthAttemptId: string): Promise<boolean> {
+export async function beginCopilotOauthAuthorization(identity: string, oauthAttemptId: string, enterpriseId?: string): Promise<boolean> {
   await initializeStorage();
-  return getStorage().beginCopilotOauthAuthorization(identity, oauthAttemptId);
+  return getStorage().beginCopilotOauthAuthorization(identity, oauthAttemptId, enterpriseId);
 }
 
-export async function failCopilotOauthAuthorization(identity: string, oauthAttemptId: string): Promise<boolean> {
+export async function failCopilotOauthAuthorization(identity: string, oauthAttemptId: string, binding?: AuthorizationBinding): Promise<boolean> {
   await initializeStorage();
-  return getStorage().failCopilotOauthAuthorization(identity, oauthAttemptId);
+  return getStorage().failCopilotOauthAuthorization(identity, oauthAttemptId, binding);
 }
 
 export async function invalidateCopilotOauthToken(
@@ -99,6 +109,8 @@ export async function releaseIdentityInitialization(identity: string, claimId: s
 
 export function toAccountDto(account: ProxyAccountRecord): ProxyAccountDto {
   return {
+    enterpriseId: account.enterpriseId,
+    accountIncarnation: account.accountIncarnation,
     identity: account.identity,
     ssoUser: account.ssoUser,
     ghLogin: account.ghLogin,

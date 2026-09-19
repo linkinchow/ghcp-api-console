@@ -2,12 +2,11 @@ import type { UserPoolCounts, UserPoolLimits, UserPoolSettings, UserPoolSettings
 
 export interface UserPoolSettingsDraft {
   idleTarget: string;
-  maxAccounts: string;
   leaseSeconds: string;
   paused: boolean;
 }
 export function poolSettingsDraft(settings: UserPoolSettings): UserPoolSettingsDraft {
-  return { idleTarget: String(settings.idle_target), maxAccounts: String(settings.max_accounts), leaseSeconds: String(settings.lease_seconds), paused: settings.paused === 1 };
+  return { idleTarget: String(settings.idle_target), leaseSeconds: String(settings.lease_seconds), paused: settings.paused === 1 };
 }
 export function parsePoolSettingsDraft(draft: UserPoolSettingsDraft, limits: UserPoolLimits): UserPoolSettingsChanges {
   const read = (raw: string, label: string, min: number, max: number) => {
@@ -18,15 +17,13 @@ export function parsePoolSettingsDraft(draft: UserPoolSettingsDraft, limits: Use
     return value;
   };
   const idle_target = read(draft.idleTarget, 'Idle target', 0, limits.maxAccounts);
-  const max_accounts = read(draft.maxAccounts, 'Maximum accounts', 1, limits.maxAccounts);
   const lease_seconds = read(draft.leaseSeconds, 'Lease TTL', limits.minLeaseSeconds, limits.maxLeaseSeconds);
-  if (idle_target > max_accounts) throw new Error('Idle target cannot exceed maximum accounts.');
-  return { idle_target, max_accounts, lease_seconds, paused: draft.paused ? 1 : 0 };
+  return { idle_target, lease_seconds, paused: draft.paused ? 1 : 0 };
 }
 export function poolWarnings(counts: UserPoolCounts, settings: UserPoolSettings): string[] {
   const warnings: string[] = [];
   if (counts.ready_idle < settings.idle_target) {
-    warnings.push(`Low idle capacity: ${counts.ready_idle} ready idle; target ${settings.idle_target}. ${settings.idle_target - counts.ready_idle} more account(s) are needed to reach the target.`);
+    warnings.push(`Low idle capacity: ${counts.ready_idle} ready idle; target ${settings.idle_target}. See global eligible idle and pending supply for the authoritative provisioning deficit.`);
   }
   if (counts.ready_idle === 0) warnings.push('No ready idle accounts. New caller keys cannot acquire an account until capacity becomes available.');
   if (settings.paused) warnings.push('Prewarming is paused. Existing leases and ready accounts remain usable, but provisioning will not advance until resumed.');

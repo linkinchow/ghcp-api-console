@@ -1,14 +1,16 @@
+import { TEST_ENTERPRISE, fixtureProfile } from '../test/enterpriseFixtures.js';
+import { createSqlitePoolFixture } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import Database from 'better-sqlite3';
 import type { LoginTaskDto, SsoUserDto } from '@ghcp/shared';
-import { runMigrations } from '../db/migrations.js';
 import type { ProxyAccountRecord } from '../db/storageTypes.js';
 import { readPoolConfig } from './config.js';
 import { realProvisioner } from './provisioner.js';
 import { UserPoolStore } from './store.js';
+import { beginSqliteAttempt, finishSqliteAttempt } from '../db/sqliteAuthorization.js';
 import { PrewarmWorker, type PrewarmStore } from './worker.js';
 
 function deferred() {
@@ -29,11 +31,11 @@ test('async worker drains downstream work past 2000 starters and atomically refi
   { timeout: 30000 }, async t => {
     const db = new Database(':memory:');
     db.pragma('foreign_keys=ON');
-    runMigrations(db);
+
     const options = readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease',
       POOL_ACCOUNT_EMAIL_DOMAIN: 'scheduler.test', POOL_WARMUP_MODEL: 'synthetic',
       READY_IDLE_TARGET: '0', POOL_MAX_ACCOUNTS: '3000', POOL_LOGIN_MAX_PENDING: '5' });
-    const store = new UserPoolStore(db, options);
+    const store = createSqlitePoolFixture(db, options);
     let now = store.now();
     store.now = () => now;
     const createdAt = new Date(now - 60000).toISOString();
@@ -42,27 +44,34 @@ test('async worker drains downstream work past 2000 starters and atomically refi
     const starters = new Set(Array.from({ length: 2000 }, (_, n) => identity(n)));
     const reservations = Array.from({ length: 5 }, (_, n) => identity(2000 + n));
     const warmups = Array.from({ length: 5 }, (_, n) => identity(2005 + n));
-    const user = (id: string): SsoUserDto => ({ ssoUser: id, email: `${id}@scheduler.test`, role: 'user',
+    const user = (id: string): SsoUserDto => ({ enterpriseId: TEST_ENTERPRISE.id, userIncarnation: incarnations.get(id)!, ssoUser: id, email: `${id}@scheduler.test`, role: 'user',
       ghLogin: `${id}_emu`, ghScimId: `scim-${id}`, emuStatus: 'active', copilotSeatStatus: 'assigned',
       createdAt, updatedAt: createdAt });
-    const makeTask = (id: string, nonce: string): LoginTaskDto => ({ id: randomUUID(), identity: id,
+    const incarnations=new Map<string,string>();
+    const makeTask = (id: string, nonce: string): LoginTaskDto => ({
+      enterpriseId:TEST_ENTERPRISE.id,enterpriseRevision:TEST_ENTERPRISE.revision,
+      accountIncarnation:incarnations.get(id)!,expectedGhLogin:`${id}_emu`,
+      id: randomUUID(), identity: id,
       ssoUser: id, ghLogin: `${id}_emu`, oauthAttemptId: nonce, ssoType: 'custom', status: 'running',
       attempts: 1, createdAt });
 
     db.transaction(() => {
       const insertAccount = db.prepare(`INSERT INTO proxy_accounts
-        (identity,sso_user,gh_login,copilot_oauth_token,copilot_oauth_status,copilot_oauth_attempt_id,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?)`);
+        (enterprise_id,account_incarnation,identity,sso_user,gh_login,copilot_oauth_token,copilot_oauth_status,copilot_oauth_attempt_id,created_at,updated_at)
+        VALUES('86e2ee02-223a-45ea-8c26-bdd1c570a4ee',?,?,?,?,?,?,?,?,?)`);
       const insertMember = db.prepare(`INSERT INTO user_pool_accounts
         (identity,ordinal,state,stage,attempt_id,oauth_attempt_id,sso_created_at,task_id,retry_at,updated_at)
         VALUES(?,?,'provisioning',?,?,?,?,?,?,?)`);
       for (let n = 0; n < 2010; n++) {
         const id = identity(n), nonce = randomUUID();
+        incarnations.set(id,randomUUID());
         const stage = n < 2000 ? 'oauth-starting' : n === 2000 ? 'oauth-dispatch' : n < 2005 ? 'oauth-wait' : 'warmup';
         const task = n >= 2000 && n < 2005 ? makeTask(id, nonce) : undefined;
         if (task) tasks.set(task.id, task);
-        insertAccount.run(id, id, `${id}_emu`, n >= 2005 ? `synthetic-token-${id}` : null,
+        insertAccount.run(incarnations.get(id),id, id, `${id}_emu`, n >= 2005 ? `synthetic-token-${id}` : null,
           n >= 2005 ? 'valid' : task ? 'refreshing' : 'missing', task ? nonce : null, createdAt, createdAt);
+        if(task) beginSqliteAttempt(db,{enterpriseId:TEST_ENTERPRISE.id,enterpriseRevision:TEST_ENTERPRISE.revision,
+          identity:id,accountIncarnation:incarnations.get(id)!,oauthAttemptId:nonce,expectedGhLogin:`${id}_emu`});
         // Starters have the oldest due time. The recovered dispatch deliberately has
         // no task_id, although Login already accepted its correctly correlated POST.
         insertMember.run(id, n, stage, randomUUID(), nonce, createdAt,
@@ -95,6 +104,7 @@ test('async worker drains downstream work past 2000 starters and atomically refi
         finally { activePending--; }
       },
       hasHolds: id => later(() => store.hasHolds(id)),
+      canProvision: id => later(() => store.canProvision(id)),
       inventory: id => later(() => store.inventory(id)),
       update: (...args) => later(() => store.update(...args)),
       fail: (...args) => later(() => store.fail(...args)),
@@ -108,20 +118,23 @@ test('async worker drains downstream work past 2000 starters and atomically refi
     const unexpected: string[] = [];
     const json = (body: unknown) => new Response(JSON.stringify(body));
     const adapter = realProvisioner(asyncStore, options, {
+      enterpriseProfile: id => { assert.equal(id, TEST_ENTERPRISE.id); return fixtureProfile(options); },
+      verifyReadiness: async (profile, signal) => { assert.equal(profile.id, TEST_ENTERPRISE.id); signal.throwIfAborted(); },
       async getAccount(id): Promise<ProxyAccountRecord | undefined> {
         await yieldTurn();
         const account = db.prepare('SELECT * FROM proxy_accounts WHERE identity=?').get(id) as {
+          account_incarnation:string;
           identity: string; sso_user: string; gh_login: string; copilot_oauth_status: ProxyAccountRecord['copilotOauthStatus'];
           copilot_oauth_token: string | null; copilot_oauth_attempt_id: string | null; copilot_oauth_updated_at: string | null;
         } | undefined;
-        return account && { identity: id, ssoUser: account.sso_user, ghLogin: account.gh_login,
+        return account && { accountIncarnation: account.account_incarnation, enterpriseId: TEST_ENTERPRISE.id, identity: id, ssoUser: account.sso_user, ghLogin: account.gh_login,
           copilotOauthStatus: account.copilot_oauth_status, copilotOauthToken: account.copilot_oauth_token ?? undefined,
           copilotOauthAttemptId: account.copilot_oauth_attempt_id ?? undefined,
           copilotOauthUpdatedAt: account.copilot_oauth_updated_at ?? undefined, createdAt, updatedAt: createdAt };
       },
       async fetch(input, init) {
         await yieldTurn();
-        const url = new URL(String(input)), method = init?.method ?? 'GET';
+        const url = new URL(String(input)); url.pathname=url.pathname.replace(`/api/profiles/${TEST_ENTERPRISE.id}`, '/api'); const method = init?.method ?? 'GET';
         if (url.pathname.startsWith('/api/users/')) {
           const id = decodeURIComponent(url.pathname.split('/')[3]!);
           if (starters.has(id)) starterRequests.push(id);
@@ -141,7 +154,10 @@ test('async worker drains downstream work past 2000 starters and atomically refi
           assert.equal(row.stage, 'oauth-dispatch');
           assert.equal(body.oauthAttemptId, row.oauth_attempt_id);
           assert.equal(body.ssoUser, row.identity);
-          assert.equal(body.ghLogin, `${row.identity}_emu`);
+          assert.equal(body.expectedGhLogin, `${row.identity}_emu`);
+          assert.equal(body.accountIncarnation,incarnations.get(row.identity));
+          assert.equal(body.enterpriseId,TEST_ENTERPRISE.id);
+          assert.equal(body.enterpriseRevision,TEST_ENTERPRISE.revision);
           assert.equal(body.ssoPassword, 'synthetic-password');
           assert.equal(body.ssoType, 'custom');
           assert.ok(!posted.some(task => task.identity === row.identity), 'no duplicate Login POST');
@@ -202,17 +218,15 @@ test('async worker drains downstream work past 2000 starters and atomically refi
     assert.equal(occupied(), 5);
     assert.equal(posted.length, 0);
 
-    // Simulate the actual callback fence: only the matching refreshing nonce may
-    // write the credential. SQLite's production trigger increments generation.
+    // Apply the real full-binding callback CAS; its production credential fence
+    // increments generation without manufacturing a nonce-only authorization path.
     const completed = [...tasks.values()].find(task => task.identity === reservations[0])!;
     const generation = store.inventory(completed.identity)!.generation;
     now += options.pollMs;
-    const timestamp = new Date(now).toISOString();
-    assert.equal(db.prepare(`UPDATE proxy_accounts SET copilot_oauth_status='valid',copilot_oauth_token=?,
-      copilot_oauth_attempt_id=NULL,copilot_oauth_updated_at=?,updated_at=?
-      WHERE identity=? AND sso_user=? AND copilot_oauth_status='refreshing' AND copilot_oauth_attempt_id=?`)
-      .run(`synthetic-token-${completed.identity}`, timestamp, timestamp,
-        completed.identity, completed.ssoUser, completed.oauthAttemptId).changes, 1);
+    const outcome=finishSqliteAttempt(db,{enterpriseId:completed.enterpriseId!,enterpriseRevision:completed.enterpriseRevision!,
+      identity:completed.identity,accountIncarnation:completed.accountIncarnation!,oauthAttemptId:completed.oauthAttemptId!,
+      expectedGhLogin:completed.expectedGhLogin!},'succeeded',`synthetic-token-${completed.identity}`,{login:completed.expectedGhLogin!,id:'101'});
+    assert.equal(outcome.outcome,'applied');
     assert.equal(store.inventory(completed.identity)!.generation, generation + 1);
     completed.status = 'success';
     const racingTicks = storm();

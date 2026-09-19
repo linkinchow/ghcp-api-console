@@ -1,22 +1,199 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import ts from 'typescript';
 import Database from 'better-sqlite3';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
-import { runMigrations } from '../../src/proxy/src/db/migrations.js';
-import { UserPoolStore } from '../../src/proxy/src/userPool/store.js';
-import { accountName } from '../../src/proxy/src/userPool/names.js';
+import { runMigrations } from '../v1-frozen/db/migrations.js';
+import { UserPoolStore, type HeldLease } from '../v1-frozen/userPool/store.js';
+import { accountName } from '../v1-frozen/userPool/names.js';
 import { migrateSqlitePoolToMysql as migrate, mysqlPoolFromEnv, preflightSqlite, type MigrationOptions } from './migrate.js';
-import { normalizePoolConfig, readPoolConfig, type PoolConfig } from '../../src/proxy/src/userPool/config.js';
-import { MYSQL_CREDENTIAL_FENCE_DDL, SQLITE_CREDENTIAL_FENCE_DDL } from '../../src/proxy/src/db/mysqlSchema.js';
+import { normalizePoolConfig, readPoolConfig, UserPoolError, type PoolConfig } from '../v1-frozen/userPool/config.js';
+import { MYSQL_CREDENTIAL_FENCE_DDL, SQLITE_CREDENTIAL_FENCE_DDL } from '../v1-frozen/db/mysqlSchema.js';
 
 const poolConfig: PoolConfig = { enabled: true, accountDomain: 'fixture.invalid', idleTarget: 2, maxAccounts: 20,
   leaseSeconds: 172800, provisionalSeconds: 300, pollMs: 5000, retryAfterSeconds: 30,
   warmupModel: 'unused-offline', requestTimeoutMs: 120000 };
 const migrateSqlitePoolToMysql = (options: MigrationOptions) => migrate({ poolConfig, ...options });
+
+// SHA-256 of LF-normalized files at 8ad76d547c9d067aac79f99391859cc67dcd7b44.
+// These are intentional compatibility copies, not a second evolving runtime.
+const frozenBaseline: Record<string, string> = {
+  'db/migrations.ts': '4c6a0d89846c2172afe05fed42f78e7dad69705e3b1d6d94b8f678875d3c7f72',
+  'db/mysqlMigrations.ts': '266de57b4b13ea679fdb729d4e765f34cb1d7d48a1d108197facc8c737d85763',
+  'db/mysqlMigrationLock.ts': '33f46f4e8b93a73be7c35eea0cddd0657eee7209c763f278f7478e384a65b7f6',
+  'db/mysqlSchema.ts': '8ba4c05f020f4e20805342a25052d63f7adf067f0958bc0657ecc0725d4f19be',
+  'userPool/config.ts': 'fe875d2592c680decf449021dfc37c335c457f634f38f2bb4ab8499b08bd963e',
+  'userPool/names.ts': 'e12598f8bfb79e7309d96651ba3208b4bbb3ece41fe88b2302c8ef376d97d84b',
+  'userPool/nameCatalog.json': '300b019ad4ed10c25071af2e8105b6fc556bfb4378bf77d3cddd90f5858951b5',
+  'userPool/paging.ts': '298a73545693a1de44b33cee4d18830887848102cb23d5ab20c597dc11474950',
+  'userPool/store.ts': 'aeddb1b05008b35715b37d1366faab37f80dea8cfbcda6b4864e36767771cb1f',
+  'userPool/storage.ts': 'f4acb7977915937bc846dc55d917bdd882f106cb6e008241cb84bef4125607f7',
+  'userPool/mysqlStore.ts': '53b0d80f8db511624feed7b34a76a799c5d8e44edd43df333d2a1003f19a66bc',
+  'userPool/mysqlMigrations.ts': '245c7ea9882bb7418b750fe3e1febbcb84f74270f13b500975a782afe19df6b8',
+  'userPool/mysqlDeadline.ts': 'ff78364275255dcb5234d459c41b60d10391449158b135ba12934f8c317dc4ca',
+  'userPool/mysqlCallerGate.ts': '2398b9af9b55aeff4fe0f0b0923bec0f05f7d8981c8fc37a783191cb625491eb',
+  'userPool/scheduling.ts': 'ff299e2a31fb09684db0e0f216047490ba54b9f403a03c13aee363c1acb5214e',
+  'userPool/inferenceTimeout.ts': 'dcce0be3c33d78fc77cfdf1adf6ac888e9192342d648e5636b9bdcc2df675834',
+};
+const upgradeRoot = fileURLToPath(new URL('../', import.meta.url));
+function sourceFiles(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
+    const path = join(directory, entry.name);
+    return entry.isDirectory() ? sourceFiles(path) : /\.(?:ts|json)$/.test(entry.name) ? [path] : [];
+  });
+}
+
+test('frozen v1 dependencies and fixture builders retain exact 8ad76d5 baseline content', () => {
+  const root = join(upgradeRoot, 'v1-frozen');
+  assert.deepEqual(sourceFiles(root).map(path => relative(root, path).replaceAll('\\', '/')).sort(),
+    Object.keys(frozenBaseline).sort());
+  for (const [path, hash] of Object.entries(frozenBaseline)) {
+    const source = readFileSync(join(root, path), 'utf8').replaceAll('\r\n', '\n');
+    assert.equal(createHash('sha256').update(source).digest('hex'), hash, `Frozen v1 baseline changed: ${path}`);
+    assert.doesNotMatch(source, /\bprocess\s*\.\s*env\b|\bdotenv\b/, `Frozen module must not read runtime environment: ${path}`);
+  }
+});
+
+test('old upgrade tools, tests and frozen dependencies have no runtime import edges', () => {
+  const files = ['sqlite-to-mysql', 'user-pool-mysql', 'v1-frozen']
+    .flatMap(directory => sourceFiles(join(upgradeRoot, directory)));
+  const allowedFiles = new Set(files.map(path => resolve(path)));
+  const allowedPackages = new Set(['better-sqlite3', 'mysql2/promise', 'typescript']);
+  for (const path of files.filter(path => path.endsWith('.ts'))) {
+    const source = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true);
+    const check = (specifier: ts.Node | undefined) => {
+      assert.ok(specifier && ts.isStringLiteralLike(specifier), `Only literal imports are supported in ${path}`);
+      const name = specifier.text;
+      if (name.startsWith('node:') || allowedPackages.has(name)) return;
+      assert.ok(name.startsWith('.'), `Unexpected external import ${name} in ${path}`);
+      const target = resolve(dirname(path), name.replace(/\.js$/, '.ts'));
+      assert.ok(allowedFiles.has(target), `Import leaves the frozen/legacy upgrade boundary: ${name} in ${path}`);
+      if (path.startsWith(join(upgradeRoot, 'v1-frozen'))) {
+        assert.ok(target.startsWith(join(upgradeRoot, 'v1-frozen') + sep),
+          `Frozen dependency must stay within v1-frozen: ${name} in ${path}`);
+      }
+    };
+    const visit = (node: ts.Node) => {
+      if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node) && node.moduleSpecifier) check(node.moduleSpecifier);
+      if (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword
+        || ts.isIdentifier(node.expression) && node.expression.text === 'require')) check(node.arguments[0]);
+      if (ts.isImportTypeNode(node)) {
+        assert.ok(ts.isLiteralTypeNode(node.argument));
+        check(node.argument.literal);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+  }
+});
+
+// Historical v1 cases moved out of runtime suites when those suites adopted enterprise schemas.
+// Assertions and fixture semantics are retained from 8ad76d5.
+test('initial pool schema upgrades preserve inventory and drain unfenced legacy holds', (t) => {
+  const options = readPoolConfig({
+    ACCOUNT_ROUTING_MODE: 'caller-lease', POOL_ACCOUNT_EMAIL_DOMAIN: 'accounts.example.test',
+    POOL_WARMUP_MODEL: 'test-model', READY_IDLE_TARGET: '10', POOL_MAX_ACCOUNTS: '100',
+  });
+  const caller = (number: number): string => `sha256:${number.toString(16).padStart(64, '0')}`;
+  function errorCode(action: () => unknown, code: string, status?: number): void {
+    assert.throws(action, (error: unknown) => error instanceof UserPoolError && error.code === code
+      && (status === undefined || error.status === status));
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'user-pool-migration-'));
+  const db = new Database(join(dir, 'legacy.sqlite'));
+  t.after(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  db.pragma('foreign_keys = ON');
+  runMigrations(db);
+  db.exec(`
+    CREATE TABLE user_pool_settings (
+      id INTEGER PRIMARY KEY, version INTEGER NOT NULL DEFAULT 1, idle_target INTEGER NOT NULL,
+      max_accounts INTEGER NOT NULL, lease_seconds INTEGER NOT NULL, paused INTEGER NOT NULL DEFAULT 0,
+      next_ordinal INTEGER NOT NULL DEFAULT 0, account_domain TEXT NOT NULL,
+      owner TEXT, owner_until INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE user_pool_accounts (
+      identity TEXT PRIMARY KEY REFERENCES proxy_accounts(identity), ordinal INTEGER UNIQUE NOT NULL,
+      state TEXT NOT NULL, stage TEXT NOT NULL DEFAULT 'new', attempt_id TEXT NOT NULL, task_id TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+      updated_at INTEGER NOT NULL, cooldown_until INTEGER NOT NULL DEFAULT 0, verified_at INTEGER
+    );
+    CREATE TABLE user_pool_leases (
+      caller_id TEXT PRIMARY KEY, member_identity TEXT UNIQUE NOT NULL REFERENCES user_pool_accounts(identity),
+      lease_id TEXT UNIQUE NOT NULL, phase TEXT NOT NULL, assigned_at INTEGER NOT NULL,
+      last_success_at INTEGER, expires_at INTEGER NOT NULL
+    );
+    CREATE TABLE user_pool_holds (
+      request_id TEXT PRIMARY KEY, lease_id TEXT NOT NULL REFERENCES user_pool_leases(lease_id) ON DELETE CASCADE,
+      expires_at INTEGER NOT NULL
+    );
+  `);
+  let now = 1_800_000_000_000;
+  const member = accountName(0);
+  db.prepare(`INSERT INTO user_pool_settings
+    (id, idle_target, max_accounts, lease_seconds, account_domain, next_ordinal) VALUES (1, 10, 100, 172800, ?, 1)`)
+    .run(options.accountDomain);
+  db.prepare(`INSERT INTO proxy_accounts
+    (identity, sso_user, copilot_oauth_status, copilot_oauth_token, created_at, updated_at)
+    VALUES (?, ?, 'valid', 'old-token', 'old', 'old')`).run(member, member);
+  db.prepare(`INSERT INTO user_pool_accounts(identity, ordinal, state, stage, attempt_id, updated_at, verified_at)
+    VALUES (?, 0, 'ready', 'ready', 'old-attempt', ?, ?)`).run(member, now, now);
+  db.prepare('INSERT INTO user_pool_leases VALUES (?, ?, ?, ?, ?, NULL, ?)')
+    .run(caller(1), member, 'legacy-lease', 'provisional', now, now + 1000);
+  db.prepare('INSERT INTO user_pool_holds VALUES (?, ?, ?)').run('legacy-request', 'legacy-lease', now + 5000);
+  const store = new UserPoolStore(db, options);
+  store.now = () => now;
+  const held: HeldLease = { ...store.leases()[0], request_id: 'legacy-request' };
+  assert.equal(store.inventory(member)!.generation, 0);
+  assert.equal(store.inventory(member)!.oauth_attempt_id, null);
+  assert.equal(store.heartbeat(held), false);
+  now += 2000;
+  store.reclaim();
+  errorCode(() => store.acquire(caller(2)), 'pool_exhausted');
+  assert.equal(store.hasHolds(member), true);
+  now += 3000;
+  store.reclaim();
+  assert.equal(store.hasHolds(member), false);
+  const replacement = store.acquire(caller(2));
+  store.finish(held, true);
+  assert.equal(store.leases()[0].lease_id, replacement.lease_id);
+  assert.equal(store.leases()[0].phase, 'provisional');
+});
+
+test('existing OAuth accounts preserve credentials and duplicate identity aliases without implicit pool enrollment', () => {
+  const db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
+  try {
+    db.exec(`
+      CREATE TABLE proxy_accounts (
+        identity TEXT PRIMARY KEY, sso_user TEXT NOT NULL, gh_login TEXT,
+        copilot_oauth_token TEXT, copilot_oauth_status TEXT NOT NULL,
+        copilot_oauth_updated_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      INSERT INTO proxy_accounts VALUES
+        ('legacy.user','legacy.user','legacy-user_test','existing-oauth-token','valid','2026-08-01','2026-07-01','2026-08-01'),
+        ('legacy.user@example.test','legacy.user','legacy-user_test','existing-oauth-token','valid','2026-08-02','2026-07-02','2026-08-02');
+    `);
+    const before = db.prepare('SELECT * FROM proxy_accounts ORDER BY identity').all();
+    runMigrations(db);
+    runMigrations(db);
+    const after = db.prepare('SELECT identity,sso_user,gh_login,copilot_oauth_token,copilot_oauth_status,copilot_oauth_updated_at,created_at,updated_at FROM proxy_accounts ORDER BY identity').all();
+    assert.deepEqual(after, before);
+    assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE name='user_pool_accounts'").get(), undefined);
+    const pool = new UserPoolStore(db, readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease',
+      POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test', POOL_WARMUP_MODEL: 'test-model', READY_IDLE_TARGET: '0' }));
+    assert.equal(pool.counts().total, 0);
+    assert.equal(pool.reserve(), undefined);
+    assert.deepEqual(db.prepare('SELECT identity,sso_user,gh_login,copilot_oauth_token,copilot_oauth_status,copilot_oauth_updated_at,created_at,updated_at FROM proxy_accounts ORDER BY identity').all(), before);
+  } finally { db.close(); }
+});
 
 const now = Date.now();
 const timestamp = new Date(now - 10000).toISOString();
@@ -317,7 +494,7 @@ test('isolated MySQL 8 copy, content verification, rollback and concurrent-impor
     const { idleTarget: _idle, maxAccounts: _max, leaseSeconds: _lease, enabled: _enabled, callerDomain: _legacy, ...invariants } = normalizePoolConfig(poolConfig);
     assert.equal(settings[0].config_fingerprint, createHash('sha256')
       .update(JSON.stringify(Object.entries(invariants).sort(([a], [b]) => a.localeCompare(b)))).digest('hex'));
-    const { MysqlPoolStore: RuntimeStore } = await import('../../src/proxy/src/userPool/mysqlStore.js');
+    const { MysqlPoolStore: RuntimeStore } = await import('../v1-frozen/userPool/mysqlStore.js');
     const runtimeConfig = readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease', STORAGE_DRIVER: 'mysql',
       POOL_ACCOUNT_EMAIL_DOMAIN: poolConfig.accountDomain, POOL_WARMUP_MODEL: poolConfig.warmupModel });
     assert.equal(runtimeConfig.prewarmConcurrency, 5);
@@ -341,9 +518,9 @@ test('isolated MySQL 8 copy, content verification, rollback and concurrent-impor
     await admin.query(`DROP DATABASE ${database}`);
     await admin.query(`CREATE DATABASE ${database} CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`);
     pool = createPool({ uri: url.toString(), connectionLimit: 6, dateStrings: true, timezone: 'Z' });
-    const { runMysqlMigrations } = await import('../../src/proxy/src/db/mysqlMigrations.js');
+    const { runMysqlMigrations } = await import('../v1-frozen/db/mysqlMigrations.js');
     await runMysqlMigrations(pool);
-    const { MysqlPoolStore } = await import('../../src/proxy/src/userPool/mysqlStore.js');
+    const { MysqlPoolStore } = await import('../v1-frozen/userPool/mysqlStore.js');
     await new MysqlPoolStore(pool, poolConfig).initialize();
     const schemaCases = [
       { name: 'no-op credential trigger', change: ['DROP TRIGGER user_pool_credential_fence',

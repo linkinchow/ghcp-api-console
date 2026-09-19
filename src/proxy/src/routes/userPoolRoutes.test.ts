@@ -1,3 +1,4 @@
+import { configureProxyFixture, TEST_ENTERPRISE } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 import { once } from 'node:events';
@@ -35,6 +36,7 @@ beforeEach(async () => {
   config.dbPath = ':memory:';
   config.requestStatsPerAccountLimit = 100;
   config.claudeCodeOptimized = true;
+  config.dbPath = configureProxyFixture();
   const pool = await getUserPool();
   assert.ok(pool instanceof UserPoolStore);
   store = pool;
@@ -135,17 +137,17 @@ test('Login task protection keeps dispatch and waiting evidence until consumed',
     assert.equal((await originalFetch(url)).status, 401);
     store.update(members[0], { stage: 'oauth-dispatch', oauth_attempt_id: 'attempt-test', task_id: null });
     let response = await originalFetch(`${url}?taskId=task-test&oauthAttemptId=attempt-test`, { headers });
-    assert.deepEqual(await response.json(), { managed: true, referenced: true });
+    assert.deepEqual(await response.json(), { enterpriseId: TEST_ENTERPRISE.id, enterpriseRevision: 1, contractVersion: 2, managed: true, referenced: true });
     store.update(members[0], { stage: 'oauth-wait', task_id: 'task-test' });
     response = await originalFetch(`${url}?taskId=task-test&oauthAttemptId=old-attempt`, { headers });
-    assert.deepEqual(await response.json(), { managed: true, referenced: true });
+    assert.deepEqual(await response.json(), { enterpriseId: TEST_ENTERPRISE.id, enterpriseRevision: 1, contractVersion: 2, managed: true, referenced: true });
     response = await originalFetch(`${url}?taskId=old-task&oauthAttemptId=old-attempt`, { headers });
-    assert.deepEqual(await response.json(), { managed: true, referenced: false });
+    assert.deepEqual(await response.json(), { enterpriseId: TEST_ENTERPRISE.id, enterpriseRevision: 1, contractVersion: 2, managed: true, referenced: false });
     store.update(members[0], { stage: 'warmup' });
     response = await originalFetch(`${url}?taskId=task-test&oauthAttemptId=attempt-test`, { headers });
-    assert.deepEqual(await response.json(), { managed: true, referenced: false });
+    assert.deepEqual(await response.json(), { enterpriseId: TEST_ENTERPRISE.id, enterpriseRevision: 1, contractVersion: 2, managed: true, referenced: false });
     response = await originalFetch(`${baseUrl}/internal/accounts/direct-user/login-task-protection?taskId=other`, { headers });
-    assert.deepEqual(await response.json(), { managed: false, referenced: false });
+    assert.deepEqual(await response.json(), { enterpriseId: TEST_ENTERPRISE.id, enterpriseRevision: 1, contractVersion: 2, managed: false, referenced: false });
   } finally { config.internalApiToken = saved; }
 });
 
@@ -302,9 +304,9 @@ test('pool mode blocks credential import before validating or overwriting any to
     assert.deepEqual(await getAccount(members[1]), before);
     assert.equal(upstreamCalls.length, 0);
     const membership = await originalFetch(`${baseUrl}/internal/accounts/by-sso-user/${members[0]}/pool-membership`, { headers: { 'X-Internal-Token': config.internalApiToken } });
-    assert.deepEqual(await membership.json(), { managed: true });
+    assert.deepEqual(await membership.json(), { enterpriseId: TEST_ENTERPRISE.id, enterpriseRevision: 1, contractVersion: 2, managed: true });
     const unknown = await originalFetch(`${baseUrl}/internal/accounts/by-sso-user/not-a-member/pool-membership`, { headers: { 'X-Internal-Token': config.internalApiToken } });
-    assert.deepEqual(await unknown.json(), { managed: false });
+    assert.deepEqual(await unknown.json(), { enterpriseId: TEST_ENTERPRISE.id, enterpriseRevision: 1, contractVersion: 2, managed: false });
   } finally { config.internalApiToken = saved; }
 });
 

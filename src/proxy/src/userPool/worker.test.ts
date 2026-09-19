@@ -1,8 +1,8 @@
+import { createSqlitePoolFixture, TEST_ENTERPRISE } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { HttpApiError } from '@ghcp/shared';
 import BetterSqlite3 from 'better-sqlite3';
-import { runMigrations } from '../db/migrations.js';
 import { readPoolConfig } from './config.js';
 import { UserPoolStore } from './store.js';
 import { PrewarmWorker, type PrewarmStore } from './worker.js';
@@ -11,7 +11,7 @@ import { ProvisionFailure, type ProvisionAdapter, type ProvisionContext, type Pr
 function fixture(target = 2) {
   let owner = '';
   let claims = 0;
-  let paused = 0;
+  let paused: 0 | 1 = 0;
   const rows = new Map<string, ProvisionInventory>();
   const holds = new Set<string>();
   const leased = new Set<string>();
@@ -27,7 +27,7 @@ function fixture(target = 2) {
     },
     releaseOwner: (expected) => { if (owner === expected) owner = ''; },
     reclaim: () => {},
-    settings: () => ({ version: 1, idle_target: target, max_accounts: 20, lease_seconds: 600, paused }),
+    settings: () => ({ version: 1, idle_target: target, max_accounts: 20, active_max_accounts: 20, lease_seconds: 600, paused }),
     hasHolds: (identity) => holds.has(identity),
     inventory: (identity) => { const row = rows.get(identity); return row && { ...row }; },
     pending: (excluded = []) => [...rows.values()].filter((row) => !excluded.includes(row.identity))
@@ -46,6 +46,7 @@ function fixture(target = 2) {
       if (paused || ready + provisioning >= target || rows.size >= 20) return undefined;
       const identity = `member-${rows.size}`;
       const row: ProvisionInventory = {
+        enterprise_id: TEST_ENTERPRISE.id, enterprise_revision: TEST_ENTERPRISE.revision,
         identity, ordinal: rows.size, state: 'provisioning', stage: 'new', attempt_id: `attempt-${identity}`,
         task_id: null, attempts: 0, retry_at: Date.now(), last_error: null, updated_at: Date.now(),
         cooldown_until: 0, verified_at: null, generation: 0, sso_created_at: null, oauth_attempt_id: null,
@@ -329,7 +330,7 @@ test('failures are bounded by retry count/backoff and secret messages are never 
   assert.equal(row.attempts, 1);
   assert.ok(row.retry_at > Date.now());
   f.pause(); // Preserve the failed row while preventing replacement reservations.
-  f.store.settings = () => ({ version: 1, idle_target: 1, max_accounts: 1, lease_seconds: 600, paused: 0 });
+  f.store.settings = () => ({ version: 1, idle_target: 1, max_accounts: 1, active_max_accounts: 1, lease_seconds: 600, paused: 0 });
   await worker.tick();
   assert.equal(calls, 1);
   for (let i = 0; i < 2; i++) { row.retry_at = 0; await worker.tick(); }
@@ -379,12 +380,12 @@ test('SQLite persists worker intents across recreation and excludes live holds d
   const db = new BetterSqlite3(':memory:');
   t.after(() => db.close());
   db.pragma('foreign_keys = ON');
-  runMigrations(db);
+
   const options = readPoolConfig({
     ACCOUNT_ROUTING_MODE: 'caller-lease', POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test',
     POOL_WARMUP_MODEL: 'test-model', READY_IDLE_TARGET: '1', POOL_MAX_ACCOUNTS: '1',
   });
-  const store = new UserPoolStore(db, options);
+  const store = createSqlitePoolFixture(db, options);
   const external = deferred<{}>();
   const first = new PrewarmWorker(store, { async step(_row, context) {
     await context.checkpoint({ stage: 'oauth-dispatch', oauth_attempt_id: 'persisted-oauth', sso_created_at: 'sso-creation-marker' });
@@ -393,7 +394,7 @@ test('SQLite persists worker intents across recreation and excludes live holds d
   void first.tick();
   await flush();
   await first.stop();
-  const reopened = new UserPoolStore(db, options);
+  const reopened = createSqlitePoolFixture(db, options);
   let calls = 0;
   let identity = '';
   const second = new PrewarmWorker(reopened, { async step(row, context) {

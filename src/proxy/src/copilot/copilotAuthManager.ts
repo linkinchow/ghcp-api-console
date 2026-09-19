@@ -12,6 +12,10 @@ import {
 import { ensureSsoUser, syncEmuUser } from '../clients/ssoClient.js';
 import { createLoginTask } from '../clients/loginClient.js';
 import { config } from '../config.js';
+import { loadProxyEnterpriseProfile } from '../enterprise.js';
+import { getStorage } from '../db/connection.js';
+import type { AuthorizationBinding } from '@ghcp/shared';
+import type { ProxyAccountRecord } from '../db/storageTypes.js';
 import { Logger } from '../logger.js';
 import type { CopilotAuthContext } from './copilotAuth.js';
 
@@ -61,27 +65,26 @@ class CopilotAuthManager {
     };
   }
 
-  async triggerOauthRefresh(identity: string, options: { ssoPassword?: string; ssoType?: SsoType } = {}): Promise<void> {
-    const account = await getAccount(identity);
+  async triggerOauthRefresh(identity: string, options: { ssoPassword?: string; ssoType?: SsoType; enterpriseId?: string; expectedAccountIncarnation?: string } = {}): Promise<void> {
+    const account = await getAccount(identity,options.enterpriseId);
     if (!account) throw new Error(`Unknown identity "${identity}".`);
+    if (options.expectedAccountIncarnation !== undefined && account.accountIncarnation !== options.expectedAccountIncarnation) {
+      throw new Error('account_incarnation_mismatch');
+    }
     if (!account.ssoUser) throw new Error(`Identity "${identity}" is missing an SSO user.`);
     if (!account.ghLogin) throw new Error(`Identity "${identity}" is missing a GitHub login.`);
     if (!options.ssoPassword) throw new Error('ssoPassword is required to reauthorize Copilot OAuth.');
-    const oauthAttemptId = randomUUID();
-    if (!await beginCopilotOauthAuthorization(identity, oauthAttemptId)) {
-      throw new Error(`Unknown identity "${identity}".`);
-    }
+    const binding = bindingFor(account,randomUUID());
+    await getStorage().beginAuthorizationAttempt(binding);
     try {
       await createLoginTask({
-        identity,
+        ...binding,
         ssoUser: account.ssoUser,
         ssoPassword: options.ssoPassword,
-        ghLogin: account.ghLogin,
-        oauthAttemptId,
         ssoType: options.ssoType ?? 'custom',
       });
     } catch (err) {
-      await failCopilotOauthAuthorization(identity, oauthAttemptId);
+      await getStorage().endAuthorizationAttempt(binding,'failed','task_dispatch_failed');
       throw err;
     }
   }
@@ -128,33 +131,28 @@ class CopilotAuthManager {
   private async initializeEnsuredIdentity(identity: string, ensured: EnsureSsoUserResponse): Promise<void> {
     const synced = await syncEmuUser(ensured.user.ssoUser, { assignCopilotSeat: true });
     if (!synced.ghLogin) throw new Error(`SSO user "${ensured.user.ssoUser}" did not return a GH login.`);
-    const oauthAttemptId = randomUUID();
-    await createAccount({
-      identity,
-      ssoUser: ensured.user.ssoUser,
-      ghLogin: synced.ghLogin,
-      copilotOauthStatus: 'refreshing',
-      copilotOauthAttemptId: oauthAttemptId,
-    });
+    const account = await createAccount({ identity, ssoUser: ensured.user.ssoUser, ghLogin: synced.ghLogin });
+    const binding = bindingFor(account,randomUUID());
+    await getStorage().beginAuthorizationAttempt(binding);
     const ssoPassword = ensured.passwordForLogin;
     if (!ssoPassword) {
-      await failCopilotOauthAuthorization(identity, oauthAttemptId);
+      await getStorage().endAuthorizationAttempt(binding,'failed','sso_password_required');
       throw new Error(`SSO password is required to initialize identity "${identity}"; reauthorize it from Console with an explicit password.`);
     }
     try {
-      await createLoginTask({
-        identity,
-        ssoUser: ensured.user.ssoUser,
-        ssoPassword,
-        ghLogin: synced.ghLogin,
-        oauthAttemptId,
-        ssoType: 'custom',
-      });
+      await createLoginTask({ ...binding,ssoUser: ensured.user.ssoUser,ssoPassword,ssoType:'custom' });
     } catch (err) {
-      await failCopilotOauthAuthorization(identity, oauthAttemptId);
+      await getStorage().endAuthorizationAttempt(binding,'failed','task_dispatch_failed');
       throw err;
     }
   }
+}
+
+function bindingFor(account: ProxyAccountRecord,oauthAttemptId: string): AuthorizationBinding {
+  if (!account.ghLogin) throw new Error('expected_github_subject_required');
+  const profile=loadProxyEnterpriseProfile(account.enterpriseId);
+  return {enterpriseId:profile.id,enterpriseRevision:profile.revision,identity:account.identity,
+    accountIncarnation:account.accountIncarnation,oauthAttemptId,expectedGhLogin:account.ghLogin};
 }
 
 function ssoUserFromIdentity(identity: string): string {

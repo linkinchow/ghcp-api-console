@@ -1,3 +1,5 @@
+import Database from 'better-sqlite3';
+import { initSqliteFixture, fixtureRegistry } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -8,8 +10,11 @@ import { SqliteStorage } from './sqliteStorage.js';
 test('coordinates identity initialization claims across SQLite connections', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'ghcp-proxy-claims-'));
   const path = join(directory, 'proxy.sqlite');
-  const first = new SqliteStorage(path, 2);
-  const second = new SqliteStorage(path, 2);
+  const db = new Database(path);
+  initSqliteFixture(db);
+  db.close();
+  const first = new SqliteStorage(path, 2, fixtureRegistry());
+  const second = new SqliteStorage(path, 2, fixtureRegistry());
   try {
     await Promise.all([first.initialize(), second.initialize()]);
     const claims = await Promise.all([

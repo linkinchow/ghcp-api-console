@@ -2,9 +2,8 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
-import { runMysqlMigrations } from '../db/mysqlMigrations.js';
 import { UserPoolError, type PoolConfig } from './config.js';
-import { MysqlPoolStore } from './mysqlStore.js';
+import { FixtureMysqlPoolStore as MysqlPoolStore, initMysqlFixture, TEST_ENTERPRISE } from '../test/enterpriseFixtures.js';
 import { MysqlConnectionError } from './mysqlDeadline.js';
 import { accountName, NAME_CAPACITY } from './names.js';
 import type { HeldLease, Inventory } from './store.js';
@@ -50,16 +49,22 @@ test('MySQL user pool: isolated real multi-connection contract', {
     const [db, otherDb] = pools;
     const first = new MysqlPoolStore(db, options);
     const second = new MysqlPoolStore(otherDb, options);
-    await runMysqlMigrations(db);
+    await initMysqlFixture(db, options);
     await Promise.all([first.initialize(), second.initialize()]);
 
     const reset = async (patch: { idle_target?: number; max_accounts?: number } = {}) => {
       // Only the random database created above is ever cleaned. Keep schema/fingerprint.
       for (const table of ['user_pool_holds', 'user_pool_catalog_holds', 'user_pool_catalog_cooldowns',
         'user_pool_leases', 'user_pool_accounts', 'user_pool_events', 'proxy_accounts']) await db.query(`DELETE FROM ${table}`);
-      await db.execute(`UPDATE user_pool_settings SET version=1, idle_target=?, max_accounts=?,
+      await db.execute(`UPDATE user_pool_settings SET version=1, idle_target=?,
         lease_seconds=?, paused=0, next_ordinal=0, owner=NULL, owner_until=0 WHERE id=1`,
-      [patch.idle_target ?? options.idleTarget, patch.max_accounts ?? options.maxAccounts, options.leaseSeconds]);
+      [patch.idle_target ?? options.idleTarget, options.leaseSeconds]);
+      const policy = await first.enterprisePolicy(TEST_ENTERPRISE.id);
+      assert.ok(policy);
+      await first.updateEnterprisePolicy(TEST_ENTERPRISE.id, policy.policyVersion,
+        { type: 'cap', maxAccounts: patch.max_accounts ?? options.maxAccounts });
+      // Reset fixture audit independently; the cap above still exercises real CAS.
+      await db.query('DELETE FROM user_pool_events');
     };
     const ready = async (count = 1): Promise<string[]> => {
       const identities: string[] = [];
@@ -99,7 +104,7 @@ test('MySQL user pool: isolated real multi-connection contract', {
       const restarted = new MysqlPoolStore(otherDb, { ...options, idleTarget: 2, maxAccounts: 2, leaseSeconds: 60 });
       await restarted.initialize();
       assert.deepEqual(await restarted.settings(), settings, 'seed changes cannot overwrite settings');
-      await assert.rejects(new MysqlPoolStore(otherDb, { ...options, accountDomain: 'other.test' }).initialize(), /domain differs/);
+      await assert.rejects(new MysqlPoolStore(otherDb, { ...options, accountDomain: 'other.test' }).initialize(), { code: 'enterprise_mysql_registry_mismatch' });
       await assert.rejects(new MysqlPoolStore(otherDb, { ...options, requestTimeoutMs: 5000 }).initialize(), /configuration differs/);
       assert.equal(JSON.stringify(await first.accounts()).includes('SyntheticToken'), false);
       const page = await first.page('accounts', { page: 1, pageSize: 1, q: member.toUpperCase(), state: 'ready_idle' });
@@ -307,7 +312,10 @@ test('MySQL user pool: isolated real multi-connection contract', {
       assert.equal(failed.attempts, 1);
       assert.ok(failed.retry_at > await first.now());
       assert.equal(await second.reserve(), undefined);
-      await first.updateSettings(1, { idle_target: 3, max_accounts: 8 });
+      await first.updateSettings(1, { idle_target: 3 });
+      const policy = await first.enterprisePolicy(TEST_ENTERPRISE.id);
+      assert.ok(policy);
+      await first.updateEnterprisePolicy(TEST_ENTERPRISE.id, policy.policyVersion, { type: 'cap', maxAccounts: 8 });
       assert.equal(await second.reserve(), undefined, 'backing-off repair already represents capacity');
       await first.disable(row.identity);
       assert.equal((await first.inventory(row.identity))!.state, 'disabled');
@@ -328,9 +336,9 @@ test('MySQL user pool: isolated real multi-connection contract', {
       assert.equal((await first.counts()).total, count);
       assert.equal(await first.reserveDeficit(randomUUID()), 0);
       await reset();
-      await db.execute(`INSERT INTO proxy_accounts(identity,sso_user,created_at,updated_at)
-        VALUES (?, 'direct', UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)), ('direct-alias', ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))`,
-      [accountName(0).toUpperCase(), accountName(1).toUpperCase()]);
+      await db.execute(`INSERT INTO proxy_accounts(enterprise_id,identity,sso_user,account_incarnation,created_at,updated_at)
+        VALUES ('86e2ee02-223a-45ea-8c26-bdd1c570a4ee', ?, 'direct', ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)), ('86e2ee02-223a-45ea-8c26-bdd1c570a4ee', 'direct-alias', ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))`,
+      [accountName(0).toUpperCase(), randomUUID(), accountName(1).toUpperCase(), randomUUID()]);
       assert.equal((await first.reserve())!.ordinal, 2);
       await db.execute('UPDATE user_pool_settings SET next_ordinal=?', [NAME_CAPACITY - 1]);
       assert.equal((await first.reserve())!.ordinal, NAME_CAPACITY - 1);
@@ -488,7 +496,7 @@ test('MySQL user pool: isolated real multi-connection contract', {
 
     await t.test('startup fails closed if an installed credential fence disappears', async () => {
       await db.query('DROP TRIGGER user_pool_credential_fence');
-      await assert.rejects(first.initialize(), /credential fence is missing/);
+      await assert.rejects(first.initialize(), { code: 'enterprise_mysql_triggers' });
     });
   } finally {
     await Promise.all(pools.map((pool) => pool.end()));

@@ -1,6 +1,8 @@
+import type { EnterpriseScope } from '@ghcp/shared';
 import type { AiCreditsPeriodUsageDto, AiCreditsUsageDto } from '@ghcp/shared';
 import { nowIso } from '@ghcp/shared';
-import { config } from '../config.js';
+import { getScopeProfile } from '../enterprise.js';
+import { readEnterpriseSecret } from '@ghcp/shared/enterpriseRuntimeV3';
 import { countAssignedCopilotSeats, getAiCreditsUsagePeriod, saveAiCreditsUsagePeriod, type AiCreditsUsageCacheRecord } from '../db/budgetRepo.js';
 
 const AI_CREDITS_SKU = 'copilot_ai_unit';
@@ -26,40 +28,44 @@ interface Period {
   month: number;
 }
 
-export function readAiCreditsUsage(now = new Date()): AiCreditsUsageDto | undefined {
+export function readAiCreditsUsage(now = new Date(), scope: EnterpriseScope): AiCreditsUsageDto | undefined {
   const current = currentPeriod(now);
   const last = previousPeriod(current);
-  const currentUsage = getAiCreditsUsagePeriod(current.year, current.month);
-  const lastUsage = getAiCreditsUsagePeriod(last.year, last.month);
+  const currentUsage = getAiCreditsUsagePeriod(current.year, current.month, scope);
+  const lastUsage = getAiCreditsUsagePeriod(last.year, last.month, scope);
   if (!currentUsage || !lastUsage) return undefined;
-  return toUsageDto(lastUsage, currentUsage, now);
+  return toUsageDto(lastUsage, currentUsage, now, scope);
 }
 
-export async function refreshAiCreditsUsage(now = new Date()): Promise<AiCreditsUsageDto> {
+export async function refreshAiCreditsUsage(now = new Date(), scope: EnterpriseScope): Promise<AiCreditsUsageDto> {
   const current = currentPeriod(now);
   const last = previousPeriod(current);
   const [lastUsage, currentUsage] = await Promise.all([
-    fetchAndSaveAiCreditsUsage(last),
-    fetchAndSaveAiCreditsUsage(current),
+    fetchAndSaveAiCreditsUsage(last, scope),
+    fetchAndSaveAiCreditsUsage(current, scope),
   ]);
-  return toUsageDto(lastUsage, currentUsage, now);
+  return toUsageDto(lastUsage, currentUsage, now, scope);
 }
 
-async function fetchAndSaveAiCreditsUsage(period: Period): Promise<AiCreditsUsageCacheRecord> {
-  if (!config.githubCopilotSeatPat) throw new Error('GITHUB_COPILOT_SEAT_PAT is required to query AI Credits usage.');
-  const url = new URL(`${config.githubApiBaseUrl.replace(/\/+$/, '')}/enterprises/${encodeURIComponent(config.enterpriseSlug)}/settings/billing/usage/summary`);
+async function fetchAndSaveAiCreditsUsage(period: Period, scope: EnterpriseScope): Promise<AiCreditsUsageCacheRecord> {
+  if (!readEnterpriseSecret(getScopeProfile(scope).sso.seatPatRef)) throw new Error('GITHUB_COPILOT_SEAT_PAT is required to query AI Credits usage.');
+  const url = new URL(`${getScopeProfile(scope).sso.githubApiBaseUrl.replace(/\/+$/, '')}/enterprises/${encodeURIComponent(getScopeProfile(scope).slug)}/settings/billing/usage/summary`);
   url.searchParams.set('year', String(period.year));
   url.searchParams.set('month', String(period.month));
   url.searchParams.set('sku', AI_CREDITS_SKU);
   const res = await fetch(url, {
+    redirect: 'error',
+    signal: AbortSignal.timeout(30_000),
     headers: {
-      Authorization: `Bearer ${config.githubCopilotSeatPat}`,
+      Authorization: `Bearer ${readEnterpriseSecret(getScopeProfile(scope).sso.seatPatRef)}`,
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2026-03-10',
     },
   });
-  if (!res.ok) throw new Error(`GitHub AI Credits usage query failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new Error(`GitHub AI Credits usage query failed: ${res.status}`);
   const rawJson = (await res.json()) as BillingUsageSummary;
+  if (rawJson.enterprise !== undefined && rawJson.enterprise !== getScopeProfile(scope).slug) throw new Error('AI Credits enterprise response mismatch.');
+  if ((rawJson.timePeriod?.year !== undefined && rawJson.timePeriod.year !== period.year) || (rawJson.timePeriod?.month !== undefined && rawJson.timePeriod.month !== period.month)) throw new Error('AI Credits period response mismatch.');
   const items = (rawJson.usageItems ?? []).filter((item) => item.sku === AI_CREDITS_SKU);
   const quantity = items.reduce((sum, item) => sum + numberOrZero(item.grossQuantity), 0);
   return saveAiCreditsUsagePeriod({
@@ -69,13 +75,14 @@ async function fetchAndSaveAiCreditsUsage(period: Period): Promise<AiCreditsUsag
     unitType: items[0]?.unitType,
     rawJson,
     fetchedAt: nowIso(),
-  });
+  }, scope);
 }
 
-function toUsageDto(lastMonth: AiCreditsUsageCacheRecord, currentMonth: AiCreditsUsageCacheRecord, now: Date): AiCreditsUsageDto {
-  const assignedSeatCount = countAssignedCopilotSeats();
+function toUsageDto(lastMonth: AiCreditsUsageCacheRecord, currentMonth: AiCreditsUsageCacheRecord, now: Date, scope: EnterpriseScope): AiCreditsUsageDto {
+  const assignedSeatCount = countAssignedCopilotSeats(scope);
   return {
-    enterprise: config.enterpriseSlug,
+    enterpriseId: scope.enterpriseId,
+    enterprise: getScopeProfile(scope).slug,
     lastMonth: toPeriodDto(lastMonth),
     currentMonth: toPeriodDto(currentMonth),
     projectedCurrentMonthQuantity: projectCurrentMonthQuantity(currentMonth.quantity, now),

@@ -8,6 +8,7 @@ import { mysqlCallerGateStats } from './mysqlCallerGate.js';
 import { MysqlDeadlineError } from './mysqlDeadline.js';
 import { MysqlPoolStore } from './mysqlStore.js';
 import type { HeldLease } from './store.js';
+import { fixtureRegistry, fixtureReadinessEvidence, TEST_ENTERPRISE } from '../test/enterpriseFixtures.js';
 
 const options: PoolConfig = {
   enabled: true, accountDomain: 'example.test', idleTarget: 1, maxAccounts: 2,
@@ -28,6 +29,8 @@ const noTickets = (db: Pool) => assert.deepEqual(mysqlCallerGateStats(db), { ret
 
 /** Each acquisition owns a distinct fake socket, with controllable driver and SQL phases. */
 function fixture(ready = false) {
+  const registry = fixtureRegistry(options);
+  const evidence = fixtureReadinessEvidence(registry);
   const calls = { acquisitions: 0, live: 0, maxLive: 0, released: 0, destroyed: 0,
     sql: [] as { socket: number; sql: string }[], order: [] as string[] };
   const sockets: PoolConnection[] = [];
@@ -65,8 +68,14 @@ function fixture(ready = false) {
         if (ready && sql.includes('FROM proxy_accounts WHERE identity=')) return [[{
           identity: 'member', copilot_oauth_status: 'valid', copilot_oauth_token: 'synthetic-token',
         }]];
-        if (ready && sql.includes('SELECT * FROM user_pool_accounts WHERE identity=')) return [[{
-          identity: 'member', state: 'ready', verified_at: 1800000000000, generation: 1,
+        if (ready && sql.includes('SELECT p.*, a.enterprise_id, e.revision enterprise_revision')) return [[{
+          identity: 'member', enterprise_id: TEST_ENTERPRISE.id, enterprise_revision: TEST_ENTERPRISE.revision,
+          state: 'ready', verified_at: 1800000000000, generation: 1,
+        }]];
+        if (ready && sql.includes('SELECT * FROM enterprise_pool_policy WHERE enterprise_id=')) return [[{
+          enterprise_id: TEST_ENTERPRISE.id, state: 'active', policy_version: 3,
+          identity_sha256: evidence.profileIdentitySha256, validation_kind: 'local_service_readiness_v1',
+          validation_evidence_json: JSON.stringify(evidence), validated_at: evidence.checkedAt, updated_at: evidence.checkedAt,
         }]];
         if (sql.includes('MAX(id)')) return [[{ n: -9999 }]];
         if (sql.includes('SELECT 1 FROM user_pool_holds')) return [[{ 1: 1 }]];
@@ -85,7 +94,7 @@ function fixture(ready = false) {
     },
   };
   const pool = rawPool as unknown as Pool;
-  const store = (patch: Partial<PoolConfig> = {}, wrapper = pool) => new MysqlPoolStore(wrapper, { ...options, ...patch });
+  const store = (patch: Partial<PoolConfig> = {}, wrapper = pool) => new MysqlPoolStore(wrapper, { ...options, ...patch }, registry);
   return { calls, hooks, pool, store, sockets };
 }
 

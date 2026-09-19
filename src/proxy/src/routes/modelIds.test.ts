@@ -1,10 +1,11 @@
+import { configureProxyFixture } from '../test/enterpriseFixtures.js';
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import type { AddressInfo } from 'node:net';
 import { once } from 'node:events';
 
 import { config } from '../config.js';
-import { importCopilotOauthToken } from '../db/accountsRepo.js';
+import { createAccount, importCopilotOauthToken } from '../db/accountsRepo.js';
 import { closeStorage } from '../db/connection.js';
 import { listRequestStats, recordRequestStat } from '../db/requestStatsRepo.js';
 import { buildApp } from '../server.js';
@@ -22,7 +23,7 @@ const originalConfig = {
 
 before(async () => {
   config.apiKey = apiKey;
-  config.dbPath = ':memory:';
+  config.dbPath = configureProxyFixture();
   config.requestStatsPerAccountLimit = 100;
   config.claudeCodeOptimized = true;
   await importCopilotOauthToken({
@@ -142,6 +143,7 @@ test('canonicalizes model metadata in streaming responses', async () => {
 
 test('canonicalizes new and historical request-stat model values at the repository boundary', async () => {
   const statsIdentity = `${identity}-stats`;
+  await createAccount({ identity: statsIdentity, ssoUser: statsIdentity });
   await recordRequestStat({
     identity: statsIdentity,
     path: '/v1/messages',

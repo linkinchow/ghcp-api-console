@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { initSsoFixture } from '../db/enterpriseFixture.js';
 
 test('marks excess GH imports as failed without rolling back available slots', async () => {
-  process.env.DB_PATH = ':memory:';
   process.env.SSO_USER_EVENTS_LOG = '/dev/null';
   process.env.SCIM_BASE_URL = 'https://scim.test/scim/v2/enterprises/test';
   process.env.SCIM_TOKEN = 'test-scim-token';
@@ -10,6 +10,7 @@ test('marks excess GH imports as failed without rolling back available slots', a
   process.env.ENTERPRISE_SLUG = 'test-enterprise';
   process.env.GITHUB_COPILOT_SEAT_PAT = 'test-seat-token';
   process.env.LOG_LEVEL = 'error';
+  const scope = initSsoFixture();
 
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input) => {
@@ -35,17 +36,17 @@ test('marks excess GH imports as failed without rolling back available slots', a
     updateSsoRuntimeSettings({
       expectedVersion: 1,
       changes: { maxSsoUsers: 1, scimRequestDelayMs: 0, scimMaxRetries: 0 },
-    });
-    const plan = await createEmuImportPlan();
+    }, scope);
+    const plan = await createEmuImportPlan(undefined, scope);
 
-    applyEmuImportPlan(plan.planId);
+    applyEmuImportPlan(plan.planId, scope);
 
-    const rows = listEmuImportPlanRows(plan.planId).items;
+    const rows = listEmuImportPlanRows(plan.planId, undefined, scope).items;
     assert.equal(rows.find((row) => row.ssoUser === 'alice')?.status, 'created');
     assert.equal(rows.find((row) => row.ssoUser === 'bob')?.status, 'failed');
     assert.match(rows.find((row) => row.ssoUser === 'bob')?.detail ?? '', /limit of 1 has been reached/);
-    assert.equal(getUser('alice')?.ghLogin, 'alice_emu');
-    assert.equal(getUser('bob'), undefined);
+    assert.equal(getUser('alice', scope)?.ghLogin, 'alice_emu');
+    assert.equal(getUser('bob', scope), undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }

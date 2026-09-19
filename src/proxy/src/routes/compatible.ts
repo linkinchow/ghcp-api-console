@@ -311,9 +311,10 @@ async function requestAuth(identity: string, context?: PoolRequest): Promise<Cop
   if (!context) return copilotAuthManager.getAuth(identity);
   context.controller.signal.throwIfAborted();
   if (!await context.store.heartbeat(context.held)) throw new UserPoolError(503, 'member_unavailable');
-  const account = await getAccount(identity);
+  const account = await getAccount(identity, context.held.enterprise_id);
   context.controller.signal.throwIfAborted();
-  if (!account?.copilotOauthToken || account.copilotOauthStatus !== 'valid' || !await context.store.heartbeat(context.held)) {
+  if (!account?.copilotOauthToken || account.enterpriseId !== context.held.enterprise_id
+    || account.copilotOauthStatus !== 'valid' || !await context.store.heartbeat(context.held)) {
     throw new UserPoolError(503, 'member_unavailable');
   }
   return { identity, accessToken: account.copilotOauthToken, api: config.copilotApiBaseUrl };
