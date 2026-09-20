@@ -100,3 +100,29 @@ test('bounded lost ACK commits only mock operation, delay aborts before token is
   assert.equal((await f.request('/chat/completions',a.token,{model:MODEL_ID})).status,503);
   assert.equal((await f.request('/chat/completions',a.token,{model:MODEL_ID})).status,200);
 });
+test('postcommit barrier exposes committed SCIM without ACK and abort preserves exactly one mutation', {timeout:5000}, async t=>{
+  const f=await fixture(t);
+  assert.equal((await f.request('/fixture/control',fixtureToken,{enterpriseId:A,channel:'inference',mode:'commit-delay'})).status,400);
+  assert.equal((await f.request('/fixture/control',fixtureToken,{enterpriseId:A,channel:'scim-create',mode:'commit-delay',delayMs:25001})).status,400);
+  assert.equal((await f.request('/fixture/control',fixtureToken,{enterpriseId:A,channel:'scim-create',mode:'commit-delay',count:1,delayMs:1000,ttlMs:3000})).status,200);
+  const controller=new AbortController();let resolved=false;
+  const pending=f.request('/scim/v2/enterprises/phase5-a/Users',f.secret(A).scimToken,{userName:'committed.crash00',active:true},'POST',controller.signal).then(r=>{resolved=true;return r;},e=>e);
+  let row;
+  try {
+    for(let i=0;i<30;i++){row=(await f.snapshot())[0];if(row.barriers.length===1)break;await new Promise(done=>setTimeout(done,10));}
+    assert.equal(row.scimUsers,1);assert.equal(row.commits['scim-create'],1);assert.equal(row.counts['scim-create'],1);
+    assert.equal(row.barriers.length,1);assert.equal(row.barriers[0].channel,'scim-create');assert.equal(resolved,false);
+    assert.equal((await f.snapshot())[1].barriers.length,0);
+  }finally{controller.abort();await pending;}
+  for(let i=0;i<30;i++){row=(await f.snapshot())[0];if(row.barriers.length===0)break;await new Promise(done=>setTimeout(done,10));}
+  assert.equal(row.barriers.length,0);assert.equal(row.scimUsers,1);assert.equal(row.commits['scim-create'],1);
+  const next=await f.request('/scim/v2/enterprises/phase5-a/Users',f.secret(A).scimToken,{userName:'finite.next00',active:true});assert.equal(next.status,201);
+  row=(await f.snapshot())[0];assert.equal(row.scimUsers,2);assert.equal(row.barriers.length,0);assert.equal(row.faults[0].remaining,0);
+});
+test('postcommit barrier expires without a controller and rejects unbounded controls', {timeout:5000}, async t=>{
+  const f=await fixture(t);
+  await f.request('/fixture/control',fixtureToken,{enterpriseId:B,channel:'scim-create',mode:'commit-delay',delayMs:30,ttlMs:1000});
+  const response=await f.request('/scim/v2/enterprises/phase5-b/Users',f.secret(B).scimToken,{userName:'bounded.expiry00',active:true});assert.equal(response.status,201);
+  const row=(await f.snapshot())[1];assert.equal(row.commits['scim-create'],1);assert.equal(row.barriers.length,0);
+  for(const patch of [{count:0},{count:1001},{ttlMs:600001},{delayMs:-1}])assert.equal((await f.request('/fixture/control',fixtureToken,{enterpriseId:B,channel:'scim-create',mode:'commit-delay',...patch})).status,400);
+});

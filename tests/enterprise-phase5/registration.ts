@@ -8,10 +8,11 @@ import { serialize } from 'node:v8';
 import type { Connection } from 'mysql2/promise';
 import type { EnterpriseRegistryV3 } from '../../src/packages/shared/src/enterpriseV3.js';
 import type { EnterpriseManifestV4, MysqlServiceV4, SqliteServiceV4 } from '../../upgrade/multi-enterprise-pool/manifest.js';
+import { accountName } from '../../src/packages/shared/src/poolNames.js';
 import { args, assertEmpty, connect, databaseUrl, hashFile, inside, insist, loadDbGate, noSymlinkPath, resultPath, safeError, sha256, writePrivate } from './db-gate.js';
 
 const SCHEMA = 'ghcp_enterprise_test_phase5_v4';
-const IDENTITY = 'phase5-registration-retained';
+const IDENTITY = accountName(0);
 const STAMP = '2026-01-02T03:04:05.006Z';
 const TOKEN = '  phase5-registration\0ByteSensitive Aaß☃  ';
 const CALLER = `sha256:${sha256('phase5-registration-retained-caller')}`;

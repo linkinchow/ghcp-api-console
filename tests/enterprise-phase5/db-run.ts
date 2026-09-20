@@ -7,6 +7,9 @@ export const SUITES = {
   v2: ['upgrade/default-enterprise/mysql.integration.test.ts'],
   v3: ['upgrade/multi-enterprise/mysql.integration.test.ts'],
   v4: ['upgrade/multi-enterprise-pool/mysql.integration.test.ts'],
+  names: ['upgrade/multi-enterprise-pool/nameCatalog.integration.test.ts'],
+  concurrency: ['tests/enterprise-phase7/concurrency.integration.test.ts'],
+  scale: ['tests/enterprise-phase7/scale.integration.test.ts'],
   phase4: ['src/proxy/src/userPool/mysqlPhase4.integration.test.ts'],
   storage: ['src/proxy/src/db/mysqlStorage.integration.test.ts'],
   pool: ['src/proxy/src/userPool/mysqlStore.integration.test.ts', 'src/proxy/src/userPool/mysqlRecovery.integration.test.ts',
@@ -56,10 +59,11 @@ export async function runRealSuite(input = args()): Promise<void> {
   if (suite === 'v2') {
     env.ENTERPRISE_MYSQL_TEST = '1'; env.ENTERPRISE_MYSQL_TEST_ALLOW_DDL = '1';
     env.ENTERPRISE_MYSQL_TEST_URL = databaseUrl(state, 'ghcp_enterprise_test_phase5_v2');
-  } else if (['v3','v4','phase4'].includes(suite)) {
+  } else if (['v3','v4','phase4','names','concurrency','scale'].includes(suite)) {
     env.GHCP_ENTERPRISE_MYSQL_TEST_ALLOW_DDL = '1';
-    env.GHCP_ENTERPRISE_MYSQL_TEST_SCHEMA = `ghcp_enterprise_test_phase5_${suite === 'phase4' ? 'runtime' : suite}`;
+    env.GHCP_ENTERPRISE_MYSQL_TEST_SCHEMA = `ghcp_enterprise_test_phase5_${['phase4','concurrency','scale'].includes(suite) ? 'runtime' : suite === 'names' ? 'v4' : suite}`;
     env.GHCP_ENTERPRISE_MYSQL_TEST_URL = databaseUrl(state, env.GHCP_ENTERPRISE_MYSQL_TEST_SCHEMA);
+    if (suite === 'names') env.GHCP_ENTERPRISE_NAME_CATALOG_TEST = '1';
   } else {
     env.MYSQL_POOL_TEST_DISPOSABLE = '1'; env.MYSQL_TEST_URL = databaseUrl(state, 'ghcp_pool_test_phase5');
   }
@@ -72,7 +76,7 @@ export async function runRealSuite(input = args()): Promise<void> {
       // Stream to private files from process start. Partial evidence survives timeout,
       // failed assertions, output overflow or an interrupted controller; never echo it.
       const result = spawnSync(process.execPath, ['--import', 'tsx', '--test', '--test-concurrency=1', '--test-reporter=tap', file],
-        { cwd: root, env, timeout: 900_000, stdio: ['ignore', stdout, stderr] });
+        { cwd: root, env, timeout: ['names','concurrency','scale'].includes(suite) ? 600_000 : 900_000, stdio: ['ignore', stdout, stderr] });
       const { tests, pass, fail, skipped } = tapSummary(stdout);
       const status = !result.error && result.status === 0 && tests !== null && tests > 0 && pass !== null && pass > 0 && fail === 0 && skipped === 0 ? 'PASS' : 'FAIL';
       results.push({ file, status, exitCode: result.status, tests, pass, fail, skipped, timedOut: result.error?.message?.includes('ETIMEDOUT') ?? false });

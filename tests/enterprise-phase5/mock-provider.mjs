@@ -8,7 +8,8 @@ export const MAX_DELAY_MS = 25_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BINDING_KEYS = ['enterpriseId','enterpriseRevision','identity','accountIncarnation','oauthAttemptId','expectedGhLogin','expectedGithubUserId'];
 const CHANNELS = ['scim-create','scim-update','scim-delete','seat','authorize','user','models','inference'];
-const MODES = ['ok','delay','lost-ack','terminal-unknown','429','401','500'];
+const MODES = ['ok','delay','commit-delay','lost-ack','terminal-unknown','429','401','500'];
+const COMMIT_CHANNELS = ['scim-create','scim-update','scim-delete','seat','authorize'];
 const equal = (a,b) => typeof a === 'string' && typeof b === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a),Buffer.from(b));
 const fail = (status,code) => { throw Object.assign(new Error(code),{status,code}); };
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -50,7 +51,7 @@ export function createMockProvider({state,registry}) {
   if (state.syntheticOnly !== true || state.fixtureVersion !== 1) throw new Error('phase5_state_invalid');
   const namespaces = new Map(registry.profiles.map(profile => [profile.id,{
     profile, secrets:state.credentials.enterprises[profile.id], users:new Map(), seats:new Set(), tokens:new Map(), attempts:new Map(),
-    faults:new Map(), counts:{}, members:{}, markers:{}, calls:[], nextId:1,
+    faults:new Map(), barriers:new Map(), commits:{}, counts:{}, members:{}, markers:{}, calls:[], nextId:1,
   }]));
   const count = (ns,key,subject,marker) => {
     ns.counts[key] = (ns.counts[key] ?? 0)+1;
@@ -67,7 +68,8 @@ export function createMockProvider({state,registry}) {
   async function before(req,res,ns,channel) {
     const f = takeFault(ns,channel);
     if (f.mode === 'delay' || f.mode === 'terminal-unknown') {
-      await delay(f.delayMs,req,res);
+      const id=randomUUID();ns.barriers.set(id,{id,channel,phase:'before',until:Date.now()+f.delayMs});
+      try { await delay(f.delayMs,req,res); } finally { ns.barriers.delete(id); }
       if (res.destroyed) return null;
     }
     if (['429','401','500','terminal-unknown'].includes(f.mode)) {
@@ -76,6 +78,18 @@ export function createMockProvider({state,registry}) {
     return f;
   }
   const respond = (res,f,status,body) => f.mode === 'lost-ack' ? res.destroy() : json(res,status,body);
+  // The mock mutation is already committed. Hold ONLY its acknowledgement, with a
+  // finite server deadline and close cancellation. Snapshots expose no credentials.
+  async function committed(req,res,ns,channel,f,status,body) {
+    ns.commits[channel]=(ns.commits[channel]??0)+1;
+    if (f.mode === 'commit-delay') {
+      const id=randomUUID(),barrier={id,channel,phase:'after',committedAt:Date.now(),until:Date.now()+f.delayMs};
+      ns.barriers.set(id,barrier);
+      try { await delay(f.delayMs,req,res); } finally { ns.barriers.delete(id); }
+      if (res.destroyed || req.aborted) return;
+    }
+    respond(res,f,status,body);
+  }
   function bearerSubject(req,id) {
     const token = req.headers.authorization?.replace(/^Bearer /,'');
     const candidates = id ? [namespaces.get(id)].filter(Boolean) : [...namespaces.values()];
@@ -94,7 +108,7 @@ export function createMockProvider({state,registry}) {
         if (path === '/fixture/snapshot' && req.method === 'GET') {
           json(res,200,{syntheticOnly:true,runId:state.runId,enterprises:[...namespaces.values()].map(ns => ({
             enterpriseId:ns.profile.id,scimUsers:ns.users.size,seats:ns.seats.size,issuedTokens:ns.tokens.size,
-            counts:ns.counts,members:ns.members,markers:ns.markers,calls:ns.calls,
+            counts:ns.counts,commits:ns.commits,barriers:[...ns.barriers.values()],members:ns.members,markers:ns.markers,calls:ns.calls,
             subjects:[...ns.users.values()].map(u => ({ssoUser:u.userName,ghLogin:u.githubLogin,active:u.active,seated:ns.seats.has(u.githubLogin)})),
             faults:[...ns.faults].map(([channel,f]) => ({channel,mode:f.mode,remaining:f.remaining,expiresAt:f.expiresAt})),
           }))}); return;
@@ -104,7 +118,7 @@ export function createMockProvider({state,registry}) {
           if (!record(body) || Object.keys(body).some(k => !['enterpriseId','channel','mode','count','delayMs','ttlMs'].includes(k))) fail(400,'invalid_control');
           const ns = namespaces.get(body.enterpriseId);
           const count = body.count ?? 1, delayMs = body.delayMs ?? 1000, ttlMs = body.ttlMs ?? 60_000;
-          if (!ns || !CHANNELS.includes(body.channel) || !MODES.includes(body.mode) || !Number.isInteger(count) || count < 1 || count > 1000
+          if (!ns || !CHANNELS.includes(body.channel) || !MODES.includes(body.mode) || (body.mode === 'commit-delay' && !COMMIT_CHANNELS.includes(body.channel)) || !Number.isInteger(count) || count < 1 || count > 1000
             || !Number.isInteger(delayMs) || delayMs < 0 || delayMs > MAX_DELAY_MS || !Number.isInteger(ttlMs) || ttlMs < 1 || ttlMs > 600_000) fail(400,'invalid_control');
           ns.faults.set(body.channel,{mode:body.mode,remaining:count,delayMs,expiresAt:Date.now()+ttlMs});
           json(res,200,{accepted:true}); return;
@@ -127,7 +141,7 @@ export function createMockProvider({state,registry}) {
           const token = existing?.token ?? `phase5_${randomUUID().replaceAll('-','')}`;
           ns.attempts.set(b.oauthAttemptId,{key,token});
           ns.tokens.set(token,{login:user.githubLogin,id:user.numericId,scimId:user.id,binding:{...b}});
-          respond(res,f,200,{token}); return;
+          await committed(req,res,ns,'authorize',f,200,{token}); return;
         }
         fail(404,'fixture_route_not_found');
       }
@@ -155,10 +169,10 @@ export function createMockProvider({state,registry}) {
           if ([...ns.users.values()].some(u => u.userName.toLowerCase() === body.userName.toLowerCase())) fail(409,'user_exists');
           const local = body.userName.split('@')[0].toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,39-ns.profile.shortcode.length-1).replace(/-+$/g,'');
           const user = {...body,id:`${ns.profile.id}-${ns.nextId}`,numericId:ns.nextId++,githubLogin:`${local}_${ns.profile.shortcode}`,active:body.active !== false};
-          ns.users.set(user.id,user); respond(res,f,201,user); return;
+          ns.users.set(user.id,user); await committed(req,res,ns,channel,f,201,user); return;
         }
         const user = ns.users.get(id); if (!user) fail(404,'user_not_found');
-        if (req.method === 'DELETE') { ns.users.delete(id); ns.seats.delete(user.githubLogin); respond(res,f,204,undefined); return; }
+        if (req.method === 'DELETE') { ns.users.delete(id); ns.seats.delete(user.githubLogin); await committed(req,res,ns,channel,f,204,undefined); return; }
           if (req.method !== 'PUT' && req.method !== 'PATCH') fail(405,'method_not_allowed');
           if (req.method === 'PUT') {
             if (body.userName !== user.userName) fail(409,'subject_reassignment_forbidden');
@@ -168,7 +182,7 @@ export function createMockProvider({state,registry}) {
           if (!Array.isArray(body.Operations) || !body.Operations.every(o => String(o.op).toLowerCase() === 'replace' && o.path === 'active' && typeof o.value === 'boolean')) fail(400,'invalid_patch');
           for (const o of body.Operations) user.active=o.value;
         }
-        respond(res,f,200,user); return;
+        await committed(req,res,ns,channel,f,200,user); return;
       }
       const gh = /^\/github\/([^/]+)(\/.*)$/.exec(path);
       if (gh) {
@@ -190,7 +204,7 @@ export function createMockProvider({state,registry}) {
           count(ns,req.method === 'POST' ? 'seat-assign' : 'seat-remove',users[0]);
           const f = await before(req,res,ns,'seat'); if (!f) return;
           if (req.method === 'POST') ns.seats.add(users[0]); else ns.seats.delete(users[0]);
-          respond(res,f,200,{seats_created:req.method === 'POST' ? 1 : 0,seats_cancelled:req.method === 'DELETE' ? 1 : 0}); return;
+          await committed(req,res,ns,'seat',f,200,{seats_created:req.method === 'POST' ? 1 : 0,seats_cancelled:req.method === 'DELETE' ? 1 : 0}); return;
         }
         if (gh[2] === `${base}/settings/billing/usage/summary` && req.method === 'GET') { json(res,200,{usageItems:[]}); return; }
         fail(404,'github_route_not_found');
