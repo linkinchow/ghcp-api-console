@@ -8,7 +8,7 @@
 messages.1.output_config: Extra inputs are not permitted
 ```
 
-当前修复分支 **`fix/messages-output-config`** 从单slug `main` 的 `8ad76d547c9d067aac79f99391859cc67dcd7b44` 分出。没有引入multi-slug迁移、registry、Models或新schema；按用户要求提交本地修复，未部署或push。
+当前修复分支 **`fix/messages-output-config`** 从单slug `main` 的 `8ad76d547c9d067aac79f99391859cc67dcd7b44` 分出。没有引入multi-slug迁移、registry、Models或新schema；修复已提交并推送，尚未部署。
 
 Anthropic支持在特定模型上通过 `role:system` 消息内的 `output_config.effort` 调节会话中的effort。此消息可以有空content，但需要配对的beta头：
 
@@ -60,7 +60,7 @@ false模式原来不做这些正文适配，但遗漏了Anthropic版本/beta头�
 - mock HTTP route：8项，2 PASS / 6 FAIL；复现缺beta400、控制消息丢失/改role。
 - 收尾追加的调用归属回归：8项，6 PASS / 2 FAIL；空system effort消息遮住末尾tool_result或自动continue。已修复且失败证据保留在本分支 `.claude/messages-intent-before.log`。
 
-收尾专项（协议helper＋HTTP/SSE路由＋请求归属）已实际执行 **33/33 PASS**。，包括优化true/false、空/非空控制消息、原JSON保留（只换model ID）、上游OAuth替换、协议头一致、缺beta仍400、上游即使收到beta仍拒绝时不伪造成功、HTTP/SSE都到最终事件。
+收尾专项（协议helper＋HTTP/SSE路由＋请求归属）已实际执行 **33/33 PASS**，包括优化true/false、空/非空控制消息、原JSON保留（只换model ID）、上游OAuth替换、协议头一致、缺beta仍400、上游即使收到beta仍拒绝时不伪造成功、HTTP/SSE都到最终事件。
 
 ### 最终执行结果
 
@@ -86,14 +86,15 @@ node --import tsx --test src/proxy/src/routes/claudeCodeCompat.test.ts src/proxy
 
 全量测试通过清空部署env、指定不存在的DOTENV路径执行；相关真实MySQL测试仍按显式门禁跳过。没有启动浏览器或应用dev server来代替协议测试。
 
-### Azure状态检查和启动
+### 测试环境状态检查和启动
 
-显式subscription `ffe7c7cd-f495-444a-9df7-9bcb39da2d66`；kubectl显式指定独立kubeconfig及context。只检查/启动已有资源，没有部署修复。
+环境操作使用显式Azure subscription、独立kubeconfig及context。公开报告不包含实际订阅ID、资源名称或连接信息。只检查/启动已有测试资源，没有部署修复。
 
-- GHCP PostgreSQL `pgghcpproxy24odtgs` 初始Ready，AKS `aks-ghcp-proxy2` 已Running/Succeeded，因此没有重启。namespace ghcp的Console/Login/SSO及2个Proxy全部Ready。
-- LiteLLM PostgreSQL `pglitellm63uc2q3` 初始Stopped，启动并等待Ready后才启动初始Stopped的 `aks-litellm6`。
-- 只读核对当前镜像仍为GHCP `d336a69`、LiteLLM `v1.102.1`；这些旧运行镜像没有接收本轮修复，不把环境启动称作补丁上线。
-- LiteLLM AKS启动命令退出码0，最终Running/Succeeded，3个LiteLLM Pod均1/1 Ready。中间一次wait误用 `app=litellm-proxy` 返回no matching resources，检查实际labels后改为 `app=litellm` 并确认全部Ready；这不是应用故障。未调用模型、修改Secret、模型权限或公司停机策略。
+- GHCP测试环境的PostgreSQL初始Ready、AKS已Running/Succeeded，因此没有重启；SSO/Login/Console及两个Proxy全部Ready。
+- LiteLLM测试环境的PostgreSQL和AKS初始Stopped；先启动数据库，确认Ready后才启动AKS。最终AKS为Running/Succeeded，三个LiteLLM副本全部Ready。
+- 运行镜像未更新；不能把环境启动称作补丁上线。
+- 中间一次readiness检查使用了错误selector，检查实际labels并改正后确认全部Ready。这不是应用故障。
+- 未调用模型、修改Secret、模型权限或公司停机策略。
 
 依赖通过公司npm feed安装，npm报告基准依赖树4项安全警告（1 moderate、2 high、1 critical）；本补丁未更新依赖或执行audit fix，这些警告不作为本次新引入缺陷，也不宣称已解决。
 
