@@ -64,7 +64,9 @@ export function prepareClaudeCodeMessagesRequest(
     forwardOptions: {
       claudeCodeOptimized: true,
       anthropicVersion: headerValue(req, 'anthropic-version') ?? DEFAULT_ANTHROPIC_VERSION,
-      anthropicBeta: anthropicBetaHeader(req, prepared, profile, options),
+      anthropicBeta: hasMessageOutputConfig(prepared)
+        ? headerValue(req, 'anthropic-beta')
+        : anthropicBetaHeader(req, prepared, profile, options),
       visionRequest: containsContentBlockType(prepared, 'image'),
       initiator: intent.initiator,
       interactionType: intent.interactionType,
@@ -77,6 +79,8 @@ export function prepareClaudeCodeMessagesRequest(
 
 export function preprocessClaudeCodeMessagesBody(body: Record<string, unknown>): Record<string, unknown> {
   const prepared = cloneJson(body) as Record<string, unknown>;
+  // Per-message effort depends on an unchanged conversation and its beta header.
+  if (hasMessageOutputConfig(prepared)) return prepared;
   const profile = getAnthropicModelProfile(stringField(prepared.model) ?? '');
 
   stripCacheControlScope(prepared);
@@ -89,6 +93,13 @@ export function preprocessClaudeCodeMessagesBody(body: Record<string, unknown>):
   rewriteMidConversationSystemMessages(prepared, profile);
   fixTrailingAssistantMessage(prepared);
   return prepared;
+}
+
+function hasMessageOutputConfig(body: Record<string, unknown>): boolean {
+  return Array.isArray(body.messages) && body.messages.some((message) => {
+    const object = recordField(message);
+    return object !== undefined && Object.hasOwn(object, 'output_config');
+  });
 }
 
 export function estimateInputTokens(body: Record<string, unknown>): number {

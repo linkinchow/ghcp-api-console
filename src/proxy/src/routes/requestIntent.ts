@@ -35,7 +35,7 @@ function inferRequestIntent(path: CopilotApiPath, body: Record<string, unknown>)
 function inferMessagesIntent(body: Record<string, unknown>): RequestIntent {
   if (isCompactRequest(body)) return { initiator: 'agent', interactionType: 'conversation-other' };
 
-  const last = lastRecord(body.messages);
+  const last = lastMessagesInput(body.messages);
   if (last && containsBlockType(last.content, 'tool_result')) return { initiator: 'agent' };
   if (last && collectText(last.content).trim() === AUTOMATIC_CONTINUE_PROMPT) return { initiator: 'agent' };
   return { initiator: 'user' };
@@ -61,6 +61,18 @@ function isCompactRequest(body: Record<string, unknown>): boolean {
     lastUserText.startsWith('<compact-summary>') ||
     /^(compact|summarize|summary of (the )?conversation|continue (from|with) (the )?summary)/i.test(lastUserText)
   );
+}
+
+function lastMessagesInput(value: unknown): Record<string, unknown> | undefined {
+  if (!Array.isArray(value)) return undefined;
+  for (let index = value.length - 1; index >= 0; index--) {
+    const message = recordField(value[index]);
+    if (!message) continue;
+    if (message.role === 'system' && Array.isArray(message.content) && message.content.length === 0
+      && Object.hasOwn(message, 'output_config')) continue;
+    return message;
+  }
+  return undefined;
 }
 
 function lastRecord(value: unknown): Record<string, unknown> | undefined {

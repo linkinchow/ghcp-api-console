@@ -45,6 +45,33 @@ test('identifies Anthropic automatic continuation and ordinary user prompts', ()
   );
 });
 
+for (const content of [
+  [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'done' }],
+  [{ type: 'text', text: AUTOMATIC_CONTINUE_PROMPT }],
+]) {
+  test(`effort-only control messages do not hide ${content[0]!.type} continuation intent`, () => {
+    const intent = resolveRequestIntent('/v1/messages', {
+      messages: [
+        { role: 'user', content },
+        { role: 'system', content: [], output_config: { effort: 'high' } },
+        { role: 'system', content: [], output_config: { effort: 'low' } },
+      ],
+    });
+    assert.equal(intent.initiator, 'agent');
+  });
+}
+
+test('effort controls do not override an explicit initiator or reclassify nonempty system input', () => {
+  const messages = [
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'done' }] },
+    { role: 'system', content: [], output_config: { effort: 'high' } },
+  ];
+  assert.equal(resolveRequestIntent('/v1/messages', { messages }, 'user').initiator, 'user');
+  assert.equal(resolveRequestIntent('/v1/messages', {
+    messages: [messages[0], { role: 'system', content: [{ type: 'text', text: 'New operator instruction' }], output_config: { effort: 'high' } }],
+  }).initiator, 'user');
+});
+
 test('identifies Chat Completions tool continuations', () => {
   assert.equal(
     resolveRequestIntent('/chat/completions', {

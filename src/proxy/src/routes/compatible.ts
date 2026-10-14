@@ -256,6 +256,10 @@ function prepareForward(
       body,
       forwardOptions: {
         initiator: resolveRequestIntent(path, body, req.get('x-initiator')).initiator,
+        ...(path === '/v1/messages' ? {
+          anthropicVersion: req.get('anthropic-version'),
+          anthropicBeta: req.get('anthropic-beta'),
+        } : {}),
       },
     };
   }
