@@ -407,7 +407,7 @@ SAML 会话**不建表**（§5.5）。
 | SSO SAML | default 用根路径 `/metadata` `/sso` `/login` `/logout`；其他企业用 `/enterprises/:id/...` | path | 未知 → 404，不回落 |
 | Login 管理 / internal | `/api/enterprises/:id/tasks...` | path，或任务行 | 无作用域 → 400 |
 
-实现方式：每个服务都有一个 `enterpriseRouter(registry)` 中间件，校验 `:enterpriseId` 并挂上 `res.locals.enterprise`（frozen profile）。路由处理函数调用 `requireEnterprise(res)` 取值。repository 函数的第一个参数是**必填**的 `EnterpriseId`，没有可选参数，也没有默认值。旧分支中 `SqliteStorage.enterpriseId(id?)`、`resolveEnterpriseScope(registry, undefined)`、`managesSsoUser(..., enterpriseId = this.enterpriseId)` 这类回落方式一律不写。
+实现方式：企业作用域的路由挂 `requireEnterprise(lookup)` 中间件，校验 `:enterpriseId`（header/query/body 中不一致的企业 ID 返回 400 `enterprise_scope_conflict`），并挂上 `res.locals.enterprise`（frozen profile）。路由处理函数调用 `enterpriseOf(res)` 取值。repository 函数的第一个参数是**必填**的 `EnterpriseId`，没有可选参数，也没有默认值。旧分支中 `SqliteStorage.enterpriseId(id?)`、`resolveEnterpriseScope(registry, undefined)`、`managesSsoUser(..., enterpriseId = this.enterpriseId)` 这类回落方式一律不写。
 
 ### 5.2 Proxy 管理路由
 
@@ -608,14 +608,18 @@ SAML 会话**不建表**（§5.5）。
 
 | 模块 | 内容 | 消除的重复 |
 | --- | --- | --- |
-| `enterprise/registry.ts` | 类型、`parseRegistry`、`parseTrustedUrl` | 旧 `enterprise.ts` 与 `enterpriseV3.ts` 两套解析器 |
+| `enterprise/registry.ts` | 类型、`parseRegistry`（结构、唯一性、容量） | 旧 `enterprise.ts` 与 `enterpriseV3.ts` 两套解析器 |
+| `enterprise/registryFields.ts` | 字段表、单字段校验、`EnterpriseRegistryError` | — |
+| `enterprise/registryDefaults.ts` | §3.3 默认值推导、GHE.com/github.com 规则、blockers | — |
+| `enterprise/trustedUrl.ts` | `parseTrustedUrl`、`sameTrustedUrl`（按路径段精确比较） | — |
 | `enterprise/registryFile.ts` | `loadRegistry({ service, env })`：读文件、与 env 合并、deep-freeze | — |
 | `enterprise/defaultFromEnv.ts` | 各服务的 env→default 映射表（§3.5） | — |
 | `enterprise/secrets.ts` | `readSecret(ref)`，带 60 秒缓存 | — |
-| `enterprise/githubEndpoints.ts` | §6，含从 Login 移入的 `githubUrls.ts` | — |
+| `enterprise/githubEndpoints.ts` | §6，含从 Login 移入的 `githubUrls.ts`；`defaultApiBaseUrls` 是唯一写公共 API 主机名的地方 | — |
 | `enterprise/fingerprint.ts` | `profileFingerprint(fields)`，唯一的 hash 实现 | 旧 `enterpriseRegistryHashV3` 三份、`enterpriseMysqlRegistryHashV3` |
-| `enterprise/scope.ts` | `EnterpriseId` 品牌类型、`enterpriseRouter`、`requireEnterprise`、`EnterpriseScopeError` | 旧 Proxy、SSO、Login 三份 `enterprise.ts` |
-| `enterprise/poolRanking.ts` | §5.8 的纯函数 | — |
+| `enterprise/scope.ts` | `EnterpriseId` 品牌类型、`requireEnterprise(lookup)` 中间件、`enterpriseOf(res)`、`EnterpriseScopeError` | 旧 Proxy、SSO、Login 三份 `enterprise.ts` |
+| `enterprise/poolRanking.ts` | §5.8 的纯函数（含按批次分配的 `planCreations`） | — |
+| `enterprise/dto.ts` | 企业 DTO：`EnterpriseSummaryDto`、`EnterprisePoolPolicyDto`、`EnterpriseReadinessDto` | — |
 | `deepFreeze.ts` | — | 旧 `enterpriseRuntimeV3.ts:40`、`login/db/connection.ts:58` |
 | `abort.ts` | `abortable(promise, signal)` | 旧 `abortable` ×2、`untilSignal`、`untilAborted` |
 | `boundedResponse.ts` | `readBoundedJson(response, maxBytes)` | 旧 `readResponse`、`readJson` 和一份内联 reader |
@@ -695,7 +699,7 @@ MySQL 的 schema 定义仍集中在 `src/proxy/src/db/mysqlSchema.ts`，只服�
 ### M1 共享基础（无行为变化）
 
 - **新增**：`src/packages/shared/src/enterprise/{registry,registryFile,defaultFromEnv,secrets,githubEndpoints,fingerprint,scope,poolRanking}.ts`、`deepFreeze.ts`、`abort.ts`、`boundedResponse.ts`、`externalFetch.ts`、`sqliteService.ts`，以及对应的 `*.test.ts`。
-- **修改**：`src/packages/shared/src/index.ts`、`contracts.ts`（企业 DTO：`EnterpriseSummaryDto`、`EnterprisePoolPolicyDto`、`EnterpriseReadinessDto`）；`src/login/src/auth/githubUrls.ts` 改为从 shared 重导出。
+- **修改**：`src/packages/shared/src/index.ts`、`enterprise/dto.ts`（企业 DTO：`EnterpriseSummaryDto`、`EnterprisePoolPolicyDto`、`EnterpriseReadinessDto`）；`src/login/src/auth/githubUrls.ts` 改为从 shared 重导出。
 - **验收**：
   - 所有服务在没有 registry 文件时行为不变，全量测试通过；
   - §9.1 中 registry、排名、端点的单元测试全部通过；
@@ -792,7 +796,7 @@ M1 ──┬── M2 ── M5 ──┐
 ```
 
 - M2、M3、M4 可由三人并行。
-- M5 的 SSO/Login 客户端先对 M3/M4 在 `contracts.ts` 中定好的契约做 mock 开发。
+- M5 的 SSO/Login 客户端先对 M3/M4 在 `enterprise/dto.ts` 中定好的契约做 mock 开发。
 - 每个里程碑单独提交和评审，不一次性合并。
 
 ---
@@ -824,14 +828,16 @@ M1 ──┬── M2 ── M5 ──┐
 
 ---
 
-## 13. 待决问题
+## 13. 已决问题（2026-10-17 用户确认）
 
-1. **default 企业的内部 ID 固定为 `default`**（旧分支用 UUID）。好处是迁移无需映射、URL 和 cookie 稳定。是否同意？
-2. **旧的无作用域管理和 internal 接口**：本设计对非直连路径一律返回 400；只有旧 `/api/accounts*` 直连路由保留一个版本。是否存在外部脚本调用 SSO、Login 或 Proxy 的 `/api` 或 `/internal`，需要更长的兼容期？
-3. **首次升级是否接受短暂停机**（Recreate，或一次性替换四个镜像）？还是必须支持逐个 Deployment 滚动（需要额外的兼容层）？
-4. **GHE.com 的 OAuth client id**：opencode 的 `Ov23li8tweQw6odWQebz` 能否在 `*.ghe.com` 上使用，需要真实环境确认。设计已支持按企业覆盖 `oauthClientId`。
-5. **Login 并发是否需要按企业公平**？本设计保持全局 FIFO 和全局并发度。
-6. **`MYSQL_AUTO_MIGRATE=false` 的客户**：由 DBA 执行生成的 `proxy-mysql-enterprise-upgrade.sql`，是否可以接受？
+| # | 问题 | 决定 |
+| --- | --- | --- |
+| 1 | 升级前企业的内部 ID | 固定为 `default`。 |
+| 2 | 无作用域的旧 `/api`、`/internal` 接口 | 没有外部脚本调用；按设计对非直连路径返回 400，只有旧 `/api/accounts*` 直连路由保留一个版本。 |
+| 3 | 首次升级是否允许短暂停机 | 允许：一次性替换四个镜像或使用 Recreate；不做滚动兼容层。 |
+| 4 | OpenCode OAuth client id 能否用于 `*.ghe.com` | 暂不决定，等真实环境确认；按企业可覆盖 `oauthClientId`。 |
+| 5 | Login 并发是否按企业公平 | 保持全局 FIFO 和全局并发度。 |
+| 6 | `MYSQL_AUTO_MIGRATE=false` 的客户 | 由 DBA 执行生成的 `proxy-mysql-enterprise-upgrade.sql`。 |
 
 ---
 
@@ -845,7 +851,7 @@ M1 ──┬── M2 ── M5 ──┐
 | `.../enterpriseV3.ts` | 重写 → `enterprise/registry.ts`、`scope.ts` | 删除 `allowLegacyOmission`、`legacyEnterpriseId`、per-profile 内部地址；`AuthorizationBinding` 丢弃 |
 | `.../enterpriseRuntimeV3.ts` | 重写 → `registryFile.ts`、`secrets.ts`、`deepFreeze.ts` | secret 引用的格式保留 |
 | `.../enterpriseRuntimeV4.ts` | 丢弃 → `fingerprint.ts` | — |
-| `.../enterprisePoolV4.ts` | 部分移植 → `contracts.ts` 中的 DTO | `validated` 状态、evidence、`validation_kind` 丢弃 |
+| `.../enterprisePoolV4.ts` | 部分移植 → `enterprise/dto.ts` 中的 DTO | `validated` 状态、evidence、`validation_kind` 丢弃 |
 | `.../enterpriseStorage.ts`、`enterpriseStorageV3.ts`、`enterpriseStorageV4.ts` | 丢弃 | 离线 schema、回执、trigger 由运行时迁移替代 |
 | `.../enterpriseMysql.ts`、`enterpriseMysqlV1.ts`、`V3`、`V4`、`SchemaV3`、`SchemaV4` | 丢弃 | MySQL schema 继续集中在 `src/proxy/src/db/mysqlSchema.ts` |
 | `.../enterpriseSqliteV1.ts`、`enterpriseSqliteReadiness.ts` | 丢弃 | 由 `sqliteService.ts` 的迁移加校验替代 |
