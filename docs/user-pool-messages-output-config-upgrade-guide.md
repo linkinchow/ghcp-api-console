@@ -74,7 +74,7 @@ messages.1.output_config: Extra inputs are not permitted
 
 ### 路径A：使用供应方已发布镜像（推荐的交付方式）
 
-**截至本指南编写时，本次镜像尚未发布到Docker Hub。下面是待发布后填写的格式，不能当成现有可拉取地址。**
+**更新（2026-10-17）：已发布包含本修复的四组件镜像（r4），但它同时包含上游合并等更多变更，需要四个组件一起升级。请改用 [单企业版升级指南（r4）](user-pool-release-upgrade-guide.md)。** 以下保留原格式说明供参考。
 
 供应方应提供：registry/repository、不可变版本tag、digest、目标架构、源commit、验证结果和回滚限制。客户使用自己的私有镜像仓库/镜像镜像同步规则亦可。
 

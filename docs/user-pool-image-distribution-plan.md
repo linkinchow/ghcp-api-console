@@ -4,7 +4,7 @@
 
 **应该提供预构建镜像。** 客户每次重装Node/npm、下载依赖和构建镜像会增加交付时间与环境差异；供应方一次受控构建、测试、扫描，客户按固定产物部署，更便于回滚与排障。
 
-本次尚未上传镜像，也没有配置Docker Hub认证或自动发布流程。写升级指南不构成公开发布许可。客户升级文档见[Messages修复升级指南](user-pool-messages-output-config-upgrade-guide.md)。
+**已发布（2026-10-17）**：首批四组件镜像 r4 已推送到 Docker Hub 公开仓库 `linkinchow/ghcp-{proxy,console,login,sso}`，tag `single-slug-164cade-amd64-r4`，实际 digest 与升级步骤见[单企业版升级指南（r4）](user-pool-release-upgrade-guide.md)。未配置自动发布流程；后续版本仍按"构建 → 隔离验证 → 扫描 → 用户确认 → 推送同一产物 → 按 digest 校验"执行。
 
 ## 一、先发布哪个镜像
 
