@@ -1,8 +1,11 @@
 export type CopilotOauthStatus = 'valid' | 'expired' | 'missing' | 'refreshing' | 'failed';
 export type EmuStatus = 'active' | 'suspended' | 'deleted' | 'not_synced';
-export type CopilotSeatStatus = 'unknown' | 'assigned' | 'unassigned' | 'assign_failed' | 'remove_failed';
+export type CopilotSeatStatus = 'unknown' | 'assigned' | 'pending_cancellation' | 'unassigned' | 'assign_failed' | 'remove_failed';
 export type CopilotSeatOperation = 'assign' | 'remove';
-export type LoginTaskStatus = 'pending' | 'running' | 'success' | 'failed' | 'cancelled';
+export type CopilotSeatSnapshot =
+  | { status: 'assigned' | 'unassigned'; pendingCancellationDate?: never }
+  | { status: 'pending_cancellation'; pendingCancellationDate: string };
+export type LoginTaskStatus = 'pending' | 'running' | 'cancelling' | 'success' | 'failed' | 'cancelled';
 export type SsoType = 'azure' | 'custom';
 export type AccountType = 'business' | 'enterprise';
 
@@ -153,6 +156,7 @@ export interface SsoUserDto {
   ghScimId?: string;
   emuStatus: EmuStatus;
   copilotSeatStatus: CopilotSeatStatus;
+  copilotSeatPendingCancellationDate?: string;
   copilotSeatLastOperation?: CopilotSeatOperation;
   copilotSeatLastError?: string;
   copilotSeatUpdatedAt?: string;
@@ -264,7 +268,8 @@ export interface ImportEmuUserRow {
   ghLogin?: string;
   ghScimId?: string;
   emuStatus?: EmuStatus;
-  copilotSeatStatus?: 'assigned' | 'unassigned';
+  copilotSeatStatus?: CopilotSeatSnapshot['status'];
+  copilotSeatPendingCancellationDate?: string;
   status: ImportEmuUserStatus;
   detail: string;
 }
@@ -336,4 +341,29 @@ export interface LoginTaskDto {
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;
+  stage?: string;
+  stageUpdatedAt?: string;
+  failureCode?: string;
+  queuedAt?: string;
 }
+
+export interface LoginAttemptDto extends LoginTaskDto {
+  taskId: string;
+  attemptNumber: number;
+  historyIncomplete?: boolean;
+}
+
+export interface LoginQueueDto {
+  concurrency: number;
+  preparing: string[];
+  pending: string[];
+  active: string[];
+  cancelling: string[];
+  longestWaitMs: number;
+  items: Array<{ taskId: string; identity: string; stage?: string; status: LoginTaskStatus; position?: number; waitMs: number; runMs?: number; stageUpdatedAt?: string }>;
+  updatedAt: string;
+}
+
+export type LoginCredentials =
+  | { credentialMode: 'default' }
+  | { credentialMode: 'override'; ssoPassword: string };

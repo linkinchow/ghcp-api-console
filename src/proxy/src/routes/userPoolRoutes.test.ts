@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 import { once } from 'node:events';
@@ -284,6 +285,35 @@ test('independent admin reauthorization cannot race a managed pool member', asyn
     assert.equal(response.status, 409);
     assert.equal((await response.json() as any).error.code, 'pool_member_managed');
     assert.equal((await getAccount(members[0]))?.copilotOauthStatus, 'valid');
+    assert.equal(upstreamCalls.length, 0);
+  } finally { config.internalApiToken = token; }
+});
+
+test('upstream batch reauthorization and Login retry preparation cannot start Login for a pool member', async () => {
+  const token = config.internalApiToken;
+  config.internalApiToken = 'test-internal-only';
+  const headers = { 'X-Internal-Token': config.internalApiToken, 'Content-Type': 'application/json' };
+  try {
+    const before = await getAccount(members[0]);
+    const preview = await originalFetch(`${baseUrl}/api/accounts/operations/preview`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ action: 'reauthorize', selection: { ids: [members[0]] } }),
+    });
+    assert.equal(preview.status, 201);
+    const item = (await preview.json() as { items: Array<{ id: string; status: string; detail?: string }> }).items[0];
+    assert.equal(item?.status, 'skipped');
+    assert.match(item?.detail ?? '', /User pool recovery controls/);
+
+    const prepare = await originalFetch(`${baseUrl}/internal/accounts/${members[0]}/oauth-attempts/${randomUUID()}/prepare`, {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        ssoUser: before?.ssoUser, ghLogin: before?.ghLogin, ssoType: 'custom',
+        previousAttemptId: before?.copilotOauthAttemptId ?? null, credentialMode: 'default',
+      }),
+    });
+    assert.equal(prepare.status, 409);
+    assert.equal((await prepare.json() as { error: { code: string } }).error.code, 'pool_member_managed');
+    assert.deepEqual(await getAccount(members[0]), before);
     assert.equal(upstreamCalls.length, 0);
   } finally { config.internalApiToken = token; }
 });

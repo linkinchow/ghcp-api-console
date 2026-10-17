@@ -1,0 +1,155 @@
+# GHE.com end-to-end qualification of the release images (SQLite, caller-lease user pool).
+# Every external party is the local mock, reachable only on the internal network under GHE.com
+# host names: fixture.ghe.com (web + OAuth device flow), api.fixture.ghe.com (SCIM, seats) and
+# copilot-api.fixture.ghe.com (Copilot). The real SSO is the SAML IdP; the real Login service
+# drives the device flow with its own Chromium. Synthetic credentials only.
+#
+#   RELEASE_CANDIDATE_TAG=single-slug-<sha>-amd64-r<N> RELEASE_GHE_CERTS_DIR=<synthetic idp certs> \
+#   docker compose -p <unique project> -f tests/image-release/ghe-compose.yaml up --abort-on-container-exit --exit-code-from driver
+name: ghcp-release-ghe
+
+x-app: &app
+  networks: [isolated]
+  stop_grace_period: 35s
+
+x-health: &health
+  interval: 2s
+  timeout: 3s
+  retries: 120
+
+services:
+  mock:
+    image: node:22-bookworm-slim@sha256:efd0ab5780c2d9ab1f0f869571a00d5edb17793bff4cce4a2792e3eb0ffc7562
+    init: true
+    command: [node, /fixtures/mock-services.mjs]
+    environment:
+      PORT: "8002"
+      INTERNAL_API_TOKEN: ghe-fixture-internal-only
+      SCIM_TOKEN: ghe-fixture-scim-only
+      SEAT_PAT: ghe-fixture-seat-only
+      SSO_DEFAULT_USER_PASSWORD: ghe-fixture-sso-default-only
+      PROXY_BASE_URL: http://proxy:3000
+      MOCK_GHE_HOST: fixture.ghe.com
+      MOCK_GHE_IDP_SSO_URL: http://sso:7001/sso
+    volumes:
+      - ../docker-user-pool:/fixtures:ro
+    networks:
+      isolated:
+        aliases: [fixture.ghe.com, api.fixture.ghe.com, copilot-api.fixture.ghe.com]
+    healthcheck:
+      <<: *health
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8002/healthz').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+
+  sso:
+    <<: *app
+    image: ghcp-release-sso:${RELEASE_CANDIDATE_TAG:?set RELEASE_CANDIDATE_TAG}
+    environment:
+      PORT: "7001"
+      LOG_LEVEL: warn
+      INTERNAL_API_TOKEN: ghe-fixture-internal-only
+      DB_PATH: /data/sso.sqlite
+      SSO_USER_EVENTS_LOG: /data/sso-user-events.log
+      BASE_URL: http://sso:7001
+      PROXY_BASE_URL: http://proxy:3000
+      SESSION_SECRET: ghe-fixture-session-only
+      SSO_DEFAULT_USER_PASSWORD: ghe-fixture-sso-default-only
+      GITHUB_BASE_URL: http://fixture.ghe.com:8002
+      ENTERPRISE_SLUG: local-test
+      # Must be ignored on GHE.com: logins carry no shortcode suffix there.
+      ENTERPRISE_SHORTCODE: test
+      GITHUB_API_BASE_URL: http://api.fixture.ghe.com:8002
+      GITHUB_COPILOT_SEAT_PAT: ghe-fixture-seat-only
+      SCIM_BASE_URL: http://api.fixture.ghe.com:8002/scim/v2/enterprises/local-test
+      SCIM_TOKEN: ghe-fixture-scim-only
+      # SP_ENTITY_ID is deliberately unset: it must default to <GITHUB_BASE_URL>/enterprises/<slug>.
+      SP_ACS_URL: http://fixture.ghe.com:8002/enterprises/local-test/saml/consume
+      CERT_DIR: /certs
+    volumes:
+      - sso-data:/data
+      - ${RELEASE_GHE_CERTS_DIR:?set RELEASE_GHE_CERTS_DIR}:/certs:ro
+    depends_on:
+      mock: { condition: service_healthy }
+    healthcheck:
+      <<: *health
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:7001/healthz').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+
+  login:
+    <<: *app
+    image: ghcp-release-login:${RELEASE_CANDIDATE_TAG:?set RELEASE_CANDIDATE_TAG}
+    environment:
+      PORT: "7003"
+      LOG_LEVEL: warn
+      INTERNAL_API_TOKEN: ghe-fixture-internal-only
+      DB_PATH: /data/login.sqlite
+      LOG_DIR: /logs/login
+      PROXY_BASE_URL: http://proxy:3000
+      SSO_URL: http://sso:7001/login
+      AUTH_HEADLESS: "true"
+      GITHUB_BASE_URL: http://fixture.ghe.com:8002
+      ENTERPRISE_SLUG: local-test
+      # GITHUB_OAUTH_CLIENT_ID is left at its default (the OpenCode client) on purpose.
+    volumes:
+      - login-data:/data
+      - login-logs:/logs
+    depends_on:
+      sso: { condition: service_healthy }
+    healthcheck:
+      <<: *health
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:7003/healthz').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+
+  proxy:
+    <<: *app
+    image: ghcp-release-proxy:${RELEASE_CANDIDATE_TAG:?set RELEASE_CANDIDATE_TAG}
+    environment:
+      PORT: "3000"
+      LOG_LEVEL: warn
+      INTERNAL_API_TOKEN: ghe-fixture-internal-only
+      API_KEY: ghe-fixture-api-only
+      DB_PATH: /data/proxy.sqlite
+      ACCOUNT_ROUTING_MODE: caller-lease
+      POOL_ACCOUNT_EMAIL_DOMAIN: pool.ghe.example.test
+      POOL_WARMUP_MODEL: claude-opus-5-2
+      READY_IDLE_TARGET: "1"
+      POOL_MAX_ACCOUNTS: "5"
+      CALLER_LEASE_TTL_SECONDS: "600"
+      PROVISIONAL_LEASE_TTL_SECONDS: "60"
+      PREWARM_POLL_SECONDS: "1"
+      PREWARM_CONCURRENCY: "1"
+      POOL_REQUEST_TIMEOUT_SECONDS: "60"
+      SSO_BASE_URL: http://sso:7001
+      LOGIN_BASE_URL: http://login:7003
+      GITHUB_BASE_URL: http://fixture.ghe.com:8002
+      ENTERPRISE_SHORTCODE: test
+      COPILOT_API_BASE_URL: http://copilot-api.fixture.ghe.com:8002
+      PROXY_ERROR_DIAGNOSTICS_ENABLED: "false"
+    volumes:
+      - proxy-data:/data
+    depends_on:
+      sso: { condition: service_healthy }
+      login: { condition: service_healthy }
+    healthcheck:
+      <<: *health
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/healthz').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+
+  driver:
+    image: node:22-bookworm-slim@sha256:efd0ab5780c2d9ab1f0f869571a00d5edb17793bff4cce4a2792e3eb0ffc7562
+    init: true
+    command: [node, /e2e/ghe-e2e.mjs]
+    networks: [isolated]
+    volumes:
+      - ./ghe-e2e.mjs:/e2e/ghe-e2e.mjs:ro
+    depends_on:
+      proxy: { condition: service_healthy }
+
+networks:
+  isolated:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${RELEASE_GHE_SUBNET:-10.244.220.0/24}
+
+volumes:
+  sso-data:
+  login-data:
+  login-logs:
+  proxy-data:

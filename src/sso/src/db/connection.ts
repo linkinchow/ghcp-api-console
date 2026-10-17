@@ -17,3 +17,8 @@ export function getDb(): Database.Database {
   }
   return db;
 }
+
+export function closeDb(): void {
+  db?.close();
+  db = undefined;
+}

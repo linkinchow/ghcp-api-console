@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { parseGithubBaseUrl } from '@ghcp/shared';
 
 export interface SsoConfig {
   port: number;
@@ -11,7 +12,10 @@ export interface SsoConfig {
   defaultUserPassword?: string;
   eventLogPath: string;
   enterpriseSlug: string;
+  /** Effective EMU login suffix; always empty on GHE.com. */
   enterpriseShortcode: string;
+  githubBaseUrl: string;
+  gheCom: boolean;
   githubApiBaseUrl: string;
   githubCopilotSeatPat?: string;
   scimBaseUrl: string;
@@ -20,6 +24,8 @@ export interface SsoConfig {
   spEntityId: string;
   spAcsUrl: string;
 }
+
+const github = parseGithubBaseUrl(process.env.GITHUB_BASE_URL);
 
 export const config: SsoConfig = {
   port: readPort(process.env.PORT, 7001),
@@ -32,7 +38,10 @@ export const config: SsoConfig = {
   defaultUserPassword: process.env.SSO_DEFAULT_USER_PASSWORD || undefined,
   eventLogPath: process.env.SSO_USER_EVENTS_LOG ?? './data/sso-user-events.log',
   enterpriseSlug: process.env.ENTERPRISE_SLUG ?? 'acme',
-  enterpriseShortcode: process.env.ENTERPRISE_SHORTCODE ?? 'octo',
+  // GHE.com hides the shortcode and its API rejects suffixed usernames, so ENTERPRISE_SHORTCODE is ignored there.
+  enterpriseShortcode: github.isGheCom ? '' : process.env.ENTERPRISE_SHORTCODE ?? 'octo',
+  githubBaseUrl: github.baseUrl,
+  gheCom: github.isGheCom,
   githubApiBaseUrl: process.env.GITHUB_API_BASE_URL ?? 'https://api.github.com',
   githubCopilotSeatPat: process.env.GITHUB_COPILOT_SEAT_PAT,
   scimBaseUrl: process.env.SCIM_BASE_URL ?? '',

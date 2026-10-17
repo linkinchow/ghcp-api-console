@@ -8,13 +8,17 @@ services:
   sso:
     build:
       context: .
-      dockerfile: src/sso/Dockerfile
+      dockerfile: deploy/images/Dockerfile.release
+      target: sso
       args:
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
     image: ghcp-sso:local
+    # Covers SHUTDOWN_TIMEOUT_MS (default 25 s) plus storage release; Docker's default is 10 s.
+    stop_grace_period: 35s
     environment:
       PORT: "7001"
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-25000}
       DB_PATH: /data/sso.sqlite
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?set INTERNAL_API_TOKEN}
       BASE_URL: ${SSO_PUBLIC_BASE_URL:?set SSO_PUBLIC_BASE_URL}
@@ -24,6 +28,7 @@ services:
       SSO_USER_EVENTS_LOG: /data/sso-user-events.log
       ENTERPRISE_SLUG: ${ENTERPRISE_SLUG:?set ENTERPRISE_SLUG}
       ENTERPRISE_SHORTCODE: ${ENTERPRISE_SHORTCODE:-octo}
+      GITHUB_BASE_URL: ${GITHUB_BASE_URL:-https://github.com}
       GITHUB_API_BASE_URL: ${GITHUB_API_BASE_URL:-https://api.github.com}
       GITHUB_COPILOT_SEAT_PAT: ${GITHUB_COPILOT_SEAT_PAT:-}
       SCIM_BASE_URL: ${SCIM_BASE_URL:?set SCIM_BASE_URL}
@@ -43,21 +48,25 @@ services:
   login:
     build:
       context: .
-      dockerfile: src/login/Dockerfile
+      dockerfile: deploy/images/Dockerfile.release
+      target: login
       args:
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
     image: ghcp-login:local
+    stop_grace_period: 35s
     environment:
       PORT: "7003"
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-25000}
       DB_PATH: /data/login.sqlite
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?set INTERNAL_API_TOKEN}
       PROXY_BASE_URL: http://proxy:3000
       LOG_DIR: /logs/login
       SSO_URL: ${LOGIN_SSO_URL:-http://sso:7001/login}
-      SSO_PROVIDER: ${LOGIN_SSO_PROVIDER:-custom}
       AUTH_HEADLESS: ${AUTH_HEADLESS:-true}
       AUTH_DEBUG_ARTIFACT_DIR: /logs/auth-debug
+      GITHUB_BASE_URL: ${GITHUB_BASE_URL:-https://github.com}
+      ENTERPRISE_SLUG: ${ENTERPRISE_SLUG:-}
       GITHUB_OAUTH_CLIENT_ID: ${GITHUB_OAUTH_CLIENT_ID:-Ov23li8tweQw6odWQebz}
       GITHUB_OAUTH_SCOPE: ${GITHUB_OAUTH_SCOPE:-read:user}
       OPENCODE_VERSION: ${OPENCODE_VERSION:-1.0.0}
@@ -74,17 +83,21 @@ services:
   proxy:
     build:
       context: .
-      dockerfile: src/proxy/Dockerfile
+      dockerfile: deploy/images/Dockerfile.release
+      target: proxy
       args:
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
     image: ghcp-proxy:local
+    stop_grace_period: 35s
     restart: "on-failure:5"
     environment:
       PORT: "3000"
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-25000}
       STORAGE_DRIVER: ${STORAGE_DRIVER:-sqlite}
       DB_PATH: ${DB_PATH:-/data/proxy.sqlite}
       MYSQL_URL: "${MYSQL_URL:-}"
+      MYSQL_AUTO_MIGRATE: "${MYSQL_AUTO_MIGRATE:-true}"
       MYSQL_CONNECTION_LIMIT: "${MYSQL_CONNECTION_LIMIT:-10}"
       MYSQL_SSL_MODE: ${MYSQL_SSL_MODE:-disabled}
       MYSQL_SSL_CA_PATH: "${MYSQL_SSL_CA_PATH:-}"
@@ -110,6 +123,7 @@ services:
       SSO_BASE_URL: http://sso:7001
       LOGIN_BASE_URL: http://login:7003
       ENTERPRISE_SHORTCODE: ${ENTERPRISE_SHORTCODE:-octo}
+      GITHUB_BASE_URL: ${GITHUB_BASE_URL:-https://github.com}
       REQUEST_STATS_PER_ACCOUNT_LIMIT: "${REQUEST_STATS_PER_ACCOUNT_LIMIT:-2}"
       PROXY_ERROR_DIAGNOSTICS_ENABLED: "${PROXY_ERROR_DIAGNOSTICS_ENABLED:-true}"
       PROXY_ERROR_DIAGNOSTICS_DIR: ${PROXY_ERROR_DIAGNOSTICS_DIR:-/data/error-diagnostics}
@@ -122,6 +136,11 @@ services:
       OPENCODE_VERSION: ${OPENCODE_VERSION:-1.0.0}
       OPENCODE_USER_AGENT: "${OPENCODE_USER_AGENT:-}"
       GITHUB_API_VERSION: ${GITHUB_API_VERSION:-2026-06-01}
+      GITHUB_API_BASE_URL: ${GITHUB_API_BASE_URL:-https://api.github.com}
+      # Console Models page: catalog of one configured GitHub enterprise admin (docs/models-admin-guide.md).
+      MODELS_ADMIN_GITHUB_LOGIN: "${MODELS_ADMIN_GITHUB_LOGIN:-}"
+      MODELS_ADMIN_GITHUB_USER_ID: "${MODELS_ADMIN_GITHUB_USER_ID:-}"
+      MODELS_ADMIN_COPILOT_TOKEN: "${MODELS_ADMIN_COPILOT_TOKEN:-}"
     ports:
       - "${PROXY_PORT:-3000}:3000"
     volumes:
@@ -138,13 +157,16 @@ services:
   console:
     build:
       context: .
-      dockerfile: src/console/Dockerfile
+      dockerfile: deploy/images/Dockerfile.release
+      target: console
       args:
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
     image: ghcp-console:local
+    stop_grace_period: 35s
     environment:
       PORT: "7004"
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-25000}
       ADMINS_FILE: /data/admins.json
       SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?set INTERNAL_API_TOKEN}

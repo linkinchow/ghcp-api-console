@@ -1,13 +1,16 @@
 import express from 'express';
 import cookieSession from 'cookie-session';
-import { apiError } from '@ghcp/shared';
+import { apiError, installGracefulShutdown, managementErrorHandler } from '@ghcp/shared';
 import { config } from './config.js';
-import { getDb } from './db/connection.js';
+import type { Server } from 'node:http';
+import { closeDb, getDb } from './db/connection.js';
 import { requireInternalToken } from './auth/internalAuth.js';
 import { usersApiRouter } from './routes/usersApi.js';
 import { budgetApiRouter } from './routes/budgetApi.js';
 import { samlRouter } from './routes/samlRoutes.js';
 import { settingsApiRouter } from './routes/settingsApi.js';
+import { loginCredentialsRouter } from './routes/loginCredentials.js';
+import { userOperationsRouter } from './routes/operationsApi.js';
 
 export function buildApp(): express.Express {
   const app = express();
@@ -18,17 +21,23 @@ export function buildApp(): express.Express {
     res.json({ status: 'ok', service: 'sso' });
   });
   app.use(samlRouter);
+  app.use('/api/users/operations', requireInternalToken, userOperationsRouter);
   app.use('/api', requireInternalToken, settingsApiRouter, usersApiRouter, budgetApiRouter);
+  app.use('/internal', requireInternalToken, loginCredentialsRouter);
+  app.use(managementErrorHandler('sso'));
   app.use((_req, res) => {
     res.status(404).json(apiError('not_found', 'SSO route is not implemented yet.'));
   });
   return app;
 }
 
-export function startServer(): void {
+export function startServer(): Server {
   getDb();
   const server = buildApp().listen(config.port, () => {
     console.log(`[sso] listening on ${config.baseUrl}`);
+    console.log(config.gheCom
+      ? `[sso] GitHub: ${config.githubBaseUrl} (GHE.com; ENTERPRISE_SHORTCODE is ignored and GH logins carry no shortcode suffix)`
+      : `[sso] GitHub: ${config.githubBaseUrl} (GH login suffix _${config.enterpriseShortcode})`);
   });
   server.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE') {
@@ -38,4 +47,6 @@ export function startServer(): void {
     }
     throw err;
   });
+  installGracefulShutdown({ server, service: 'sso', release: closeDb });
+  return server;
 }

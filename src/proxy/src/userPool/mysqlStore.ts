@@ -3,7 +3,7 @@ import type { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql
 import type { PoolConfig } from './config.js';
 import { normalizeCaller, normalizePoolConfig, UserPoolError } from './config.js';
 import { accountName, NAME_CAPACITY } from './names.js';
-import { runMysqlPoolMigrations } from './mysqlMigrations.js';
+import { runMysqlPoolMigrations, validateMysqlPoolSchema } from './mysqlMigrations.js';
 import { leaseMysqlConnection, MysqlDeadline, MysqlDeadlineError } from './mysqlDeadline.js';
 import { acquireMysqlCaller, type MysqlCallerPermit } from './mysqlCallerGate.js';
 import type { HeldLease, Inventory, InventoryFence, Lease, PoolSettings } from './store.js';
@@ -50,12 +50,12 @@ export class MysqlPoolStore implements PoolStore {
   private reclaimCursor = '';
   private readonly pendingSelection = new PendingSelection();
 
-  constructor(private readonly pool: Pool, options: PoolConfig) {
+  constructor(private readonly pool: Pool, options: PoolConfig, private readonly autoMigrate = true) {
     this.options = normalizePoolConfig(options);
   }
 
   async initialize(): Promise<void> {
-    await runMysqlPoolMigrations(this.pool);
+    await (this.autoMigrate ? runMysqlPoolMigrations(this.pool) : validateMysqlPoolSchema(this.pool));
     // Targets/cap/lease duration are initial seeds, subsequently shared mutable settings.
     const { idleTarget: _idle, maxAccounts: _max, leaseSeconds: _lease, enabled: _enabled,
       callerDomain: _legacy, ...invariants } = this.options;

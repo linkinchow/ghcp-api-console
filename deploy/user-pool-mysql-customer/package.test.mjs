@@ -26,12 +26,14 @@ test('requires immutable SHA, explicit platform/output, no arbitrary flags', () 
   ]) assert.throws(() => parseArgs(invalid));
 });
 
-test('all four builds reuse fixed Dockerfiles and archive stdin, without run/push args', () => {
+test('all four builds use the release Dockerfile targets and archive stdin, without run/push args', () => {
   const options = parseArgs(valid);
   assert.deepEqual(SERVICES, ['sso', 'login', 'proxy', 'console']);
   for (const service of SERVICES) {
     const spec = buildSpec(options, service);
-    assert.equal(spec.dockerfile, `src/${service}/Dockerfile`);
+    assert.equal(spec.dockerfile, 'deploy/images/Dockerfile.release');
+    assert.equal(spec.args[spec.args.indexOf('--target') + 1], service);
+    assert.equal(spec.args.includes('--build-arg'), false);
     assert.equal(spec.tag, `customer-ghcp-${service}:${commit}`);
     assert.equal(spec.args[0], 'build');
     assert.equal(spec.args.at(-1), '-');
@@ -41,6 +43,15 @@ test('all four builds reuse fixed Dockerfiles and archive stdin, without run/pus
   assert.throws(() => buildSpec(options, 'mock-github'));
 });
 
+test('an optional npm registry is passed as a build arg and must be https without credentials', () => {
+  const registry = 'https://registry.example.test/npm/';
+  const spec = buildSpec(parseArgs([...valid, '--npm-registry', registry]), 'proxy');
+  assert.equal(spec.args[spec.args.indexOf('--build-arg') + 1], `NPM_REGISTRY=${registry}`);
+  for (const invalid of ['http://registry.example.test/', 'https://user:secret@registry.example.test/', 'registry.example.test']) {
+    assert.throws(() => parseArgs([...valid, '--npm-registry', invalid]), /npm-registry/);
+  }
+});
+
 test('refuses existing evidence directories and paths inside checkout', () => {
   assert.throws(() => requireExternalNewOutput(directory, root), /already exist/);
   assert.throws(() => requireExternalNewOutput(path.join(root, `not-created-${randomUUID()}`), root), /outside/);
@@ -48,18 +59,23 @@ test('refuses existing evidence directories and paths inside checkout', () => {
 });
 
 test('actual default plan records source hashes and creates no output or Docker dependency', () => {
-  const result = spawnSync(process.execPath, [path.join(directory, 'build-images.mjs'), ...valid], { encoding: 'utf8', timeout: 15000, shell: false });
+  // The plan reads build inputs from Git, so use a commit that contains the release Dockerfile.
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', shell: false }).stdout.trim();
+  const args = valid.map((arg) => arg === commit ? head : arg);
+  const result = spawnSync(process.execPath, [path.join(directory, 'build-images.mjs'), ...args], { encoding: 'utf8', timeout: 15000, shell: false });
   assert.equal(result.status, 0, result.stderr);
   const plan = JSON.parse(result.stdout);
   assert.equal(plan.status, 'plan-only');
   assert.equal(plan.deploymentApproved, false);
-  assert.equal(plan.commit, commit);
+  assert.equal(plan.commit, head);
   assert.equal(plan.images.length, 4);
   assert.equal(existsSync(output), false);
-  const git = spawnSync('git', ['show', `${commit}:package-lock.json`], { cwd: root, encoding: 'buffer', shell: false });
+  const git = spawnSync('git', ['show', `${head}:package-lock.json`], { cwd: root, encoding: 'buffer', shell: false });
   assert.equal(git.status, 0);
   assert.equal(plan.inputs.find((input) => input.path === 'package-lock.json').sha256, createHash('sha256').update(git.stdout).digest('hex'));
-  assert.equal(plan.inputs.filter((input) => input.baseImageReferences).length, 4);
+  const dockerfiles = plan.inputs.filter((input) => input.baseImageReferences);
+  assert.equal(dockerfiles.length, 1);
+  assert.match(dockerfiles[0].baseImageReferences.join(), /^node:22-bookworm-slim@sha256:[a-f0-9]{64}$/);
 });
 
 test('invalid missing commit rejects before output creation', () => {
@@ -81,6 +97,12 @@ test('template preserves explicit startup block and existing health contracts', 
   assert.match(yaml, /MYSQL_SSL_MODE: verify-ca/);
   assert.match(yaml, /type: ClusterIP/);
   assert.doesNotMatch(yaml, /kind: (Secret|PersistentVolumeClaim|Ingress|StatefulSet)/);
+  // The image entrypoint (Tini + node) must not be replaced: overrides bypass signal forwarding.
+  for (const template of ['rancher.template.yaml', 'kubernetes.template.yaml']) {
+    const text = readFileSync(path.join(directory, template), 'utf8');
+    const proxyContainer = text.slice(text.indexOf('- name: proxy'), text.indexOf('ports:', text.indexOf('- name: proxy')));
+    assert.doesNotMatch(proxyContainer, /^\s+(command|args):/m);
+  }
   const server = readFileSync(path.join(root, 'src/proxy/src/server.ts'), 'utf8');
   const health = server.slice(server.indexOf("app.get('/healthz'"), server.indexOf("app.get('/readyz'"));
   assert.doesNotMatch(health, /pingStorage|assertUserPoolOwner/);

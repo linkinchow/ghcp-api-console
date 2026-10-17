@@ -2,7 +2,10 @@
 
 本文面向第一次接触 GitHub Enterprise 管理、Enterprise Managed Users(EMU)、SAML SSO、SCIM、GitHub Copilot seat 和本项目部署配置的读者。目标是帮助你从零完成 GitHub Enterprise EMU 初始化、本项目 SSO/Console/Proxy/Login 服务配置、Copilot 授权管理，以及最终用户侧 API 调用验证。
 
+本文同时适用于 GitHub.com 上的 EMU 和 GHE.com（GitHub Enterprise Cloud with data residency）。两者的步骤顺序相同，差异集中在 Enterprise 创建方式、各服务地址、shortcode 和 Login 登录流程，汇总见 [2.5 节](#25-githubcom-与-ghecomdata-residency)。正文默认以 GitHub.com 举例，GHE.com 的不同之处单独注明。
+
 > **重要**：GitHub Copilot 当前不提供面向第三方服务端集成的正式公开裸 API。本项目依赖 GitHub Copilot 内部接口，适合学习、验证和自维护部署。用于生产前，需要**自行评估**合规、稳定性、安全、账号管理、日志留存和运维风险。
+> 本向导截图都是基于 GitHub.com 的界面，GHE.com 的界面可能略有不同，但是极为相似，请根据实际界面进行操作。
 
 > **时间花费**：大约 30分钟 - 2小时， 取决于你对 GitHub Enterprise、SAML/SCIM、Copilot、Docker Compose 和 Node.js 的熟悉程度。
 
@@ -50,6 +53,8 @@ Client / SDK / Internal App
 
 > 第 6 步会出现"SCIM 成功但 Copilot seat 分配失败"的中间状态，这是本顺序下的预期结果，完成第 7、8 步后再重新分配 seat 即可。逐项验收清单见[第 16 节](#16-完成配置后的验收清单)。
 
+> **GHE.com（data residency）**：步骤顺序与上表相同。差异在于第 1 步的创建方式（见第 4 节开头）、第 3 步使用 `.env.example.data-residency` 并改用 GHE.com 地址，以及 GH login 不带 shortcode 后缀，汇总见 [2.5 节](#25-githubcom-与-ghecomdata-residency)。
+
 > **如果仅是快速为EMU的enterprise开通copilot**，则仅执行第 1、8 步即可。**注意**：在省略了 2-7 步时，一定要在第8步（[10.4.2 节](#1042-如果您跳过了sso的设置步骤则一定要在设置完账单信息后点击激活)）做激活操作，否则需要补充完成前面的步骤才可以激活enterprise。
 
 ## 2. 关键概念
@@ -65,9 +70,9 @@ GitHub Enterprise Managed Users(EMU) 是由企业统一管理的 GitHub 用户�
 | 字段 | 说明 |
 | --- | --- |
 | Enterprise slug | Enterprise 的 URL 标识。例如 slug 为 `acme` 时，Enterprise URL 中会出现 `/enterprises/acme`。 |
-| shortcode | EMU 登录名后缀。例如 shortcode 为 `open`，本地 SSO 用户 `alice` 在 GitHub 侧登录名通常是 `alice_open`。 |
+| shortcode | EMU 登录名后缀。在 GitHub.com 上创建 EMU 时自行填写，例如 shortcode 为 `open`，本地 SSO 用户 `alice` 在 GitHub 侧登录名通常是 `alice_open`。GHE.com 上 shortcode 由 GitHub 随机生成并隐藏，用户名不显示后缀（`alice`），见 [2.5 节](#25-githubcom-与-ghecomdata-residency)。 |
 
-创建完成后，GitHub 会先生成一个初始超级管理员，格式通常是 `admin_<shortcode>`。后续建议通过本项目创建并同步一个新的管理员 EMU 用户，用它承担日常管理工作。
+创建完成后，GitHub 会先生成一个初始超级管理员（setup user），用户名格式为 `<shortcode>_admin`。后续建议通过本项目创建并同步一个新的管理员 EMU 用户，用它承担日常管理工作。
 
 ### 2.2 SAML SSO 与 SCIM
 
@@ -101,6 +106,33 @@ SAML SSO 解决“用户如何登录 GitHub Enterprise”的问题；SCIM 解决
 
 当前代码不保存独立的 GitHub token，也不存在“Proxy 用 GitHub token 再换取短期 Copilot token”的步骤。`GITHUB_COPILOT_SEAT_PAT` 是管理员用于同步 SSO 用户到 GitHub 上使用的，与最终用户的 Copilot OAuth 授权是两条独立链路。
 
+### 2.5 GitHub.com 与 GHE.com（data residency）
+
+GHE.com 是 GitHub Enterprise Cloud with data residency：企业数据存放在所选区域，企业拥有专属域名 `https://<subdomain>.ghe.com`，并且固定使用 EMU。本项目通过 `GITHUB_BASE_URL` 区分两种部署：地址以 `.ghe.com` 结尾时，`login`、`sso`、`proxy` 都进入 GHE.com 模式。
+
+| 项目 | GitHub.com | GHE.com |
+| --- | --- | --- |
+| `.env` 模板 | `cp .env.example .env` | `cp .env.example.data-residency .env` |
+| `GITHUB_BASE_URL` | `https://github.com`（默认） | `https://<subdomain>.ghe.com` |
+| `GITHUB_API_BASE_URL` | `https://api.github.com` | `https://api.<subdomain>.ghe.com` |
+| `SCIM_BASE_URL` | `https://api.github.com/scim/v2/enterprises/<slug>` | `https://api.<subdomain>.ghe.com/scim/v2/enterprises/<slug>` |
+| `SP_ENTITY_ID` | `https://github.com/enterprises/<slug>` | `https://<subdomain>.ghe.com/enterprises/<slug>` |
+| `SP_ACS_URL` | `https://github.com/enterprises/<slug>/saml/consume` | `https://<subdomain>.ghe.com/enterprises/<slug>/saml/consume` |
+| `COPILOT_API_BASE_URL` | `https://api.githubcopilot.com` | `https://copilot-api.<subdomain>.ghe.com` |
+| `GITHUB_OAUTH_CLIENT_ID` | OpenCode client id | 同左，不需要修改 |
+| shortcode | 创建 EMU 时自行填写，必须写入 `ENTERPRISE_SHORTCODE` | 由 GitHub 随机生成并隐藏；不需要配置，`ENTERPRISE_SHORTCODE` 即使填写也会被忽略 |
+| EMU 用户的 GH login | `<ssoUser>_<shortcode>`，最长 39 字符 | `<ssoUser>`，不带后缀，最长 30 字符 |
+| 初始超级管理员 | `<shortcode>_admin` | `<随机 shortcode>_admin`，例如 `2abvd19d_admin`；通常只有这里能看到 shortcode |
+| Login 自动登录流程 | 打开 Device Flow 验证页，按需输入 GitHub 用户名，再跳转到 SSO 登录 | 直接打开 `https://<subdomain>.ghe.com/enterprises/<slug>/sso`，点击 **Continue** 跳到 SSO 登录页；登录后回到 GHE.com 再填写 device code 并授权。全程不输入 GitHub 用户名 |
+| `ENTERPRISE_SLUG` | `sso` 使用 | `sso` 与 `login` 都使用；`login` 缺少该值时会启动失败 |
+
+注意事项：
+
+- 上表所有地址必须属于同一个部署，不要混用 `github.com` 和 `ghe.com` 的地址。
+- GHE.com 的 REST API 会拒绝带 shortcode 后缀的用户名（返回 404，提示 `Unable to complete request that contains suffixed values ... Remove the suffix`）。因此 GHE.com 下 `sso` 给 Copilot seat 分配、查询和 Import from GH 使用的 GH login 都不带后缀。
+- 由于 GH login 最长 30 字符，GHE.com 下 SSO 用户名应控制在 30 个字符以内。
+- 修改 `GITHUB_BASE_URL` 后需要重启 `sso`、`proxy`、`login`。
+
 ## 3. 准备工作清单
 
 开始前请确认你具备以下条件：
@@ -111,7 +143,7 @@ SAML SSO 解决“用户如何登录 GitHub Enterprise”的问题；SCIM 解决
 | 管理邮箱 | 用于接收初始超级管理员密码重置邮件，必须是真实可访问邮箱。 |
 | Copilot 开通 | Enterprise 需要能开通 GitHub Copilot；必要时可提交 GitHub Support 工单。 |
 | Billing | 可填写 GitHub Enterprise billing 信息，并可关联 Azure Subscription 或其他账单方式。 |
-| 网络 | 执行 SAML 登录的浏览器必须能访问 `sso`；可选择公网地址，或让服务器端 Login 浏览器通过 Docker 内网访问。服务器还需能访问 GitHub、SCIM 和 Copilot API。 |
+| 网络 | 执行 SAML 登录的浏览器必须能访问 `sso`；可选择公网地址，或让服务器端 Login 浏览器通过 Docker 内网访问。服务器还需能访问 GitHub、SCIM 和 Copilot API。GHE.com 部署需能访问 `<subdomain>.ghe.com` 及其子域名（`api.`、`copilot-api.` 等）和 `auth.ghe.com`。 |
 | 证书 | 准备 SAML IdP 证书和私钥；开发验证可用 `scripts/gen-certs.sh` 生成。 |
 | 运行环境 | Docker / Docker Compose；本地开发还需要 Node.js 22 和 npm。 |
 
@@ -133,17 +165,25 @@ Enterprise、Billing、管理员身份和 EMU 用户资料会影响企业验证�
 
 | 配置 | 示例 | 说明 |
 | --- | --- | --- |
+| `GITHUB_BASE_URL` | `https://github.com` 或 `https://acme.ghe.com` | GitHub Web 地址；GHE.com 部署填专属域名。决定是否进入 GHE.com 模式。 |
 | `ENTERPRISE_SLUG` | `acme` | GitHub Enterprise slug。不是贴enterprise的地址，是一个字符串。 |
-| `ENTERPRISE_SHORTCODE` | `open` | EMU 登录名后缀。 |
+| `ENTERPRISE_SHORTCODE` | `open` | EMU 登录名后缀。仅 GitHub.com 需要；GHE.com 不需要。 |
 | `SSO_PUBLIC_BASE_URL` | `https://sso.example.com` 或 `http://sso:7001` | SAML IdP 基础地址；根据 SSO 是否对公网开放选择。 |
-| `SCIM_BASE_URL` | `https://api.github.com/scim/v2/enterprises/acme` | GitHub Enterprise SCIM API 地址。 |
-| `SP_ENTITY_ID` | `https://github.com/enterprises/acme` | GitHub Enterprise SAML SP entity ID。 |
-| `SP_ACS_URL` | `https://github.com/enterprises/acme/saml/consume` | GitHub Enterprise SAML ACS 地址。 |
+| `SCIM_BASE_URL` | `https://api.github.com/scim/v2/enterprises/acme` | GitHub Enterprise SCIM API 地址；GHE.com 为 `https://api.<subdomain>.ghe.com/scim/v2/enterprises/acme`。 |
+| `SP_ENTITY_ID` | `https://github.com/enterprises/acme` | GitHub Enterprise SAML SP entity ID；GHE.com 为 `https://<subdomain>.ghe.com/enterprises/acme`。 |
+| `SP_ACS_URL` | `https://github.com/enterprises/acme/saml/consume` | GitHub Enterprise SAML ACS 地址；GHE.com 为 `https://<subdomain>.ghe.com/enterprises/acme/saml/consume`。 |
 | `API_KEY` | 自定义强随机值 | 调用 proxy 公共 API 的 Bearer token。 |
 | `INTERNAL_API_TOKEN` | 自定义强随机值 | `proxy`、`sso`、`login`、`console` 内部通信共享密钥。 |
 | `SESSION_SECRET` | 自定义强随机值 | `sso` 和 `console` cookie session 签名密钥。 |
 
 ## 4. 创建 GitHub Enterprise EMU
+
+> **GHE.com（data residency）**：使用同一个创建入口，但在类型选择后多了几项、少了 shortcode：
+> - 选择 **Get started with managed users**，在 **Data hosting** 下拉框中选择数据驻留区域。
+> - 填写 **Subdomain**，它会成为专属域名 `https://<subdomain>.ghe.com`，创建后不能修改。
+> - 表单中没有 shortcode 字段，shortcode 由 GitHub 随机生成。
+>
+> 点击 **Create enterprise** 后，GitHub 可能需要数小时完成开通，之后会向管理员邮箱发送欢迎邮件和密码重置链接。如果打开链接时出现证书错误（如 `net::ERR_CERT_COMMON_NAME_INVALID`），等开通完成后再试。初始超级管理员为 `<随机 shortcode>_admin`，登录地址是 `https://<subdomain>.ghe.com`，而不是 `github.com`。后续 Enterprise settings、SAML/SCIM、PAT、Billing 和 Copilot 等页面也都在该域名下操作。
 
 ### 4.1 从个人 GitHub 账号创建 Enterprise
 
@@ -174,8 +214,8 @@ Enterprise 类型选择 **Enterprise with managed users**。Identity Provider �
 填写时请特别注意：
 
 - slug 创建后会用于 Enterprise URL，也会出现在 `ENTERPRISE_SLUG`、`SCIM_BASE_URL`、`SP_ENTITY_ID`、`SP_ACS_URL` 中。
-- shortcode 会影响所有 EMU 用户的 GitHub 登录名。例如本地 SSO 用户 `alice` 可能需要用 `alice_<shortcode>` 登录 GitHub。
-- 初始超级管理员通常是 `admin_<shortcode>`。
+- shortcode 会影响所有 EMU 用户的 GitHub 登录名。例如本地 SSO 用户 `alice` 可能需要用 `alice_<shortcode>` 登录 GitHub。GHE.com 上没有该字段，用户名也不显示后缀。
+- 初始超级管理员是 `<shortcode>_admin`。
 - 管理员邮箱务必使用企业自有域名的公司邮箱，不要使用 Gmail、Outlook 等免费公共邮箱；同时确认该邮箱有明确的长期负责人和恢复流程。
 
 ### 4.4 通过邮件设置初始超级管理员密码
@@ -184,7 +224,7 @@ Enterprise 类型选择 **Enterprise with managed users**。Identity Provider �
 
 <img src="images/01.3.check-admin-email.png" alt="查看管理员邮箱" width="580">
 
-设置密码后，使用 `admin_<shortcode>` 登录 GitHub Enterprise 管理页面。
+设置密码后，使用 `<shortcode>_admin` 登录 GitHub Enterprise 管理页面（GHE.com 在 `https://<subdomain>.ghe.com` 登录）。
 
 <img src="images/01.4.login-to-gh-ent.png" alt="登录 Enterprise 管理页面" width="893">
 
@@ -203,6 +243,12 @@ SCIM_BASE_URL=https://api.github.com/scim/v2/enterprises/<enterprise-slug>
 SCIM_TOKEN=<your-scim-token>
 ```
 
+GHE.com 的 SCIM API 位于专属域名的 `api.` 子域名下：
+
+```env
+SCIM_BASE_URL=https://api.<subdomain>.ghe.com/scim/v2/enterprises/<enterprise-slug>
+```
+
 注意事项：
 
 - token 通常只展示一次。
@@ -217,7 +263,11 @@ SCIM_TOKEN=<your-scim-token>
 
 ```bash
 cp .env.example .env
+# GHE.com（data residency）改用：
+# cp .env.example.data-residency .env
 ```
+
+`.env.example.data-residency` 已按 2.5 节填好 GHE.com 的地址格式，把其中的 `sample-ent` 换成实际的子域名和 enterprise slug 即可。
 
 根 `.env` 用于 Docker Compose 变量插值；只有 `docker-compose.yml` 明确列出的变量才会传入容器。`src/<service>/.env` 只用于单独运行对应 workspace，不会被 Compose 自动加载。环境变量都在服务启动时读取，修改后需要重启对应服务。
 
@@ -229,11 +279,12 @@ cp .env.example .env
 | `INTERNAL_API_TOKEN` | 内部 API 共享密钥。`proxy`、`sso`、`login`、`console` 必须一致。 |
 | `SESSION_SECRET` | `sso` / `console` cookie session 签名密钥。生产环境必须使用强随机值。 |
 | `SSO_PUBLIC_BASE_URL` | SAML 配置中使用的 SSO 基础地址。该地址必须与 GitHub 中配置的 IdP 地址一致，并可由执行登录的浏览器访问；登录完全在服务器端执行时不要求对公网开放。 |
-| `SP_ENTITY_ID` | `https://github.com/enterprises/<enterprise-slug>`。 |
-| `SP_ACS_URL` | `https://github.com/enterprises/<enterprise-slug>/saml/consume`。 |
-| `ENTERPRISE_SLUG` | 创建 EMU 时填写的 slug。 |
-| `ENTERPRISE_SHORTCODE` | 创建 EMU 时填写的 shortcode。 |
-| `SCIM_BASE_URL` | `https://api.github.com/scim/v2/enterprises/<enterprise-slug>`。 |
+| `SP_ENTITY_ID` | `https://github.com/enterprises/<enterprise-slug>`；GHE.com 为 `https://<subdomain>.ghe.com/enterprises/<enterprise-slug>`。 |
+| `SP_ACS_URL` | `https://github.com/enterprises/<enterprise-slug>/saml/consume`；GHE.com 为 `https://<subdomain>.ghe.com/enterprises/<enterprise-slug>/saml/consume`。 |
+| `GITHUB_BASE_URL` | GitHub Web 地址。GitHub.com 保持 `https://github.com`；GHE.com 填 `https://<subdomain>.ghe.com`。`login`、`sso`、`proxy` 都据此判断是否为 GHE.com 模式。 |
+| `ENTERPRISE_SLUG` | 创建 EMU 时填写的 slug。GHE.com 模式下 `login` 也用它拼出企业 SSO 入口。 |
+| `ENTERPRISE_SHORTCODE` | 创建 EMU 时填写的 shortcode。GHE.com 不需要填写，填写了也会被忽略。 |
+| `SCIM_BASE_URL` | `https://api.github.com/scim/v2/enterprises/<enterprise-slug>`；GHE.com 为 `https://api.<subdomain>.ghe.com/scim/v2/enterprises/<enterprise-slug>`。 |
 | `SCIM_TOKEN` | 第 5 节生成的 SCIM token。 |
 | `GITHUB_COPILOT_SEAT_PAT` | 第 9 节创建的 GitHub 管理 PAT；此时还没有可以先留空，创建后再补。 |
 | `LOGIN_SSO_URL` | Login 容器内 Playwright 能访问的完整 SSO 登录页。Compose 内部使用 `http://sso:7001/login`；不要使用 `127.0.0.1` 或 `localhost`，它们指向 Login 容器自身。跨网络部署时使用从 Login 节点可访问的完整 `/login` URL。 |
@@ -274,6 +325,8 @@ sequenceDiagram
 ```
 
 关键点是：访问 Sign on URL 和提交 `SAMLResponse` 的都是执行登录的浏览器，GitHub 负责发起跳转并验证 SAML 响应。因此，当登录完全由 Login 容器执行时，SSO 地址只需对 Login 容器可达；如果用户自己的浏览器也要直接登录 GitHub，该地址就必须能被用户浏览器访问。
+
+GHE.com 模式下，上图第一步由 Login 直接打开企业 SSO 入口 `https://<subdomain>.ghe.com/enterprises/<slug>/sso`，并点击页面上的 **Continue** 跳转到 Sign on URL，不经过 GitHub 用户名输入页。其余 SAML 交互完全相同。回到 GHE.com 后，Login 再打开 Device Flow 验证页填写 device code 并完成授权。
 
 本项目默认由 Login 容器中的 Playwright 完成登录，因此可以选择公网模式或仅 Docker 内网模式。无论选择哪种模式，`SSO_PUBLIC_BASE_URL`、`LOGIN_SSO_URL` 和 GitHub SAML 配置中的地址必须使用同一个 base URL。
 
@@ -353,9 +406,9 @@ ports:
 | `PROXY_ERROR_DIAGNOSTICS_MAX_FILES` | `5` | 包含当前文件在内的最大文件数。 |
 | `PROXY_ERROR_DIAGNOSTICS_SHARED` | `false` | 多 Proxy 实例共用一个 RWX 诊断卷时设为 `true`。 |
 | `PROXY_INSTANCE_ID` | 空（回落到 `HOSTNAME`） | 共享诊断模式下当前实例的独立子目录标识。 |
-| `GITHUB_OAUTH_CLIENT_ID` | OpenCode client id | Login Device Flow 使用的 OAuth client id；除非明确更换兼容 client，否则保持模板值。 |
+| `GITHUB_OAUTH_CLIENT_ID` | OpenCode client id | Login Device Flow 使用的 OAuth client id；除非明确更换兼容 client，否则保持模板值。GHE.com 使用同一个 client id。 |
 | `GITHUB_OAUTH_SCOPE` | `read:user` | Login Device Flow 请求的 scope。 |
-| `COPILOT_API_BASE_URL` | `https://api.githubcopilot.com` | Proxy 直接访问 Copilot API 的 base URL。 |
+| `COPILOT_API_BASE_URL` | `https://api.githubcopilot.com` | Proxy 直接访问 Copilot API 的 base URL；GHE.com 为 `https://copilot-api.<subdomain>.ghe.com`。 |
 | `OPENCODE_VERSION` | 根模板为 `1.18.4` | 生成 Proxy/Login 的 `User-Agent: opencode/<version>`；如显式注入 `OPENCODE_USER_AGENT`，后者优先。 |
 | `GITHUB_API_VERSION` | `2026-06-01` | Proxy 发给 Copilot API 的 `X-GitHub-Api-Version`。 |
 | `LOGIN_SSO_PROVIDER` | `custom` | 默认 SSO provider：`custom` 或 `azure`；任务参数可覆盖。 |
@@ -367,8 +420,9 @@ ports:
 | --- | --- | --- |
 | `SSO_PUBLIC_BASE_URL` | 模板为 `http://sso:7001` | SAML IdP 的稳定 base URL，不要附加 `/sso` 或 `/metadata`；公网和内网模式的具体取值见 6.1.1 节。 |
 | `SSO_CERT_DIR` | `./certs` | 宿主机证书目录；Compose 只读挂载到 SSO 容器 `/certs`。 |
-| `ENTERPRISE_SHORTCODE` | `octo` | 必须改成创建 EMU 时确定的 shortcode，不能无条件沿用示例值。 |
-| `GITHUB_API_BASE_URL` | `https://api.github.com` | SSO 调用 Copilot seat、AI Credits 等 GitHub API 的根地址。 |
+| `GITHUB_BASE_URL` | `https://github.com` | GitHub Web 地址，`login`、`sso`、`proxy` 共用。以 `.ghe.com` 结尾时进入 GHE.com 模式：Device Flow 端点改为该域名，Login 从企业 SSO 入口登录，GH login 不带 shortcode 后缀。只能填写 origin，不能带路径。 |
+| `ENTERPRISE_SHORTCODE` | `octo` | GitHub.com 必须改成创建 EMU 时确定的 shortcode，不能无条件沿用示例值。GHE.com 模式下忽略此项。 |
+| `GITHUB_API_BASE_URL` | `https://api.github.com` | SSO 调用 Copilot seat、AI Credits 等 GitHub API 的根地址；GHE.com 为 `https://api.<subdomain>.ghe.com`。 |
 | `GITHUB_COPILOT_SEAT_PAT` | 默认空 | 为空时可先启动基础服务，但 seat 管理和 AI Credits 刷新不可用；写入后重启 SSO。 |
 | `SSO_DEFAULT_USER_PASSWORD` | 空 | 新建 SSO 用户未显式提供密码时使用；为空会退回使用 `ssoUser` 作为密码，只适合受控验证环境。生产环境应设置强值，或为真实用户配置独立密码。修改该变量不会更新现有用户的密码 hash，轮换时必须同步修改用户密码。 |
 | `LOG_LEVEL` | `info` | 所有服务的结构化日志等级：`debug`、`info`、`warn`、`error`。 |
@@ -556,7 +610,7 @@ http://localhost:7004
 - SSO 用户名。
 - SSO 登录密码。
 - 该用户的管理员角色。
-- 对应 GitHub 登录名格式：`<ssoUser>_<enterprise-shortcode>`。
+- 对应 GitHub 登录名格式：`<ssoUser>_<enterprise-shortcode>`；GHE.com 为 `<ssoUser>`（不带后缀，最长 30 字符）。
 
 本项目中，SSO 本地用户角色为 `admin` 时，同步 EMU 时可映射为 GitHub Enterprise 的 `enterprise_owner`。
 
@@ -634,7 +688,7 @@ SAML 配置保存成功后，GitHub 会生成 recovery code。
 
 <img src="images/02.6.save-recovery-code-after-saml-config.png" alt="保存 recovery code" width="659">
 
-请按企业安全规范离线保存。后续使用初始超级管理员 `admin_<shortcode>` 登录时，可能需要消耗 recovery code。recovery code 不应进入仓库、截图、IM 工具或工单正文。
+请按企业安全规范离线保存。后续使用初始超级管理员 `<shortcode>_admin` 登录时，可能需要消耗 recovery code。recovery code 不应进入仓库、截图、IM 工具或工单正文。
 
 ### 7.5 启用 Open SCIM Configuration
 
@@ -658,11 +712,11 @@ SAML 配置保存成功后，GitHub 会生成 recovery code。
 请验证：
 
 - 本地 SSO 用户的 `emuStatus` 为 active 或等价成功状态。
-- 记录中有 GitHub login，格式通常为 `<ssoUser>_<shortcode>`。
+- 记录中有 GitHub login，格式通常为 `<ssoUser>_<shortcode>`；GHE.com 为 `<ssoUser>`（不带后缀）。如果 GHE.com 下仍看到带后缀的 GH login，说明 `GITHUB_BASE_URL` 未配置为 GHE.com 地址，修正并重启后需对该用户重新执行同步。
 - 该 GitHub login 可以通过 SAML SSO 登录 GitHub。
 - 登录后可以进入 Enterprise 管理页面并看到管理菜单。
 
-后续建议使用这个新同步的管理员账号进行 GitHub Enterprise 日常配置，而不是继续依赖初始 `admin_<shortcode>`。
+后续建议使用这个新同步的管理员账号进行 GitHub Enterprise 日常配置，而不是继续依赖初始 `<shortcode>_admin`。
 
 ## 9. 创建 GitHub 管理 PAT
 
@@ -741,7 +795,7 @@ npm run compose:up
 
 <img src="images/04.5.activate-enterprise.png" alt="激活 GitHub Enterprise" width="1446">
 
-**注意**：如果没有看到上图的激活按钮，则需要退出 设置管理员 shortcode_admin 账号，使用已经同步到 GitHub Enterprise 的管理员账号登录后才能看到激活按钮。
+**注意**：如果没有看到上图的激活按钮，则需要退出初始超级管理员 `<shortcode>_admin` 账号，使用已经同步到 GitHub Enterprise 的管理员账号登录后才能看到激活按钮。
 
 #### 10.4.2 如果您跳过了SSO的设置步骤，则一定要在设置完账单信息后点击激活：
 
@@ -796,6 +850,7 @@ STORAGE_DRIVER=sqlite
 DB_PATH=/data/proxy.sqlite
 SSO_PUBLIC_BASE_URL=http://sso:7001
 SSO_CERT_DIR=./certs
+GITHUB_BASE_URL=https://github.com
 SP_ENTITY_ID=https://github.com/enterprises/<enterprise-slug>
 SP_ACS_URL=https://github.com/enterprises/<enterprise-slug>/saml/consume
 ENTERPRISE_SLUG=<enterprise-slug>
@@ -805,6 +860,19 @@ SCIM_TOKEN=<scim-token>
 GITHUB_COPILOT_SEAT_PAT=<github-admin-pat>
 SSO_DEFAULT_USER_PASSWORD=<strong-bootstrap-password>
 LOGIN_SSO_URL=http://sso:7001/login
+```
+
+GHE.com（data residency）部署时，以下 GitHub 相关项改为 GHE.com 地址，其余与上面相同：
+
+```env
+GITHUB_BASE_URL=https://<subdomain>.ghe.com
+SP_ENTITY_ID=https://<subdomain>.ghe.com/enterprises/<enterprise-slug>
+SP_ACS_URL=https://<subdomain>.ghe.com/enterprises/<enterprise-slug>/saml/consume
+ENTERPRISE_SLUG=<enterprise-slug>
+# ENTERPRISE_SHORTCODE 不需要配置（GHE.com 模式下被忽略）
+GITHUB_API_BASE_URL=https://api.<subdomain>.ghe.com
+SCIM_BASE_URL=https://api.<subdomain>.ghe.com/scim/v2/enterprises/<enterprise-slug>
+COPILOT_API_BASE_URL=https://copilot-api.<subdomain>.ghe.com
 ```
 
 上面的 `SSO_PUBLIC_BASE_URL` 和 `LOGIN_SSO_URL` 适用于不开放 7001 的默认 Compose 内网模式，GitHub Sign on URL 应填写 `http://sso:7001/sso`，Issuer 应填写 `http://sso:7001/metadata`。如果选择公网模式或 Login 单独部署在其他节点，应按照 6.1.1 节同时修改这四处地址。`STORAGE_DRIVER=sqlite` 是单实例部署的默认值；如果这套部署要跑多个 Proxy 实例，请改为 `mysql` 并按 6.1.2 节补齐 `MYSQL_URL` 与 TLS 参数。`SSO_DEFAULT_USER_PASSWORD` 用于自动创建用户后的首次登录，是多个自动创建用户共享的启动配置；应按高敏感凭据管理。若改为逐用户独立密码，自动流程无法从 hash 反推出密码，需要在 Proxy Accounts 中手动输入实际密码重新授权。
@@ -1186,6 +1254,9 @@ curl http://localhost:3000/responses \
 | SAML 测试失败 | 登录浏览器无法访问 SSO；Issuer 错误；证书不匹配；ACS 配置不一致 | 检查 `SSO_PUBLIC_BASE_URL`、GitHub Sign on URL、Issuer、Public certificate、`SP_ENTITY_ID`、`SP_ACS_URL`；内网模式还需确认 Login 与 SSO 位于同一 Docker 网络。 |
 | SCIM 同步失败 | SCIM token 无效；Open SCIM Configuration 未启用；Enterprise slug 错误 | 检查 `SCIM_BASE_URL`、`SCIM_TOKEN`、GitHub SCIM 配置页面和 SSO Users 错误详情。 |
 | Copilot seat 分配失败 | PAT 为空或权限不足；Copilot 未开通；用户未同步到 EMU | 检查 `GITHUB_COPILOT_SEAT_PAT`、GitHub Copilot 开通状态、用户 `ghLogin` 和 seat 错误详情。 |
+| GHE.com 下分配 seat 返回 404，提示 `Unable to complete request that contains suffixed values ... Remove the suffix` | `GITHUB_BASE_URL` 未设置为 GHE.com 地址，`sso` 仍按 `<ssoUser>_<shortcode>` 生成 GH login | 设置 `GITHUB_BASE_URL=https://<subdomain>.ghe.com` 并重启 `sso`、`proxy`、`login`；对已用带后缀 GH login 同步过的用户重新执行 Sync GH login（或 Import from GH），确认 `ghLogin` 不带后缀后再分配 seat。 |
+| GHE.com 下 Login 任务失败，提示 `Unexpected external login URL` 或在 `github.com` 页面超时 | Login 未配置 `GITHUB_BASE_URL`，仍按 GitHub.com 流程登录 | 在 `.env` 中设置 GHE.com 的 `GITHUB_BASE_URL` 与 `ENTERPRISE_SLUG`，重启 `login` 后在 Proxy Accounts 重新授权。 |
+| `login` 启动失败，提示 `ENTERPRISE_SLUG is required when GITHUB_BASE_URL points to GHE.com` | GHE.com 模式下缺少 `ENTERPRISE_SLUG` | 在 `.env` 中补齐 `ENTERPRISE_SLUG` 后重启。 |
 | AI Credits 刷新失败 | PAT 没有 billing usage 权限；Enterprise billing 未激活 | 检查 PAT 权限、Billing 状态、AI Credits Usage 页面错误。 |
 | 首次请求一直 `account_initializing`，之后变成 `oauth_not_ready` | Login 任务失败；SSO 密码错误；GitHub SAML 登录失败；seat 未分配 | 查看 Dashboard、Proxy Accounts、Login Tasks、SSO Users；修复后在 Proxy Accounts 使用实际 SSO 密码重新授权。 |
 | 请求返回 `account_limit_reached` | SSO runtime setting `maxSsoUsers` 已达到上限 | 在 Settings 检查容量限制，并先确认新 identity 合法，避免因错误 identity header 创建无用账号。 |
@@ -1205,12 +1276,12 @@ curl http://localhost:3000/responses \
 
 建议按以下顺序确认配置已经跑通：
 
-1. GitHub Enterprise EMU 创建完成，可以使用 `admin_<shortcode>` 登录。
+1. GitHub Enterprise EMU 创建完成，可以使用 `<shortcode>_admin` 登录（GHE.com 在 `https://<subdomain>.ghe.com` 登录）。
 2. GitHub Enterprise 已生成 SCIM token，并写入 `.env`。
 3. `sso` 的 `/metadata` 和 `/sso` 可被执行登录的浏览器访问；内网模式下应由 Login 容器访问。
 4. SAML SSO 测试成功，recovery code 已安全保存。
 5. Open SCIM Configuration 已启用。
-6. console 中首个 SSO 管理员已同步到 GitHub，且可用 `<ssoUser>_<shortcode>` 登录。
+6. console 中首个 SSO 管理员已同步到 GitHub，且可用 `<ssoUser>_<shortcode>` 登录（GHE.com 为不带后缀的 `<ssoUser>`）。
 7. 管理 PAT 已写入 `GITHUB_COPILOT_SEAT_PAT`，`sso` 已重启。
 8. Enterprise 管理邮箱使用企业自有域名，SSO/EMU 用户均对应真实人员，不存在 `user01` 等占位账号或共享账号。
 9. Billing 公司名称、地址、税务和联系人信息与实际法定主体一致，GitHub Enterprise 已激活。

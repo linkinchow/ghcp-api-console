@@ -82,7 +82,7 @@ services:
 
   sso:
     image: ghcp-pool-mysql-sso:check
-    build: { context: ../.., dockerfile: src/sso/Dockerfile }
+    build: { context: ../.., dockerfile: deploy/images/Dockerfile.release, target: sso }
     working_dir: /app/src/sso
     command: ["node", "dist/index.js"]
     environment:
@@ -115,7 +115,7 @@ services:
 
   login:
     image: ghcp-pool-mysql-login:check
-    build: { context: ../.., dockerfile: src/login/Dockerfile }
+    build: { context: ../.., dockerfile: deploy/images/Dockerfile.release, target: login }
     working_dir: /app/src/login
     command: ["node", "dist/index.js"]
     environment:
@@ -138,7 +138,7 @@ services:
   # the initial owner without adding a production owner/debug endpoint.
   proxy:
     <<: *proxy
-    build: { context: ../.., dockerfile: src/proxy/Dockerfile }
+    build: { context: ../.., dockerfile: deploy/images/Dockerfile.release, target: proxy }
     depends_on:
       mysql: { condition: service_healthy }
       sso: { condition: service_healthy }
@@ -150,7 +150,7 @@ services:
 
   console:
     image: ghcp-pool-mysql-console:check
-    build: { context: ../.., dockerfile: src/console/Dockerfile }
+    build: { context: ../.., dockerfile: deploy/images/Dockerfile.release, target: console }
     working_dir: /app/src/console
     command: ["node", "dist/server/index.js"]
     environment:

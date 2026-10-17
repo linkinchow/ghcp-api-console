@@ -1,4 +1,4 @@
-import type { ProxyRequestStatDto } from '@ghcp/shared';
+import type { ManagementQuery, ProxyRequestStatDto } from '@ghcp/shared';
 import { toCanonicalRequestedModelId } from '../copilot/modelIds.js';
 import { getStorage, initializeStorage } from './connection.js';
 import type { RecordRequestStatInput } from './storageTypes.js';
@@ -22,4 +22,9 @@ export async function listRequestStats(identity?: string, limit = 100): Promise<
 export async function pruneAllRequestStats(): Promise<void> {
   await initializeStorage();
   await getStorage().pruneAllRequestStats();
+}
+
+export async function listRequestStatsPage(query: ManagementQuery) {
+  await initializeStorage();
+  return getStorage().listRequestStatsPage(query);
 }

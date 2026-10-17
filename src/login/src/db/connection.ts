@@ -11,7 +11,13 @@ export function getDb(): Database.Database {
     mkdirSync(dirname(config.dbPath), { recursive: true });
     db = new Database(config.dbPath);
     db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = ON');
     runMigrations(db);
   }
   return db;
+}
+
+export function closeDb(): void {
+  db?.close();
+  db = undefined;
 }

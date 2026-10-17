@@ -1,9 +1,36 @@
-import type { Pool, RowDataPacket } from 'mysql2/promise';
-import { withMysqlMigrationLock } from './mysqlMigrationLock.js';
+import type { Pool, PoolConnection, RowDataPacket } from 'mysql2/promise';
+import { MYSQL_MIGRATION_DEADLINE_MS, withMysqlMigrationLock } from './mysqlMigrationLock.js';
+import { isMysqlStorageUnavailable, leaseMysqlConnection, MysqlDeadline } from '../userPool/mysqlDeadline.js';
 import { MYSQL_BASE_TABLES, MYSQL_SCHEMA, mysqlCreateTable, validateMysqlSchema } from './mysqlSchema.js';
 
-const INITIAL_SCHEMA_MIGRATION = '2026-08-27-proxy-mysql-initial';
+export const INITIAL_SCHEMA_MIGRATION = '2026-08-27-proxy-mysql-initial';
 export const TOKEN_COLLATION_MIGRATION = '2026-08-27-proxy-token-binary-collation';
+
+const MANUAL_SCHEMA_HINT = 'Ask a database administrator to apply scripts/proxy-mysql-initial.sql '
+  + 'and grant the runtime account the required permissions.';
+
+/**
+ * MYSQL_AUTO_MIGRATE=false: a database administrator prepared the schema. Validate it read-only
+ * (no DDL, no migration lock) against the same definition auto-migration would create, so a
+ * missing column or table fails at startup instead of on the first request that touches it.
+ */
+export async function validateMysqlTables(pool: Pool): Promise<void> {
+  await validatePreparedMysqlSchema(pool, (connection) => validateMysqlSchema(connection, MYSQL_BASE_TABLES));
+}
+
+export async function validatePreparedMysqlSchema(pool: Pool, validate: (connection: PoolConnection) => Promise<unknown>): Promise<void> {
+  const deadline = new MysqlDeadline(MYSQL_MIGRATION_DEADLINE_MS, MYSQL_MIGRATION_DEADLINE_MS);
+  const lease = await leaseMysqlConnection(pool, deadline);
+  try {
+    await validate(lease.connection);
+  } catch (cause) {
+    if (isMysqlStorageUnavailable(cause)) throw cause;
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    throw new Error(`Proxy MySQL schema is not ready for MYSQL_AUTO_MIGRATE=false: ${detail} ${MANUAL_SCHEMA_HINT}`, { cause });
+  } finally {
+    lease.release();
+  }
+}
 
 export async function runMysqlMigrations(pool: Pool): Promise<void> {
   await withMysqlMigrationLock(pool, async connection => {

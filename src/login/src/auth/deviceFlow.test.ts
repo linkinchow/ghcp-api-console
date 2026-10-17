@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { loginWithDeviceFlow } from './deviceFlow.js';
+
+process.env.DOTENV_CONFIG_PATH = '/dev/null';
+delete process.env.GITHUB_BASE_URL;
+const { loginWithDeviceFlow } = await import('./deviceFlow.js');
 
 test('uses the OpenCode OAuth client and headers while polling', async () => {
   const requests: Array<{ input: string | URL | Request; init?: RequestInit }> = [];

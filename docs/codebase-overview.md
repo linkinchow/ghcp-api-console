@@ -21,7 +21,7 @@
 
 | 层 | 技术 | 证据 |
 | --- | --- | --- |
-| 运行时 | Node.js 22（Docker 基础镜像 `node:22-bookworm-slim`） | `src/proxy/Dockerfile:1` |
+| 运行时 | Node.js 22（Docker 基础镜像 `node:22-bookworm-slim`，按 digest 固定） | `deploy/images/Dockerfile.release` |
 | 模块系统 | ESM（`"type": "module"`，全部相对导入带 `.js` 后缀） | 根 `package.json`；`src/proxy/src/server.ts:4` `from './config.js'` |
 | 语言 | TypeScript 5.7，`tsx` 跑开发态、`tsc` 出构建产物 | 根 `package.json` scripts |
 | 仓库结构 | npm workspaces 单仓多包 | 根 `package.json` `workspaces: ["src/packages/*", "src/proxy", "src/sso", "src/login", "src/console", "src/mock-github"]` |
@@ -44,7 +44,7 @@
 | Console | `src/console/src/server/index.ts:84`（**没有单独的 index 包装，`buildApp().listen()` 直接写在模块底部**） | 7004（`src/console/src/server/config.ts`） | `npm run start:console` |
 | Mock GitHub | `src/mock-github/src/server.ts` | **待确认**（未读取该文件的端口配置） | `npm run start:mock-github` |
 
-生产入口是各 workspace 的 `start:prod`，Dockerfile 里 `CMD ["npm", "--workspace", "@ghcp/proxy", "run", "start:prod"]`（`src/proxy/Dockerfile:12`）。
+生产镜像以 Tini 为 PID 1，直接运行编译产物：工作目录 `/app/src/<服务>`，`CMD ["node", "dist/index.js"]`（Console 为 `dist/server/index.js`），见 `deploy/images/Dockerfile.release`。各 workspace 的 `start:prod` 与之等价，供非容器部署使用。
 
 Proxy 的启动顺序值得注意（`src/proxy/src/server.ts:109-128`）：先 `initializeStorage()`（建表/跑迁移）→ 再 `pruneAllRequestStats()`（按每账号保留条数裁剪历史）→ 最后才 `listen()`。任一步失败都会 `closeStorage()` 后抛出，不会带病启动。
 
@@ -613,7 +613,7 @@ Proxy 配置项全貌（`ProxyConfig` 接口，`config.ts:3-30`）分五组：�
 | `npm run upgrade:sqlite-to-mysql` | 数据迁移工具 |
 | `npm run validate:health` | 健康检查脚本（`scripts/validate-health.sh`） |
 
-Dockerfile 是**单阶段**的（`src/proxy/Dockerfile`）：`npm ci` → 构建 shared → 构建本服务 → `npm prune --omit=dev`。四个服务的 Dockerfile 结构相同，只是 workspace 名和端口不同。
+四个服务共用一个**多阶段** Dockerfile（`deploy/images/Dockerfile.release`，用 `--target proxy|sso|login|console` 选择）：构建阶段 `npm ci` → 构建全部 workspace → `npm prune --omit=dev` → `deploy/images/package-runtime.mjs` 只挑出目标服务和 shared 的编译产物；运行阶段移除 npm/Yarn/corepack，以 Tini 为 PID 1。Login 额外安装 Chromium。
 
 ### 7.3 测试
 

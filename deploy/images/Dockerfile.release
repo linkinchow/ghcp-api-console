@@ -1,0 +1,62 @@
+ARG NODE_IMAGE=node:22-bookworm-slim@sha256:efd0ab5780c2d9ab1f0f869571a00d5edb17793bff4cce4a2792e3eb0ffc7562
+FROM ${NODE_IMAGE} AS build
+# Public npm by default; pass --build-arg NPM_REGISTRY=<approved registry> to use another.
+# Never put credentials in this URL (build args are recorded in the image history).
+ARG NPM_REGISTRY=https://registry.npmjs.org/
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+WORKDIR /app
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY src ./src
+RUN npm ci --registry="${NPM_REGISTRY}" \
+    && npm run build:deploy \
+    && npm prune --omit=dev --registry="${NPM_REGISTRY}"
+COPY deploy/images/package-runtime.mjs /packaging/package-runtime.mjs
+RUN node /packaging/package-runtime.mjs
+
+FROM ${NODE_IMAGE} AS runtime
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends tini && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /usr/local/lib/node_modules/npm /opt/yarn-* \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/yarn /usr/local/bin/yarnpkg /usr/local/bin/corepack
+ARG SOURCE_REVISION
+ARG RELEASE_VERSION
+LABEL org.opencontainers.image.source="https://github.com/linkinchow/ghcp-api-console" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      org.opencontainers.image.version="${RELEASE_VERSION}" \
+      org.opencontainers.image.description="Single-enterprise GHCP services; SQLite/MySQL baseline"
+ENV NODE_ENV=production
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
+WORKDIR /app
+COPY --from=build /app/package.json /app/package-lock.json ./
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /runtime/shared ./src/packages/shared
+
+FROM runtime AS proxy
+COPY --from=build /runtime/proxy ./src/proxy
+WORKDIR /app/src/proxy
+# Deprecated compatibility: older Kubernetes/Rancher templates override the command with
+# `node src/proxy/dist/index.js`, which resolves against this WORKDIR. Remove that override.
+RUN mkdir -p src/proxy/dist \
+    && echo "import '../../../dist/index.js';" > src/proxy/dist/index.js
+EXPOSE 3000
+CMD ["node", "dist/index.js"]
+
+FROM runtime AS console
+COPY --from=build /runtime/console ./src/console
+WORKDIR /app/src/console
+EXPOSE 7004
+CMD ["node", "dist/server/index.js"]
+
+FROM runtime AS sso
+COPY --from=build /runtime/sso ./src/sso
+WORKDIR /app/src/sso
+EXPOSE 7001
+CMD ["node", "dist/index.js"]
+
+FROM runtime AS login
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN node node_modules/playwright/cli.js install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /runtime/login ./src/login
+WORKDIR /app/src/login
+EXPOSE 7003
+CMD ["node", "dist/index.js"]
