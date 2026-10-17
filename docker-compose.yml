@@ -8,13 +8,17 @@ services:
   sso:
     build:
       context: .
-      dockerfile: src/sso/Dockerfile
+      dockerfile: deploy/images/Dockerfile.release
+      target: sso
       args:
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
     image: ghcp-sso:local
+    # Covers SHUTDOWN_TIMEOUT_MS (default 25 s) plus storage release; Docker's default is 10 s.
+    stop_grace_period: 35s
     environment:
       PORT: "7001"
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-25000}
       DB_PATH: /data/sso.sqlite
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?set INTERNAL_API_TOKEN}
       BASE_URL: ${SSO_PUBLIC_BASE_URL:?set SSO_PUBLIC_BASE_URL}
@@ -44,13 +48,16 @@ services:
   login:
     build:
       context: .
-      dockerfile: src/login/Dockerfile
+      dockerfile: deploy/images/Dockerfile.release
+      target: login
       args:
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
     image: ghcp-login:local
+    stop_grace_period: 35s
     environment:
       PORT: "7003"
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-25000}
       DB_PATH: /data/login.sqlite
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?set INTERNAL_API_TOKEN}
       PROXY_BASE_URL: http://proxy:3000
@@ -76,14 +83,17 @@ services:
   proxy:
     build:
       context: .
-      dockerfile: src/proxy/Dockerfile
+      dockerfile: deploy/images/Dockerfile.release
+      target: proxy
       args:
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
     image: ghcp-proxy:local
+    stop_grace_period: 35s
     restart: "on-failure:5"
     environment:
       PORT: "3000"
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-25000}
       STORAGE_DRIVER: ${STORAGE_DRIVER:-sqlite}
       DB_PATH: ${DB_PATH:-/data/proxy.sqlite}
       MYSQL_URL: "${MYSQL_URL:-}"
@@ -142,13 +152,16 @@ services:
   console:
     build:
       context: .
-      dockerfile: src/console/Dockerfile
+      dockerfile: deploy/images/Dockerfile.release
+      target: console
       args:
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
     image: ghcp-console:local
+    stop_grace_period: 35s
     environment:
       PORT: "7004"
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-25000}
       ADMINS_FILE: /data/admins.json
       SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?set INTERNAL_API_TOKEN}

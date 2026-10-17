@@ -96,7 +96,7 @@ spec:
         - name: proxy
           image: REPLACE_PROXY_IMAGE
           imagePullPolicy: IfNotPresent
-          command: [node, src/proxy/dist/index.js]
+          # No command override: the image runs Tini as PID 1, which forwards SIGTERM to node.
           ports:
             - name: http
               containerPort: 3000

@@ -66,14 +66,14 @@ Package scripts 提供 `start`、`start:prod`、`build`、`typecheck` 和 `test`
 
 ### 3.3 Docker
 
-`src/proxy/Dockerfile` 支持从仓库根目录构建镜像：
+镜像统一由 `deploy/images/Dockerfile.release` 构建（多阶段：运行层只含本服务和 shared 的编译产物及生产依赖；Tini 作为 PID 1 转发 SIGTERM，工作目录 `/app/src/proxy`，启动命令 `node dist/index.js`）。从仓库根目录构建：
 
 ```bash
-docker build -f src/proxy/Dockerfile -t ghcp-proxy .
+docker build -f deploy/images/Dockerfile.release --target proxy -t ghcp-proxy .
 docker run --rm -p 3000:3000 --env-file src/proxy/.env ghcp-proxy
 ```
 
-Dockerfile 会复制根 `package*.json`、`tsconfig.base.json` 和 `src`，执行 `npm install && npm --workspace @ghcp/shared run build`，最后运行 `npm --workspace @ghcp/proxy run start`。
+`NPM_REGISTRY` 构建参数可指定组织批准的 npm 源（不要在 URL 中放凭据）。停止时，进行中的请求（含 SSE 流）最多继续 `SHUTDOWN_TIMEOUT_MS`（默认 25000）毫秒；`docker stop` 请配合 `-t 35` 或更长。
 
 ## 4. 配置参数
 

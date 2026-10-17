@@ -7,19 +7,19 @@
 从当前检出目录构建各个镜像。`NPM_REGISTRY` 为可选参数；公共 npm 不可访问时，将其设为组织批准的受保护包源。不要将凭据放入构建参数、关闭 TLS 校验或绕过软件包发布管控。
 
 ```bash
-docker build --build-arg NPM_REGISTRY="$NPM_REGISTRY" -t ghcp-pool-smoke-proxy:local -f src/proxy/Dockerfile .
+docker build --build-arg NPM_REGISTRY="$NPM_REGISTRY" -t ghcp-pool-smoke-proxy:local -f deploy/images/Dockerfile.release --target proxy .
 ```
 
 ```bash
-docker build --build-arg NPM_REGISTRY="$NPM_REGISTRY" -t ghcp-pool-smoke-sso:local -f src/sso/Dockerfile .
+docker build --build-arg NPM_REGISTRY="$NPM_REGISTRY" -t ghcp-pool-smoke-sso:local -f deploy/images/Dockerfile.release --target sso .
 ```
 
 ```bash
-docker build --build-arg NPM_REGISTRY="$NPM_REGISTRY" -t ghcp-pool-smoke-login:local -f src/login/Dockerfile .
+docker build --build-arg NPM_REGISTRY="$NPM_REGISTRY" -t ghcp-pool-smoke-login:local -f deploy/images/Dockerfile.release --target login .
 ```
 
 ```bash
-docker build --build-arg NPM_REGISTRY="$NPM_REGISTRY" -t ghcp-pool-smoke-console:local -f src/console/Dockerfile .
+docker build --build-arg NPM_REGISTRY="$NPM_REGISTRY" -t ghcp-pool-smoke-console:local -f deploy/images/Dockerfile.release --target console .
 ```
 
 如果不需要自定义包源，应省略该构建参数，而不是传入空值。Login 还会通过正常安装流程下载 Chromium 和操作系统依赖库。

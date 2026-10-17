@@ -101,10 +101,10 @@ npm --workspace @ghcp/console run test
 
 ### Docker
 
-`src/console/Dockerfile` 支持从仓库根作为构建上下文构建镜像：
+镜像统一由 `deploy/images/Dockerfile.release` 构建（多阶段：运行层只含本服务和 shared 的编译产物及生产依赖；Tini 作为 PID 1 转发 SIGTERM，工作目录 `/app/src/console`，启动命令 `node dist/server/index.js`）。从仓库根目录构建：
 
 ```bash
-docker build -f src/console/Dockerfile -t ghcp-console .
+docker build -f deploy/images/Dockerfile.release --target console -t ghcp-console .
 docker run --rm -p 7004:7004 \
   -e SESSION_SECRET='replace-me' \
   -e INTERNAL_API_TOKEN='same-as-services' \

@@ -31,6 +31,10 @@ COPY --from=build /runtime/shared ./src/packages/shared
 FROM runtime AS proxy
 COPY --from=build /runtime/proxy ./src/proxy
 WORKDIR /app/src/proxy
+# Deprecated compatibility: older Kubernetes/Rancher templates override the command with
+# `node src/proxy/dist/index.js`, which resolves against this WORKDIR. Remove that override.
+RUN mkdir -p src/proxy/dist \
+    && echo "import '../../../dist/index.js';" > src/proxy/dist/index.js
 EXPOSE 3000
 CMD ["node", "dist/index.js"]
 

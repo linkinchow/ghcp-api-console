@@ -7,16 +7,19 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const SERVICES = Object.freeze(['sso', 'login', 'proxy', 'console']);
+export const RELEASE_DOCKERFILE = 'deploy/images/Dockerfile.release';
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = path.resolve(path.dirname(scriptPath), '../..');
 const HELP = `Build customer-owned images from one exact, locally available Git commit.
 
 node deploy/user-pool-mysql-customer/build-images.mjs \\
   --commit <40-lowercase-hex-SHA> --output <new-absolute-directory-outside-checkout> \\
-  --image-prefix <local-name-prefix> --platform <linux/amd64|linux/arm64> [--execute-build]
+  --image-prefix <local-name-prefix> --platform <linux/amd64|linux/arm64> \
+  [--npm-registry <https-url-without-credentials>] [--execute-build]
 
 Without --execute-build: validate source and print a build plan; no Docker or writes.
-With --execute-build: archive only the exact commit, build four existing Dockerfiles,
+With --execute-build: archive only the exact commit, build the four targets of
+${RELEASE_DOCKERFILE} (the same definition as the published images),
 record local image IDs and build inputs. No fetch, checkout, push, container startup,
 application environment loading, database access, migration or host installation.
 Docker builds use the existing npm ci / Login browser install inside their images.
@@ -26,7 +29,7 @@ export function parseArgs(args) {
   const result = { execute: false };
   const keys = new Map([
     ['--commit', 'commit'], ['--output', 'output'],
-    ['--image-prefix', 'prefix'], ['--platform', 'platform'],
+    ['--image-prefix', 'prefix'], ['--platform', 'platform'], ['--npm-registry', 'npmRegistry'],
   ]);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -45,7 +48,16 @@ export function parseArgs(args) {
   if (!path.isAbsolute(result.output ?? '')) throw new Error('--output must be an absolute path');
   if (!/^[a-z0-9]+(?:[._-][a-z0-9]+)*$/.test(result.prefix ?? '')) throw new Error('--image-prefix must be a local name, without registry, tag or shell syntax');
   if (!['linux/amd64', 'linux/arm64'].includes(result.platform)) throw new Error('Explicit linux/amd64 or linux/arm64 platform required; platform support must be verified by the customer');
+  if (result.npmRegistry !== undefined) assertRegistryUrl(result.npmRegistry);
   return result;
+}
+
+function assertRegistryUrl(value) {
+  let url;
+  try { url = new URL(value); } catch { throw new Error('--npm-registry must be an absolute URL'); }
+  if (url.protocol !== 'https:') throw new Error('--npm-registry must use https');
+  // Build args are recorded in image history; credentials belong in a build secret, never here.
+  if (url.username || url.password) throw new Error('--npm-registry must not contain credentials');
 }
 
 export function buildSpec(options, service) {
@@ -53,11 +65,13 @@ export function buildSpec(options, service) {
   const tag = `${options.prefix}-${service}:${options.commit}`;
   return {
     service,
-    dockerfile: `src/${service}/Dockerfile`,
+    dockerfile: RELEASE_DOCKERFILE,
+    target: service,
     tag,
     args: [
       'build', '--platform', options.platform,
-      '--file', `src/${service}/Dockerfile`, '--tag', tag,
+      '--file', RELEASE_DOCKERFILE, '--target', service, '--tag', tag,
+      ...(options.npmRegistry ? ['--build-arg', `NPM_REGISTRY=${options.npmRegistry}`] : []),
       '--label', `org.opencontainers.image.revision=${options.commit}`,
       '--iidfile', path.join(options.output, `${service}.iid`), '-',
     ],
@@ -93,11 +107,14 @@ export function main(args = process.argv.slice(2)) {
   const resolvedCommit = run('git', ['rev-parse', '--verify', `${options.commit}^{commit}`]);
   if (resolvedCommit !== options.commit) throw new Error('Commit resolution must match the supplied exact SHA');
   // Read all build inputs from Git, not from potentially modified checkout files.
-  const files = ['package.json', 'package-lock.json', 'tsconfig.base.json', '.dockerignore', ...SERVICES.map((s) => `src/${s}/Dockerfile`)];
+  const files = ['package.json', 'package-lock.json', 'tsconfig.base.json', '.dockerignore', RELEASE_DOCKERFILE, 'deploy/images/package-runtime.mjs'];
   const inputDetails = files.map((file) => {
     const result = spawnSync('git', ['show', `${options.commit}:${file}`], { cwd: repoRoot, encoding: 'buffer', shell: false, maxBuffer: 16 * 1024 * 1024 });
     if (result.error || result.status !== 0) throw new Error(`Cannot read source input ${file}`);
-    return { path: file, sha256: sha256(result.stdout), ...(file.endsWith('Dockerfile') ? { baseImageReferences: [...result.stdout.toString('utf8').matchAll(/^FROM\s+(.+)$/gm)].map((match) => match[1].trim()) } : {}) };
+    if (file !== RELEASE_DOCKERFILE) return { path: file, sha256: sha256(result.stdout) };
+    // Every stage starts FROM ${NODE_IMAGE}; record the digest-pinned default.
+    const baseImageReferences = [...result.stdout.toString('utf8').matchAll(/^ARG NODE_IMAGE=(.+)$/gm)].map((match) => match[1].trim());
+    return { path: file, sha256: sha256(result.stdout), baseImageReferences };
   });
   const specs = SERVICES.map((service) => buildSpec(options, service));
   if (!options.execute) {
@@ -123,7 +140,7 @@ export function main(args = process.argv.slice(2)) {
     dockerVersion,
     nodeVersion: process.version,
     inputs: inputDetails,
-    reproducibility: 'Exact source commit and lockfile; existing Dockerfiles use mutable base tags and Login browser/OS packages. Byte-identical builds are not claimed. Resolved base digests are not captured by this script.',
+    reproducibility: 'Exact source commit and lockfile; the Node base image is pinned by digest in the Dockerfile. OS package upgrades and the Login browser are resolved at build time, so byte-identical builds are not claimed.',
     customerRegistryManifestDigest: null,
     deploymentApproved: false,
     images: [],

@@ -112,10 +112,10 @@ npm --workspace @ghcp/sso run build
 
 ### Docker
 
-`src/sso/Dockerfile` 会在镜像内执行 `npm install`，构建 `@ghcp/shared`，然后运行 `npm --workspace @ghcp/sso run start`。
+镜像统一由 `deploy/images/Dockerfile.release` 构建（多阶段：运行层只含本服务和 shared 的编译产物及生产依赖；Tini 作为 PID 1 转发 SIGTERM，工作目录 `/app/src/sso`，启动命令 `node dist/index.js`）。从仓库根目录构建：
 
 ```bash
-docker build -f src/sso/Dockerfile -t ghcp-sso .
+docker build -f deploy/images/Dockerfile.release --target sso -t ghcp-sso .
 docker run --rm -p 7001:7001 --env-file src/sso/.env.example ghcp-sso
 ```
 

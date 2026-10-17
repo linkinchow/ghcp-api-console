@@ -35,9 +35,9 @@
 node deploy/user-pool-mysql-customer/build-images.mjs --commit <FULL_40_HEX_COMMIT> --output <NEW_ABSOLUTE_OUTPUT_DIR> --image-prefix customer-ghcp --platform linux/amd64
 ```
 
-客户批准构建后，同样参数加 `--execute-build`。脚本复用 `src/sso/Dockerfile`、`src/login/Dockerfile`、`src/proxy/Dockerfile`、`src/console/Dockerfile` 和 `package-lock.json`；不改Dockerfile、不增加依赖。现有Dockerfile在镜像内执行 `npm ci`；Login还安装Chromium及系统依赖，因此**构建需要批准的下载网络，不是离线构建，也不是在宿主安装依赖**。失败不自动重试，输出目录保留部分证据，下一次需新目录。
+客户批准构建后，同样参数加 `--execute-build`。脚本使用 `deploy/images/Dockerfile.release` 的 `sso`、`login`、`proxy`、`console` 四个 target（与发布到 Docker Hub 的镜像同一定义）和 `package-lock.json`；不改Dockerfile、不增加依赖。可用 `--npm-registry <https-url>` 指定组织批准的 npm 源（URL 中不得含凭据）。构建在镜像内执行 `npm ci`；Login还安装Chromium及系统依赖，因此**构建需要批准的下载网络，不是离线构建，也不是在宿主安装依赖**。失败不自动重试，输出目录保留部分证据，下一次需新目录。
 
-生成的 `build-manifest.json` 包含：完整commit、源码tar与构建脚本hash、输入文件hash、Docker/Node版本、平台、Dockerfile的FROM引用及四个本地image ID。输出状态只有 `built-locally-not-deployed` 才表示四服务均构建完成，不等于运行验收。`customerRegistryManifestDigest` / `rancherRuntimeImageId` 默认null，须客户分发/部署后补实际值。
+生成的 `build-manifest.json` 包含：完整commit、源码tar与构建脚本hash、输入文件hash、Docker/Node版本、平台、按digest固定的Node基础镜像引用及四个本地image ID。输出状态只有 `built-locally-not-deployed` 才表示四服务均构建完成，不等于运行验收。`customerRegistryManifestDigest` / `rancherRuntimeImageId` 默认null，须客户分发/部署后补实际值。
 
 **可重复性限制**：当前Dockerfile的 `node:22-bookworm-slim` 是可变tag，Login系统/browser包也不是完全固定的构建来源。脚本记录FROM文本但不捕获所有已解析base digest，不声称bit-for-bit可复现，也不声称历史开发者镜像digest等于客户构建结果。客户应保留构建日志/产物，在维护前构建并固定这些实际产物，不在cutover时重建。若客户要求字节级可复现供应链，这是另一个需批准的目标，不擅自改变此闭集源码。
 
@@ -60,7 +60,7 @@ node deploy/user-pool-mysql-customer/build-images.mjs --commit <FULL_40_HEX_COMM
 1. 默认3仅是草案；先将客户选定副本数和跨节点分布固定。已有3/5独立进程测试不证明Rancher跨节点HA或吞吐。迁移首次实际启动按一副本验证，验证后才扩至所选副本数。
 2. `Service` 是ClusterIP、无sticky session，不是公网网关。客户现有可信网关验证virtual key并覆盖用户身份头，再使用Proxy服务密钥；禁止把内部管理口或凭据开放给普通caller。已有网关/NetworkPolicy必须限制业务和内部路径、客户端及出站访问。此包不创建入口控制器或通用网络策略。
 3. `/readyz` 已存在：存储ping有5秒预算；模板probe timeout6秒，不按本机owner摘除MySQL standby。`/healthz` 已存在：进程HTTP存活、无DB访问；liveness不使用DB就绪探测，避免短DB故障的全副本重启风暴。startup probe预算/重启退避仍需客户实际环境验证。
-4. 显式 `node src/proxy/dist/index.js` 沿用现有编译入口，让node接收SIGTERM。preStop的10秒只是endpoint传播等待，不是完整drain API；45秒grace留给等待与关闭。**现有源码SIGTERM后约25秒强制关闭HTTP连接**，更长流仍可能被截断。先由现有入口停止新admission并观察流排空，再批准终止；不要凭模板宣称无中断rollout。LB idle timeout必须覆盖批准的流长，关闭全量缓冲，不自动重放不明结果。
+4. 模板不覆盖启动命令：镜像以Tini为PID 1，把SIGTERM转发给node（旧模板的 `command: [node, src/proxy/dist/index.js]` 覆盖会绕过Tini，应删除；镜像内保留兼容入口，但已废弃）。preStop的10秒只是endpoint传播等待，不是完整drain API；45秒grace = preStop 10秒 + `SHUTDOWN_TIMEOUT_MS`（默认25秒）+ 资源释放余量。**SIGTERM后约25秒强制关闭仍在进行的HTTP连接**，更长流仍可能被截断。先由现有入口停止新admission并观察流排空，再批准终止；不要凭模板宣称无中断rollout。LB idle timeout必须覆盖批准的流长，关闭全量缓冲，不自动重放不明结果。
 5. 单一共享MySQL写端点、verify-ca、CA只读挂载；不能连接只读副本或将required误当证书验证。所有Proxy/importer使用相同fingerprint不变量；模板并发值只是草案，迁移必须以实际批准值替换，不能直接改env绕过不一致。
 6. 将companion-routing中的 `PROXY_BASE_URL` 合并到**既有**SSO/Login/Console，保留其余所有设置/secret/卷并保持各1实例；同namespace的 `http://ghcp-pool-proxy:3000` 不带 `/api`。跨namespace需改为实际Service DNS并验证可达。
 7. resources、secret名、namespace、镜像、CA、域名/模型等占位未替换时，不是有效部署。先在客户工具中做离线schema检查，再在授权的预生产环境做server-side验证和实际路由/恢复验证；离线语法通过不能代替AdmissionPolicy/Rancher验收。

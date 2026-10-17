@@ -70,10 +70,10 @@ npm run login:token -- \
 
 ### Docker
 
-`src/login/Dockerfile` 会安装依赖、构建 `@ghcp/shared`，并安装 Chromium 及系统依赖；容器启动命令是 `npm --workspace @ghcp/login run start`。
+镜像统一由 `deploy/images/Dockerfile.release` 构建（多阶段：运行层只含本服务和 shared 的编译产物及生产依赖；Tini 作为 PID 1 转发 SIGTERM，工作目录 `/app/src/login`，启动命令 `node dist/index.js`）。从仓库根目录构建：Login 镜像额外安装 Chromium 及其系统依赖。
 
 ```bash
-docker build -f src/login/Dockerfile -t ghcp-login .
+docker build -f deploy/images/Dockerfile.release --target login -t ghcp-login .
 docker run --rm -p 7003:7003 \
   -e INTERNAL_API_TOKEN=change-me-internal-token \
   -e PROXY_BASE_URL=http://host.docker.internal:3000 \
