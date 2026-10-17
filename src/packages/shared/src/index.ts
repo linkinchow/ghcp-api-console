@@ -1,4 +1,5 @@
 export * from './api.js';
+export * from './models.js';
 export * from './contracts.js';
 export * from './httpClient.js';
 export * from './ids.js';

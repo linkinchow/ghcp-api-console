@@ -103,6 +103,31 @@ const MODELS_RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
 const modelsCache = new Map<ModelsCacheKey, ModelsCacheEntry>();
 const modelsCacheLogger = new Logger('models-cache');
 
+export interface ModelsCatalog {
+  models: ModelInfo[];
+  /** When the returned snapshot was fetched from Copilot (epoch ms), not when it was served. */
+  fetchedAt: number;
+  cacheStatus: 'fresh' | 'cached' | 'stale';
+}
+
+/** Like listModels, but also reports how old the catalog is (for the Console Models page). */
+export async function listModelsWithMetadata(copilot: CopilotAuthContext, options: ListModelsOptions = {}): Promise<ModelsCatalog> {
+  const useCache = options.useCache !== false;
+  try {
+    const { snapshot, cacheStatus } = await lookupModelsSnapshot(copilot, {
+      forceRefresh: !useCache,
+      allowStaleOnError: useCache,
+      signal: options.signal,
+      diagnostics: options.diagnostics,
+    });
+    return { models: snapshot.models, fetchedAt: snapshot.fetchedAt, cacheStatus };
+  } catch (error) {
+    // A rejected credential must not keep serving its still-fresh snapshot on the next lookup.
+    if (error instanceof CopilotApiError && [401, 403].includes(error.status)) modelsCache.delete(modelsCacheKey(copilot));
+    throw error;
+  }
+}
+
 export async function listModels(copilot: CopilotAuthContext, options: ListModelsOptions = {}): Promise<ModelInfo[]> {
   const useCache = options.useCache !== false;
   const snapshot = await getModelsSnapshot(copilot, {
@@ -213,19 +238,31 @@ export function modelSupportsPath(model: ModelInfo, path: CopilotApiPath): boole
   return inferSupportedPaths(model).includes(modelCapabilityPath(path));
 }
 
-async function getModelsSnapshot(
+interface ModelsLookupOptions {
+  forceRefresh?: boolean;
+  allowStaleOnError?: boolean;
+  diagnostics?: ErrorDiagnosticContext;
+  signal?: AbortSignal;
+}
+
+async function getModelsSnapshot(copilot: CopilotAuthContext, options: ModelsLookupOptions = {}): Promise<ModelsSnapshot> {
+  return (await lookupModelsSnapshot(copilot, options)).snapshot;
+}
+
+async function lookupModelsSnapshot(
   copilot: CopilotAuthContext,
-  options: { forceRefresh?: boolean; allowStaleOnError?: boolean; diagnostics?: ErrorDiagnosticContext; signal?: AbortSignal } = {},
-): Promise<ModelsSnapshot> {
+  options: ModelsLookupOptions = {},
+): Promise<{ snapshot: ModelsSnapshot; cacheStatus: ModelsCatalog['cacheStatus'] }> {
   options.signal?.throwIfAborted();
   const cacheKey = modelsCacheKey(copilot);
   const entry = modelsCacheEntry(cacheKey, copilot.identity);
   const now = Date.now();
   const snapshot = entry.snapshot;
-  if (!options.forceRefresh && snapshot && snapshot.expiresAt > now) return snapshot;
+  if (!options.forceRefresh && snapshot && snapshot.expiresAt > now) return { snapshot, cacheStatus: 'cached' };
 
   try {
-    return await refreshModelsSnapshot(cacheKey, copilot, entry, options.diagnostics, options.signal);
+    const refreshed = await refreshModelsSnapshot(cacheKey, copilot, entry, options.diagnostics, options.signal);
+    return { snapshot: refreshed, cacheStatus: 'fresh' };
   } catch (err) {
     options.signal?.throwIfAborted();
     if (err instanceof ModelIdCollisionError) throw err;
@@ -236,7 +273,7 @@ async function getModelsSnapshot(
         ageSeconds: Math.round((now - snapshot.fetchedAt) / 1000),
         error: errorMessage(err),
       });
-      return snapshot;
+      return { snapshot, cacheStatus: 'stale' };
     }
     throw err;
   }

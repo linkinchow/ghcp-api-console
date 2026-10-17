@@ -7,7 +7,7 @@ import type {
 } from '@ghcp/shared';
 import { useEffect, useId, useRef, useState, type FormEvent, type InputHTMLAttributes, type ReactNode } from 'react';
 import {
-  Activity, AlertTriangle, BarChart3, Eye, EyeOff, KeyRound, Layers, LayoutDashboard, ListChecks,
+  Activity, AlertTriangle, BarChart3, Boxes, Eye, EyeOff, KeyRound, Layers, LayoutDashboard, ListChecks,
   Loader2, Lock, LogOut, RefreshCw, Settings as SettingsIcon, ShieldCheck, UserRound, Users, Wallet,
 } from 'lucide-react';
 import { api, ConsoleApiError } from './api/client.js';
@@ -43,13 +43,14 @@ import { Table, Th, Td } from './components/ui/table.js';
 import { Textarea } from './components/ui/textarea.js';
 import { formatCopilotSeat, formatDate, formatNumber, statusTone, tokenTotal } from './lib/format.js';
 import { RequestFailure } from './components/RequestFailure.js';
+import { ModelsPage } from './pages/ModelsPage.js';
 import { UserPoolPage } from './pages/UserPoolPage.js';
 
 interface SetupState {
   initialized: boolean;
 }
 
-type Page = 'dashboard' | 'users' | 'budgets' | 'stats' | 'accounts' | 'user-pool' | 'tasks' | 'settings' | 'error-diagnostics' | 'diagnostics';
+type Page = 'dashboard' | 'users' | 'budgets' | 'stats' | 'accounts' | 'models' | 'user-pool' | 'tasks' | 'settings' | 'error-diagnostics' | 'diagnostics';
 type Notify = (message: string, tone?: 'success' | 'warning' | 'error') => void;
 const pageViews = new Map<Page, string>();
 const EMU_IMPORT_ROW_STATUSES: (ImportEmuUserStatus | '')[] = ['', 'pending_create', 'pending_update', 'created', 'updated', 'skipped', 'conflict', 'failed'];
@@ -61,6 +62,7 @@ const pages: { id: Page; label: string; description: string; icon: typeof Layout
   { id: 'budgets', label: 'AI Credits Usage', description: 'Review enterprise AI Credits consumption and Copilot seat cost.', icon: Wallet },
   { id: 'stats', label: 'Request Stats', description: 'Review request failures and input/output/cache token usage.', icon: BarChart3 },
   { id: 'accounts', label: 'Proxy Accounts', description: 'Inspect identity mappings and refresh GitHub or Copilot tokens.', icon: KeyRound },
+  { id: 'models', label: 'Models', description: 'Browse the Copilot model catalog of the configured GitHub enterprise admin.', icon: Boxes },
   { id: 'user-pool', label: 'User pool', description: 'Manage idle capacity, exclusive caller leases, and account recovery.', icon: Layers },
   { id: 'tasks', label: 'Login Tasks', description: 'Monitor automatic login and GitHub-token refresh tasks.', icon: ListChecks },
   { id: 'settings', label: 'Settings', description: 'Change the Console password and update runtime service settings.', icon: SettingsIcon },
@@ -276,6 +278,7 @@ function AdminApp(props: { onLogout: () => void }) {
           {page === 'budgets' ? <AiCreditsUsagePage notify={notify} /> : null}
           {page === 'stats' ? <RequestStatsPage /> : null}
           {page === 'accounts' ? <ProxyAccountsPage notify={notify} /> : null}
+          {page === 'models' ? <ModelsPage notify={notify} /> : null}
           {page === 'user-pool' ? <UserPoolPage notify={notify} /> : null}
           {page === 'tasks' ? <LoginTasksPage notify={notify} /> : null}
           {page === 'settings' ? <SettingsPage notify={notify} /> : null}

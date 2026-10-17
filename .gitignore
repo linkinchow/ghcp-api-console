@@ -30,6 +30,7 @@ curl.http
 
 .claude/*
 !docs/codebase-overview.md
+!docs/models-admin-guide.md
 !docs/repo-map.md
 !docs/user-pool-*.md
 **/__pycache__/

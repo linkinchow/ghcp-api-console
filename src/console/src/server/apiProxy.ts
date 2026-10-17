@@ -5,6 +5,8 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
 const logger = loggerFor('console', 'api-proxy');
+/** Models lookups wait on GitHub and Copilot; bound them a little above Proxy's own 35 s deadline. */
+const MODELS_READ_TIMEOUT_MS = 40_000;
 
 export function serviceProxy(target: 'proxy' | 'sso' | 'login', mountPath: string) {
   return async (req: Request, res: Response): Promise<void> => {
@@ -33,6 +35,9 @@ export function serviceProxy(target: 'proxy' | 'sso' | 'login', mountPath: strin
     const controller = new AbortController();
     const abort = () => { if (!res.writableEnded) controller.abort(); };
     res.once('close', abort);
+    const isModelsRead = target === 'proxy' && req.method === 'GET' && /^\/models(?:\?|$)/.test(suffix);
+    const modelsTimeout = isModelsRead ? setTimeout(() => controller.abort(), MODELS_READ_TIMEOUT_MS) : undefined;
+    modelsTimeout?.unref();
     logger.info('proxy-request', 'Forwarding console API request', {
       target,
       method: req.method,
@@ -87,7 +92,11 @@ export function serviceProxy(target: 'proxy' | 'sso' | 'login', mountPath: strin
         durationMs: Date.now() - startedAt,
         ...errorFields(err),
       });
-      if (!res.headersSent && !res.destroyed) {
+      if (isModelsRead && !res.headersSent && !res.destroyed) {
+        // Never relay transport error text for the Models page; it only needs to know the lookup failed.
+        res.status(controller.signal.aborted ? 504 : 502)
+          .json(apiError('models_service_unavailable', 'The model catalog service is unavailable.'));
+      } else if (!res.headersSent && !res.destroyed) {
         // Headers copied from the upstream response describe a CSV attachment that will never be
         // sent. Leaving them on turns the JSON error into a downloaded file named like the export.
         for (const header of ['Content-Disposition', 'X-Export-Matched-At-Start', 'Cache-Control']) res.removeHeader(header);
@@ -95,6 +104,7 @@ export function serviceProxy(target: 'proxy' | 'sso' | 'login', mountPath: strin
         res.status(502).json(apiError('service_proxy_failed', err instanceof Error ? err.message : String(err)));
       }
     } finally {
+      clearTimeout(modelsTimeout);
       res.removeListener('close', abort);
     }
   };

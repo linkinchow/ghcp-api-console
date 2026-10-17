@@ -111,6 +111,12 @@ Proxy 通过 `dotenv/config` 读取环境变量。未设置时使用 `src/config
 | `PROXY_ERROR_DIAGNOSTICS_SHARED` | `false` / `false` | 否 | 在多 Pod 共用 RWX 根目录时启用实例隔离写入和聚合读取。 |
 | `PROXY_INSTANCE_ID` | `HOSTNAME` / 空 | 共享诊断模式 | 当前 Pod 的安全目录标识；Kubernetes 建议通过 Downward API 注入 Pod 名。 |
 | `COPILOT_API_BASE_URL` | `https://api.githubcopilot.com` / 同 | 否 | Copilot API base URL；GitHub.com 用默认值，GHE.com 为 `https://copilot-api.<sub>.ghe.com`。 |
+| `GITHUB_API_BASE_URL` | `https://api.github.com` / 同 | 否 | GitHub REST API；Models 页面用它校验管理员 token 归属。GHE.com 为 `https://api.<sub>.ghe.com`。 |
+| `MODELS_ADMIN_GITHUB_LOGIN` | 空 / 空 | 否 | Console Models 页面使用的 GitHub 企业管理员登录名；未设置时页面提示未配置。详见 `docs/models-admin-guide.md`。 |
+| `MODELS_ADMIN_GITHUB_USER_ID` | 空 / 空 | 否 | 管理员的数字 GitHub 用户 ID（推荐），防止登录名改名复用。 |
+| `MODELS_ADMIN_COPILOT_TOKEN_FILE` | 空 / 空 | 否 | 管理员 Copilot OAuth token 的 Secret 文件绝对路径，每次查询重新读取（推荐）。 |
+| `MODELS_ADMIN_COPILOT_TOKEN` | 空 / 空 | 否 | 直接提供 token；不能与 `_FILE` 同时设置。 |
+| `SHUTDOWN_TIMEOUT_MS` | `25000` / 同 | 否 | 收到 SIGTERM 后，进行中的请求（含 SSE 流）最多继续的毫秒数，之后关闭连接；需小于容器停止宽限期。 |
 | `OPENCODE_VERSION` | `1.0.0` / `1.18.4` | 否 | 生成 `User-Agent: opencode/<version>`。 |
 | `OPENCODE_USER_AGENT` | 未设置 / 未设置 | 否 | 显式覆盖完整 User-Agent；非空时优先于 `OPENCODE_VERSION`。 |
 | `GITHUB_API_VERSION` | `2026-06-01` / 同 | 否 | `X-GitHub-Api-Version` 请求头。 |

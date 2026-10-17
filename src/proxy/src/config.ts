@@ -15,6 +15,10 @@ export interface ProxyConfig {
   identityHeader: string;
   identityHeaderRequired: boolean;
   claudeCodeOptimized: boolean;
+  githubApiBaseUrl: string;
+  modelsAdminGithubLogin?: string;
+  modelsAdminGithubUserId?: string;
+  modelsAdminCopilotTokenFile?: string;
   internalApiToken: string;
   ssoBaseUrl: string;
   loginBaseUrl: string;
@@ -47,6 +51,10 @@ export const config: ProxyConfig = {
   identityHeader: process.env.IDENTITY_HEADER ?? 'X-User-Identity',
   identityHeaderRequired: readBoolean(process.env.IDENTITY_HEADER_REQUIRED, true),
   claudeCodeOptimized: readBoolean(process.env.CLAUDE_CODE_OPTIMIZED, false),
+  githubApiBaseUrl: (readOptionalString(process.env.GITHUB_API_BASE_URL) ?? 'https://api.github.com').replace(/\/+$/, ''),
+  modelsAdminGithubLogin: readOptionalString(process.env.MODELS_ADMIN_GITHUB_LOGIN),
+  modelsAdminGithubUserId: readOptionalString(process.env.MODELS_ADMIN_GITHUB_USER_ID),
+  modelsAdminCopilotTokenFile: readOptionalString(process.env.MODELS_ADMIN_COPILOT_TOKEN_FILE),
   internalApiToken: process.env.INTERNAL_API_TOKEN ?? '',
   ssoBaseUrl: process.env.SSO_BASE_URL ?? 'http://localhost:7001',
   loginBaseUrl: process.env.LOGIN_BASE_URL ?? 'http://localhost:7003',

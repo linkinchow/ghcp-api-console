@@ -16,6 +16,7 @@ import { userPoolApiRouter } from './routes/userPoolApi.js';
 import { assertUserPoolOwner, getUserPool, routeUserPool, startUserPool, stopUserPool } from './userPool/runtime.js';
 import { readPoolConfig } from './userPool/config.js';
 import { accountOperationsRouter } from './routes/operationsApi.js';
+import { createModelsApiRouter } from './routes/modelsApi.js';
 
 const requestLogger = new Logger('request');
 
@@ -40,7 +41,7 @@ export function buildApp(): express.Express {
     }
   });
   app.use('/api/accounts/operations', requireInternalToken, accountOperationsRouter, managementErrorHandler('proxy'));
-  app.use('/api', requireInternalToken, adminApiRouter, userPoolApiRouter, managementErrorHandler('proxy'));
+  app.use('/api', requireInternalToken, createModelsApiRouter(), adminApiRouter, userPoolApiRouter, managementErrorHandler('proxy'));
   app.use('/internal', requireInternalToken, internalApiRouter, managementErrorHandler('proxy'));
   app.use(requireApiKey, requireIdentityHeader, routeUserPool, compatibleRouter);
   app.use((req, res) => {
