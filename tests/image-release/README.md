@@ -7,6 +7,7 @@
 | 文件 | 用途 |
 | --- | --- |
 | `compose.yaml`、`mock.mjs`、`verify.mjs` | SQLite 直连模式的快速冒烟：健康检查、合成凭据导入、`/v1/messages` JSON/SSE 与缺少 beta 头时的 400、SSO/Login/Console 基本接口。 |
+| `ghe-compose.yaml`、`ghe-e2e.mjs` | GHE.com 模式全链路：真实 SSO（SAML IdP）+ 真实 Login（Chromium 设备授权）+ Proxy 账号池，mock（`tests/docker-user-pool/mock-ghe.mjs`）扮演 `*.ghe.com` 各主机。驱动容器的退出码即结果。 |
 | `qualification-compose.json` | MySQL 8.4 + 双 Proxy（caller-lease）+ SSO/Login/Console + mock + 本机回环 bridge 的完整环境。 |
 | `qualification-prepare.mjs` | 新建一次运行目录（`.claude/release-qualification-run-<uuid>/`）：复制并适配 `tests/docker-user-pool` 的 smoke 与 mock、写入合成证书和 MySQL 初始化脚本。 |
 | `qualification-run.mjs` | 执行资格验证。默认模式：基线镜像 → 候选镜像 → 基线镜像（同一数据卷原地升级再回滚）；`RELEASE_QUALIFICATION_MODE=candidate-fresh`：候选镜像全新库。 |

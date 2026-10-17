@@ -14,6 +14,9 @@ import http from 'node:http';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 const MockLoginQueue = process.env.MYSQL_PROVISION_FIXTURE === '1'
   ? (await import('./mock-login-queue.mjs')).MockLoginQueue : undefined;
+// GHE.com mode: this fixture also plays <host> (web + device flow), api.<host> and copilot-api.<host>.
+const GHE_HOST = process.env.MOCK_GHE_HOST?.trim().toLowerCase() || undefined;
+const { createGheMock } = GHE_HOST ? await import('./mock-ghe.mjs') : {};
 
 const PORT = Number(process.env.PORT ?? 8002);
 const INTERNAL = process.env.INTERNAL_API_TOKEN ?? 'local-pool-internal-test-only';
@@ -30,6 +33,10 @@ const SCIM_ROOT = '/scim/v2/enterprises/local-test/Users';
 const BILLING_ROOT = '/enterprises/local-test/copilot/billing';
 const USER_SCHEMA = 'urn:ietf:params:scim:schemas:core:2.0:User';
 const users = new Map(), seats = new Set(), tasks = new Map(), tokens = new Map();
+const ghe = GHE_HOST ? createGheMock({
+  host: GHE_HOST, port: PORT, slug: 'local-test',
+  idpSsoUrl: process.env.MOCK_GHE_IDP_SSO_URL ?? 'http://sso:7001/sso', users, tokens,
+}) : undefined;
 const inference = [];
 const otherInference = [];
 const counters = { scimCreates: 0, scimConflicts: 0, scimUpdates: 0, scimDeletes: 0, seatAssignments: 0, taskPosts: 0, callbacksSucceeded: 0, callbacksFailed: 0, modelLists: 0 };
@@ -88,7 +95,10 @@ function scimResource(body, prior) {
     emails: Array.isArray(body.emails) ? body.emails.filter(email => record(email) && typeof email.value === 'string').map(email => ({ value: email.value, primary: email.primary === true, type: 'work' })) : [],
     roles: [{ value: body.roles?.[0]?.value === 'enterprise_owner' ? 'enterprise_owner' : 'user', primary: false }],
     active: body.active !== false,
-    githubLogin: `${body.userName.toLowerCase().replace(/[^a-z0-9-]/g, '-')}_test`,
+    // GHE.com logins carry no shortcode suffix and are at most 30 characters.
+    githubLogin: ghe
+      ? body.userName.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30)
+      : `${body.userName.toLowerCase().replace(/[^a-z0-9-]/g, '-')}_test`,
     meta: { resourceType: 'User', created: prior?.meta.created ?? now, lastModified: now },
   };
 }
@@ -339,6 +349,12 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://fixture.invalid');
     if (req.method === 'GET' && ['/healthz', '/readyz'].includes(url.pathname)) return json(res, 200, { status: 'ok', service: 'local-pool-mock', fixture: true });
+    if (ghe && url.pathname === '/test/ghe' && req.method === 'GET') {
+      if (!authorize(req, res, INTERNAL)) return;
+      const accounts = [...users.values()].map(({ userName, githubLogin, active }) => ({ userName, githubLogin, active }));
+      return json(res, 200, { fixture: true, ghe: ghe.evidence, users: accounts, seats: [...seats], inference: inference.map(({ identity, path, outcome }) => ({ identity, path, outcome })) });
+    }
+    if (ghe?.handles(req)) return await ghe.handle(req, res, url);
     if (url.pathname === '/test/counts' && req.method === 'GET') {
       if (!authorize(req, res, INTERNAL)) return;
       return json(res, 200, { fixture: true, counters, loginQueue: loginQueue?.snapshot() ?? null,
@@ -371,11 +387,19 @@ const server = http.createServer(async (req, res) => {
       res.once('close', complete);
       await new Promise(resolve => setTimeout(resolve, stageDelay));
     }
-    if (url.pathname === SCIM_ROOT || url.pathname.startsWith(`${SCIM_ROOT}/`)) return await scim(req, res, url);
-    if (url.pathname.startsWith(`${BILLING_ROOT}/`)) return await billing(req, res, url);
-    if (url.pathname.startsWith('/enterprises/local-test/members/')) return await billing(req, res, url);
+    if (url.pathname === SCIM_ROOT || url.pathname.startsWith(`${SCIM_ROOT}/`)) {
+      ghe?.recordHost('scim', req);
+      return await scim(req, res, url);
+    }
+    if (url.pathname.startsWith(`${BILLING_ROOT}/`) || url.pathname.startsWith('/enterprises/local-test/members/')) {
+      ghe?.recordHost('seats', req);
+      return await billing(req, res, url);
+    }
     if (url.pathname === '/api/tasks' || url.pathname.startsWith('/api/tasks/')) return await fakeLogin(req, res, url);
-    if (['/models', '/v1/messages', '/v1/messages/count_tokens', '/chat/completions', '/responses'].includes(url.pathname)) return await upstream(req, res, url);
+    if (['/models', '/v1/messages', '/v1/messages/count_tokens', '/chat/completions', '/responses'].includes(url.pathname)) {
+      ghe?.recordHost('copilot', req);
+      return await upstream(req, res, url);
+    }
     failure(res, 404, 'not_found');
   } catch (error) {
     if (res.headersSent) res.destroy();

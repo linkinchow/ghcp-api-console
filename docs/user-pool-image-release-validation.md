@@ -43,6 +43,24 @@
 | Console Models 页面 | Browser 预览实测：渲染、Messages 过滤、详情、过期提示、错误提示、刷新；名称中的 HTML 按纯文本显示 |
 | Console 浏览器测试（本机 Edge，串行） | 61 项。合并后发现并修复 3 处测试与新 UI 不匹配（请求统计改为服务端分页、失败详情改用 RequestFailure 组件、managed list 的错误文案）。之后三轮完整/分组运行中每一项都至少通过一次；剩余失败均为本机偶发超时（如 `page.goto` 8 秒），失败项每轮不同。未在 CI 级稳定环境复测。 |
 
+
+#### GHE.com 模式（mock 全链路，2026-10-17）
+
+`tests/image-release/ghe-compose.yaml`：r4 四个镜像中的 SSO、Login、Proxy 均配置为 GHE.com 模式（`GITHUB_BASE_URL=http://fixture.ghe.com:8002`），存储为 SQLite，账号池为 caller-lease 模式。mock 在内网中扮演 `fixture.ghe.com`（网页与 OAuth 设备授权）、`api.fixture.ghe.com`（SCIM、席位）和 `copilot-api.fixture.ghe.com`（Copilot）。**真实 SSO 担任 SAML IdP，真实 Login 用镜像内的 Chromium 完成设备授权。**
+
+| 检查 | 结果 |
+| --- | --- |
+| 账号池自动开户直到 ready（SSO → SCIM → 席位 → Login → 令牌回调 → 预热） | PASS |
+| 设备授权请求发往 GHE 主机，使用默认 OpenCode Client ID | PASS |
+| SSO 的 SAML 响应：Audience = `<GITHUB_BASE_URL>/enterprises/<slug>`，Destination、InResponseTo 正确，带签名，NameID 为账号 | PASS |
+| SCIM 登录名无 shortcode 后缀（配置的 `ENTERPRISE_SHORTCODE=test` 被正确忽略），不超过 30 字符；席位分配给该登录名 | PASS |
+| SCIM 与席位请求只访问 `api.fixture.ghe.com`，Copilot 请求只访问 `copilot-api.fixture.ghe.com` | PASS |
+| 调用方推理请求由经 GHE 授权的账号令牌提供服务 | PASS |
+
+另外，上游的 GHE 浏览器流程测试（`ghecomFlow`）已在 r4 Login 镜像内用镜像自带的 Chromium 离线运行，通过。
+
+**范围限制**：GHE 网页由 mock 模拟，结构按上游测试的页面编写，与真实 GHE.com 页面可能不同；OpenCode Client ID 能否在真实 `*.ghe.com` 上使用、真实 `api.<子域>.ghe.com` 的行为，都**未在真实环境验证**。
+
 资格验证报告：`.claude/release-qualification-run-d5bac5e1-7465-403b-809e-b85bd17a4efc`（升级/回滚）、`.claude/release-qualification-run-a5617312-a79a-4ce4-a3ae-8b7ef9ee258e`（全新库）。
 
 验证过程中修复的问题（均为测试工具或测试夹具，非产品代码）：
