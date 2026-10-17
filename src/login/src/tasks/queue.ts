@@ -38,6 +38,7 @@ export class LoginQueue {
   private readonly completions = new Map<string, Promise<void>>();
   private readonly cancelling = new Set<string>();
   private readonly dependencies: LoginQueueDependencies;
+  private accepting = true;
 
   constructor(dependencies: Partial<LoginQueueDependencies> = {}) {
     this.dependencies = { ...defaultDependencies, ...dependencies };
@@ -137,7 +138,13 @@ export class LoginQueue {
     this.drain();
   }
 
+  /** Shutdown: start no new browser sessions. Queued tasks are recovered on the next start. */
+  stopAccepting(): void {
+    this.accepting = false;
+  }
+
   private drain(): void {
+    if (!this.accepting) return;
     while (this.active.size < this.dependencies.getConcurrency() && this.pending.length > 0) {
       const payload = this.pending.shift()!;
       const task = this.dependencies.getTask(payload.taskId);

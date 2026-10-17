@@ -1,8 +1,9 @@
 import express from 'express';
 import cookieSession from 'cookie-session';
-import { apiError, managementErrorHandler } from '@ghcp/shared';
+import { apiError, installGracefulShutdown, managementErrorHandler } from '@ghcp/shared';
 import { config } from './config.js';
-import { getDb } from './db/connection.js';
+import type { Server } from 'node:http';
+import { closeDb, getDb } from './db/connection.js';
 import { requireInternalToken } from './auth/internalAuth.js';
 import { usersApiRouter } from './routes/usersApi.js';
 import { budgetApiRouter } from './routes/budgetApi.js';
@@ -30,7 +31,7 @@ export function buildApp(): express.Express {
   return app;
 }
 
-export function startServer(): void {
+export function startServer(): Server {
   getDb();
   const server = buildApp().listen(config.port, () => {
     console.log(`[sso] listening on ${config.baseUrl}`);
@@ -46,4 +47,6 @@ export function startServer(): void {
     }
     throw err;
   });
+  installGracefulShutdown({ server, service: 'sso', release: closeDb });
+  return server;
 }

@@ -1,7 +1,7 @@
 import { resolve } from 'node:path';
 import express from 'express';
 import cookieSession from 'cookie-session';
-import { apiError } from '@ghcp/shared';
+import { apiError, installGracefulShutdown } from '@ghcp/shared';
 import { config } from './config.js';
 import { requireAdmin, session } from './auth.js';
 import { changeAdminPassword, isInitialized, setupAdmin, verifyAdmin } from './adminsStore.js';
@@ -82,6 +82,7 @@ export function buildApp(): express.Express {
   return app;
 }
 
-buildApp().listen(config.port, () => {
+const server = buildApp().listen(config.port, () => {
   console.log(`[console] listening on http://localhost:${config.port}`);
 });
+installGracefulShutdown({ server, service: 'console' });

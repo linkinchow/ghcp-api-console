@@ -1,7 +1,9 @@
 import express from 'express';
-import { apiError, managementErrorHandler } from '@ghcp/shared';
+import type { Server } from 'node:http';
+import { apiError, installGracefulShutdown, managementErrorHandler } from '@ghcp/shared';
 import { config } from './config.js';
-import { getDb } from './db/connection.js';
+import { closeDb, getDb } from './db/connection.js';
+import { loginQueue } from './tasks/queue.js';
 import { recoverLoginOutcomes } from './tasks/recovery.js';
 import { requireInternalToken } from './auth/internalAuth.js';
 import { tasksApiRouter } from './routes/tasksApi.js';
@@ -23,12 +25,20 @@ export function buildApp(): express.Express {
   return app;
 }
 
-export function startServer(): void {
+export function startServer(): Server {
   getDb();
   recoverLoginOutcomes();
-  buildApp().listen(config.port, () => {
+  const server = buildApp().listen(config.port, () => {
     console.log(`[login] listening on http://localhost:${config.port}`);
     const { github } = config.auth;
     console.log(`[login] GitHub: ${github.baseUrl}${github.isGheCom ? ` (GHE.com, enterprise SSO ${github.enterpriseSsoUrl})` : ''}`);
   });
+  installGracefulShutdown({
+    server,
+    service: 'login',
+    // Running browser sessions are not awaited: interrupted tasks are recovered on the next start.
+    onShutdownStart: () => loginQueue.stopAccepting(),
+    release: closeDb,
+  });
+  return server;
 }

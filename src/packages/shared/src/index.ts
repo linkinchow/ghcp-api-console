@@ -11,3 +11,4 @@ export * from './operationRoutes.js';
 export * from './export.js';
 export * from './github.js';
 export * from './sqliteSnapshot.js';
+export * from './shutdown.js';
