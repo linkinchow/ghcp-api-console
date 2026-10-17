@@ -635,7 +635,8 @@ async function main() {
 
   owned = true;
   await legacyCommandCheck();
-  await compose(['up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '105'], { timeout: 120000 });
+  // A fresh MySQL volume can take minutes to initialise when Docker Desktop disk I/O is slow.
+  await compose(['up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300'], { timeout: 320000 });
   await verifyOwnedContainers();
   smoke = await import(pathToFileURL(join(state.directory, 'fixtures/mysql-smoke.mjs')).href);
   await smoke.health();

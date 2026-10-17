@@ -29,7 +29,7 @@
         ],
         "interval": "2s",
         "timeout": "3s",
-        "retries": 40,
+        "retries": 120,
         "start_period": "5s"
       }
     },
