@@ -1,6 +1,85 @@
 # 四组件 Docker Hub 首次发布准备与验证记录
 
-状态（2026-10-17）：**r3四镜像基础功能、MySQL双副本账号池、限定基线升级/回滚、全新库供给及依赖行为验证已完成；部署命令兼容/许可证清单仍待修正，安全门禁未通过，未执行Docker Hub push。**
+状态（2026-10-17）：**当前候选为 r4（源码 `164cade`）。功能、升级/回滚与全新库资格验证通过；基础镜像系统包告警已按用户决定记录风险；未执行 Docker Hub push。** r3 及更早记录保留在第 1–7 节，作为历史证据。
+
+## 0. 当前候选 r4
+
+### 0.1 与 r3 相比的变更
+
+| 变更 | 说明 |
+| --- | --- |
+| 合并上游 `c8715cb..a64b92d` | GHE.com（`GITHUB_BASE_URL`）、SSO OOM 修复与异步密码哈希、席位 pending_cancellation、管理/运维批量接口、MySQL 低权限模式、无席位用户删除修复。 |
+| 合并时的安全适配 | 异步默认密码识别（旧写法会永远返回第一个候选）；账号池保护覆盖上游新运维路径；MySQL 新查询沿用带超时的连接租用；低权限模式改为只读完整 schema 校验；`scripts/proxy-mysql-initial.sql` 由 schema 生成并有漂移测试。 |
+| 四服务优雅停机 | 共享 `installGracefulShutdown`：排空在途请求（含 SSE），超过 `SHUTDOWN_TIMEOUT_MS`（默认 25 秒）关闭连接，释放存储后退出 0；二次信号或释放卡住时退出 1。compose `stop_grace_period: 35s`。 |
+| 镜像定义统一 | 删除四个旧 `src/*/Dockerfile`；compose、客户构建脚本、测试 compose 统一使用 `deploy/images/Dockerfile.release`。默认 npm 源改为公共 npm，我方构建显式传入公司源。 |
+| 部署命令兼容 | k8s/rancher 模板去掉 Proxy 的 `command` 覆盖（它会绕过 Tini）；镜像保留废弃的兼容入口，旧覆盖仍能启动。 |
+| 许可证清单 | 兼容旧式 `licenses` 数组和 `license` 对象；r4 构建中 184 个生产依赖均识别到许可证。 |
+| Console Models 页面 | 用配置的企业管理员 token 查看 Copilot 模型目录，绝不回退到账号池账号；见 [Models 使用指南](models-admin-guide.md)。 |
+
+### 0.2 构建
+
+四个镜像均以 `git archive 164cade` 的干净源码为构建上下文，`linux/amd64`，基础镜像按 digest 固定。仅本地 tag `ghcp-release-<组件>:single-slug-164cade-amd64-r4`，未推送。
+
+| 组件 | 本地 Image ID |
+| --- | --- |
+| Proxy | `sha256:4f6a96d44fec31d85fc4cbadfeee20b02f39312c4d67663ac6958f9e228f368b` |
+| Console | `sha256:c47daade0588506aebe936b13f938bcb13e6d62f6dbb6c46fe86a7a60497e26f` |
+| SSO | `sha256:ef5e6efe5dcdc1bb6a269161175e2ccbc5adafe272b17ddaffc13d01d626143e` |
+| Login | `sha256:d6c1a938b466386faf27a28921413444f5ded685edec8b665ae4bb1589383f21` |
+
+镜像比 r3 大约 32MB：上游把前端图标库 `lucide-react` 放在根依赖，随生产依赖进入运行层。不影响功能。
+
+### 0.3 已执行的验证
+
+| 检查 | 结果 |
+| --- | --- |
+| 类型检查（全部 workspace + upgrade 工具） | PASS |
+| 单元测试 | shared 6/6、SSO 56/56、Login 26/26、Console 15/15、Proxy 558 通过 / 28 跳过（需真实 MySQL）/ 0 失败、部署脚本 9/9 |
+| 基线 `ac354ac` → r4 → 基线（真实 MySQL 8.4、双 Proxy caller-lease、同一数据卷） | PASS：账号、凭据、成员、租约、MySQL schema 升级与回滚前后一致；SSO 原有表、列、行全部保留（只允许新增列与追加迁移记录）；JSON/SSE 协议与请求统计绑定正确；调度 owner 正常接管续约 |
+| r4 全新库供给 | PASS |
+| r4 停止退出码 | 两轮中五个服务（含双 Proxy）全部 **0**（r3 时 SSO/Login/Console 为 143，基线 npm 为 1） |
+| 旧模板启动命令（`--entrypoint node`，无 Tini，离线 SQLite） | 能启动；`docker stop` 退出码 0 |
+| 运行时检查 | Tini 为 PID 1、无 npm、工作目录、依赖版本与行为、better-sqlite3 WAL/STRICT/事务、Login 内 Chromium 渲染本地页面、真实 Login 任务 0 |
+| Console Models 页面 | Browser 预览实测：渲染、Messages 过滤、详情、过期提示、错误提示、刷新；名称中的 HTML 按纯文本显示 |
+| Console 浏览器测试（本机 Edge，串行） | 61 项。合并后发现并修复 3 处测试与新 UI 不匹配（请求统计改为服务端分页、失败详情改用 RequestFailure 组件、managed list 的错误文案）。之后三轮完整/分组运行中每一项都至少通过一次；剩余失败均为本机偶发超时（如 `page.goto` 8 秒），失败项每轮不同。未在 CI 级稳定环境复测。 |
+
+资格验证报告：`.claude/release-qualification-run-d5bac5e1-7465-403b-809e-b85bd17a4efc`（升级/回滚）、`.claude/release-qualification-run-a5617312-a79a-4ce4-a3ae-8b7ef9ee258e`（全新库）。
+
+验证过程中修复的问题（均为测试工具或测试夹具，非产品代码）：
+
+1. mock 的席位列表缺少 `pending_cancellation_date`，且没有成员席位查询接口；上游新 SSO 会因此报错。按 GitHub 文档补齐（成员接口同样返回 `{ total_seats, seats }`）。
+2. bridge 健康检查写死了 r3 的项目名。
+3. 失败清理时，日志读取超时会跳过停止容器；现在日志失败不影响停止。
+4. Docker Desktop 负载高时出现超时（基线 smoke 偶发 500、运行时检查超时、MySQL 观察连接被 bridge 的 120 秒空闲超时断开）。放宽了对性能敏感的超时并在使用前重连观察连接；按"Docker Desktop 只测功能"的原则，不据此判断性能。
+
+### 0.4 安全门禁与风险记录
+
+Docker Scout（critical/high）：Proxy、Console、SSO 各 **8 条 high**，Login **10 条 high**，全部 **0 critical**。全部来自基础镜像的 Debian Bookworm 系统包，Debian 均标注尚无修复（`not fixed`）。npm 生产依赖 `npm audit --omit=dev` 为 0。
+
+**用户决定（2026-10-17）：记录风险后发布；Debian 发布修复后重建并发布新版本。** 每个候选仍须扫描；出现 critical、npm 应用依赖的 high、或已有修复的系统包告警时，必须修复后重建，不能只记录。
+
+可达性依据为在 r4 镜像内实际核实（离线容器）：`ldd /usr/local/bin/node` 不链接 libssl/libz，Node 使用自带 OpenSSL 3.5.8 与 zlib 1.3.1；Login 的 Chromium 动态链接系统 libexpat 与 libz，但不链接 libssl（使用自带 BoringSSL）。
+
+| 包 | CVE | 涉及镜像 | 触发前提 | 本应用中的情况 |
+| --- | --- | --- | --- | --- |
+| util-linux | 2026-53613、78409、78410、76642 | 全部 | 本地低权限用户 + fstab 中 `user`/`users` 或 `X-mount.*` 授权条目，利用 setuid `mount` 的路径竞态 | 镜像无此类 fstab 条目，进程以 root 运行且从不调用 `mount`；容器内无其他本地用户。不可达。 |
+| util-linux | 2026-78408 | 全部 | 特权操作员对攻击者控制的目标执行 `nsenter --join-cgroup` | 应用与部署流程不调用 `nsenter`。不可达。 |
+| util-linux（libblkid） | 2026-53615 | 全部 | 探测攻击者构造的磁盘镜像或可移动介质的分区表 | 应用不探测块设备。不可达。 |
+| perl | 2026-82560 | 全部 | 用 Pod::Text 格式化恶意 POD 文档 | 应用不运行 perl；perl-base 为 Debian 必需包。不可达。 |
+| zlib | 2026-85091 | 全部 | 非阻塞 `gzwrite` 停顿后调用 `gzprintf`（gzip 文件写入 API） | Node 不使用系统 zlib。Login 的 Chromium 加载系统 libz，但该缺陷位于 gzip 文件写入接口，并非网页内容解压路径。可达性低，记录为已知风险。 |
+| expat | 2026-77214 | Login | 调用方向 `XML_ParseBuffer` 传入未校验的长度（API 误用） | Chromium 加载系统 libexpat（主要经 fontconfig 读取本地字体配置）。触发需要调用方误用 API，不是由网页 XML 内容直接触发。记录为已知风险。 |
+| openssl（libssl3） | 2026-84782 | Login | DTLS 重传路径 | Node 与 Chromium 都不链接系统 libssl；应用不使用 DTLS。不可达。 |
+
+以上为基于缺陷描述和实际链接关系的工程判断，不是形式化 VEX 证明。Login 的 Chromium 只访问 GitHub 与配置的 SSO 页面，并只在完成授权任务时运行。
+
+### 0.5 发布前剩余步骤
+
+1. 本轮改动（Dockerfile 默认源、验证脚本、浏览器测试）提交后，以最终提交重新构建候选并完整复跑本节验证；发布的必须是被验证的同一产物。
+2. 用户确认后：PR 合入 main → 推送 Docker Hub → 按 digest 重新拉取验证 → 更新客户升级指南路径 A。
+
+---
+
+以下为 r3 及更早的历史记录。
 
 ## 1. 已批准的发布范围
 

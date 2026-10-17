@@ -1,6 +1,8 @@
 ARG NODE_IMAGE=node:22-bookworm-slim@sha256:efd0ab5780c2d9ab1f0f869571a00d5edb17793bff4cce4a2792e3eb0ffc7562
 FROM ${NODE_IMAGE} AS build
-ARG NPM_REGISTRY=https://packagefeedproxy.microsoft.io/npm/
+# Public npm by default; pass --build-arg NPM_REGISTRY=<approved registry> to use another.
+# Never put credentials in this URL (build args are recorded in the image history).
+ARG NPM_REGISTRY=https://registry.npmjs.org/
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 WORKDIR /app
 COPY package.json package-lock.json tsconfig.base.json ./

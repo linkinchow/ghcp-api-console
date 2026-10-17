@@ -169,7 +169,8 @@ test('dashboard and account details retain compact summary columns, totals and e
   assert.equal(await tasks.getByRole('checkbox').count(), 0);
   assert.equal(await requests.getByRole('cell', { name: '1,385', exact: true }).count(), 1, 'Totals include both cache token fields');
   await tasks.getByTitle('Fixture authorization failure', { exact: true }).waitFor();
-  await requests.getByTitle('Fixture upstream request failed', { exact: true }).waitFor();
+  // Request failures use RequestFailure: the collapsed summary holds the full reason text.
+  await requests.locator('summary').getByText('Fixture upstream request failed', { exact: true }).waitFor();
 
   await fixture.goto('accounts');
   const row = page.getByRole('row').filter({ has: page.getByRole('checkbox', { name: 'Select identity-0', exact: true }) });
@@ -334,7 +335,7 @@ test('record identities and related tasks are plain text while details and row o
     assert.equal(await row.locator('a[href]').count(), 0);
     if (route === 'stats') {
       await row.locator('summary').click();
-      await row.locator('details p').getByText('Fixture upstream request failed', { exact: true }).waitFor();
+      await row.locator('details pre').getByText('Fixture upstream request failed', { exact: true }).waitFor();
       assert.equal(await page.getByText(/Related diagnostics/).count(), 0);
     }
   }

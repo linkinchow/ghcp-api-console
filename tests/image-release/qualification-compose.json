@@ -1,0 +1,337 @@
+{
+  "name": "ghcp-release-qualification",
+  "services": {
+    "mysql": {
+      "image": "${RELEASE_QUALIFICATION_MYSQL_IMAGE:?specify cached MySQL 8.4 image}",
+      "command": [
+        "--character-set-server=utf8mb4",
+        "--collation-server=utf8mb4_bin",
+        "--max-connections=80",
+        "--log-bin-trust-function-creators=1"
+      ],
+      "environment": {
+        "MYSQL_DATABASE": "ghcp_pool_mysql_test",
+        "MYSQL_USER": "pool_fixture",
+        "MYSQL_PASSWORD": "mysql-fixture-db-only",
+        "MYSQL_ROOT_PASSWORD": "mysql-fixture-root-only"
+      },
+      "volumes": [
+        "mysql-data:/var/lib/mysql",
+        "${RELEASE_QUALIFICATION_DIR:?run prepare}/mysql-init.sql:/docker-entrypoint-initdb.d/01-fixture.sql:ro"
+      ],
+      "networks": [
+        "isolated"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysql --protocol=tcp -h 127.0.0.1 -uroot -Nse 'SELECT 1' >/dev/null 2>&1"
+        ],
+        "interval": "2s",
+        "timeout": "3s",
+        "retries": 40,
+        "start_period": "5s"
+      }
+    },
+    "mock": {
+      "image": "node:22-bookworm-slim@sha256:efd0ab5780c2d9ab1f0f869571a00d5edb17793bff4cce4a2792e3eb0ffc7562",
+      "init": true,
+      "command": [
+        "node",
+        "/fixtures/mysql-bridge.mjs",
+        "mock"
+      ],
+      "environment": {
+        "INTERNAL_API_TOKEN": "mysql-fixture-internal-only",
+        "SCIM_TOKEN": "mysql-fixture-scim-only",
+        "SEAT_PAT": "mysql-fixture-seat-only",
+        "SSO_DEFAULT_USER_PASSWORD": "mysql-fixture-sso-only",
+        "PROXY_BASE_URL": "http://proxy:3000"
+      },
+      "volumes": [
+        "${RELEASE_QUALIFICATION_DIR:?run prepare}/fixtures:/fixtures:ro"
+      ],
+      "networks": [
+        "isolated"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8002/healthz').then(async r=>process.exit(r.ok&&(await r.json()).fixture===true?0:1)).catch(()=>process.exit(1))"
+        ],
+        "interval": "2s",
+        "timeout": "3s",
+        "retries": 35
+      }
+    },
+    "sso": {
+      "image": "${RELEASE_QUALIFICATION_PREFIX:-ghcp-release}-sso:${RELEASE_QUALIFICATION_TAG:?run prepare}",
+      "environment": {
+        "INTERNAL_API_TOKEN": "mysql-fixture-internal-only",
+        "LOG_LEVEL": "warn",
+        "PORT": "7001",
+        "DB_PATH": "/data/sso.sqlite",
+        "BASE_URL": "http://sso:7001",
+        "PROXY_BASE_URL": "http://proxy:3000",
+        "SESSION_SECRET": "mysql-fixture-session-only",
+        "SSO_DEFAULT_USER_PASSWORD": "mysql-fixture-sso-only",
+        "SSO_USER_EVENTS_LOG": "/data/sso-user-events.log",
+        "ENTERPRISE_SLUG": "local-test",
+        "ENTERPRISE_SHORTCODE": "test",
+        "GITHUB_API_BASE_URL": "http://mock:8002",
+        "GITHUB_COPILOT_SEAT_PAT": "mysql-fixture-seat-only",
+        "SCIM_BASE_URL": "http://mock:8002/scim/v2/enterprises/local-test",
+        "SCIM_TOKEN": "mysql-fixture-scim-only",
+        "SP_ENTITY_ID": "http://mock:8002/saml",
+        "SP_ACS_URL": "http://mock:8002/saml/acs",
+        "CERT_DIR": "/certs"
+      },
+      "volumes": [
+        "sso-data:/data",
+        "${RELEASE_QUALIFICATION_DIR:?run prepare}/certs:/certs:ro",
+        "${RELEASE_QUALIFICATION_DIR:?run prepare}/fixtures:/qualification:ro"
+      ],
+      "networks": [
+        "isolated"
+      ],
+      "depends_on": {
+        "mock": {
+          "condition": "service_healthy"
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:7001/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ],
+        "interval": "2s",
+        "timeout": "3s",
+        "retries": 35
+      }
+    },
+    "login": {
+      "image": "${RELEASE_QUALIFICATION_PREFIX:-ghcp-release}-login:${RELEASE_QUALIFICATION_TAG:?run prepare}",
+      "environment": {
+        "INTERNAL_API_TOKEN": "mysql-fixture-internal-only",
+        "LOG_LEVEL": "warn",
+        "PORT": "7003",
+        "DB_PATH": "/data/login.sqlite",
+        "PROXY_BASE_URL": "http://proxy:3000",
+        "LOG_DIR": "/logs/login",
+        "SSO_URL": "http://sso:7001/login",
+        "SSO_PROVIDER": "custom",
+        "AUTH_HEADLESS": "true",
+        "GITHUB_OAUTH_CLIENT_ID": "mysql-fixture-unused"
+      },
+      "volumes": [
+        "login-data:/data",
+        "login-logs:/logs",
+        "${RELEASE_QUALIFICATION_DIR:?run prepare}/fixtures:/qualification:ro"
+      ],
+      "networks": [
+        "isolated"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:7003/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ],
+        "interval": "2s",
+        "timeout": "3s",
+        "retries": 35
+      }
+    },
+    "proxy": {
+      "image": "${RELEASE_QUALIFICATION_PREFIX:-ghcp-release}-proxy:${RELEASE_QUALIFICATION_TAG:?run prepare}",
+      "environment": {
+        "INTERNAL_API_TOKEN": "mysql-fixture-internal-only",
+        "LOG_LEVEL": "warn",
+        "PORT": "3000",
+        "STORAGE_DRIVER": "mysql",
+        "MYSQL_URL": "mysql://pool_fixture:mysql-fixture-db-only@mysql:3306/ghcp_pool_mysql_test",
+        "MYSQL_CONNECTION_LIMIT": "10",
+        "MYSQL_SSL_MODE": "disabled",
+        "API_KEY": "mysql-fixture-api-only",
+        "ACCOUNT_ROUTING_MODE": "caller-lease",
+        "POOL_ACCOUNT_EMAIL_DOMAIN": "pool.mysql.example.test",
+        "POOL_WARMUP_MODEL": "claude-opus-5-2",
+        "READY_IDLE_TARGET": "0",
+        "POOL_MAX_ACCOUNTS": "2000",
+        "CALLER_LEASE_TTL_SECONDS": "600",
+        "PROVISIONAL_LEASE_TTL_SECONDS": "60",
+        "PREWARM_POLL_SECONDS": "1",
+        "PREWARM_CONCURRENCY": "2",
+        "POOL_REQUEST_TIMEOUT_SECONDS": "30",
+        "POOL_EXHAUSTED_RETRY_AFTER_SECONDS": "2",
+        "SSO_BASE_URL": "http://sso:7001",
+        "LOGIN_BASE_URL": "http://mock:8002",
+        "COPILOT_API_BASE_URL": "http://mock:8002",
+        "ENTERPRISE_SHORTCODE": "test",
+        "REQUEST_STATS_PER_ACCOUNT_LIMIT": "100",
+        "PROXY_ERROR_DIAGNOSTICS_ENABLED": "false",
+        "PROXY_ERROR_DIAGNOSTICS_REDACT": "true"
+      },
+      "volumes": [
+        "proxy-data:/data",
+        "${RELEASE_QUALIFICATION_DIR:?run prepare}/fixtures:/qualification:ro"
+      ],
+      "networks": [
+        "isolated"
+      ],
+      "depends_on": {
+        "mysql": {
+          "condition": "service_healthy"
+        },
+        "sso": {
+          "condition": "service_healthy"
+        },
+        "mock": {
+          "condition": "service_healthy"
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ],
+        "interval": "2s",
+        "timeout": "3s",
+        "retries": 35
+      }
+    },
+    "proxy2": {
+      "extends": {
+        "service": "proxy"
+      },
+      "volumes": [
+        "proxy2-data:/data",
+        "${RELEASE_QUALIFICATION_DIR:?run prepare}/fixtures:/qualification:ro"
+      ],
+      "depends_on": {
+        "proxy": {
+          "condition": "service_healthy"
+        }
+      }
+    },
+    "console": {
+      "image": "${RELEASE_QUALIFICATION_PREFIX:-ghcp-release}-console:${RELEASE_QUALIFICATION_TAG:?run prepare}",
+      "environment": {
+        "INTERNAL_API_TOKEN": "mysql-fixture-internal-only",
+        "LOG_LEVEL": "warn",
+        "PORT": "7004",
+        "ADMINS_FILE": "/data/admins.json",
+        "SESSION_SECRET": "mysql-fixture-session-only",
+        "PROXY_BASE_URL": "http://proxy:3000",
+        "SSO_BASE_URL": "http://sso:7001",
+        "LOGIN_BASE_URL": "http://login:7003"
+      },
+      "volumes": [
+        "console-data:/data",
+        "${RELEASE_QUALIFICATION_DIR:?run prepare}/fixtures:/qualification:ro"
+      ],
+      "networks": [
+        "isolated"
+      ],
+      "depends_on": {
+        "proxy2": {
+          "condition": "service_healthy"
+        },
+        "login": {
+          "condition": "service_healthy"
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:7004/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ],
+        "interval": "2s",
+        "timeout": "3s",
+        "retries": 35
+      }
+    },
+    "bridge": {
+      "image": "node:22-bookworm-slim@sha256:efd0ab5780c2d9ab1f0f869571a00d5edb17793bff4cce4a2792e3eb0ffc7562",
+      "init": true,
+      "command": [
+        "node",
+        "/fixtures/mysql-bridge.mjs",
+        "bridge"
+      ],
+      "environment": {
+        "INTERNAL_API_TOKEN": "mysql-fixture-internal-only",
+        "QUALIFICATION_PROJECT": "${RELEASE_QUALIFICATION_PROJECT:?run prepare}"
+      },
+      "volumes": [
+        "${RELEASE_QUALIFICATION_DIR:?run prepare}/fixtures:/fixtures:ro"
+      ],
+      "ports": [
+        "127.0.0.1:19300:19300",
+        "127.0.0.1:19301:19301",
+        "127.0.0.1:19302:19302",
+        "127.0.0.1:19304:19304",
+        "127.0.0.1:34384:34384"
+      ],
+      "networks": [
+        "isolated",
+        "ingress"
+      ],
+      "depends_on": {
+        "console": {
+          "condition": "service_healthy"
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:19302/__mysql/manifest').then(async r=>process.exit(r.ok&&(await r.json()).project===process.env.QUALIFICATION_PROJECT?0:1)).catch(()=>process.exit(1))"
+        ],
+        "interval": "2s",
+        "timeout": "3s",
+        "retries": 35
+      }
+    }
+  },
+  "networks": {
+    "isolated": {
+      "internal": true,
+      "ipam": {
+        "config": [
+          {
+            "subnet": "${RELEASE_QUALIFICATION_ISOLATED_SUBNET:-10.244.186.0/24}"
+          }
+        ]
+      }
+    },
+    "ingress": {
+      "ipam": {
+        "config": [
+          {
+            "subnet": "${RELEASE_QUALIFICATION_INGRESS_SUBNET:-10.244.187.0/24}"
+          }
+        ]
+      }
+    }
+  },
+  "volumes": {
+    "mysql-data": {},
+    "sso-data": {},
+    "login-data": {},
+    "login-logs": {},
+    "console-data": {},
+    "proxy-data": {},
+    "proxy2-data": {}
+  }
+}

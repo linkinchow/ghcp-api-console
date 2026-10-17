@@ -1,0 +1,77 @@
+name: ghcp-image-release-sqlite
+services:
+  mock:
+    init: true
+    image: node:22-bookworm-slim@sha256:efd0ab5780c2d9ab1f0f869571a00d5edb17793bff4cce4a2792e3eb0ffc7562
+    command: ["node", "/fixtures/mock.mjs"]
+    volumes: ["./mock.mjs:/fixtures/mock.mjs:ro"]
+    networks: [isolated]
+  proxy:
+    image: ghcp-release-proxy:${RELEASE_CANDIDATE_TAG:?set RELEASE_CANDIDATE_TAG}
+    environment:
+      PORT: "3000"
+      STORAGE_DRIVER: sqlite
+      DB_PATH: /data/proxy.sqlite
+      ACCOUNT_ROUTING_MODE: direct
+      API_KEY: release-fixture-api
+      INTERNAL_API_TOKEN: release-fixture-internal
+      COPILOT_API_BASE_URL: http://mock:8002
+      SSO_BASE_URL: http://sso:7001
+      LOGIN_BASE_URL: http://login:7003
+      PROXY_ERROR_DIAGNOSTICS_ENABLED: "false"
+      PROXY_ERROR_DIAGNOSTICS_REDACT: "true"
+    volumes: ["proxy-data:/data"]
+    networks: [isolated]
+  sso:
+    image: ghcp-release-sso:${RELEASE_CANDIDATE_TAG:?set RELEASE_CANDIDATE_TAG}
+    environment:
+      PORT: "7001"
+      DB_PATH: /data/sso.sqlite
+      CERT_DIR: /certs
+      INTERNAL_API_TOKEN: release-fixture-internal
+      SESSION_SECRET: release-fixture-session-long-only
+      BASE_URL: http://sso:7001
+      PROXY_BASE_URL: http://proxy:3000
+      MOCK_GITHUB_BASE_URL: http://mock:8002
+      GITHUB_API_BASE_URL: http://mock:8002
+      SCIM_BASE_URL: http://mock:8002/scim
+      SCIM_TOKEN: release-fixture-scim
+      ENTERPRISE_SLUG: release-fixture
+      ENTERPRISE_SHORTCODE: fixture
+      SSO_DEFAULT_USER_PASSWORD: release-fixture-password-only
+    volumes:
+      - sso-data:/data
+      - ${RELEASE_FIXTURE_DIR:?set isolated release fixture dir}/certs:/certs:ro
+    networks: [isolated]
+  login:
+    image: ghcp-release-login:${RELEASE_CANDIDATE_TAG:?set RELEASE_CANDIDATE_TAG}
+    environment:
+      PORT: "7003"
+      DB_PATH: /data/login.sqlite
+      INTERNAL_API_TOKEN: release-fixture-internal
+      PROXY_BASE_URL: http://proxy:3000
+      SSO_URL: http://sso:7001/login
+      SESSION_SECRET: release-fixture-session-long-only
+      AUTH_HEADLESS: "true"
+    volumes: ["login-data:/data"]
+    networks: [isolated]
+  console:
+    image: ghcp-release-console:${RELEASE_CANDIDATE_TAG:?set RELEASE_CANDIDATE_TAG}
+    environment:
+      PORT: "7004"
+      ADMINS_FILE: /data/admins.json
+      SESSION_SECRET: release-fixture-session-long-only
+      INTERNAL_API_TOKEN: release-fixture-internal
+      PROXY_BASE_URL: http://proxy:3000
+      SSO_BASE_URL: http://sso:7001
+      LOGIN_BASE_URL: http://login:7003
+    volumes: ["console-data:/data"]
+    networks: [isolated]
+networks:
+  isolated:
+    internal: true
+volumes:
+  proxy-data:
+  sso-data:
+  login-data:
+  console-data:

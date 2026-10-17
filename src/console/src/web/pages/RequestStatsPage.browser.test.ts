@@ -67,7 +67,8 @@ for (const clipboard of ['success', 'reject', 'absent'] as const) {
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
       fixture.fail = true;
       await page.getByRole('button', { name: 'Refresh', exact: true }).click();
-      await page.getByText('Stats unavailable.', { exact: true }).waitFor();
+      // The managed list keeps the previous rows and marks them stale next to the error.
+      await page.getByRole('alert').filter({ hasText: 'Stats unavailable.' }).waitFor();
       assert.equal(await row.locator('pre').textContent(), longReason, 'failed refresh does not mutate existing reasons');
       assert.deepEqual(fixture.mutations, []);
       assert.deepEqual(fixture.unexpected, []);
@@ -104,7 +105,13 @@ async function offlineStats(clipboard: 'success' | 'reject' | 'absent') {
     }
     if (url.pathname === '/api/console/proxy/request-stats') {
       if (fixture.fail) return json({ error: { code: 'service_proxy_failed', message: 'Stats unavailable.' } }, 502);
-      return json(reasons.map((failureReason, index) => ({ id: index + 1, identity: `fixture-${index}`, path: '/v1/chat/completions', model: 'fixture-model', success: false, requestedAt: '2026-09-18T12:00:00Z', inputTokens: 1, outputTokens: 0, failureReason })));
+      const rows = reasons.map((failureReason, index) => ({
+        id: index + 1, identity: `fixture-${index}`, path: '/v1/chat/completions', model: 'fixture-model',
+        success: false, requestedAt: '2026-09-18T12:00:00Z', inputTokens: 1, outputTokens: 0, failureReason,
+      }));
+      // The Request Stats page pages on the server (`page`/`pageSize`); the dashboard still asks for a plain list.
+      const paged = url.searchParams.has('page') || url.searchParams.has('pageSize');
+      return json(paged ? { items: rows, total: rows.length, page: 1, pageSize: 25 } : rows);
     }
     if (url.pathname === '/' || /^\/assets\/[\w.-]+$/.test(url.pathname)) {
       const file = resolve(process.cwd(), 'dist/web', url.pathname === '/' ? 'index.html' : url.pathname.slice(1));

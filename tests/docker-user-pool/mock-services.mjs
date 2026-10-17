@@ -148,11 +148,21 @@ async function scim(req, res, url) {
   if (req.method === 'DELETE') { users.delete(id); seats.delete(existing.githubLogin); counters.scimDeletes++; return json(res, 204); }
   failure(res, 404, 'not_found');
 }
+function seatDetail(login) {
+  return { assignee: { login }, plan_type: 'enterprise', pending_cancellation_date: null };
+}
 async function billing(req, res, url) {
   if (!authorize(req, res, SEAT_PAT, true)) return;
   if (url.pathname === `${BILLING_ROOT}/seats` && req.method === 'GET') {
     const page = pageNumber(url.searchParams.get('page'), 1, 100000), perPage = pageNumber(url.searchParams.get('per_page'), 100);
-    return json(res, 200, { total_seats: seats.size, seats: [...seats].slice((page - 1) * perPage, page * perPage).map(login => ({ assignee: { login }, plan_type: 'enterprise' })) });
+    return json(res, 200, { total_seats: seats.size, seats: [...seats].slice((page - 1) * perPage, page * perPage).map(seatDetail) });
+  }
+  // GET /enterprises/{enterprise}/members/{username}/copilot answers with the same seats wrapper.
+  const member = url.pathname.match(/^\/enterprises\/local-test\/members\/([^/]+)\/copilot$/);
+  if (member && req.method === 'GET') {
+    const login = decodeURIComponent(member[1]);
+    const assigned = seats.has(login) ? [seatDetail(login)] : [];
+    return json(res, 200, { total_seats: assigned.length, seats: assigned });
   }
   if (url.pathname === `${BILLING_ROOT}/selected_users` && ['POST', 'DELETE'].includes(req.method)) {
     const body = await bodyJson(req);
@@ -363,6 +373,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === SCIM_ROOT || url.pathname.startsWith(`${SCIM_ROOT}/`)) return await scim(req, res, url);
     if (url.pathname.startsWith(`${BILLING_ROOT}/`)) return await billing(req, res, url);
+    if (url.pathname.startsWith('/enterprises/local-test/members/')) return await billing(req, res, url);
     if (url.pathname === '/api/tasks' || url.pathname.startsWith('/api/tasks/')) return await fakeLogin(req, res, url);
     if (['/models', '/v1/messages', '/v1/messages/count_tokens', '/chat/completions', '/responses'].includes(url.pathname)) return await upstream(req, res, url);
     failure(res, 404, 'not_found');
