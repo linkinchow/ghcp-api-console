@@ -1,10 +1,12 @@
 import 'dotenv/config';
+import { parseGithubBaseUrl } from '@ghcp/shared';
 
 export interface ProxyConfig {
   port: number;
   storageDriver: 'sqlite' | 'mysql';
   dbPath: string;
   mysqlUrl?: string;
+  mysqlAutoMigrate: boolean;
   mysqlConnectionLimit: number;
   mysqlSslMode: 'disabled' | 'required' | 'verify-ca';
   mysqlSslCaPath?: string;
@@ -16,6 +18,7 @@ export interface ProxyConfig {
   internalApiToken: string;
   ssoBaseUrl: string;
   loginBaseUrl: string;
+  /** Effective EMU login suffix stripped from new identities; always empty on GHE.com. */
   enterpriseShortcode: string;
   requestStatsPerAccountLimit: number;
   errorDiagnosticsEnabled: boolean;
@@ -35,6 +38,7 @@ export const config: ProxyConfig = {
   storageDriver: readStorageDriver(process.env.STORAGE_DRIVER),
   dbPath: process.env.DB_PATH ?? './data/proxy.sqlite',
   mysqlUrl: readOptionalString(process.env.MYSQL_URL),
+  mysqlAutoMigrate: readBoolean(process.env.MYSQL_AUTO_MIGRATE, true),
   mysqlConnectionLimit: readPositiveInteger(process.env.MYSQL_CONNECTION_LIMIT, 10),
   mysqlSslMode: readMysqlSslMode(process.env.MYSQL_SSL_MODE),
   mysqlSslCaPath: readOptionalString(process.env.MYSQL_SSL_CA_PATH),
@@ -46,7 +50,10 @@ export const config: ProxyConfig = {
   internalApiToken: process.env.INTERNAL_API_TOKEN ?? '',
   ssoBaseUrl: process.env.SSO_BASE_URL ?? 'http://localhost:7001',
   loginBaseUrl: process.env.LOGIN_BASE_URL ?? 'http://localhost:7003',
-  enterpriseShortcode: readOptionalString(process.env.ENTERPRISE_SHORTCODE) ?? 'octo',
+  // GHE.com logins carry no visible shortcode suffix, so ENTERPRISE_SHORTCODE is ignored there.
+  enterpriseShortcode: parseGithubBaseUrl(process.env.GITHUB_BASE_URL).isGheCom
+    ? ''
+    : readOptionalString(process.env.ENTERPRISE_SHORTCODE) ?? 'octo',
   requestStatsPerAccountLimit: readPositiveInteger(process.env.REQUEST_STATS_PER_ACCOUNT_LIMIT, 2),
   errorDiagnosticsEnabled: readBoolean(process.env.PROXY_ERROR_DIAGNOSTICS_ENABLED, true),
   errorDiagnosticsDir: readOptionalString(process.env.PROXY_ERROR_DIAGNOSTICS_DIR) ?? './data/error-diagnostics',

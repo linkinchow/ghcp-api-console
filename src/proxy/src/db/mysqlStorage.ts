@@ -12,8 +12,11 @@ import {
   type DeleteProxyAccountResult,
   type PageResponse,
   type ProxyRequestStatDto,
+  type ManagementQuery,
+  type ManagementSummary,
 } from '@ghcp/shared';
-import { runMysqlMigrations } from './mysqlMigrations.js';
+import { runMysqlMigrations, validateMysqlTables } from './mysqlMigrations.js';
+import { managementSql } from './managementQueries.js';
 import { MysqlPoolStore } from '../userPool/mysqlStore.js';
 import type { PoolConfig } from '../userPool/config.js';
 import { leaseMysqlConnection, MysqlDeadline } from '../userPool/mysqlDeadline.js';
@@ -57,12 +60,14 @@ interface StatRow extends RowDataPacket {
   cache_write_tokens: number | null;
 }
 
+const SNAPSHOT_READ_DEADLINE_MS = 30_000;
+
 export class MysqlStorage implements ProxyStorage {
   private poolStore?: Promise<MysqlPoolStore>;
 
   userPool(options: PoolConfig): Promise<MysqlPoolStore> {
     return this.poolStore ??= (async () => {
-      const store = new MysqlPoolStore(this.pool, options);
+      const store = new MysqlPoolStore(this.pool, options, this.autoMigrate);
       await store.initialize();
       return store;
     })().catch((error: unknown) => {
@@ -71,13 +76,40 @@ export class MysqlStorage implements ProxyStorage {
     });
   }
 
+  async withReadSnapshot<T>(read: (reader: Pick<ProxyStorage, 'listAccounts' | 'listRequestStatsPage'>) => Promise<T>): Promise<T> {
+    // Snapshot reads page through whole tables for exports, so they get a longer budget than single statements.
+    const lease = await leaseMysqlConnection(this.pool, new MysqlDeadline(SNAPSHOT_READ_DEADLINE_MS, SNAPSHOT_READ_DEADLINE_MS));
+    const { connection } = lease;
+    try {
+      await connection.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+      await connection.beginTransaction();
+      return await read({
+        listAccounts: (query) => this.listAccounts(query, connection),
+        listRequestStatsPage: (query) => this.listRequestStatsPage(query, connection),
+      });
+    } finally {
+      try {
+        if (!lease.destroyed) await connection.rollback();
+      } catch {
+        lease.destroy();
+      } finally {
+        lease.release();
+      }
+    }
+  }
+
   constructor(
     private readonly pool: Pool,
     private readonly requestStatsPerAccountLimit: number,
-  ) {}
+    private readonly autoMigrate = true,
+  ) { }
 
   async initialize(): Promise<void> {
-    await runMysqlMigrations(this.pool);
+    if (this.autoMigrate) {
+      await runMysqlMigrations(this.pool);
+    } else {
+      await validateMysqlTables(this.pool);
+    }
     await this.ping();
   }
 
@@ -89,25 +121,28 @@ export class MysqlStorage implements ProxyStorage {
     await this.pool.end();
   }
 
-  async listAccounts(query: AccountListQuery = {}): Promise<PageResponse<ProxyAccountRecord>> {
-    const page = Math.max(1, Math.trunc(query.page ?? 1));
+  async listAccounts(query: AccountListQuery = {}, connection: Pick<Pool, 'execute'> = { execute: this.execute }): Promise<PageResponse<ProxyAccountRecord>> {
+    let page = Math.max(1, Math.trunc(query.page ?? 1));
     const pageSize = Math.max(1, Math.min(Math.trunc(query.pageSize ?? 25), 100));
-    const q = query.q?.trim();
-    const where = q
-      ? 'WHERE LOWER(identity) LIKE LOWER(?) OR LOWER(sso_user) LIKE LOWER(?) OR LOWER(gh_login) LIKE LOWER(?)'
-      : '';
-    const args = q ? [`%${q}%`, `%${q}%`, `%${q}%`] : [];
-    const sort = sortColumn(query.sort);
-    const dir = query.dir === 'asc' ? 'ASC' : 'DESC';
-    const [countRows] = await this.execute<Array<RowDataPacket & { count: number }>>(
+    const { where, args, order } = managementSql('accounts', query, mysqlTimestamp);
+    const [countRows] = await connection.execute<Array<RowDataPacket & { count: number }>>(
       `SELECT COUNT(*) AS count FROM proxy_accounts ${where}`,
       args,
     );
-    const [rows] = await this.execute<AccountRow[]>(
-      `SELECT * FROM proxy_accounts ${where} ORDER BY ${sort} ${dir} LIMIT ? OFFSET ?`,
+    const total = Number(countRows[0]?.count ?? 0);
+    page = Math.min(page, Math.max(1, Math.ceil(total / pageSize)));
+    const [rows] = await connection.execute<AccountRow[]>(
+      `SELECT * FROM proxy_accounts ${where} ORDER BY ${order} LIMIT ? OFFSET ?`,
       [...args, pageSize, (page - 1) * pageSize],
     );
-    return pageResponse(rows.map(mapAccountRow), Number(countRows[0]?.count ?? 0), page, pageSize);
+    return pageResponse(rows.map(mapAccountRow), total, page, pageSize);
+  }
+
+  async summarizeAccounts(): Promise<ManagementSummary> {
+    const [rows] = await this.execute<Array<RowDataPacket & { status: string; count: number }>>(
+      'SELECT copilot_oauth_status AS status, COUNT(*) AS count FROM proxy_accounts GROUP BY copilot_oauth_status',
+    );
+    return { total: rows.reduce((total, row) => total + Number(row.count), 0), counts: Object.fromEntries(rows.map((row) => [row.status, Number(row.count)])), updatedAt: nowIso() };
   }
 
   async getAccount(identity: string): Promise<ProxyAccountRecord | undefined> {
@@ -227,12 +262,14 @@ export class MysqlStorage implements ProxyStorage {
     ghLogin?: string,
   ): Promise<ProxyAccountRecord | undefined> {
     const now = mysqlTimestamp(nowIso());
+    // The status guard makes "cancel wins": once Login marked the attempt failed, a token that
+    // arrives late for the same attempt is refused instead of silently reviving it.
     const [result] = await this.execute<ResultSetHeader>(`
       UPDATE proxy_accounts
       SET copilot_oauth_token = ?, gh_login = COALESCE(?, gh_login),
           copilot_oauth_status = 'valid', copilot_oauth_updated_at = ?,
           copilot_oauth_attempt_id = NULL, updated_at = ?
-      WHERE identity = ? AND copilot_oauth_attempt_id = ?
+      WHERE identity = ? AND copilot_oauth_attempt_id = ? AND copilot_oauth_status = 'refreshing'
     `, [copilotOauthToken, ghLogin ?? null, now, now, identity, oauthAttemptId]);
     return result.affectedRows > 0 ? this.getAccount(identity) : undefined;
   }
@@ -244,12 +281,15 @@ export class MysqlStorage implements ProxyStorage {
     );
   }
 
-  async beginCopilotOauthAuthorization(identity: string, oauthAttemptId: string): Promise<boolean> {
+  async beginCopilotOauthAuthorization(identity: string, oauthAttemptId: string, expectedAttemptId?: string | null): Promise<boolean> {
+    // `<=>` is MySQL's NULL-safe equality, so `null` matches an account without an attempt.
+    const guard = expectedAttemptId === undefined ? '' : ' AND copilot_oauth_attempt_id <=> ?';
+    const args = expectedAttemptId === undefined ? [] : [expectedAttemptId];
     const [result] = await this.execute<ResultSetHeader>(`
       UPDATE proxy_accounts
       SET copilot_oauth_status = 'refreshing', copilot_oauth_attempt_id = ?, updated_at = ?
-      WHERE identity = ?
-    `, [oauthAttemptId, mysqlTimestamp(nowIso()), identity]);
+      WHERE identity = ? ${guard}
+    `, [oauthAttemptId, mysqlTimestamp(nowIso()), identity, ...args]);
     return result.affectedRows > 0;
   }
 
@@ -350,6 +390,17 @@ export class MysqlStorage implements ProxyStorage {
     return rows.map(mapStatRow);
   }
 
+  async listRequestStatsPage(query: ManagementQuery = {}, connection: Pick<Pool, 'execute'> = { execute: this.execute }): Promise<PageResponse<ProxyRequestStatDto>> {
+    const { where, args, order } = managementSql('requests', query, mysqlTimestamp);
+    const [counts] = await connection.execute<Array<RowDataPacket & { count: number }>>(`SELECT COUNT(*) AS count FROM proxy_request_stats ${where}`, args);
+    const total = Number(counts[0]?.count ?? 0);
+    const pageSize = Math.max(1, Math.min(query.pageSize ?? 25, 100));
+    const page = Math.min(Math.max(1, query.page ?? 1), Math.max(1, Math.ceil(total / pageSize)));
+    const [rows] = await connection.execute<StatRow[]>(`SELECT * FROM proxy_request_stats ${where} ORDER BY ${order} LIMIT ? OFFSET ?`,
+      [...args, pageSize, (page - 1) * pageSize]);
+    return pageResponse(rows.map(mapStatRow), total, page, pageSize);
+  }
+
   async pruneAllRequestStats(): Promise<void> {
     await this.execute(`
       DELETE stats
@@ -391,25 +442,38 @@ export class MysqlStorage implements ProxyStorage {
     finally { lease.release(); }
   }) as Pool['execute'];
 
+  /**
+   * Runs `operation` in one transaction. Deadlocks and lock-wait timeouts roll back and retry a
+   * bounded number of times: every caller performs a single idempotent unit of work, so replaying
+   * the callback on a fresh transaction is safe and beats surfacing a transient InnoDB error.
+   * Each attempt leases its connection under a fresh deadline.
+   */
   private async transaction<T>(operation: (connection: PoolConnection) => Promise<T>): Promise<T> {
-    const lease = await leaseMysqlConnection(this.pool, new MysqlDeadline());
-    const { connection } = lease;
-    let committing = false;
-    try {
-      await connection.beginTransaction();
-      const result = await operation(connection);
-      committing = true;
-      await connection.commit();
-      return result;
-    } catch (err) {
-      if (committing) lease.destroy();
-      else if (!lease.destroyed) {
-        try { await connection.rollback(); }
-        catch { lease.destroy(); }
+    for (let attempt = 0; ; attempt += 1) {
+      const lease = await leaseMysqlConnection(this.pool, new MysqlDeadline());
+      const { connection } = lease;
+      let committing = false;
+      try {
+        await connection.beginTransaction();
+        const result = await operation(connection);
+        committing = true;
+        await connection.commit();
+        return result;
+      } catch (err) {
+        // A failed COMMIT has an unknown outcome: drop the socket and never replay the work.
+        if (committing) {
+          lease.destroy();
+          throw err;
+        }
+        if (!lease.destroyed) {
+          try { await connection.rollback(); }
+          catch { lease.destroy(); }
+        }
+        if (!isRetryableMysqlLockError(err) || attempt === 2) throw err;
+        await sleep((attempt + 1) * 25);
+      } finally {
+        lease.release();
       }
-      throw err;
-    } finally {
-      lease.release();
     }
   }
 }
@@ -464,21 +528,4 @@ function isRetryableMysqlLockError(err: unknown): boolean {
 
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-function sortColumn(sort: AccountListQuery['sort']): string {
-  switch (sort) {
-    case 'identity':
-      return 'identity';
-    case 'ssoUser':
-      return 'sso_user';
-    case 'ghLogin':
-      return 'gh_login';
-    case 'copilotOauthStatus':
-      return 'copilot_oauth_status';
-    case 'createdAt':
-      return 'created_at';
-    default:
-      return 'updated_at';
-  }
 }

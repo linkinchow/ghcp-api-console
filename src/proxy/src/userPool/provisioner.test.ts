@@ -280,6 +280,25 @@ test('SCIM success without paid Copilot entitlement never starts OAuth or marks 
   assert.equal(f.row().state, 'provisioning');
 });
 
+test('a seat pending cancellation is not an entitlement: it is reassigned before OAuth and blocks warmup', async () => {
+  // GitHub keeps a cancelled seat usable until its date; the pool must not rely on it.
+  const syncing = fixture('scim-synced');
+  syncing.changeUser({ copilotSeatStatus: 'pending_cancellation' });
+  syncing.fail((path) => {
+    if (!path.endsWith('/copilot-seat')) return undefined;
+    syncing.changeUser({ copilotSeatStatus: 'assigned' });
+    return json(syncing.user());
+  });
+  await syncing.advance();
+  assert.equal(syncing.row().stage, 'synced');
+  assert.equal(syncing.requests.filter((request) => request.path.endsWith('/copilot-seat')).length, 1);
+
+  const warming = fixture('warmup');
+  warming.changeUser({ copilotSeatStatus: 'pending_cancellation' });
+  await rejectsCode(warming.advance(), 'entitlement_not_ready');
+  assert.equal(warming.warms(), 0);
+});
+
 test('OAuth starting resumes the same attempt and does not reset an already refreshing account', async () => {
   const f = fixture('oauth-starting');
   f.changeAccount({ copilotOauthStatus: 'refreshing', copilotOauthAttemptId: 'oauth-attempt' });

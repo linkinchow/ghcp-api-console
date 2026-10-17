@@ -86,7 +86,7 @@ export function mysqlCreateTable(name: string): string {
   }
   for (const index of table.indexes ?? []) definitions.push(`INDEX ${index}`);
   for (const check of table.checks ?? []) definitions.push(`CHECK (${check})`);
-  return `CREATE TABLE IF NOT EXISTS \`${name}\` (${definitions.join(',\n')}) ENGINE=InnoDB`
+  return `CREATE TABLE IF NOT EXISTS \`${name}\` (\n  ${definitions.join(',\n  ')}\n) ENGINE=InnoDB`
     + (table.pool ? ' DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin' : '');
 }
 

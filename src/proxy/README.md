@@ -79,13 +79,16 @@ Dockerfile 会复制根 `package*.json`、`tsconfig.base.json` 和 `src`，执�
 
 Proxy 通过 `dotenv/config` 读取环境变量。未设置时使用 `src/config.ts` 的默认值；`src/proxy/.env.example` 是面向本模块的示例。
 
+示例默认使用 SQLite，`MYSQL_*` 列为注释可选项，并非废弃变量。切换为 `STORAGE_DRIVER=mysql` 时取消所需项的注释并填写连接信息；`MYSQL_SSL_MODE` 只能填写 `disabled`、`required`、`verify-ca` 中的一个值，不能把选项列表作为值。
+
 | 变量 | 代码默认值 / 示例值 | 必填 | 用途与关系 |
 | --- | --- | --- | --- |
 | `PORT` | `3000` / `3000` | 否 | HTTP 监听端口。 |
 | `LOG_LEVEL` | `info`（shared logger 默认）/ `info` | 否 | 日志级别：`debug`、`info`、`warn`、`error`；无效值回退 `info`。 |
 | `STORAGE_DRIVER` | `sqlite` / `sqlite` | 否 | `sqlite` 或 `mysql`；SQLite 只支持单实例，MySQL 用于多 Pod。 |
 | `DB_PATH` | `./data/proxy.sqlite` / 同 | SQLite 模式 | SQLite 文件路径；启动时自动创建目录、开启 WAL。 |
-| `MYSQL_URL` | 未设置 / 空 | MySQL 模式 | 所有 Proxy Pod 共享的 MySQL 8 连接 URL。 |
+| `MYSQL_URL` | 未设置 / 注释占位值 | MySQL 模式 | 所有 Proxy Pod 共享的 MySQL 8 连接 URL。 |
+| `MYSQL_AUTO_MIGRATE` | `true` / `true` | 否 | 仅影响 MySQL；`false` 时跳过自动迁移，启动时只读校验管理员预建的表结构（启用用户池时含池表和凭据防护触发器），不执行任何 DDL。 |
 | `MYSQL_CONNECTION_LIMIT` | `10` / `10` | 否 | 每个 Proxy Pod 的 MySQL 连接池上限。 |
 | `MYSQL_SSL_MODE` | `disabled` / `disabled` | 否 | `disabled`、`required`（加密但不验证 CA）或 `verify-ca`；远程生产数据库应优先使用 `verify-ca`。 |
 | `MYSQL_SSL_CA_PATH` | 未设置 / 空 | `verify-ca` 模式 | MySQL CA 证书文件路径。 |
@@ -97,7 +100,8 @@ Proxy 通过 `dotenv/config` 读取环境变量。未设置时使用 `src/config
 | `INTERNAL_API_TOKEN` | 空字符串 / `change-me` | 是 | `/api`、`/internal` 鉴权；同时用于 Proxy 调用 SSO/Login 服务。 |
 | `SSO_BASE_URL` | `http://localhost:7001` / 同 | 否 | SSO 服务地址；用于确保用户、读取 SSO 用户、同步 EMU。 |
 | `LOGIN_BASE_URL` | `http://localhost:7003` / 同 | 否 | Login 服务地址；用于创建 Copilot OAuth 重新授权任务。 |
-| `ENTERPRISE_SHORTCODE` | `octo` / `octo` | 否 | 初始化身份时从规范化 identity 末尾剥离 `_<shortcode>`，生成 SSO 用户名。 |
+| `ENTERPRISE_SHORTCODE` | `octo` / `octo` | 否 | 初始化身份时从规范化 identity 末尾剥离 `_<shortcode>`，生成 SSO 用户名。GHE.com 模式下忽略（GH login 不带后缀）。 |
+| `GITHUB_BASE_URL` | `https://github.com` / 同 | 否 | GitHub Web origin；host 以 `.ghe.com` 结尾时为 GHE.com 模式，忽略 `ENTERPRISE_SHORTCODE`。 |
 | `REQUEST_STATS_PER_ACCOUNT_LIMIT` | `2` / `2` | 否 | 每个 identity 保留的请求统计条数；必须为正整数。 |
 | `PROXY_ERROR_DIAGNOSTICS_ENABLED` | `true` / `true` | 否 | 是否保存 Copilot 上游失败诊断。关闭后控制台错误摘要仍会输出。 |
 | `PROXY_ERROR_DIAGNOSTICS_DIR` | `./data/error-diagnostics` / 同 | 否 | 轮转文本日志目录；Compose 使用 `/data/error-diagnostics`。 |
@@ -106,7 +110,7 @@ Proxy 通过 `dotenv/config` 读取环境变量。未设置时使用 `src/config
 | `PROXY_ERROR_DIAGNOSTICS_MAX_FILES` | `5` / `5` | 否 | 包含当前文件在内的最大轮转文件数；必须为正整数。 |
 | `PROXY_ERROR_DIAGNOSTICS_SHARED` | `false` / `false` | 否 | 在多 Pod 共用 RWX 根目录时启用实例隔离写入和聚合读取。 |
 | `PROXY_INSTANCE_ID` | `HOSTNAME` / 空 | 共享诊断模式 | 当前 Pod 的安全目录标识；Kubernetes 建议通过 Downward API 注入 Pod 名。 |
-| `COPILOT_API_BASE_URL` | `https://api.githubcopilot.com` / 同 | 否 | GitHub.com Copilot API base URL。 |
+| `COPILOT_API_BASE_URL` | `https://api.githubcopilot.com` / 同 | 否 | Copilot API base URL；GitHub.com 用默认值，GHE.com 为 `https://copilot-api.<sub>.ghe.com`。 |
 | `OPENCODE_VERSION` | `1.0.0` / `1.18.4` | 否 | 生成 `User-Agent: opencode/<version>`。 |
 | `OPENCODE_USER_AGENT` | 未设置 / 未设置 | 否 | 显式覆盖完整 User-Agent；非空时优先于 `OPENCODE_VERSION`。 |
 | `GITHUB_API_VERSION` | `2026-06-01` / 同 | 否 | `X-GitHub-Api-Version` 请求头。 |
@@ -235,7 +239,7 @@ X-Internal-Token: <INTERNAL_API_TOKEN>
 | `POST` | `/api/accounts/copilot-oauth-token/import` | `{ csvText: string }`；CSV 头必须是 `name,copilotOauthToken`，name 不可重复 | `BatchResult<ImportCopilotOauthTokenRow>`；每个 token 通过 `/models` 验证后才写入。 |
 | `GET` | `/api/accounts/:identity/request-stats?limit=` | `limit` 默认 100，最大 1000 | `ProxyRequestStatDto[]`。 |
 | `GET` | `/api/request-stats?limit=` | 同上 | 跨账号最近请求统计。 |
-| `POST` | `/api/accounts/:identity/copilot-oauth/reauthorize` | `{ ssoPassword: string, ssoType?: "azure" | "custom" }`；`ssoPassword` 必填 | 标记 OAuth `refreshing` 并创建 Login 任务，返回 `ProxyAccountDto`。 |
+| `POST` | `/api/accounts/:identity/copilot-oauth/reauthorize` | `{ credentialMode: "default", ssoType? }` 或 `{ credentialMode: "override", ssoPassword, ssoType? }`；兼容旧的非空密码请求 | 标记 OAuth `refreshing` 并创建 Login 任务，返回 `ProxyAccountDto`；提交后账号被删除则明确返回冲突。 |
 | `GET` | `/api/error-diagnostics?page=&pageSize=` | 分页参数可选，`pageSize` 最大 100 | `ProxyErrorDiagnosticsListResponse`，只返回摘要并指明功能是否开启、是否脱敏。 |
 | `GET` | `/api/error-diagnostics/:id` | 诊断 UUID | `ProxyErrorDiagnosticDetailDto`，包含摘要字段和完整人类可读日志；不存在返回 404，功能关闭返回 503。 |
 | `GET` | `/api/error-diagnostics/:id/download` | 诊断 UUID | 以 `Content-Disposition: attachment` 下载 `.log` 文本。 |
@@ -255,7 +259,31 @@ X-Internal-Token: <INTERNAL_API_TOKEN>
 
 ### 6.1 SQLite / MySQL 表
 
-`src/db/connection.ts` 根据 `STORAGE_DRIVER` 创建 SQLite provider 或 MySQL 连接池。SQLite 会按 `DB_PATH` 创建目录、启用 WAL 和外键；MySQL 要求 8.x/InnoDB，并通过 advisory lock 保证多个 Pod 并发启动时只有一个实例执行 schema migration。两种 provider 暴露相同的异步账号、统计和初始化租约语义。
+`src/db/connection.ts` 根据 `STORAGE_DRIVER` 创建 SQLite provider 或 MySQL 连接池。SQLite 会按 `DB_PATH` 创建目录、启用 WAL 和外键；MySQL 要求 8.x/InnoDB，默认自动迁移，并通过 advisory lock 保证多个 Pod 并发启动时只有一个实例执行 schema migration。两种 provider 暴露相同的异步账号、统计和初始化租约语义。
+
+#### MySQL 低权限运行
+
+当运行账号没有 `CREATE`、`ALTER` 权限时，由管理员提前准备好与当前版本匹配的业务表，并向 Proxy 容器实际注入以下环境变量：
+
+```dotenv
+STORAGE_DRIVER=mysql
+MYSQL_URL=mysql://proxy_runtime:change-me@mysql:3306/proxy
+MYSQL_AUTO_MIGRATE=false
+```
+
+关闭自动迁移后，Proxy 启动时**只读校验**表结构，不执行建表、改表、迁移锁或任何写入：
+
+- 业务表（`schema_migrations`、`proxy_accounts`、`proxy_request_stats`、`proxy_identity_initializations`）按与自动迁移相同的定义逐项核对：列、类型、可空、排序规则、默认值、主键/唯一键、索引。
+- 启用用户池（caller-lease 模式）时，额外核对池表和 `user_pool_credential_fence` 凭据防护触发器。
+
+任何不一致都会在监听 HTTP 端口之前报错，并提示管理员执行 `scripts/proxy-mysql-initial.sql`；不会自动修复。该脚本由 `src/db/mysqlSchema.ts` 生成（`npm --workspace @ghcp/proxy run mysql:initial-sql`），单元测试保证两者一致；脚本同时写入迁移记录，以后切回自动迁移也不会重复执行。
+
+运行账号权限：
+
+- 对本库具备 `SELECT`、`INSERT`、`UPDATE`、`DELETE`（启动时会清理请求统计，因此不是只读模式）。
+- 启用用户池时，还需要对 `proxy_accounts` 具备 `TRIGGER` 权限：MySQL 只向持有该权限的账号显示触发器元数据，Proxy 需要据此确认凭据防护触发器存在。
+
+校验在存储初始化时完成，之后 `/readyz` 只检查连接。配置修改后需要重启 Proxy；未设置或为 `true` 时保持自动迁移，SQLite 不受此开关影响。
 
 #### `proxy_accounts`
 
@@ -287,6 +315,14 @@ X-Internal-Token: <INTERNAL_API_TOKEN>
 索引：`idx_proxy_request_stats_identity_time(identity, requested_at DESC)`。每次写入后会按 `REQUEST_STATS_PER_ACCOUNT_LIMIT` 清理该账号旧记录；服务启动时也会清理一次。
 
 `proxy_identity_initializations` 保存带过期时间和唯一 claim ID 的初始化租约。未知 identity 在调用 SSO、SCIM/seat 和 Login 之前必须先取得租约，因此多个 Proxy Pod 不会重复执行外部副作用；旧 Pod 也不能释放新 Pod 的 claim。
+
+授权栅栏只有 `proxy_accounts.copilot_oauth_attempt_id` 一列，不再有单独的回执表：`begin` 把账号切到新 attempt（Login 重试必须带 `previousAttemptId`，与账号当前 attempt 不一致时返回 `409 authorization_conflict`；Console 的手动/批量重新授权则强制切换，作为账号卡在 `refreshing` 时的恢复入口）；token 写回和失败上报都只在账号仍指向该 attempt 时生效，写回还要求状态仍为 `refreshing`，因此"先取消/失败则拒绝迟到写回，先写回则保持成功"。创建 Login 任务的响应丢失时按 attempt 到 Login 核对；核对不了就把该 attempt 标为失败并返回 `502 login_submission_unconfirmed`，已写回的 token 因 attempt 已清空而不受影响。这些都是单条 UPDATE，不需要事务；删除账号仍在事务中进行，事务遇到 `ER_LOCK_DEADLOCK` / `ER_LOCK_WAIT_TIMEOUT` 会回滚并最多重试 2 次。账号批量操作（`/api/accounts/operations`）的预览与结果只保存在 Proxy 进程内存中，多实例部署下预览与确认需要落到同一实例，否则确认会返回 `404 operation_not_found` 并提示重新预览。
+
+管理查询补充 `GET /api/accounts/summary`、完整分页 `GET /api/request-stats?page=&pageSize=&identity=&model=&success=&from=&to=`，旧的仅 `limit` 请求仍返回数组。账号支持 OAuth 状态和更新时间筛选；`q`/`model` 中的 `%`、`_` 按字面匹配。Request Stats 的范围始终受 retention 限制。账号 `/api/accounts/operations` 使用 preview / execute / history / export 处理删除与重新授权，复用单项业务及缓存失效；其错误同样经过 `managementErrorHandler`，与其他管理路由返回一致的错误结构。`reauthorize` 必须显式传 `ssoType`（`custom` 或 `azure`），缺省返回 `400 sso_type_required`。Console 的单账号和批量重新授权对话框默认选择 Custom 并显式传入 `custom`；Proxy 不保存账号所属 SSO 提供方，Azure 账号仍需切换为 Azure 并提供覆盖密码，API 不推断提供方。
+
+Accounts、Request Stats、Error Diagnostics 均有 `GET/POST <资源>/export`：全部匹配、`scope=page` 或 POST 已选范围。SQLite 使用独立只读快照连接，MySQL 使用独立 repeatable-read 事务；按页流式输出，下载断开会释放读取资源。诊断导出仅含摘要，在本地/共享模式下先捕获保留摘要，再一致筛选分页，保留共享 clear cutoff 语义。长下载会延长数据库读快照寿命，应避免同时发起大量全量导出。
+
+服务间新增 `POST /internal/accounts/:identity/oauth-attempts/:attemptId/prepare`。prepare 校验映射、活动授权及密码模式；默认密码经 SSO 内部只读入口解析，Console 公共 API 无法调用该入口。
 
 SQLite 是默认的单 Pod 模式，不能把同一个 SQLite 文件以 RWX 方式提供给多个 Proxy Pod。MySQL 模式不包含 identity/token 缓存，每个请求直接按主键读取共享数据库。已有 SQLite 数据切换到 MySQL 使用仓库根目录 `upgrade/sqlite-to-mysql` 的显式工具。
 
@@ -342,13 +378,15 @@ src/proxy/
     │   ├── copilotAuth.ts       # Copilot OAuth auth context
     │   ├── copilotAuthManager.ts # 账号初始化、OAuth 状态与重新授权
     │   └── copilotClient.ts     # Copilot 模型列表、路径校验、转发 headers
-    ├── clients/                 # SSO/Login 服务 JSON client
+    ├── clients/                 # SSO/Login 服务 JSON client，响应丢失时按 attempt 到 Login 核对任务是否已接受
     ├── accounts/                # Copilot OAuth token 验证与 CSV 导入
     ├── diagnostics/             # 错误现场构造、人类可读格式、轮转文本 store 与测试
     └── db/                      # SQLite/MySQL provider、迁移、accounts/stats repo
 ```
 
 `src/packages/shared/src/contracts.ts` 和 `api.ts` 定义 Proxy 与其他服务共享的 DTO、分页、批处理和错误结构。
+
+SQLite/MySQL 的管理列表筛选和稳定排序共用 `src/db/managementQueries.ts` 的 `managementSql()`，存储实现不再各自维护排序字段映射。Login 提交响应不确定时，客户端仍通过 `getLoginTaskByAttempt()` 核对是否已接受任务；移除未使用的按任务 ID 查询包装不影响服务端查询接口。
 
 ## 8. 开发提示
 
@@ -360,3 +398,4 @@ src/proxy/
 - 扩展新 Copilot 路径时，至少同步更新 `COPILOT_FORWARD_PATHS`、`compatible.ts` 路由、模型路径推断、`ProxyRequestStatDto.path`、SQLite/MySQL 统计语义和本文档。
 - 新增配置时，同时更新 `config.ts`、`src/proxy/.env.example` 和本 README；若配置影响其他服务，也要检查 shared contracts 或调用客户端。
 - 本模块提供 `test` 脚本；改代码后运行 `npm --workspace @ghcp/proxy run test` 和 `npm --workspace @ghcp/proxy run typecheck`，涉及 shared 类型时也运行 shared typecheck。
+- MySQL 集成测试使用 `MYSQL_TEST_URL` 并通过 `npm --workspace @ghcp/proxy run test:mysql` 执行；该账号需要迁移权限。可额外设置 `MYSQL_TEST_RUNTIME_URL`，指向同一测试库的低权限账号，仅授予三张业务表的读写权限、不授予 `CREATE`、`ALTER` 或迁移历史表权限，以验证关闭迁移后的初始化和业务操作。测试会清理三张业务表，必须使用专用测试库，不能连接业务数据库。

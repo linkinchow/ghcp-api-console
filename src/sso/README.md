@@ -47,16 +47,24 @@ SSO 数据库只保存 scrypt 密码哈希和 salt，不能还原用户的明文
 - enterprise role 可由请求显式传入；未传时本地 `role=admin` 映射为 `enterprise_owner`，其他映射为 `user`。
 - `suspend_emu`：PATCH SCIM user 的 `active=false`，并标记 `emuStatus=suspended`。
 - `delete_emu`：移除 Copilot seat、删除 SCIM user，并将本地 EMU 信息重置为 `not_synced`。
-- 反向导入：从 SCIM 拉取用户并分页读取 Enterprise Copilot seats 生成 preview plan，apply 时同步本地身份映射和 `copilot_seat_status`。
+- 反向导入：从 SCIM 拉取用户并完整分页读取 Enterprise Copilot seats 生成 preview plan，apply 时同步本地身份映射、企业直接席位状态和待取消日期。组织或团队来源不计入直接席位。
 - SCIM 请求支持节流和对 `429`、`5xx`、带 `retry-after` 的 `403` 重试。
 
 ### Copilot seats 与 AI Credits
 
 - `sync_emu` 默认只同步 GH login；请求显式传入 `assignCopilotSeat=true` 时才会继续尝试分配 Copilot seat。
-- 可单独调用 assign/remove seat API。
-- seat 状态写入 `sso_users.copilot_seat_*`；失败会记录 `assign_failed` / `remove_failed` 和错误信息。
+- 可单独调用 assign/remove seat API；变更受理后通过企业级 `GET /enterprises/{enterprise}/members/{username}/copilot` 回读 `{ total_seats, seats }` 确认状态。
+- 正常状态为 `assigned`、`pending_cancellation`、`unassigned`。取消接口只返回 `seats_cancelled` 数量，不代表立即失去权限；待取消日期来自 GH 的 `pending_cancellation_date`，保存为 `copilotSeatPendingCancellationDate`（`YYYY-MM-DD`），Console 显示 `cancell at <日期>`。不推算下个月 1 号、不进行本地时区换算。
+- 这里只跟踪**企业直接分配**的席位：排除有 `organization` 或 `assigning_team` 来源的记录。因此 `unassigned` 不代表账号不能通过组织或团队使用 Copilot。
+- 到期后保持最后确认状态；使用 **Import from GH** 或再次 **Remove seat** 确认未分配后，才写 `unassigned` 并清除日期。没有按时钟自动失效或后台对账。**Assign seat** 确认恢复后写 `assigned` 并清除日期。
+- seat 状态写入 `sso_users.copilot_seat_*`。失败保留已有的 assigned/pending_cancellation/unassigned 快照并记录错误；尚无已确认状态时，变更失败记录 `assign_failed` / `remove_failed`。变更已受理但回读失败时，保留状态、日期和上次成功同步时间，API/批量结果明确报告“请求已受理、同步失败”；不会猜日期或返回虚假的成功。
+- Import from GH 的预览、存储行、分页结果及 apply 都携带状态与日期；仅日期变化也会更新。Apply 使用**预览时快照**，席位变更后需重新 Preview；查询失败不会生成全员未分配的计划。
 - AI Credits 刷新会查询 GitHub billing usage summary，固定使用 `sku=copilot_ai_unit`，缓存上月和本月用量。
-- seat 月成本在代码中固定按 `19 * assignedSeatCount` 计算。
+- seat 月成本固定按 `19 * assignedSeatCount` 估算；数量包含最后同步的 assigned 和 pending_cancellation 直接席位，即使日期已过也要确认未分配后才扣除。这是可能滞后的本地估算，不是 GitHub 账单。
+
+升级时 SQLite 自动为用户与导入行增加 `copilot_seat_pending_cancellation_date`。旧的未应用预览会标为 conflict，要求重新 Preview；已应用历史保留。升级后应重新执行一次全量 Import from GH 校正旧二态数据，不通过数据库迁移猜测旧 `unassigned` 是否实际待取消。
+
+仅 Remove seat 不删除 SSO/GH/Proxy 记录或作废 OAuth token；删除/暂停 GH 用户仍有其独立的权限影响。Proxy 未知 identity 初始化继续按原逻辑显式分配席位，因此仍可能恢复待取消的直接席位，本次不增加阻止该行为的策略。
 
 ### 与 proxy 的边界
 
@@ -117,6 +125,8 @@ docker run --rm -p 7001:7001 --env-file src/sso/.env.example ghcp-sso
 
 `src/sso/src/config.ts` 使用 `dotenv/config` 读取环境变量；`.env.example` 是示例值，不代表生产可用值。
 
+`MOCK_GITHUB_BASE_URL` 仍用于本地 fallback，并未废弃；示例已显式设置 `SCIM_BASE_URL` 和 `SP_ACS_URL`，因此将它列为注释可选项。
+
 | 变量 | 默认值 | 何时必填 | 用途/关系 |
 |---|---:|---|---|
 | `PORT` | `7001` | 否 | Express 监听端口。 |
@@ -130,14 +140,15 @@ docker run --rm -p 7001:7001 --env-file src/sso/.env.example ghcp-sso
 | `SSO_DEFAULT_USER_PASSWORD` | 未设置 | 否 | 新用户默认密码；未设置时使用 `ssoUser`。只从环境变量读取，不进入 DB 或 Console。 |
 | `SSO_USER_EVENTS_LOG` | `./data/sso-user-events.log` | 否 | 追加写入部分用户事件。 |
 | `ENTERPRISE_SLUG` | `acme` | GitHub/SCIM/Copilot 场景必填 | GitHub Enterprise slug；用于 SCIM fallback、Copilot seat、AI Credits、默认 SP entityID。 |
-| `ENTERPRISE_SHORTCODE` | `octo` | GH login fallback 时必填 | SCIM 响应无 `githubLogin` 时生成 `<normalized>_<shortcode>`；`ensure` 也会剥离该后缀。 |
-| `GITHUB_API_BASE_URL` | `https://api.github.com` | Copilot/API 调用时 | Copilot seat 和 AI Credits 的 GitHub API 根地址。 |
+| `ENTERPRISE_SHORTCODE` | `octo` | GitHub.com GH login fallback 时必填 | SCIM 响应无 `githubLogin` 时生成 `<normalized>_<shortcode>`（总长 ≤39）；`ensure` 也会剥离该后缀。GHE.com 模式（`GITHUB_BASE_URL` 为 `*.ghe.com`）下忽略：shortcode 被隐藏，GHE.com API 拒绝带后缀的用户名，GH login 直接为 `<normalized>`（≤30 字符）。 |
+| `GITHUB_BASE_URL` | `https://github.com` | GHE.com 必填 | GitHub Web origin；host 以 `.ghe.com` 结尾时为 GHE.com 模式（忽略 `ENTERPRISE_SHORTCODE`）。也用于 `SP_ENTITY_ID` 的兜底值。 |
+| `GITHUB_API_BASE_URL` | `https://api.github.com` | Copilot/API 调用时 | Copilot seat 和 AI Credits 的 GitHub API 根地址；GHE.com 为 `https://api.<sub>.ghe.com`。 |
 | `GITHUB_COPILOT_SEAT_PAT` | 未设置 | Copilot seat / AI Credits 必填 | Bearer token；代码不在启动时强校验，调用相关功能时校验。 |
-| `SCIM_BASE_URL` | 空字符串 | 真实 SCIM 必填 | GitHub SCIM base URL；为空时使用 `MOCK_GITHUB_BASE_URL/scim/v2/enterprises/{ENTERPRISE_SLUG}`。 |
+| `SCIM_BASE_URL` | 空字符串 | 真实 SCIM 必填 | GitHub SCIM base URL；为空时使用 `MOCK_GITHUB_BASE_URL/scim/v2/enterprises/{ENTERPRISE_SLUG}`。GHE.com 为 `https://api.<sub>.ghe.com/scim/v2/enterprises/<slug>`。 |
 | `SCIM_TOKEN` | 空字符串 | SCIM 调用必填 | SCIM Bearer token；代码不在启动时强校验。 |
 | `CERT_DIR` | `../../certs` | SAML 启动必填 | 目录中必须有 `idp-cert.pem`、`idp-key.pem`。`.env.example` 示例为 `../../certs`。 |
-| `SP_ENTITY_ID` | 空字符串 | 真实 GitHub SAML 建议配置 | 为空时 fallback 为 `https://github.com/enterprises/{ENTERPRISE_SLUG}`。 |
-| `SP_ACS_URL` | 空字符串 | 真实 GitHub SAML 必填 | 为空时 fallback 到 mock GitHub ACS。 |
+| `SP_ENTITY_ID` | 空字符串 | 真实 GitHub SAML 建议配置 | 为空时 fallback 为 `{GITHUB_BASE_URL}/enterprises/{ENTERPRISE_SLUG}`。GHE.com 为 `https://<sub>.ghe.com/enterprises/<slug>`。 |
+| `SP_ACS_URL` | 空字符串 | 真实 GitHub SAML 必填 | 为空时 fallback 到 mock GitHub ACS。GHE.com 为 `https://<sub>.ghe.com/enterprises/<slug>/saml/consume`。 |
 
 用户上限、用户名 fallback、默认邮箱域、SCIM 限流/重试和 `sync_emu` 并发保存在 `sso_runtime_settings`，通过 Console Settings 页面保存后对下一次操作生效。
 
@@ -221,11 +232,11 @@ EMU import row 状态当前支持：`pending_create`、`pending_update`、`creat
 
 | 表 | 主键/索引 | 主要字段 | 作用 |
 |---|---|---|---|
-| `sso_users` | `sso_user` PK | `password_hash`, `salt`, `email`, `role`, `gh_login`, `gh_scim_id`, `emu_status`, `copilot_seat_status`, `copilot_seat_last_operation`, `copilot_seat_last_error`, `copilot_seat_updated_at`, `created_at`, `updated_at` | 本地 SSO 用户和外部身份映射。 |
+| `sso_users` | `sso_user` PK | `password_hash`, `salt`, `email`, `role`, `gh_login`, `gh_scim_id`, `emu_status`, `copilot_seat_status`, `copilot_seat_pending_cancellation_date`, `copilot_seat_last_operation`, `copilot_seat_last_error`, `copilot_seat_updated_at`, `created_at`, `updated_at` | 本地 SSO 用户和外部身份映射。 |
 | `sso_runtime_settings` | `id=1` | `max_sso_users`, `user_prefix`, `email_domain`, `bulk_sync_concurrency`, SCIM delay/retry 字段、`version`, `updated_at` | 持久化 Console runtime settings 和乐观锁版本。 |
 | `sso_budget_cache` | `period_key` PK | `year`, `month`, `quantity`, `unit_type`, `raw_json`, `fetched_at` | AI Credits 月度用量缓存。 |
 | `sso_emu_import_plans` | `id` PK | `sso_user`, `status`, `created_at`, `updated_at`, `applied_at` | SCIM 反向导入 preview/apply 计划。 |
-| `sso_emu_import_plan_rows` | `(plan_id, row_index)` PK；`(plan_id,status,row_index)` 索引 | `sso_user`, `email`, `gh_login`, `gh_scim_id`, `emu_status`, `copilot_seat_status`, `status`, `detail`, `action` | 导入计划明细。 |
+| `sso_emu_import_plan_rows` | `(plan_id, row_index)` PK；`(plan_id,status,row_index)` 索引 | `sso_user`, `email`, `gh_login`, `gh_scim_id`, `emu_status`, `copilot_seat_status`, `copilot_seat_pending_cancellation_date`, `status`, `detail`, `action` | 导入计划明细。 |
 
 当前未配置：`gh_login`、`gh_scim_id` 没有数据库唯一索引；重复绑定主要依赖业务逻辑检查。
 
@@ -265,7 +276,7 @@ EMU import row 状态当前支持：`pending_create`、`pending_update`、`creat
 | `src/users/service.ts` | 用户生命周期、SCIM 同步、导入计划、batch、proxy 清理的核心业务逻辑。 |
 | `src/users/bulkImport.ts` | 简单 CSV 解析，支持 header、去重和错误收集。 |
 | `src/scim/scimClient.ts` | SCIM create/update/list/suspend/delete、鉴权、重试、节流。 |
-| `src/scim/handle.ts` | 从 `ssoUser` 和 enterprise shortcode 推导 GH login。 |
+| `src/scim/handle.ts` | 从 `ssoUser` 和 enterprise shortcode 推导 GH login；GHE.com 模式下不带后缀。 |
 | `src/copilot/seats.ts` | GitHub Copilot selected users assign/remove，以及 Enterprise seat 列表分页查询。 |
 | `src/budget/budgetService.ts` | AI Credits usage 查询、缓存和投影计算。 |
 | `src/routes/budgetApi.ts` | AI Credits cache 读取/刷新 API。 |
@@ -283,3 +294,11 @@ EMU import row 状态当前支持：`pending_create`、`pending_update`、`creat
 - 调试 Copilot/AI Credits：确认 `GITHUB_COPILOT_SEAT_PAT`、`GITHUB_API_BASE_URL`、`ENTERPRISE_SLUG`；相关功能调用时才会校验 PAT。
 - 调试 SAML：确认 `BASE_URL`、`SP_ENTITY_ID`、`SP_ACS_URL`、`CERT_DIR`；证书文件缺失会导致服务启动失败。
 - `sync_emu` 批量操作使用 Console Settings 中的并发值，其他破坏性批量操作保持串行。
+
+## 异步管理与默认登录凭据
+
+Users 查询支持 `status`（EMU 状态）、`role`、`seatStatus`、更新时间 `from/to` 和稳定排序；`GET /api/users/summary` 返回全部保留用户的真实聚合。`GET /api/users/export` 导出一致快照的全部匹配项，`scope=page` 导出当前页；POST 同一路径传 `{ selection }` 导出至多 1000 个已选目标。
+
+`/api/users/operations` 提供 `POST /preview`、`POST /:id/execute`、`GET /:id` 和 `GET /:id/export`。选择可以是 `{ ids }` 或 `{ query, excludedIds }`；每批至多 1000，预览冻结目标并在 10 分钟后过期，执行时重新校验。预览与结果只保存在 SSO 进程内存中（结果在结束后保留约 1 小时），重复确认同一预览返回当前状态而不会再执行；浏览器关闭不停止已接受的工作，进程重启后批次状态丢失、不自动重放，以用户列表为准。业务仍复用 `runSsoUserBatch`，`sync_emu` 保留 runtime 并发与 SCIM 节流/重试，删除等操作保持串行和既有级联顺序。旧同步 `POST /api/users/batch` 保持兼容。
+
+`POST /internal/users/:ssoUser/login-credentials` 只允许携带内部认证的服务调用，使用 `Cache-Control: no-store`。它沿用既有默认密码候选策略，只验证现有用户的摘要，不创建用户、不重置密码；已改密或未知默认值返回 `409 password_override_required`。摘要校验在工作线程池异步执行，最多同时处理 4 个请求，繁忙时返回 `429 default_credentials_busy` 和 `Retry-After: 1`，不会无界排队阻塞普通 API。密码只向协调登录的 Proxy 返回，不进入 Console 转发路径、批次数据或导出。

@@ -6,6 +6,7 @@ import express from 'express';
 import cookieSession from 'cookie-session';
 import { INTERNAL_AUTH_HEADER } from '@ghcp/shared';
 import { requireAdmin, session } from './auth.js';
+import { request } from 'node:http';
 import { config } from './config.js';
 import { serviceProxy } from './apiProxy.js';
 
@@ -17,6 +18,7 @@ test('preserves attachment content type, disposition, and bytes', async () => {
     res.setHeader('Content-Disposition', 'attachment; filename="proxy-error-diagnostic-id.json"');
     res.send(payload);
   });
+
   const upstream = upstreamApp.listen(0, '127.0.0.1');
   await listening(upstream);
 
@@ -98,6 +100,52 @@ test('pool settings forwarding requires Console authentication and replaces clie
     await close(server);
     await close(upstream);
   }
+});
+
+test('preserves public path prefixes, rejects traversal and releases interrupted download streams', async (t) => {
+  let calls = 0;
+  let closed: (() => void) | undefined;
+  const disconnected = new Promise<void>((resolve) => { closed = resolve; });
+  const upstreamApp = express();
+  upstreamApp.use((req, res) => {
+    calls++;
+    assert.match(req.url, /^\/base\/api\//);
+    if (req.url.endsWith('/percent%25value')) { res.status(204).end(); return; }
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="fixture.csv"');
+    res.setHeader('X-Export-Matched-At-Start', '1000');
+    const timer = setInterval(() => res.write('fixture,row\n'.repeat(100)), 10);
+    res.on('close', () => { clearInterval(timer); closed!(); });
+  });
+  const upstream = upstreamApp.listen(0, '127.0.0.1');
+  await listening(upstream);
+  t.after(() => { upstream.closeAllConnections(); return close(upstream); });
+  const previous = config.proxyBaseUrl;
+  config.proxyBaseUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}/base`;
+  t.after(() => { config.proxyBaseUrl = previous; });
+  const app = express();
+  app.use('/api/console/proxy', serviceProxy('proxy', '/api/console/proxy'));
+  const server = app.listen(0, '127.0.0.1');
+  await listening(server);
+  t.after(() => { server.closeAllConnections(); return close(server); });
+  const port = (server.address() as AddressInfo).port;
+  for (const suffix of ['/%2e%2e/internal/users/user/login-credentials', '/%252e%252e/internal/users/user/login-credentials']) {
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = request({ hostname: '127.0.0.1', port, path: `/api/console/proxy${suffix}` }, (res) => { res.resume(); resolve(res.statusCode!); });
+      req.on('error', reject); req.end();
+    });
+    assert.equal(status, 400);
+  }
+  assert.equal(calls, 0);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/api/console/proxy/accounts/percent%25value`)).status, 204);
+  const abort = new AbortController();
+  const response = await fetch(`http://127.0.0.1:${port}/api/console/proxy/accounts/export`, { signal: abort.signal });
+  assert.equal(response.headers.get('x-export-matched-at-start'), '1000');
+  const reader = response.body!.getReader();
+  assert.equal((await reader.read()).done, false);
+  abort.abort();
+  await disconnected;
+  assert.equal(calls, 2);
 });
 
 function listening(server: Server): Promise<void> {

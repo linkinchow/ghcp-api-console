@@ -59,5 +59,5 @@ function createMysqlStorage(): MysqlStorage {
       rejectUnauthorized: true,
     };
   }
-  return new MysqlStorage(createPool(poolOptions), config.requestStatsPerAccountLimit);
+  return new MysqlStorage(createPool(poolOptions), config.requestStatsPerAccountLimit, config.mysqlAutoMigrate);
 }

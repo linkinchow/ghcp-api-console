@@ -29,12 +29,13 @@ test('Login task mutations preserve pool recovery evidence and fail closed', asy
     assert.equal(url.origin, 'https://proxy.test');
     assert.ok(url.pathname.endsWith('/login-task-protection'));
     assert.equal(new Headers(init?.headers).get('X-Internal-Token'), 'login-protection-test');
-    assert.equal(url.searchParams.get('oauthAttemptId'), 'attempt-test');
+    assert.match(url.searchParams.get('oauthAttemptId') ?? '', /^attempt-/);
     lookups++;
     if (unavailable) throw new Error('private upstream failure');
     return new Response(JSON.stringify(protection), { headers: { 'Content-Type': 'application/json' } });
   };
-  const seed = (identity: string) => createTask({ identity, ssoUser: identity, ghLogin: `${identity}_test`, oauthAttemptId: 'attempt-test', ssoType: 'custom' });
+  // Attempt IDs are unique per account mapping, so each seeded identity gets its own.
+  const seed = (identity: string) => createTask({ identity, ssoUser: identity, ghLogin: `${identity}_test`, oauthAttemptId: `attempt-${identity}`, ssoType: 'custom' });
   const request = (id: string, operation: 'delete' | 'retry', authenticated = true) => fetch(`${base}/api/tasks/${id}${operation === 'retry' ? '/retry' : ''}`, {
     method: operation === 'delete' ? 'DELETE' : 'POST',
     headers: { 'Content-Type': 'application/json', ...(authenticated ? { 'X-Internal-Token': 'login-protection-test' } : {}) },

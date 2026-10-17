@@ -28,7 +28,13 @@ export function resolvePoolManagedPassword(ssoUser: string, explicitPassword?: s
   return password;
 }
 
-export function knownDefaultPasswordForUser(user: SsoUserRecord): string | undefined {
-  const candidates = [...new Set([config.defaultUserPassword, user.ssoUser].filter((value): value is string => Boolean(value)))];
-  return candidates.find((candidate) => verifyPassword(candidate, user.passwordHash, user.salt));
+export async function knownDefaultPasswordForUserAsync(user: SsoUserRecord): Promise<string | undefined> {
+  for (const candidate of defaultCandidates(user)) {
+    if (await verifyPassword(candidate, user.passwordHash, user.salt)) return candidate;
+  }
+  return undefined;
+}
+
+function defaultCandidates(user: SsoUserRecord): string[] {
+  return [...new Set([config.defaultUserPassword, user.ssoUser].filter((value): value is string => Boolean(value)))];
 }

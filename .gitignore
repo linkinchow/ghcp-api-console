@@ -2,6 +2,7 @@
 **/.env
 **/*.env*
 !**/.env.example
+!.env.example.data-residency
 **/data/*.sqlite
 **/data/*.sqlite-shm
 **/data/*.sqlite-wal
@@ -27,7 +28,7 @@ guidance-draft.md
 tmp.md
 curl.http
 
-
+.claude/*
 !docs/codebase-overview.md
 !docs/repo-map.md
 !docs/user-pool-*.md
@@ -37,3 +38,4 @@ curl.http
 .claude/
 /tests/docker-user-pool/local-run.json
 /tests/docker-user-pool/local-*.json
+insight.md

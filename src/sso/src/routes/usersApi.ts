@@ -1,10 +1,11 @@
 import { Router } from 'express';
-import { apiError, errorFields, loggerFor } from '@ghcp/shared';
-import { getUser, listUsers, PoolMemberManagedError, SsoUserLimitReachedError, toDto } from '../db/usersRepo.js';
+import { apiError, csvExport, errorFields, loggerFor, readManagementQuery, withSqliteReadSnapshot } from '@ghcp/shared';
+import { getDb } from '../db/connection.js';
+import { getUser, listUsers, PoolMemberManagedError, summarizeUsers, SsoUserLimitReachedError, toDto } from '../db/usersRepo.js';
 import { PoolMembershipUnavailableError } from '../clients/proxyClient.js';
 import type { ScimEnterpriseRole } from '../scim/scimClient.js';
 import type { ImportEmuUserStatus, SsoUserBatchOperation, SsoUserLoginCredentialsResponse } from '@ghcp/shared';
-import { knownDefaultPasswordForUser, PoolPasswordPolicyError } from '../users/passwordPolicy.js';
+import { knownDefaultPasswordForUserAsync, PoolPasswordPolicyError } from '../users/passwordPolicy.js';
 import {
   applyEmuImportPlan,
   assignCopilotSeatForSsoUser,
@@ -28,14 +29,14 @@ const EMU_IMPORT_ROW_STATUSES = new Set(['pending_create', 'pending_update', 'cr
 const SSO_USER_BATCH_OPERATIONS = new Set(['sync_emu', 'suspend_emu', 'delete_emu', 'delete_sso', 'assign_copilot', 'remove_copilot']);
 const logger = loggerFor('sso', 'users-api');
 
-usersApiRouter.post('/users/ensure', (req, res) => {
+usersApiRouter.post('/users/ensure', async (req, res) => {
   const { identity, preferredSsoUser } = req.body as { identity?: unknown; preferredSsoUser?: unknown };
   if (typeof identity !== 'string' || !identity.trim()) {
     res.status(400).json(apiError('invalid_identity', 'identity is required.'));
     return;
   }
   try {
-    res.json(ensureUser(identity, typeof preferredSsoUser === 'string' ? preferredSsoUser : undefined));
+    res.json(await ensureUser(identity, typeof preferredSsoUser === 'string' ? preferredSsoUser : undefined));
   } catch (err) {
     sendCreateUserError(res, err, 'ensure_user_failed');
   }
@@ -43,39 +44,44 @@ usersApiRouter.post('/users/ensure', (req, res) => {
 
 usersApiRouter.get('/users', (req, res) => {
   res.json(
-    listUsers({
-      q: stringQuery(req.query.q),
-      page: numberQuery(req.query.page),
-      pageSize: numberQuery(req.query.pageSize),
-      sort: stringQuery(req.query.sort) as never,
-      dir: stringQuery(req.query.dir) as never,
-    }),
+    listUsers(readManagementQuery(req.query)),
   );
 });
+
+usersApiRouter.get('/users/summary', (_req, res) => res.json(summarizeUsers()));
+usersApiRouter.route('/users/export').get(exportUsers()).post(exportUsers());
+function exportUsers() {
+  return csvExport('sso-users',
+    ['ssoUser', 'email', 'role', 'ghLogin', 'emuStatus', 'copilotSeatStatus', 'copilotSeatPendingCancellationDate', 'updatedAt'],
+    async (query) => listUsers(query),
+    (user) => [user.ssoUser, user.email, user.role, user.ghLogin, user.emuStatus, user.copilotSeatStatus, user.copilotSeatPendingCancellationDate, user.updatedAt],
+    (_query, consume) => withSqliteReadSnapshot(getDb(), (database) => consume(async (query) => listUsers(query, database))),
+  );
+}
 
 usersApiRouter.get('/users/capacity', (_req, res) => {
   res.json(getSsoUserCapacity());
 });
 
-usersApiRouter.post('/users', (req, res) => {
+usersApiRouter.post('/users', async (req, res) => {
   if (req.body?.poolManaged !== undefined && typeof req.body.poolManaged !== 'boolean') {
     res.status(400).json(apiError('invalid_pool_managed', 'poolManaged must be a boolean when provided.'));
     return;
   }
   try {
-    res.status(201).json(createSsoUser(req.body as Parameters<typeof createSsoUser>[0]));
+    res.status(201).json(await createSsoUser(req.body as Parameters<typeof createSsoUser>[0]));
   } catch (err) {
     sendCreateUserError(res, err, 'create_user_failed');
   }
 });
 
-usersApiRouter.post('/users/import', (req, res) => {
+usersApiRouter.post('/users/import', async (req, res) => {
   const { csvText } = req.body as { csvText?: unknown };
   if (typeof csvText !== 'string' || !csvText.trim()) {
     res.status(400).json(apiError('invalid_import', 'csvText is required.'));
     return;
   }
-  res.json(importUsers(csvText));
+  res.json(await importUsers(csvText));
 });
 
 usersApiRouter.post('/users/batch', async (req, res) => {
@@ -167,7 +173,7 @@ usersApiRouter.get('/users/emu/import/plans/:planId/rows', async (req, res) => {
 });
 
 usersApiRouter.post('/users/emu/import/plans/:planId/apply', async (req, res) => {
-  await sendAsync(res, 'apply-emu-import-plan', { planId: req.params.planId }, () => Promise.resolve(applyEmuImportPlan(req.params.planId)));
+  await sendAsync(res, 'apply-emu-import-plan', { planId: req.params.planId }, () => applyEmuImportPlan(req.params.planId));
 });
 
 usersApiRouter.delete('/users/emu/import/plans/:planId', async (req, res) => {
@@ -188,7 +194,7 @@ usersApiRouter.get('/users/:ssoUser', (req, res) => {
 
 // Mounted behind requireInternalToken in server.ts. This deliberately never ensures,
 // creates or changes a user/password: ownership is checked on the same read snapshot.
-usersApiRouter.post('/users/:ssoUser/login-credentials', (req, res) => {
+usersApiRouter.post('/users/:ssoUser/login-credentials', async (req, res) => {
   res.set('Cache-Control', 'no-store');
   const { expectedCreatedAt, expectedEmail } = (req.body ?? {}) as { expectedCreatedAt?: unknown; expectedEmail?: unknown };
   if (typeof expectedCreatedAt !== 'string' || !expectedCreatedAt.trim() || !Number.isFinite(Date.parse(expectedCreatedAt))
@@ -206,7 +212,7 @@ usersApiRouter.post('/users/:ssoUser/login-credentials', (req, res) => {
     res.status(409).json(apiError('user_ownership_mismatch', 'SSO user no longer matches the expected ownership or is not eligible for login.'));
     return;
   }
-  const passwordForLogin = knownDefaultPasswordForUser(user);
+  const passwordForLogin = await knownDefaultPasswordForUserAsync(user);
   if (passwordForLogin === undefined) {
     res.status(409).json(apiError('login_credentials_unavailable', 'The existing SSO user password is not available for automatic login.'));
     return;
@@ -214,9 +220,9 @@ usersApiRouter.post('/users/:ssoUser/login-credentials', (req, res) => {
   res.json({ user: toDto(user), passwordForLogin } satisfies SsoUserLoginCredentialsResponse);
 });
 
-usersApiRouter.patch('/users/:ssoUser', (req, res, next) => {
+usersApiRouter.patch('/users/:ssoUser', async (req, res, next) => {
   try {
-    const user = patchSsoUser(req.params.ssoUser, req.body as { password?: string; email?: string; role?: 'user' | 'admin' });
+    const user = await patchSsoUser(req.params.ssoUser, req.body as { password?: string; email?: string; role?: 'user' | 'admin' });
     if (!user) {
       res.status(404).json(apiError('user_not_found', 'SSO user was not found.'));
       return;

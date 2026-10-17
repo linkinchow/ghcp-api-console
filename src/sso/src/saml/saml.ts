@@ -6,10 +6,11 @@ import { inflateRawSync } from 'node:zlib';
 import * as samlify from 'samlify';
 import { config } from '../config.js';
 import type { SsoUserRecord } from '../db/usersRepo.js';
+import { validateSamlXml } from './xmlValidator.js';
 
 const require = createRequire(import.meta.url);
 const { SamlLib } = require('samlify') as Pick<typeof import('samlify'), 'SamlLib'>;
-samlify.setSchemaValidator(require('@authenio/samlify-node-xmllint'));
+samlify.setSchemaValidator({ validate: validateSamlXml });
 
 const BINDING = {
   redirect: 'urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect',
@@ -25,7 +26,7 @@ const XSI = 'http://www.w3.org/2001/XMLSchema-instance';
 const idpEntityId = `${config.baseUrl}/metadata`;
 const idpSsoUrl = `${config.baseUrl}/sso`;
 const idpLogoutUrl = `${config.baseUrl}/logout`;
-const spEntityId = config.spEntityId || `https://github.com/enterprises/${config.enterpriseSlug}`;
+const spEntityId = config.spEntityId || `${config.githubBaseUrl}/enterprises/${config.enterpriseSlug}`;
 const spAcsUrl = config.spAcsUrl || `${config.mockGithubBaseUrl}/enterprises/${config.enterpriseSlug}/saml/consume`;
 
 const loginResponseTemplate =

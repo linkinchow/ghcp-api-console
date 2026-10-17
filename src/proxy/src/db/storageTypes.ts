@@ -3,6 +3,8 @@ import type {
   DeleteProxyAccountResult,
   PageResponse,
   ProxyRequestStatDto,
+  ManagementQuery,
+  ManagementSummary,
 } from '@ghcp/shared';
 
 export interface ProxyAccountRecord {
@@ -17,13 +19,7 @@ export interface ProxyAccountRecord {
   updatedAt: string;
 }
 
-export interface AccountListQuery {
-  q?: string;
-  page?: number;
-  pageSize?: number;
-  sort?: 'identity' | 'ssoUser' | 'ghLogin' | 'copilotOauthStatus' | 'createdAt' | 'updatedAt';
-  dir?: 'asc' | 'desc';
-}
+export interface AccountListQuery extends ManagementQuery { }
 
 export interface CreateAccountInput {
   identity: string;
@@ -68,11 +64,13 @@ import type { Awaitable, PoolStore } from '../userPool/storage.js';
 
 export interface ProxyStorage {
   userPool(options: PoolConfig): Awaitable<PoolStore>;
+  withReadSnapshot<T>(read: (reader: Pick<ProxyStorage, 'listAccounts' | 'listRequestStatsPage'>) => Promise<T>): Promise<T>;
   initialize(): Promise<void>;
   ping(): Promise<void>;
   close(): Promise<void>;
 
   listAccounts(query?: AccountListQuery): Promise<PageResponse<ProxyAccountRecord>>;
+  summarizeAccounts(): Promise<ManagementSummary>;
   getAccount(identity: string): Promise<ProxyAccountRecord | undefined>;
   deleteAccount(identity: string): Promise<DeleteProxyAccountResult | undefined>;
   deleteAccountsBySsoUser(ssoUser: string): Promise<DeleteAccountsBySsoUserResult>;
@@ -85,7 +83,12 @@ export interface ProxyStorage {
     ghLogin?: string,
   ): Promise<ProxyAccountRecord | undefined>;
   markCopilotOauthStatus(identity: string, status: CopilotOauthStatus): Promise<void>;
-  beginCopilotOauthAuthorization(identity: string, oauthAttemptId: string): Promise<boolean>;
+  /**
+   * Switches the account to a new authorization attempt. When `expectedAttemptId` is given (a string
+   * or `null`), the switch only happens if the account still points at that attempt, so a stale
+   * caller cannot supersede an authorization it does not know about; `undefined` forces the switch.
+   */
+  beginCopilotOauthAuthorization(identity: string, oauthAttemptId: string, expectedAttemptId?: string | null): Promise<boolean>;
   failCopilotOauthAuthorization(identity: string, oauthAttemptId: string): Promise<boolean>;
   invalidateCopilotOauthToken(
     identity: string,
@@ -98,5 +101,6 @@ export interface ProxyStorage {
 
   recordRequestStat(input: RecordRequestStatInput): Promise<void>;
   listRequestStats(identity?: string, limit?: number): Promise<ProxyRequestStatDto[]>;
+  listRequestStatsPage(query?: ManagementQuery): Promise<PageResponse<ProxyRequestStatDto>>;
   pruneAllRequestStats(): Promise<void>;
 }
