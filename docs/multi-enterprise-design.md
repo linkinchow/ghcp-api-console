@@ -163,7 +163,7 @@
 | `github.apiBaseUrl` | 否 | github.com → `https://api.github.com`；`<sub>.ghe.com` → `https://api.<sub>.ghe.com` | SSO（席位、预算），Proxy（`/user` 主体校验、Models） |
 | `github.copilotApiBaseUrl` | 否 | github.com → `https://api.githubcopilot.com`；GHE.com → `https://copilot-api.<sub>.ghe.com` | Proxy |
 | `github.slug` | SSO 必填；GHE.com 时 Login 也必填 | — | SSO、Login |
-| `github.shortcode` | github.com 必填；GHE.com 必须为 `""` 或省略 | — | SSO、Proxy |
+| `github.shortcode` | github.com：缺失时是 Proxy/SSO 的 readiness blocker，显式空串是解析错误；先转小写再校验。GHE.com 必须为 `""` 或省略 | — | SSO、Proxy |
 | `github.oauthClientId` | 否 | `GITHUB_OAUTH_CLIENT_ID` | Login 设备流 |
 | `sso.spEntityId` / `sso.spAcsUrl` | 否 | `<baseUrl>/enterprises/<slug>`、`.../saml/consume` | SSO |
 | `sso.scimBaseUrl` | 否 | `<apiBaseUrl>/scim/v2/enterprises/<slug>` | SSO |
@@ -175,13 +175,13 @@
 | `login.allowedLoginUrls` | 否 | `[ssoLoginUrl]`。最多 16 项；origin 相同且路径整段前缀匹配；query、fragment 被去掉 | Login |
 | `login.selectors` | 否 | 全局 `AUTH_*_SELECTOR` | Login |
 | `pool.accountDomain` | 池模式必填 | — | Proxy |
-| `pool.initialMaxAccounts` | 否 | default 企业取 `POOL_MAX_ACCOUNTS`；其他企业取 `10` | Proxy，只在首次插入 `proxy_enterprises` 行时使用 |
+| `pool.initialMaxAccounts` | 否 | default 企业在 caller-lease 模式下取 `POOL_MAX_ACCOUNTS`，否则 `100`；其他企业取 `10` | Proxy，只在首次插入 `proxy_enterprises` 行时使用 |
 | `modelsAdmin.*` | 否 | 未配置时，该企业的 Models 页显示 `models_admin_not_configured` | Proxy |
 
 ### 3.4 Secret 引用
 
 - 格式只有两种：`{ "env": "NAME" }`（`^[A-Z][A-Z0-9_]{0,127}$`）和 `{ "file": "/abs/path" }`（必须是绝对路径）。
-- `env` 引用在启动时读取。`file` 引用在使用时读取，并缓存 60 秒，所以轮换挂载的 Secret 不需要重启。Models 管理员 token 沿用基线做法，每次请求重新读取。
+- `env` 引用在每次使用时读取环境变量（进程内环境不变，效果等同启动时读取）。`file` 引用在使用时读取，并缓存 60 秒，所以轮换挂载的 Secret 不需要重启。Models 管理员 token 沿用基线做法，每次请求重新读取。
 - 内容限制：最大 128 KiB；不允许 `\0`；只去掉一个结尾换行。
 - 只在需要该 secret 的服务内解析，并且是**懒加载**。某个企业缺 secret 只会让该企业 not ready，不阻塞其他企业，也不阻塞启动。
 - secret 值不进日志、DTO 或错误消息。错误消息只给出字段路径，例如 `contoso-eu.sso.scimToken`。
@@ -217,7 +217,8 @@
   - `shortcode` 必须为空；
   - `slug` 必填；
   - `apiBaseUrl` 和 `copilotApiBaseUrl` 的主机必须属于同一 `<sub>.ghe.com`。
-- github.com：`shortcode` 必须匹配 `^[a-z0-9]{3,8}$`；`apiBaseUrl` 默认 `api.github.com`，显式值只能是 http(s) origin（测试 mock 用）。
+- github.com：`shortcode` 必须匹配 `^[a-z0-9]{3,8}$`（大小写不敏感，存小写）；`apiBaseUrl` 默认 `api.github.com`。
+- `apiBaseUrl` 与 `copilotApiBaseUrl` 的显式值可以带网关路径（基线接受任意值，原地升级需要），但仍按可信 URL 规则拒绝 query、userinfo 和穿越。
 - 容量：所有 `initialMaxAccounts` 之和，以及运行时所有 cap 之和，都不能超过 `NAME_CAPACITY`（10,000）。
 - 不可变身份：每个服务的库中记录了每个企业的 `profile_fingerprint`（§4.2）。如果某企业在库中已有数据，而 fingerprint 变化（例如改了 `baseUrl`、`shortcode` 或 `accountDomain`），启动报 `enterprise_identity_changed`。企业没有数据时允许修改，并更新库中的 fingerprint。
   - Proxy 中“有数据”指该企业已有账号池成员（`inventory_count > 0`）。直连账号从不依赖 `accountDomain` 和 `shortcode`，所以直连部署切换到 caller-lease（首次设置 `POOL_ACCOUNT_EMAIL_DOMAIN`）仍然允许。
@@ -377,7 +378,7 @@ SAML 会话**不建表**（§5.5）。
 | 表 | 变化 | 旧行映射 |
 | --- | --- | --- |
 | `schema_migrations`（新） | 同 SSO | — |
-| `login_enterprises`（新） | `id PK, profile_fingerprint, created_at`。fingerprint 字段为 `{ id, githubBaseUrl, slug }` | 插入 `default` |
+| `login_enterprises`（新） | `id PK, profile_fingerprint, created_at`。fingerprint 字段为 `{ id, githubBaseUrl, slug }`，其中 slug 只对 GHE.com 企业计入（Login 只在 GHE.com 使用 slug；r4 的 Login 常不设 `ENTERPRISE_SLUG`，github.com 企业补上 slug 不应算身份变化） | 插入 `default` |
 | `login_tasks` | 加 `enterprise_id`（可空列，FK）→ 回填 → required 与 immutable trigger；`INDEX (enterprise_id, status, created_at)` | `default` |
 | `login_task_attempts` | 不变，通过 `task_id` 继承 | — |
 | `login_runtime_settings` | 不变，仍是全局（并发度是 Login 进程级资源） | — |
@@ -811,7 +812,7 @@ M1 ──┬── M2 ── M5 ──┐
 
 ## 11. 发布与镜像
 
-- 仍使用单一 `deploy/images/Dockerfile.release`。新增 build arg `RELEASE_LINE=single|multi`，只影响 OCI label 和 `/health` 中的 `releaseLine` 字段。
+- 仍使用单一 `deploy/images/Dockerfile.release`。新增 build arg `RELEASE_LINE=single|multi`，只影响 OCI label `com.ghcp.release-line`、环境变量 `GHCP_RELEASE_LINE` 和 `/healthz` 中的 `releaseLine` 字段。
 - 分支：从 `release/proxy-dockerhub`（或其合入的 `main`）切出 `feat/multi-enterprise`。single-slug 发布线继续独立维护。
 - Docker Hub 标签与 single-slug **完全分开**：
   - 发布：`linkinchow/ghcp-{proxy,console,sso,login}:multi-<sha7>-amd64`；

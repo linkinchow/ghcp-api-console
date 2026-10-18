@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { Locator, Page } from 'playwright';
-import { createConsoleFixture, paths, settle } from './test-support/console-fixture.js';
+import { createConsoleFixture, ENTERPRISE, paths, settle } from './test-support/console-fixture.js';
 
 const pages = [
   ['dashboard', 'Dashboard'], ['users', 'SSO Users'], ['budgets', 'AI Credits Usage'],
@@ -154,23 +154,20 @@ test('all nine admin pages share contained desktop and phone layouts with light 
   }
 });
 
-test('dashboard and account details retain compact summary columns, totals and empty states', { timeout: 60_000 }, async (t) => {
+test('dashboard cards and account details retain summary totals and empty states', { timeout: 60_000 }, async (t) => {
   const fixture = await createConsoleFixture(t);
   const { page, data } = fixture;
   await fixture.goto('dashboard');
-  const tasks = page.locator('main table').nth(0);
-  const requests = page.locator('main table').nth(1);
+  const card = page.getByRole('region', { name: `Enterprise ${ENTERPRISE}`, exact: true });
+  const metric = (label: string) => card.locator('dt', { hasText: label }).locator('xpath=following-sibling::dd[1]');
+  assert.equal(await metric('Proxy accounts').innerText(), '2');
+  assert.equal(await metric('SSO users').innerText(), '2');
+  assert.equal(await metric('Failed tasks').innerText(), '2', 'The dashboard counts failed tasks of the enterprise');
+  const failedTasks = card.getByRole('link', { name: 'Failed tasks', exact: true });
+  assert.equal(await failedTasks.getAttribute('href'), `#/tasks?e=${ENTERPRISE}&status=failed`);
+  const failedRequests = card.getByRole('link', { name: 'Failed requests', exact: true });
+  assert.equal(await failedRequests.getAttribute('href'), `#/stats?e=${ENTERPRISE}&success=false`);
   const requestColumns = ['Identity', 'Path', 'Model', 'Outcome', 'Total', 'Failure'];
-  assert.deepEqual(await tasks.getByRole('columnheader').allTextContents(), ['Identity', 'SSO user', 'Status', 'Failure']);
-  assert.deepEqual(await requests.getByRole('columnheader').allTextContents(), requestColumns);
-  assert.equal(await tasks.getAttribute('data-density'), 'compact');
-  assert.equal(await requests.getAttribute('data-density'), 'compact');
-  assert.equal(await tasks.locator('tbody tr').count(), 2, 'The dashboard keeps only failed tasks');
-  assert.equal(await tasks.getByRole('checkbox').count(), 0);
-  assert.equal(await requests.getByRole('cell', { name: '1,385', exact: true }).count(), 1, 'Totals include both cache token fields');
-  await tasks.getByTitle('Fixture authorization failure', { exact: true }).waitFor();
-  // Request failures use RequestFailure: the collapsed summary holds the full reason text.
-  await requests.locator('summary').getByText('Fixture upstream request failed', { exact: true }).waitFor();
 
   await fixture.goto('accounts');
   const row = page.getByRole('row').filter({ has: page.getByRole('checkbox', { name: 'Select identity-0', exact: true }) });
@@ -194,8 +191,7 @@ test('dashboard and account details retain compact summary columns, totals and e
 
   data.tasks.length = 0;
   await fixture.goto('dashboard');
-  assert.equal(await tasks.getByRole('cell', { name: 'No login tasks found.', exact: true }).getAttribute('colspan'), '4');
-  assert.equal(await requests.getByRole('cell', { name: 'No request stats found.', exact: true }).getAttribute('colspan'), '6');
+  assert.equal(await metric('Failed tasks').innerText(), '0');
   fixture.assertHealthy();
 });
 

@@ -4,6 +4,17 @@ import { createHash, createPrivateKey, createPublicKey, randomUUID, X509Certific
 import { copyFile, lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import {
+  BASELINE_R4_TAG,
+  buildMultiCompose,
+  buildRegistry,
+  buildSqliteCompose,
+  CONTOSO_SECRETS,
+  MULTI_MODES,
+  MULTI_TAG,
+  RELEASE_PREFIX,
+  SINGLE_TAG,
+} from './qualification-multi-lib.mjs';
 
 // Each qualification uses its own Compose project (and so its own volumes); never reuse one.
 export const PROJECT = process.env.RELEASE_QUALIFICATION_PROJECT ?? '';
@@ -27,20 +38,36 @@ export async function loadState(path) {
   assert.equal(resolve(path), join(directory, 'run.json'), 'state_path_mismatch');
   assert.equal(state.version, 1);
   assert.equal(state.project, PROJECT);
-  assert.equal(resolve(state.compose), COMPOSE);
-  assert.match(state.mysqlImage, MYSQL_IMAGE_REFERENCE);
+  if (MULTI_MODES.includes(state.mode)) {
+    // Multi modes run Compose files generated into the run directory; their hashes are pinned in run.json.
+    for (const [name, file] of Object.entries(state.composeFiles)) {
+      assert.equal(resolve(file.path), join(directory, `${name}.compose.json`), 'compose_not_run_owned');
+      assert.equal(sha(await readFile(file.path, 'utf8')), file.sha256, 'compose_changed_since_prepare');
+    }
+  } else {
+    assert.equal(resolve(state.compose), COMPOSE);
+  }
+  if (state.mode !== 'multi-upgrade-sqlite') assert.match(state.mysqlImage, MYSQL_IMAGE_REFERENCE);
   return { ...state, directory };
 }
 
 export async function prepare() {
   assert.equal(process.argv.length, 2, 'prepare_accepts_env_only');
   assert.match(PROJECT, /^ghcp-release-qualification-[a-z0-9-]+$/, 'qualification_project_required');
+  const mode = process.env.RELEASE_QUALIFICATION_MODE || undefined;
+  const multi = MULTI_MODES.includes(mode);
+  assert.ok(!mode || multi || mode === 'candidate-fresh', 'invalid_qualification_mode');
   const candidateTag = process.env.RELEASE_QUALIFICATION_CANDIDATE_TAG;
-  assert.match(candidateTag ?? '', /^single-slug-[a-f0-9]{7}-amd64-r\d+$/, 'candidate_tag_required');
+  // Single-slug modes keep their r4-era tags; multi candidates (design §11) upgrade in place from single-slug r4.
+  assert.match(candidateTag ?? '', multi ? MULTI_TAG : SINGLE_TAG, 'candidate_tag_required');
+  const baselineTag = process.env.RELEASE_QUALIFICATION_BASELINE_TAG || BASELINE_R4_TAG;
+  if (multi) assert.match(baselineTag, SINGLE_TAG, 'single_slug_baseline_tag_required');
   const certDir = process.env.RELEASE_QUALIFICATION_CERTS_DIR;
   const mysqlImage = process.env.RELEASE_QUALIFICATION_MYSQL_IMAGE;
   assert.ok(certDir, 'synthetic_certs_directory_required');
-  assert.match(mysqlImage ?? '', MYSQL_IMAGE_REFERENCE, 'cached_mysql_8_4_reference_required');
+  if (mode !== 'multi-upgrade-sqlite') {
+    assert.match(mysqlImage ?? '', MYSQL_IMAGE_REFERENCE, 'cached_mysql_8_4_reference_required');
+  }
   const certificatePaths = ['idp-cert.pem', 'idp-key.pem'].map((name) => join(resolve(certDir), name));
   for (const path of certificatePaths) {
     assert.ok((await lstat(path)).isFile(), 'regular_synthetic_pem_required');
@@ -70,10 +97,12 @@ export async function prepare() {
     ['33184', '34384'],
   ]);
   const fixtures = {};
-  for (const name of ['mysql-smoke.mjs', 'mysql-bridge.mjs', 'mock-services.mjs']) {
+  // mock-services.mjs imports mock-ghe.mjs only when GHE.com tenants are configured (multi modes).
+  const mockModules = multi ? ['mock-services.mjs', 'mock-ghe.mjs'] : ['mock-services.mjs'];
+  for (const name of ['mysql-smoke.mjs', 'mysql-bridge.mjs', ...mockModules]) {
     const original = await readFile(join(ROOT, 'tests/docker-user-pool', name), 'utf8');
     let adapted = original;
-    if (name !== 'mock-services.mjs') {
+    if (!mockModules.includes(name)) {
       assert.ok(adapted.includes("'ghcp-user-pool-mysql-test'"), 'fixture_project_marker_missing');
       for (const [from, to] of replacements) adapted = adapted.replaceAll(from, to);
       for (const from of replacements.keys()) assert.ok(!adapted.includes(from), 'old_project_or_port_retained');
@@ -85,6 +114,7 @@ export async function prepare() {
     join(ROOT, 'tests/image-release/qualification-verify-runtime.mjs'),
     join(directory, 'fixtures/qualification-verify-runtime.mjs'),
   );
+  const multiState = multi ? await prepareMulti(directory, mode) : {};
   await writeFile(
     join(directory, 'empty.env'),
     '# Fixture-only; prevents discovery of deployment env files.\n',
@@ -107,12 +137,41 @@ GRANT SELECT, INSERT, UPDATE ON ghcp_pool_mysql_test.* TO 'pool_load'@'%';
     createdAt: new Date().toISOString(),
     certSha256: sha(cert),
     fixtures,
-    baseline: BASELINE,
-    candidate: { prefix: 'ghcp-release', tag: candidateTag },
+    baseline: multi ? { prefix: RELEASE_PREFIX, tag: baselineTag } : BASELINE,
+    candidate: { prefix: RELEASE_PREFIX, tag: candidateTag },
+    ...multiState,
   };
   await writeFile(join(directory, 'run.json'), JSON.stringify(state, null, 2), { flag: 'wx', mode: 0o600 });
   console.log(`RELEASE_QUALIFICATION_STATE ${join(directory, 'run.json')}`);
   return state;
+}
+
+/**
+ * Multi-enterprise modes (design §9.4): probe/snapshot/volume-copy fixtures, the step-4 registry with its synthetic
+ * secret files, an empty registry directory, and the Compose files generated from the checked-in r4 one.
+ */
+async function prepareMulti(directory, mode) {
+  for (const name of ['multi-probe.mjs', 'multi-sqlite-snapshot.mjs', 'multi-volume-copy.mjs', 'mock.mjs']) {
+    await copyFile(join(ROOT, 'tests/image-release', name), join(directory, 'fixtures', name));
+  }
+  await mkdir(join(directory, 'registry/contoso'), { recursive: true, mode: 0o755 });
+  await mkdir(join(directory, 'backups'), { mode: 0o700 });
+  const registry = JSON.stringify(buildRegistry(), null, 2);
+  await writeFile(join(directory, 'registry/registry.json'), registry, { flag: 'wx', mode: 0o644 });
+  for (const [path, value] of Object.entries(CONTOSO_SECRETS)) {
+    await writeFile(join(directory, 'registry', path), `${value}\n`, { flag: 'wx', mode: 0o644 });
+  }
+  const files = mode === 'multi-upgrade'
+    ? buildMultiCompose(JSON.parse(await readFile(COMPOSE, 'utf8')))
+    : { sqlite: buildSqliteCompose() };
+  const composeFiles = {};
+  for (const [name, content] of Object.entries(files)) {
+    const path = join(directory, `${name}.compose.json`);
+    const text = JSON.stringify(content, null, 2);
+    await writeFile(path, text, { flag: 'wx', mode: 0o644 });
+    composeFiles[name] = { path, sha256: sha(text) };
+  }
+  return { mode, composeFiles, registrySha256: sha(registry) };
 }
 
 // Run only when executed directly; qualification-run.mjs imports this module for its exports.

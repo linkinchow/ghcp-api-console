@@ -5,7 +5,9 @@ import test from 'node:test';
 import express from 'express';
 import { chromium } from 'playwright';
 import type { LoginTaskDto, ManagementOperation, ManagementSelection } from '@ghcp/shared';
-import { assertNoAutomaticReads, createConsoleFixture, paths, settle } from './test-support/console-fixture.js';
+import {
+  assertNoAutomaticReads, createConsoleFixture, mountEnterpriseList, paths, scoped, settle,
+} from './test-support/console-fixture.js';
 
 const customPasswordLabel = 'Use a custom password instead of the default password';
 
@@ -23,18 +25,26 @@ test('admin lists support adjustable pages, cross-page retry overrides and resto
   const exports: { scope?: string; selection?: ManagementSelection }[] = [];
   const app = express();
   app.use(express.json());
+  mountEnterpriseList(app);
   app.get('/api/console/setup', (_req, res) => res.json({ initialized: true }));
   app.get('/api/console/me', (_req, res) => authenticated ? res.json({ username: 'fixture-admin', role: 'admin' }) : res.status(401).json({ error: { code: 'not_authenticated', message: 'Sign in required.' } }));
   app.use('/api/console/login-service', (_req, res, next) => {
     if (!authenticated) { res.status(401).json({ error: { code: 'not_authenticated', message: 'Sign in required.' } }); return; }
     next();
   });
-  app.get('/api/console/proxy/accounts/summary', (_req, res) => res.json({ total: 137, counts: { valid: 137 }, updatedAt: new Date().toISOString() }));
-  app.get('/api/console/sso/users/summary', (_req, res) => res.json({ total: 146, counts: { active: 146 }, updatedAt: new Date().toISOString() }));
-  app.get('/api/console/login-service/tasks/summary', (_req, res) => res.json({ total: tasks.length, counts: { failed: tasks.filter((task) => task.status === 'failed').length }, updatedAt: new Date().toISOString() }));
-  app.get('/api/console/proxy/request-stats', (_req, res) => res.json([]));
-  app.get('/api/console/login-service/queue', (_req, res) => res.json({ concurrency: 2, pending: [], active: [], cancelling: [], updatedAt: new Date().toISOString() }));
-  app.route('/api/console/login-service/tasks/export')
+  const summary = (total: number, counts: Record<string, number>) => {
+    return { total, counts, updatedAt: new Date().toISOString() };
+  };
+  app.get(`${scoped.proxy}/accounts/summary`, (_req, res) => res.json(summary(137, { valid: 137 })));
+  app.get(`${scoped.sso}/users/summary`, (_req, res) => res.json(summary(146, { active: 146 })));
+  app.get(`${scoped.login}/tasks/summary`, (_req, res) => {
+    res.json(summary(tasks.length, { failed: tasks.filter((task) => task.status === 'failed').length }));
+  });
+  app.get(`${scoped.proxy}/request-stats`, (_req, res) => res.json([]));
+  app.get(`${scoped.login}/queue`, (_req, res) => res.json({
+    concurrency: 2, pending: [], active: [], cancelling: [], updatedAt: new Date().toISOString(),
+  }));
+  app.route(`${scoped.login}/tasks/export`)
     .get((req, res) => {
       exports.push({ scope: req.query.scope ? String(req.query.scope) : undefined });
       res.attachment('tasks.csv').type('text/csv').send('id,status\ntask-000,failed\n');
@@ -43,7 +53,7 @@ test('admin lists support adjustable pages, cross-page retry overrides and resto
       exports.push({ selection: req.body.selection });
       res.attachment('tasks.csv').type('text/csv').send('id,status\ntask-000,failed\n');
     });
-  app.get('/api/console/login-service/tasks', (req, res) => {
+  app.get(`${scoped.login}/tasks`, (req, res) => {
     taskRequests++;
     if (req.query.limit) { res.json(tasks.slice(0, Number(req.query.limit))); return; }
     const statuses = String(req.query.status ?? '').split(',').filter(Boolean);
@@ -52,17 +62,19 @@ test('admin lists support adjustable pages, cross-page retry overrides and resto
     const page = Math.min(Number(req.query.page ?? 1), Math.max(1, Math.ceil(filtered.length / pageSize)));
     res.json({ items: filtered.slice((page - 1) * pageSize, page * pageSize), total: filtered.length, page, pageSize });
   });
-  app.get('/api/console/login-service/tasks/:id/attempts', (req, res) => {
+  app.get(`${scoped.login}/tasks/:id/attempts`, (req, res) => {
     const task = tasks.find((entry) => entry.id === req.params.id)!;
     res.json([{ ...task, id: `attempt-${task.id}`, taskId: task.id, attemptNumber: 1, queuedAt: task.createdAt, historyIncomplete: false }]);
   });
-  app.get('/api/console/login-service/tasks/:id', (req, res) => {
+  app.get(`${scoped.login}/tasks/:id`, (req, res) => {
     const task = tasks.find((entry) => entry.id === req.params.id);
     if (!task) { res.status(404).json({ error: { code: 'task_not_found', message: 'Task was removed.' } }); return; }
     res.json(task);
   });
-  app.get('/api/console/login-service/tasks/:id/attempts/:attemptId/log', (_req, res) => res.json({ content: 'Fixture log preview.', truncated: true }));
-  app.post('/api/console/login-service/tasks/operations/preview', (req, res) => {
+  app.get(`${scoped.login}/tasks/:id/attempts/:attemptId/log`, (_req, res) => {
+    res.json({ content: 'Fixture log preview.', truncated: true });
+  });
+  app.post(`${scoped.login}/tasks/operations/preview`, (req, res) => {
     const ids = req.body.selection.ids as string[];
     operation = {
       id: 'fixture-operation', scope: 'tasks', action: req.body.action, status: 'preview',
@@ -71,13 +83,13 @@ test('admin lists support adjustable pages, cross-page retry overrides and resto
     };
     res.status(201).json(operation);
   });
-  app.post('/api/console/login-service/tasks/operations/:id/execute', (req, res) => {
+  app.post(`${scoped.login}/tasks/operations/:id/execute`, (req, res) => {
     submitted = req.body;
     operation = { ...operation!, status: 'completed', items: operation!.items.map((item) => ({ ...item, status: 'success' })) };
     for (const item of operation.items) tasks.find((task) => task.id === item.id)!.status = 'success';
     res.status(202).json(operation);
   });
-  app.get('/api/console/proxy/accounts', (req, res) => res.json({
+  app.get(`${scoped.proxy}/accounts`, (req, res) => res.json({
     items: [{ identity: String(req.query.q ?? 'identity-26'), ssoUser: 'user-26', ghLogin: 'gh-26', copilotOauthStatus: 'valid', createdAt: '2026-09-01T00:00:00.000Z', updatedAt: '2026-09-01T00:00:00.000Z' }],
     total: 1, page: 1, pageSize: Number(req.query.pageSize ?? 25),
   }));
@@ -106,7 +118,7 @@ test('admin lists support adjustable pages, cross-page retry overrides and resto
   await page.evaluate(() => { Reflect.deleteProperty(document, 'hidden'); document.dispatchEvent(new Event('visibilitychange')); });
   await page.clock.fastForward(300_000);
   assert.equal(taskRequests, beforePause, 'Returning to a visible page must not refresh records');
-  const refreshed = page.waitForResponse((response) => response.url().includes('/login-service/tasks?'));
+  const refreshed = page.waitForResponse((response) => response.url().includes(`${scoped.login}/tasks?`));
   await page.getByRole('button', { name: 'Refresh', exact: true }).click();
   await refreshed;
   assert.equal(taskRequests, beforePause + 1, 'Manual refresh reads the current list once');

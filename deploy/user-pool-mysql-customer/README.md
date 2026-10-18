@@ -2,6 +2,8 @@
 
 **模板，不是可直接上线的客户最终配置。** 未执行客户镜像构建、Rancher部署、真实账号写入或客户迁移。请先看[四阶段闭集计划](../../docs/user-pool-delivery-plan.md)。我们交付固定源码与构建规范，**不向我们的registry发布镜像**；客户沿用其SQLite部署时的源码自建方式。
 
+**多企业版（multi）首次升级**：两个模板的 Proxy Deployment 已改为 `strategy: Recreate`，并新增 `MYSQL_MIGRATION_LOCK_WAIT_SECONDS`、`DIRECT_MODE_ENTERPRISE_ID` 和 registry 挂载示例（注释）。四个组件须在同一维护窗口内替换，回滚只能恢复备份，见[多企业版升级指南](../../docs/multi-enterprise-upgrade-guide.md)。构建多企业版镜像时给 `build-images.mjs` 加 `--release-line multi`。
+
 ## 包内文件与边界
 
 - `build-images.mjs`：显式完整Git commit，默认只读预览；只有 `--execute-build` 才构建四服务并记录本地image ID。使用Node内置模块、Git和已安装Docker，无安装脚本、fetch/checkout、容器启动、push或迁移。

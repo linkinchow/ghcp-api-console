@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "enterprises": [
+    {
+      "id": "default",
+      "displayName": "Fabrikam (github.com)",
+      "github": {
+        "baseUrl": "https://github.com",
+        "slug": "fabrikam",
+        "shortcode": "fab"
+      },
+      "sso": {
+        "signingCert": { "file": "/certs/idp-cert.pem" },
+        "signingKey": { "file": "/certs/idp-key.pem" },
+        "sessionSecret": { "env": "SESSION_SECRET" },
+        "scimToken": { "env": "SCIM_TOKEN" },
+        "seatPat": { "env": "GITHUB_COPILOT_SEAT_PAT" },
+        "defaultUserPassword": { "env": "SSO_DEFAULT_USER_PASSWORD" }
+      },
+      "login": {
+        "ssoLoginUrl": "http://sso:7001/login"
+      },
+      "pool": {
+        "accountDomain": "pool.fabrikam.example.com"
+      }
+    },
+    {
+      "id": "contoso-ghe",
+      "displayName": "Contoso (GHE.com)",
+      "github": {
+        "baseUrl": "https://contoso.ghe.com",
+        "slug": "contoso"
+      },
+      "sso": {
+        "emailDomain": "contoso.example.com",
+        "userPrefix": "ghcp",
+        "signingCert": { "file": "/run/secrets/contoso-ghe/idp-cert.pem" },
+        "signingKey": { "file": "/run/secrets/contoso-ghe/idp-key.pem" },
+        "sessionSecret": { "file": "/run/secrets/contoso-ghe/session-secret" },
+        "scimToken": { "file": "/run/secrets/contoso-ghe/scim-token" },
+        "seatPat": { "file": "/run/secrets/contoso-ghe/seat-pat" },
+        "defaultUserPassword": { "file": "/run/secrets/contoso-ghe/default-user-password" }
+      },
+      "login": {
+        "ssoProvider": "custom",
+        "ssoLoginUrl": "http://sso:7001/enterprises/contoso-ghe/login"
+      },
+      "pool": {
+        "accountDomain": "pool.contoso.example.com",
+        "initialMaxAccounts": 20
+      },
+      "modelsAdmin": {
+        "githubLogin": "contoso-admin",
+        "copilotToken": { "file": "/run/secrets/contoso-ghe/models-admin-copilot-token" }
+      }
+    }
+  ]
+}

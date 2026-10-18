@@ -8,6 +8,8 @@ export interface ConsoleConfig {
   proxyBaseUrl: string;
   ssoBaseUrl: string;
   loginBaseUrl: string;
+  /** Browser-facing Console URL behind a proxy that rewrites `Host`; its host is accepted as a write origin. */
+  publicBaseUrl?: string;
 }
 
 export const config: ConsoleConfig = {
@@ -18,7 +20,17 @@ export const config: ConsoleConfig = {
   proxyBaseUrl: process.env.PROXY_BASE_URL ?? 'http://localhost:3000',
   ssoBaseUrl: process.env.SSO_BASE_URL ?? 'http://localhost:7001',
   loginBaseUrl: process.env.LOGIN_BASE_URL ?? 'http://localhost:7003',
+  publicBaseUrl: readPublicBaseUrl(process.env.CONSOLE_PUBLIC_BASE_URL),
 };
+
+function readPublicBaseUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const parsed = URL.canParse(value) ? new URL(value) : undefined;
+  if (parsed?.protocol !== 'http:' && parsed?.protocol !== 'https:') {
+    throw new Error(`Invalid CONSOLE_PUBLIC_BASE_URL "${value}".`);
+  }
+  return value;
+}
 
 function readPort(value: string | undefined, defaultValue: number): number {
   const parsed = Number(value ?? defaultValue);

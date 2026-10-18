@@ -148,6 +148,34 @@ test('preserves public path prefixes, rejects traversal and releases interrupted
   assert.equal(calls, 2);
 });
 
+test('the enterprise comes only from the forwarded path, never from browser headers', async () => {
+  const seen: Array<{ path: string; enterprise?: string }> = [];
+  const upstreamApp = express();
+  upstreamApp.use((req, res) => {
+    seen.push({ path: req.path, enterprise: req.get('x-enterprise-id') });
+    res.json({ items: [], total: 0, page: 1, pageSize: 25 });
+  });
+  const upstream = upstreamApp.listen(0, '127.0.0.1');
+  await listening(upstream);
+  const original = config.proxyBaseUrl;
+  config.proxyBaseUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
+  const app = express();
+  app.use('/api/console/proxy', serviceProxy('proxy', '/api/console/proxy'));
+  const server = app.listen(0, '127.0.0.1');
+  await listening(server);
+  try {
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const headers = { 'X-Enterprise-Id': 'untrusted-browser-selection' };
+    const response = await fetch(`${origin}/api/console/proxy/enterprises/ghe-tenant/accounts`, { headers });
+    assert.equal(response.status, 200);
+    assert.deepEqual(seen, [{ path: '/api/enterprises/ghe-tenant/accounts', enterprise: undefined }]);
+  } finally {
+    config.proxyBaseUrl = original;
+    await close(server);
+    await close(upstream);
+  }
+});
+
 function listening(server: Server): Promise<void> {
   if (server.listening) return Promise.resolve();
   return new Promise((resolve) => server.once('listening', resolve));

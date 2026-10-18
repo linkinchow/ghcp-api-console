@@ -5,7 +5,7 @@ import { canonicalJson, nowIso, type EnterpriseId, type EnterpriseProfile } from
 /** What storage needs to create or verify a `login_enterprises` row (design §4.4). */
 export interface LoginEnterpriseSeed {
   id: EnterpriseId;
-  /** sha256 of the canonical `{ id, githubBaseUrl, slug }`. */
+  /** sha256 of the canonical `{ id, githubBaseUrl, slug }`; the slug only counts on GHE.com. */
   fingerprint: string;
 }
 
@@ -36,13 +36,14 @@ export function loginEnterpriseSeed(profile: EnterpriseProfile): LoginEnterprise
   return { id: profile.id, fingerprint: loginProfileFingerprint(profile) };
 }
 
-/** GitHub slugs are case-insensitive, so the slug is hashed in lower case. */
+/**
+ * Login uses the slug only on GHE.com (enterprise SSO entry). On github.com it is ignored, so adding or changing it
+ * there must not look like an identity change (r4 Login often ran without ENTERPRISE_SLUG). Slugs are
+ * case-insensitive, so the slug is hashed in lower case.
+ */
 export function loginProfileFingerprint(profile: EnterpriseProfile): string {
-  const identity = {
-    id: profile.id,
-    githubBaseUrl: profile.github.baseUrl,
-    slug: profile.github.slug?.toLowerCase() ?? null,
-  };
+  const slug = profile.github.isGheCom ? profile.github.slug?.toLowerCase() ?? null : null;
+  const identity = { id: profile.id, githubBaseUrl: profile.github.baseUrl, slug };
   return createHash('sha256').update(canonicalJson(identity)).digest('hex');
 }
 

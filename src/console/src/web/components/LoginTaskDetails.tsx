@@ -6,6 +6,16 @@ import { Button, ButtonLink } from './ui/button.js';
 import { Card } from './ui/card.js';
 import { Dialog } from './ui/dialog.js';
 import { formatDate, statusTone } from '../lib/format.js';
+import { useEnterpriseScope } from '../lib/scope.js';
+import { loginPath } from '../api/login.js';
+
+function taskPath(enterpriseId: string, taskId: string): string {
+  return `${loginPath(enterpriseId)}/tasks/${encodeURIComponent(taskId)}`;
+}
+
+function attemptLogPath(enterpriseId: string, taskId: string, attemptId: string): string {
+  return `${taskPath(enterpriseId, taskId)}/attempts/${encodeURIComponent(attemptId)}/log`;
+}
 
 export function QueueOverview({ refreshKey = 0, onLoadingChange }: { refreshKey?: number; onLoadingChange?: (loading: boolean) => void }) {
   const [queue, setQueue] = useState<LoginQueueDto>();
@@ -15,6 +25,7 @@ export function QueueOverview({ refreshKey = 0, onLoadingChange }: { refreshKey?
   const [queueFetchedAt, setQueueFetchedAt] = useState<string>();
   const [summaryFetchedAt, setSummaryFetchedAt] = useState<string>();
   const [loading, setLoading] = useState(true);
+  const enterpriseId = useEnterpriseScope().id;
   const sequence = useRef(0);
   const loadingChanged = useRef(onLoadingChange);
   loadingChanged.current = onLoadingChange;
@@ -26,13 +37,14 @@ export function QueueOverview({ refreshKey = 0, onLoadingChange }: { refreshKey?
     loadingChanged.current?.(true);
     const loadQueue = async () => {
       try {
-        const next = await api<LoginQueueDto>('/api/console/login-service/queue', { signal: controller.signal });
+        const next = await api<LoginQueueDto>(`${loginPath(enterpriseId)}/queue`, { signal: controller.signal });
         if (isCurrent()) { setQueue(next); setQueueFetchedAt(new Date().toISOString()); setQueueError(undefined); }
       } catch (err) { if (isCurrent()) setQueueError(message(err)); }
     };
     const loadSummary = async () => {
       try {
-        const next = await api<ManagementSummary>('/api/console/login-service/tasks/summary', { signal: controller.signal });
+        const path = `${loginPath(enterpriseId)}/tasks/summary`;
+        const next = await api<ManagementSummary>(path, { signal: controller.signal });
         if (isCurrent()) { setSummary(next); setSummaryFetchedAt(new Date().toISOString()); setSummaryError(undefined); }
       } catch (err) { if (isCurrent()) setSummaryError(message(err)); }
     };
@@ -40,7 +52,7 @@ export function QueueOverview({ refreshKey = 0, onLoadingChange }: { refreshKey?
       if (isCurrent()) { setLoading(false); loadingChanged.current?.(false); }
     });
     return () => { controller.abort(); loadingChanged.current?.(false); };
-  }, [refreshKey]);
+  }, [refreshKey, enterpriseId]);
   return <Card className="space-y-3" aria-busy={loading}>
     <div className="flex flex-wrap items-center justify-between gap-2"><h3 className="font-semibold">Login queue</h3><ButtonLink variant="secondary" size="sm" href="#settings">Concurrency settings</ButtonLink></div>
     <p className="text-xs text-slate-500">Snapshot only, including wait and run times. Use the task list Refresh to update the list, queue and task summary.{loading ? ' Refreshing queue and summary…' : ''}</p>
@@ -70,6 +82,7 @@ export function LoginTaskDetails({ task, onClose }: { task?: LoginTaskDto; onClo
 }
 
 function TaskDetailsSnapshot({ task, onClose }: { task: LoginTaskDto; onClose: () => void }) {
+  const enterpriseId = useEnterpriseScope().id;
   const [snapshot, setSnapshot] = useState(task);
   const [attempts, setAttempts] = useState<LoginAttemptDto[]>([]);
   const [taskError, setTaskError] = useState<string>();
@@ -93,7 +106,7 @@ function TaskDetailsSnapshot({ task, onClose }: { task: LoginTaskDto; onClose: (
     request.current = controller;
     const current = ++sequence.current;
     setLoading(true);
-    const path = `/api/console/login-service/tasks/${encodeURIComponent(task.id)}`;
+    const path = taskPath(enterpriseId, task.id);
     const [taskResult, attemptsResult] = await Promise.allSettled([
       api<LoginTaskDto>(path, { signal: controller.signal }).then((value) => ({ value, fetchedAt: new Date().toISOString() })),
       api<LoginAttemptDto[]>(`${path}/attempts`, { signal: controller.signal }).then((value) => ({ value, fetchedAt: new Date().toISOString() })),
@@ -142,7 +155,8 @@ function TaskDetailsSnapshot({ task, onClose }: { task: LoginTaskDto; onClose: (
     const current = ++logSequence.current;
     setLogLoading(attempt.id); setLogError(undefined);
     try {
-      const result = await api<{ content: string; truncated: boolean }>(`/api/console/login-service/tasks/${encodeURIComponent(task.id)}/attempts/${encodeURIComponent(attempt.id)}/log`, { signal: controller.signal });
+      const path = attemptLogPath(enterpriseId, task.id, attempt.id);
+      const result = await api<{ content: string; truncated: boolean }>(path, { signal: controller.signal });
       if (active.current && !controller.signal.aborted && logSequence.current === current) setLog({
         content: result.content + (result.truncated ? '\n\n[Preview truncated at 20 KB. Download the complete log.]' : ''),
         attemptNumber: attempt.attemptNumber,
@@ -180,7 +194,8 @@ function TaskDetailsSnapshot({ task, onClose }: { task: LoginTaskDto; onClose: (
         {attempt.status === 'failed' ? <p className="rounded bg-amber-50 p-2 text-xs text-amber-800">{failureAdvice(attempt.failureCode)}</p> : null}
         {attempt.historyIncomplete ? <p className="text-xs text-amber-700">Legacy history is incomplete; the old account log may have been overwritten.</p> : <div className="flex flex-wrap gap-2">
           <Button variant="secondary" disabled={logLoading === attempt.id} onClick={() => void previewLog(attempt)}>{logLoading === attempt.id ? 'Reading log…' : 'Preview log'}</Button>
-          <ButtonLink variant="secondary" target="_blank" rel="noreferrer" href={`/api/console/login-service/tasks/${encodeURIComponent(task.id)}/attempts/${encodeURIComponent(attempt.id)}/log?download=1`}>Download log</ButtonLink>
+          <ButtonLink variant="secondary" target="_blank" rel="noreferrer"
+            href={`${attemptLogPath(enterpriseId, task.id, attempt.id)}?download=1`}>Download log</ButtonLink>
         </div>}
       </div>)}</div>
       {log ? <div className="space-y-2"><p className="text-xs text-slate-500">Attempt {log.attemptNumber} log fetched {formatDate(log.fetchedAt)}. This preview does not refresh automatically.</p><pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded bg-slate-950 p-3 text-xs text-slate-100">{log.content}</pre></div> : null}

@@ -1,14 +1,19 @@
-import type { LoginRuntimeSettingsDto, LoginTaskDto, UpdateLoginRuntimeSettingsRequest } from '@ghcp/shared';
+import type { LoginRuntimeSettingsDto, UpdateLoginRuntimeSettingsRequest } from '@ghcp/shared';
 import { api } from './client.js';
+import { enterprisePath } from './enterprises.js';
 
-export function listLoginTasks(limit = 100): Promise<LoginTaskDto[]> {
-  return api<LoginTaskDto[]>(`/api/console/login-service/tasks?limit=${encodeURIComponent(String(limit))}`);
+/** Login runtime settings are process-wide (one queue and concurrency for every enterprise). */
+const SETTINGS = '/api/console/login-service/settings/runtime';
+
+/** `/api/console/login-service/enterprises/<id>`: tasks, queue and task operations. */
+export function loginPath(enterpriseId: string): string {
+  return enterprisePath('login-service', enterpriseId);
 }
 
-export function getLoginRuntimeSettings(): Promise<LoginRuntimeSettingsDto> {
-  return api<LoginRuntimeSettingsDto>('/api/console/login-service/settings/runtime');
+export function getLoginRuntimeSettings(signal?: AbortSignal): Promise<LoginRuntimeSettingsDto> {
+  return api<LoginRuntimeSettingsDto>(SETTINGS, { signal });
 }
 
 export function updateLoginRuntimeSettings(body: UpdateLoginRuntimeSettingsRequest): Promise<LoginRuntimeSettingsDto> {
-  return api<LoginRuntimeSettingsDto>('/api/console/login-service/settings/runtime', { method: 'PATCH', body: JSON.stringify(body) });
+  return api<LoginRuntimeSettingsDto>(SETTINGS, { method: 'PATCH', body: JSON.stringify(body) });
 }

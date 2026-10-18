@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import Database from 'better-sqlite3';
-import { DEFAULT_ENTERPRISE_ID, parseRegistry, runSqliteMigrations, type EnterpriseId } from '@ghcp/shared';
+import {
+  DEFAULT_ENTERPRISE_ID,
+  DEFAULT_GITHUB_BASE_URL,
+  parseRegistry,
+  runSqliteMigrations,
+  type EnterpriseId,
+} from '@ghcp/shared';
 import { EnterpriseIdentityError, loginEnterpriseSeed, type LoginEnterpriseSeed } from './enterpriseRepo.js';
 import { ENTERPRISE_MIGRATION_IDS, enterpriseSteps, runMigrations } from './migrations.js';
 
@@ -352,6 +358,18 @@ test('the fingerprint covers id, GitHub base URL and slug (case-insensitively), 
   assert.equal(loginEnterpriseSeed(registry('CONTOSO', 'http://sso/b', 'two')).fingerprint, base);
   assert.notEqual(loginEnterpriseSeed(registry('contoso-2', 'http://sso/a', 'one')).fingerprint, base);
   assert.match(base, /^[0-9a-f]{64}$/);
+});
+
+test('on github.com the slug is not part of the fingerprint, so adding one to an r4 default is not a change', () => {
+  const githubCom = (slug: string | undefined) => parseRegistry({
+    version: 1,
+    enterprises: [{
+      id: 'default',
+      github: { baseUrl: DEFAULT_GITHUB_BASE_URL, shortcode: 'octo', ...(slug ? { slug } : {}) },
+    }],
+  }, { service: 'login' }).enterprises[0]!;
+  const withoutSlug = loginEnterpriseSeed(githubCom(undefined)).fingerprint;
+  assert.equal(loginEnterpriseSeed(githubCom('acme')).fingerprint, withoutSlug);
 });
 
 test('migrations need the default enterprise', () => {

@@ -57,3 +57,15 @@ test('the Models relay replaces upstream transport errors with a fixed message',
   assert.equal(text.includes('private-token'), false);
   assert.match(text, /models_service_unavailable/);
 });
+
+test('the enterprise-scoped Models relay hides transport errors the same way', async (t) => {
+  const base = await relay(t, async (url) => {
+    assert.equal(url, `${PROXY}/api/enterprises/ghe-tenant/models?refresh=false`);
+    throw new Error('private-token-that-must-not-escape');
+  });
+  const response = await fetch(`${base}/enterprises/ghe-tenant/models?refresh=false`);
+  assert.equal(response.status, 502);
+  const text = await response.text();
+  assert.equal(text.includes('private-token'), false);
+  assert.match(text, /models_service_unavailable/);
+});

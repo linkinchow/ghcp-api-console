@@ -1,0 +1,30 @@
+# Multi-enterprise release line only: mount one enterprise registry into Proxy, SSO and Login.
+# Use after docker-compose.yml (and any user-pool file), for example:
+#   docker compose -f docker-compose.yml -f docker-compose.enterprise-registry.yml up -d
+# Read docs/multi-enterprise-registry.md first. Without this file the variables in .env define the
+# `default` enterprise and nothing else changes.
+# - The registry holds secret references only ({"env": ...} or {"file": ...}), never secret values.
+# - {"file": ...} paths in the registry refer to paths inside the containers: put the files under
+#   ENTERPRISE_SECRETS_DIR on the host and reference them as /run/secrets/<enterprise-id>/<name>.
+# - If the registry defines `default`, leave the matching .env variables empty or equal to the file
+#   (for example GITHUB_BASE_URL=, ENTERPRISE_SHORTCODE=); a different value stops startup with
+#   enterprise_env_conflict.
+# - Changing the file needs a restart of Proxy, SSO and Login; there is no hot reload.
+services:
+  sso:
+    environment:
+      ENTERPRISE_REGISTRY_FILE: /config/enterprise-registry.json
+    volumes:
+      - ${ENTERPRISE_REGISTRY_HOST_FILE:?set ENTERPRISE_REGISTRY_HOST_FILE}:/config/enterprise-registry.json:ro
+      - ${ENTERPRISE_SECRETS_DIR:?set ENTERPRISE_SECRETS_DIR}:/run/secrets:ro
+  login:
+    environment:
+      ENTERPRISE_REGISTRY_FILE: /config/enterprise-registry.json
+    volumes:
+      - ${ENTERPRISE_REGISTRY_HOST_FILE:?set ENTERPRISE_REGISTRY_HOST_FILE}:/config/enterprise-registry.json:ro
+  proxy:
+    environment:
+      ENTERPRISE_REGISTRY_FILE: /config/enterprise-registry.json
+    volumes:
+      - ${ENTERPRISE_REGISTRY_HOST_FILE:?set ENTERPRISE_REGISTRY_HOST_FILE}:/config/enterprise-registry.json:ro
+      - ${ENTERPRISE_SECRETS_DIR:?set ENTERPRISE_SECRETS_DIR}:/run/secrets:ro

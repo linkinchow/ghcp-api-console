@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ImportEmuPlanDto, ImportEmuUserRow } from '@ghcp/shared';
-import { createConsoleFixture, paths, settle } from './test-support/console-fixture.js';
+import { createConsoleFixture, paths, scoped, settle } from './test-support/console-fixture.js';
 
 test('direct seat cancellation dates, filters and import snapshots render consistently', { timeout: 60_000 }, async (t) => {
   const fixture = await createConsoleFixture(t);
@@ -33,7 +33,7 @@ test('direct seat cancellation dates, filters and import snapshots render consis
   }];
   let applied = false;
   const importRequests: string[] = [];
-  await page.route('**/api/console/sso/users/emu/import/plans**', async (route) => {
+  await page.route(`**${scoped.sso}/users/emu/import/plans**`, async (route) => {
     const request = route.request();
     const url = new URL(request.url());
     importRequests.push(`${request.method()} ${url.pathname}`);

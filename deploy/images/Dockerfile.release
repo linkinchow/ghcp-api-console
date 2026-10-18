@@ -19,11 +19,17 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/yarn /usr/local/bin/yarnpkg /usr/local/bin/corepack
 ARG SOURCE_REVISION
 ARG RELEASE_VERSION
+# Release line: `single` (single-enterprise) or `multi` (multi-enterprise). It only sets the label below and
+# GHCP_RELEASE_LINE, which every service reports as `releaseLine` on /healthz.
+ARG RELEASE_LINE=single
+RUN case "${RELEASE_LINE}" in single|multi) ;; *) echo "RELEASE_LINE must be single or multi" >&2; exit 1;; esac
 LABEL org.opencontainers.image.source="https://github.com/linkinchow/ghcp-api-console" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.version="${RELEASE_VERSION}" \
-      org.opencontainers.image.description="Single-enterprise GHCP services; SQLite/MySQL baseline"
-ENV NODE_ENV=production
+      org.opencontainers.image.description="GHCP services, ${RELEASE_LINE}-enterprise release line; SQLite/MySQL" \
+      com.ghcp.release-line="${RELEASE_LINE}"
+ENV NODE_ENV=production \
+    GHCP_RELEASE_LINE=${RELEASE_LINE}
 ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
 WORKDIR /app
 COPY --from=build /app/package.json /app/package-lock.json ./

@@ -1,5 +1,5 @@
 import express from 'express';
-import { apiError, installGracefulShutdown, managementErrorHandler } from '@ghcp/shared';
+import { apiError, installGracefulShutdown, managementErrorHandler, releaseLine } from '@ghcp/shared';
 import { config } from './config.js';
 import type { Server } from 'node:http';
 import { closeDb, getDb } from './db/connection.js';
@@ -19,7 +19,7 @@ export function buildApp(): express.Express {
   app.use(express.json({ limit: '5mb' }));
   app.use(express.urlencoded({ extended: false, limit: '1mb' }));
   app.get('/healthz', (_req, res) => {
-    res.json({ status: 'ok', service: 'sso' });
+    res.json({ status: 'ok', service: 'sso', releaseLine: releaseLine() });
   });
   mountSamlRouters(app);
   mountManagementRouters(app);

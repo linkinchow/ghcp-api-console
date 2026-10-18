@@ -1,6 +1,6 @@
 import express from 'express';
 import type { Server } from 'node:http';
-import { apiError, installGracefulShutdown, managementErrorHandler } from '@ghcp/shared';
+import { apiError, installGracefulShutdown, managementErrorHandler, releaseLine } from '@ghcp/shared';
 import { config } from './config.js';
 import { closeDb, getDb } from './db/connection.js';
 import { loginEnterprises, loginRegistryWarnings, type LoginEnterprise } from './enterprises.js';
@@ -15,7 +15,7 @@ export function buildApp(): express.Express {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
   app.get('/healthz', (_req, res) => {
-    res.json({ status: 'ok', service: 'login' });
+    res.json({ status: 'ok', service: 'login', releaseLine: releaseLine() });
   });
   mountManagementRouters(app);
   app.use(managementErrorHandler('login'));

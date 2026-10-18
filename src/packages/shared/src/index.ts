@@ -13,6 +13,7 @@ export * from './export.js';
 export * from './github.js';
 export * from './sqliteSnapshot.js';
 export * from './shutdown.js';
+export * from './releaseLine.js';
 export * from './enterprise/githubEndpoints.js';
 export * from './enterprise/scope.js';
 export * from './deepFreeze.js';

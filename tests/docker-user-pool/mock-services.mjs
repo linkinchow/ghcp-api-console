@@ -1,5 +1,6 @@
 // Node 22, zero dependencies, local fixtures only. No telemetry or external APIs.
-// The only outbound request is the OAuth callback to http://proxy:3000.
+// The only outbound requests are the OAuth callback to http://proxy:3000 and, when MOCK_LOGIN_READINESS_URL is
+// set, Login's readiness listing at that fixed internal origin.
 // Authenticated POST /test/control {status?:200|401|429|500,retryAfter?:1..120,
 // streamMode?:'success'|'error'|'early-eof'|'hold'} controls ONE next inference,
 // including warmup: pause provisioning before using it. {} restores normal reply.
@@ -10,13 +11,25 @@
 // cancellation (bounded at 30s). /test/state requires X-Internal-Token and records
 // identities/counts only, never tokens, passwords, headers, or request bodies.
 // State is in memory: restart Proxy, not this fixture, for persistence testing.
+//
+// Tenants (docs/multi-enterprise-design.md §9.5). The `default` tenant is the github.com-shaped enterprise
+// `local-test` (or, with MOCK_GHE_HOST, the single GHE.com tenant of ghe-e2e) and answers on every host that no
+// other tenant owns, exactly as before. MOCK_GHE_TENANTS (JSON array of
+// {host, slug, enterpriseId, port?, scimToken, seatPat, ssoPassword, idpSsoUrl?}) adds GHE.com tenants that are
+// dispatched by Host only: <host> (web + device flow, mock-ghe.mjs), api.<host> (SCIM, seats, /user) and
+// copilot-api.<host> (models, inference). Each tenant has its own users, seats, tokens, tasks and counters, so a
+// credential of one tenant is rejected by another. GHE.com handles carry no shortcode suffix (<= 30 chars).
+// The fake Login answers /api/tasks (single enterprise) and /api/enterprises/:id/tasks (scoped, with scoped
+// callbacks to /internal/enterprises/:id/...).
 import http from 'node:http';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 const MockLoginQueue = process.env.MYSQL_PROVISION_FIXTURE === '1'
   ? (await import('./mock-login-queue.mjs')).MockLoginQueue : undefined;
 // GHE.com mode: this fixture also plays <host> (web + device flow), api.<host> and copilot-api.<host>.
+const ENTERPRISE_ID = /^[a-z][a-z0-9-]{0,30}[a-z0-9]$/;
 const GHE_HOST = process.env.MOCK_GHE_HOST?.trim().toLowerCase() || undefined;
-const { createGheMock } = GHE_HOST ? await import('./mock-ghe.mjs') : {};
+const TENANT_CONFIG = parseTenantConfig(process.env.MOCK_GHE_TENANTS);
+const { createGheMock } = GHE_HOST || TENANT_CONFIG.length ? await import('./mock-ghe.mjs') : {};
 
 const PORT = Number(process.env.PORT ?? 8002);
 const INTERNAL = process.env.INTERNAL_API_TOKEN ?? 'local-pool-internal-test-only';
@@ -28,18 +41,83 @@ const callbackOrigins = process.env.MYSQL_STABILITY_FIXTURE === '1'
   ? ['http://proxy:3000', 'http://pool-lb:8081'] : ['http://proxy:3000'];
 if (!callbackOrigins.includes(proxyUrl.origin) || proxyUrl.username || proxyUrl.password || proxyUrl.pathname !== '/' || proxyUrl.search || proxyUrl.hash) throw new Error('Callback must use an isolated fixed Proxy origin');
 if (![INTERNAL, SCIM_TOKEN, SEAT_PAT, SSO_PASSWORD].every(Boolean)) throw new Error('Fixture credentials must be nonempty');
+// Login's readiness listing (GET /internal/enterprises) is forwarded only to this fixed internal origin.
+const LOGIN_READINESS_ORIGINS = ['http://login:7003'];
+const loginReadinessUrl = process.env.MOCK_LOGIN_READINESS_URL?.trim() || undefined;
+if (loginReadinessUrl && !LOGIN_READINESS_ORIGINS.includes(loginReadinessUrl)) {
+  throw new Error('Login readiness must use a fixed internal origin');
+}
 const RAW_MODEL = process.env.POOL_MOCK_MODEL ?? 'claude-opus-5.2';
-const SCIM_ROOT = '/scim/v2/enterprises/local-test/Users';
-const BILLING_ROOT = '/enterprises/local-test/copilot/billing';
 const USER_SCHEMA = 'urn:ietf:params:scim:schemas:core:2.0:User';
-const users = new Map(), seats = new Set(), tasks = new Map(), tokens = new Map();
-const ghe = GHE_HOST ? createGheMock({
-  host: GHE_HOST, port: PORT, slug: 'local-test',
-  idpSsoUrl: process.env.MOCK_GHE_IDP_SSO_URL ?? 'http://sso:7001/sso', users, tokens,
-}) : undefined;
-const inference = [];
+
+function parseTenantConfig(raw) {
+  if (!raw?.trim()) return [];
+  const value = JSON.parse(raw);
+  if (!Array.isArray(value) || value.length > 8) {
+    throw new Error('MOCK_GHE_TENANTS must be an array of at most 8 tenants');
+  }
+  return value.map((tenant) => {
+    const host = String(tenant.host ?? '').toLowerCase();
+    const secrets = [tenant.scimToken, tenant.seatPat, tenant.ssoPassword];
+    if (!/^[a-z0-9-]+\.ghe\.com$/.test(host)
+      || !/^[a-z0-9][a-z0-9-]{0,99}$/.test(String(tenant.slug ?? ''))
+      || !ENTERPRISE_ID.test(String(tenant.enterpriseId ?? ''))
+      || tenant.enterpriseId === 'default'
+      || !secrets.every((value) => typeof value === 'string' && value)) {
+      throw new Error('Invalid MOCK_GHE_TENANTS entry');
+    }
+    return { ...tenant, host };
+  });
+}
+
+/** One enterprise's GitHub side: SCIM users, seats, OAuth tokens, Login tasks, inference log and counters. */
+function createTenant({ key, slug, enterpriseId, scimToken, seatPat, ssoPassword, suffix, gheHost, port, idpSsoUrl }) {
+  const tenant = {
+    key, slug, enterpriseId, scimToken, seatPat, ssoPassword, suffix, gheHost,
+    scimRoot: `/scim/v2/enterprises/${slug}/Users`,
+    billingRoot: `/enterprises/${slug}/copilot/billing`,
+    membersPrefix: `/enterprises/${slug}/members/`,
+    users: new Map(), seats: new Set(), tasks: new Map(), tokens: new Map(), inference: [],
+    counters: {
+      scimCreates: 0,
+      scimConflicts: 0,
+      scimUpdates: 0,
+      scimDeletes: 0,
+      seatAssignments: 0,
+      taskPosts: 0,
+      callbacksSucceeded: 0,
+      callbacksFailed: 0,
+      modelLists: 0,
+    },
+    // Numeric GitHub user ids start at 1001 in every tenant on purpose: ids of different instances collide.
+    userIds: new Map(), nextUserId: 1001,
+    audit: { userLookups: 0, crossTenantTokensRejected: 0, scopedCallbacks: 0 },
+  };
+  tenant.ghe = gheHost
+    ? createGheMock({ host: gheHost, port, slug, idpSsoUrl, users: tenant.users, tokens: tenant.tokens })
+    : undefined;
+  return tenant;
+}
+
+const defaultTenant = createTenant({
+  key: 'default', slug: 'local-test', enterpriseId: 'default', scimToken: SCIM_TOKEN, seatPat: SEAT_PAT,
+  ssoPassword: SSO_PASSWORD, suffix: GHE_HOST ? '' : 'test', gheHost: GHE_HOST, port: PORT,
+  idpSsoUrl: process.env.MOCK_GHE_IDP_SSO_URL ?? 'http://sso:7001/sso',
+});
+const gheTenants = TENANT_CONFIG.map((config) => createTenant({
+  key: config.host, slug: config.slug, enterpriseId: config.enterpriseId, scimToken: config.scimToken,
+  seatPat: config.seatPat, ssoPassword: config.ssoPassword, suffix: '', gheHost: config.host,
+  port: Number(config.port ?? PORT),
+  idpSsoUrl: config.idpSsoUrl ?? `http://sso:7001/enterprises/${config.enterpriseId}/sso`,
+}));
+if (GHE_HOST && gheTenants.some((tenant) => tenant.gheHost === GHE_HOST)) {
+  throw new Error('MOCK_GHE_HOST duplicates a tenant');
+}
+const allTenants = [defaultTenant, ...gheTenants];
+// Back-compatible aliases of the single-tenant fixture.
+const { users, seats, tasks, tokens, inference, counters } = defaultTenant;
+const ghe = defaultTenant.ghe;
 const otherInference = [];
-const counters = { scimCreates: 0, scimConflicts: 0, scimUpdates: 0, scimDeletes: 0, seatAssignments: 0, taskPosts: 0, callbacksSucceeded: 0, callbacksFailed: 0, modelLists: 0 };
 let nextControl, sequence = 0;
 const stageDelay = Number(process.env.POOL_MOCK_STAGE_DELAY_MS ?? 0);
 if (!Number.isInteger(stageDelay) || stageDelay < 0 || stageDelay > 1000) throw new Error('Invalid stage delay');
@@ -85,7 +163,25 @@ function pageNumber(value, fallback, max = 1000) {
   if (!Number.isSafeInteger(number) || number < 1 || number > max) throw Object.assign(new Error('invalid_pagination'), { status: 400 });
   return number;
 }
-function scimResource(body, prior) {
+function hostnameOf(req) {
+  return (req.headers.host ?? '').replace(/:\d+$/, '').toLowerCase();
+}
+/** The tenant a request's Host belongs to, and which of its hosts it addressed; anything else is `default`. */
+function routeOf(req) {
+  const host = hostnameOf(req);
+  for (const tenant of gheTenants) {
+    if (host === tenant.gheHost) return { tenant, kind: 'web' };
+    if (host === `api.${tenant.gheHost}`) return { tenant, kind: 'api' };
+    if (host === `copilot-api.${tenant.gheHost}`) return { tenant, kind: 'copilot' };
+  }
+  return { tenant: defaultTenant, kind: 'default' };
+}
+function githubLoginOf(tenant, userName) {
+  const base = userName.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+  // GHE.com logins carry no shortcode suffix and are at most 30 characters.
+  return tenant.suffix ? `${base}_${tenant.suffix}` : base.slice(0, 30);
+}
+function scimResource(tenant, body, prior) {
   if (!safeString(body.userName) || body.active !== undefined && typeof body.active !== 'boolean') return undefined;
   const now = isoNow();
   return {
@@ -95,20 +191,23 @@ function scimResource(body, prior) {
     emails: Array.isArray(body.emails) ? body.emails.filter(email => record(email) && typeof email.value === 'string').map(email => ({ value: email.value, primary: email.primary === true, type: 'work' })) : [],
     roles: [{ value: body.roles?.[0]?.value === 'enterprise_owner' ? 'enterprise_owner' : 'user', primary: false }],
     active: body.active !== false,
-    // GHE.com logins carry no shortcode suffix and are at most 30 characters.
-    githubLogin: ghe
-      ? body.userName.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30)
-      : `${body.userName.toLowerCase().replace(/[^a-z0-9-]/g, '-')}_test`,
+    githubLogin: githubLoginOf(tenant, body.userName),
     meta: { resourceType: 'User', created: prior?.meta.created ?? now, lastModified: now },
   };
 }
-const duplicateUser = (name, except) => [...users.values()].some(user => user.id !== except && user.userName.toLowerCase() === name.toLowerCase());
-const scimReply = (res, status, user) => json(res, status, user, { 'Content-Type': 'application/scim+json', Location: `${SCIM_ROOT}/${user.id}` });
-async function scim(req, res, url) {
-  if (!authorize(req, res, SCIM_TOKEN, true)) return;
+const duplicateUser = (tenant, name, except) => [...tenant.users.values()].some(
+  user => user.id !== except && user.userName.toLowerCase() === name.toLowerCase(),
+);
+const scimReply = (tenant, res, status, user) => json(res, status, user, {
+  'Content-Type': 'application/scim+json',
+  Location: `${tenant.scimRoot}/${user.id}`,
+});
+async function scim(tenant, req, res, url) {
+  if (!authorize(req, res, tenant.scimToken, true)) return;
   const path = url.pathname;
+  const SCIM_ROOT = tenant.scimRoot;
   if (path === SCIM_ROOT && req.method === 'GET') {
-    let rows = [...users.values()];
+    let rows = [...tenant.users.values()];
     if (url.searchParams.has('filter')) {
       const match = /^userName eq ("(?:[^"\\]|\\.)*")$/.exec(url.searchParams.get('filter'));
       if (!match) return scimFailure(res, 400, 'unsupported_filter');
@@ -121,24 +220,30 @@ async function scim(req, res, url) {
     return json(res, 200, { schemas: ['urn:ietf:params:scim:api:messages:2.0:ListResponse'], totalResults: rows.length, startIndex, itemsPerPage: page.length, Resources: page }, { 'Content-Type': 'application/scim+json' });
   }
   if (path === SCIM_ROOT && req.method === 'POST') {
-    const user = scimResource(await bodyJson(req));
+    const user = scimResource(tenant, await bodyJson(req));
     if (!user) return scimFailure(res, 400, 'invalid_user');
-    if (duplicateUser(user.userName)) { counters.scimConflicts++; return scimFailure(res, 409, 'uniqueness'); }
-    users.set(user.id, user); counters.scimCreates++;
-    return scimReply(res, 201, user);
+    if (duplicateUser(tenant, user.userName)) {
+      tenant.counters.scimConflicts++;
+      return scimFailure(res, 409, 'uniqueness');
+    }
+    tenant.users.set(user.id, user);
+    tenant.counters.scimCreates++;
+    tenant.userIds.set(user.id, tenant.nextUserId++);
+    return scimReply(tenant, res, 201, user);
   }
   const id = path.startsWith(`${SCIM_ROOT}/`) ? path.slice(SCIM_ROOT.length + 1) : '';
   if (!id || id.includes('/')) return failure(res, 404, 'not_found');
-  const existing = users.get(id);
+  const existing = tenant.users.get(id);
   if (!existing) return scimFailure(res, 404, 'not_found');
-  if (req.method === 'GET') return scimReply(res, 200, existing);
+  if (req.method === 'GET') return scimReply(tenant, res, 200, existing);
   if (req.method === 'PUT') {
-    const user = scimResource(await bodyJson(req), existing);
+    const user = scimResource(tenant, await bodyJson(req), existing);
     if (!user) return scimFailure(res, 400, 'invalid_user');
-    if (duplicateUser(user.userName, id)) return scimFailure(res, 409, 'uniqueness');
-    if (user.githubLogin !== existing.githubLogin || !user.active) seats.delete(existing.githubLogin);
-    users.set(id, user); counters.scimUpdates++;
-    return scimReply(res, 200, user);
+    if (duplicateUser(tenant, user.userName, id)) return scimFailure(res, 409, 'uniqueness');
+    if (user.githubLogin !== existing.githubLogin || !user.active) tenant.seats.delete(existing.githubLogin);
+    tenant.users.set(id, user);
+    tenant.counters.scimUpdates++;
+    return scimReply(tenant, res, 200, user);
   }
   if (req.method === 'PATCH') {
     const body = await bodyJson(req);
@@ -151,47 +256,88 @@ async function scim(req, res, url) {
       updated.active = value;
     }
     updated.meta.lastModified = isoNow();
-    if (!updated.active) seats.delete(updated.githubLogin);
-    users.set(id, updated); counters.scimUpdates++;
-    return scimReply(res, 200, updated);
+    if (!updated.active) tenant.seats.delete(updated.githubLogin);
+    tenant.users.set(id, updated);
+    tenant.counters.scimUpdates++;
+    return scimReply(tenant, res, 200, updated);
   }
-  if (req.method === 'DELETE') { users.delete(id); seats.delete(existing.githubLogin); counters.scimDeletes++; return json(res, 204); }
+  if (req.method === 'DELETE') {
+    tenant.users.delete(id);
+    tenant.seats.delete(existing.githubLogin);
+    tenant.counters.scimDeletes++;
+    return json(res, 204);
+  }
   failure(res, 404, 'not_found');
 }
 function seatDetail(login) {
   return { assignee: { login }, plan_type: 'enterprise', pending_cancellation_date: null };
 }
-async function billing(req, res, url) {
-  if (!authorize(req, res, SEAT_PAT, true)) return;
+async function billing(tenant, req, res, url) {
+  if (!authorize(req, res, tenant.seatPat, true)) return;
+  const BILLING_ROOT = tenant.billingRoot;
   if (url.pathname === `${BILLING_ROOT}/seats` && req.method === 'GET') {
     const page = pageNumber(url.searchParams.get('page'), 1, 100000), perPage = pageNumber(url.searchParams.get('per_page'), 100);
-    return json(res, 200, { total_seats: seats.size, seats: [...seats].slice((page - 1) * perPage, page * perPage).map(seatDetail) });
+    return json(res, 200, {
+      total_seats: tenant.seats.size,
+      seats: [...tenant.seats].slice((page - 1) * perPage, page * perPage).map(seatDetail),
+    });
   }
   // GET /enterprises/{enterprise}/members/{username}/copilot answers with the same seats wrapper.
-  const member = url.pathname.match(/^\/enterprises\/local-test\/members\/([^/]+)\/copilot$/);
+  const member = url.pathname.startsWith(tenant.membersPrefix)
+    ? /^([^/]+)\/copilot$/.exec(url.pathname.slice(tenant.membersPrefix.length))
+    : null;
   if (member && req.method === 'GET') {
     const login = decodeURIComponent(member[1]);
-    const assigned = seats.has(login) ? [seatDetail(login)] : [];
+    const assigned = tenant.seats.has(login) ? [seatDetail(login)] : [];
     return json(res, 200, { total_seats: assigned.length, seats: assigned });
   }
   if (url.pathname === `${BILLING_ROOT}/selected_users` && ['POST', 'DELETE'].includes(req.method)) {
     const body = await bodyJson(req);
     if (!Array.isArray(body.selected_usernames) || !body.selected_usernames.length || !body.selected_usernames.every(safeString)) return failure(res, 422, 'selected_usernames_required');
-    if (!body.selected_usernames.every(login => [...users.values()].some(user => user.active && user.githubLogin === login))) return failure(res, 422, 'active_scim_login_required');
+    const activeLogin = login => [...tenant.users.values()].some(user => user.active && user.githubLogin === login);
+    if (!body.selected_usernames.every(activeLogin)) return failure(res, 422, 'active_scim_login_required');
     for (const login of body.selected_usernames) {
-      if (req.method === 'POST') { if (!seats.has(login)) counters.seatAssignments++; seats.add(login); }
-      else seats.delete(login);
+      if (req.method === 'POST') {
+        if (!tenant.seats.has(login)) tenant.counters.seatAssignments++;
+        tenant.seats.add(login);
+      }
+      else tenant.seats.delete(login);
     }
     return json(res, 201, req.method === 'POST' ? { seats_created: body.selected_usernames.length } : { seats_cancelled: body.selected_usernames.length });
   }
   failure(res, 404, 'not_found');
 }
+/** Member of a tenant's token, or undefined; a token of another tenant is counted and rejected. */
+function tokenMember(tenant, req) {
+  const auth = req.headers.authorization;
+  const token = typeof auth === 'string' && auth.startsWith('Bearer ') ? auth.slice(7) : undefined;
+  const member = token === undefined ? undefined : tenant.tokens.get(token);
+  if (!member && token !== undefined && allTenants.some(other => other !== tenant && other.tokens.has(token))) {
+    tenant.audit.crossTenantTokensRejected++;
+  }
+  return member;
+}
+/** GET /user: the GitHub subject of an OAuth token (Proxy's callback subject check, design §5.7). */
+function githubUser(tenant, req, res) {
+  tenant.audit.userLookups++;
+  const member = tokenMember(tenant, req);
+  if (!member) return failure(res, 401, 'invalid_fixture_token');
+  const user = [...tenant.users.values()].find(row => row.githubLogin === member.ghLogin);
+  if (!user) return failure(res, 404, 'unknown_fixture_user');
+  return json(res, 200, { login: user.githubLogin, id: tenant.userIds.get(user.id) ?? 1, type: 'User' });
+}
 async function callback(task) {
+  const tenant = tenantOfEnterprise(task.enterpriseId ?? 'default') ?? defaultTenant;
   const token = `local-fixture-oauth-${randomUUID()}`;
-  tokens.set(token, { identity: task.identity, ghLogin: task.ghLogin });
+  tenant.tokens.set(token, { identity: task.identity, ghLogin: task.ghLogin });
   try {
-    const target = new URL(`/internal/accounts/${encodeURIComponent(task.identity)}/copilot-oauth-token`, proxyUrl);
+    const identity = encodeURIComponent(task.identity);
+    const path = task.enterpriseId
+      ? `/internal/enterprises/${encodeURIComponent(task.enterpriseId)}/accounts/${identity}/copilot-oauth-token`
+      : `/internal/accounts/${identity}/copilot-oauth-token`;
+    const target = new URL(path, proxyUrl);
     if (!callbackOrigins.includes(target.origin)) throw new Error('forbidden_origin');
+    if (task.enterpriseId) tenant.audit.scopedCallbacks++;
     const response = await fetch(target, {
       method: 'PUT', redirect: 'error', signal: AbortSignal.timeout(8000),
       headers: { 'X-Internal-Token': INTERNAL, 'Content-Type': 'application/json' },
@@ -199,9 +345,13 @@ async function callback(task) {
     });
     await response.body?.cancel();
     if (!response.ok) throw new Error('callback_rejected');
-    counters.callbacksSucceeded++; task.status = 'success';
+    tenant.counters.callbacksSucceeded++;
+    task.status = 'success';
   } catch {
-    tokens.delete(token); counters.callbacksFailed++; task.status = 'failed'; task.error = 'local_callback_failed';
+    tenant.tokens.delete(token);
+    tenant.counters.callbacksFailed++;
+    task.status = 'failed';
+    task.error = 'local_callback_failed';
   }
   task.finishedAt = isoNow();
 }
@@ -209,34 +359,128 @@ const loginQueue = process.env.MYSQL_PROVISION_FIXTURE === '1' ? new MockLoginQu
   concurrency: Number(process.env.POOL_MOCK_LOGIN_CONCURRENCY ?? 1),
   delayMs: Number(process.env.POOL_MOCK_LOGIN_DELAY_MS ?? 50), complete: callback,
 }) : undefined;
+function tenantOfEnterprise(enterpriseId) {
+  return enterpriseId === 'default' ? defaultTenant : gheTenants.find(tenant => tenant.enterpriseId === enterpriseId);
+}
+/** Tasks created before the upgrade (no enterprise) belong to `default`, as Login's migration maps them. */
+const taskEnterprise = task => task.enterpriseId ?? 'default';
+function listTasks(res, url, rows) {
+  const q = (url.searchParams.get('q') ?? '').toLowerCase();
+  const status = url.searchParams.get('status');
+  const matchesQuery = task => `${task.identity} ${task.ssoUser} ${task.ghLogin}`.toLowerCase().includes(q);
+  rows = rows.filter(task => (!status || task.status === status) && matchesQuery(task));
+  if (['q', 'page', 'pageSize', 'status'].some(key => url.searchParams.has(key))) {
+    const page = pageNumber(url.searchParams.get('page'), 1, 100000);
+    const pageSize = pageNumber(url.searchParams.get('pageSize'), 100);
+    return json(res, 200, {
+      items: rows.slice((page - 1) * pageSize, page * pageSize),
+      total: rows.length,
+      page,
+      pageSize,
+    });
+  }
+  return json(res, 200, rows.slice(0, pageNumber(url.searchParams.get('limit'), 100)));
+}
+function acceptTask(tenant, res, body, enterpriseId) {
+  // No deduplication/adoption: accidental duplicate POSTs remain visible.
+  const task = {
+    id: randomUUID(),
+    identity: body.identity,
+    ssoUser: body.ssoUser,
+    ghLogin: body.ghLogin,
+    oauthAttemptId: body.oauthAttemptId,
+    ssoType: 'custom',
+    status: 'running',
+    attempts: 1,
+    createdAt: isoNow(),
+    startedAt: isoNow(),
+    ...(enterpriseId ? { enterpriseId } : {}),
+  };
+  tenant.tasks.set(task.id, task);
+  tenant.counters.taskPosts++;
+  if (loginQueue) loginQueue.enqueue(task);
+  json(res, 202, task);
+  if (!loginQueue) setImmediate(() => { void callback(task); });
+}
+function checkTaskBody(tenant, res, body) {
+  if (!['identity', 'ssoUser', 'ghLogin', 'oauthAttemptId'].every(key => safeString(body[key]))) {
+    failure(res, 400, 'invalid_login_task');
+    return false;
+  }
+  if (!equal(body.ssoPassword, tenant.ssoPassword)) {
+    failure(res, 401, 'invalid_sso_credentials');
+    return false;
+  }
+  const user = [...tenant.users.values()].find(
+    user => user.userName === body.ssoUser && user.githubLogin === body.ghLogin && user.active,
+  );
+  if (body.identity !== body.ssoUser || !user || !tenant.seats.has(body.ghLogin)) {
+    failure(res, 409, 'scim_and_seat_required');
+    return false;
+  }
+  return true;
+}
 async function fakeLogin(req, res, url) {
   if (!authorize(req, res, INTERNAL)) return;
   if (url.pathname === '/api/tasks' && req.method === 'POST') {
     const body = await bodyJson(req);
     if (!['identity', 'ssoUser', 'ghLogin', 'oauthAttemptId'].every(key => safeString(body[key])) || body.ssoType !== 'custom') return failure(res, 400, 'invalid_login_task');
-    if (!equal(body.ssoPassword, SSO_PASSWORD)) return failure(res, 401, 'invalid_sso_credentials');
-    const user = [...users.values()].find(user => user.userName === body.ssoUser && user.githubLogin === body.ghLogin && user.active);
-    if (body.identity !== body.ssoUser || !user || !seats.has(body.ghLogin)) return failure(res, 409, 'scim_and_seat_required');
-    // No deduplication/adoption: accidental duplicate POSTs remain visible.
-    const task = { id: randomUUID(), identity: body.identity, ssoUser: body.ssoUser, ghLogin: body.ghLogin, oauthAttemptId: body.oauthAttemptId, ssoType: body.ssoType, status: 'running', attempts: 1, createdAt: isoNow(), startedAt: isoNow() };
-    tasks.set(task.id, task); counters.taskPosts++;
-    if (loginQueue) loginQueue.enqueue(task);
-    json(res, 202, task);
-    if (!loginQueue) setImmediate(() => { void callback(task); });
-    return;
+    if (!checkTaskBody(defaultTenant, res, body)) return;
+    return acceptTask(defaultTenant, res, body);
   }
-  if (url.pathname === '/api/tasks' && req.method === 'GET') {
-    const q = (url.searchParams.get('q') ?? '').toLowerCase(), status = url.searchParams.get('status');
-    const rows = [...tasks.values()].filter(task => (!status || task.status === status) && `${task.identity} ${task.ssoUser} ${task.ghLogin}`.toLowerCase().includes(q));
-    if (['q', 'page', 'pageSize', 'status'].some(key => url.searchParams.has(key))) {
-      const page = pageNumber(url.searchParams.get('page'), 1, 100000), pageSize = pageNumber(url.searchParams.get('pageSize'), 100);
-      return json(res, 200, { items: rows.slice((page - 1) * pageSize, page * pageSize), total: rows.length, page, pageSize });
-    }
-    return json(res, 200, rows.slice(0, pageNumber(url.searchParams.get('limit'), 100)));
-  }
+  if (url.pathname === '/api/tasks' && req.method === 'GET') return listTasks(res, url, [...tasks.values()]);
   const id = url.pathname.slice('/api/tasks/'.length);
   if (url.pathname.startsWith('/api/tasks/') && req.method === 'GET' && !id.includes('/')) return tasks.has(id) ? json(res, 200, tasks.get(id)) : failure(res, 404, 'task_not_found');
   failure(res, 404, 'not_found');
+}
+/** Login's scoped task API (design §5.7): the provider comes from the enterprise, so `ssoType` may be omitted. */
+async function scopedLogin(req, res, url, match) {
+  if (!authorize(req, res, INTERNAL)) return;
+  const enterpriseId = match[1];
+  const rest = match[2] ?? '';
+  const tenant = tenantOfEnterprise(enterpriseId);
+  if (!tenant) return failure(res, 404, 'enterprise_not_found');
+  const rows = [...tenant.tasks.values()].filter(task => taskEnterprise(task) === enterpriseId);
+  if (rest === '' && req.method === 'POST') {
+    const body = await bodyJson(req);
+    if (body.ssoType !== undefined && body.ssoType !== 'custom') return failure(res, 400, 'invalid_login_task');
+    if (['ssoUrl', 'selectorOverrides', 'enterpriseId'].some(key => key in body)) {
+      return failure(res, 400, 'invalid_login_task');
+    }
+    if (!checkTaskBody(tenant, res, body)) return;
+    return acceptTask(tenant, res, body, enterpriseId);
+  }
+  if (rest === '' && req.method === 'GET') return listTasks(res, url, rows);
+  const attempt = /^by-attempt\/([^/]+)$/.exec(rest);
+  if (attempt && req.method === 'GET') {
+    const task = rows.find(row => row.oauthAttemptId === decodeURIComponent(attempt[1]));
+    return task ? json(res, 200, task) : failure(res, 404, 'task_not_found');
+  }
+  if (/^[^/]+$/.test(rest) && req.method === 'GET') {
+    const task = rows.find(row => row.id === rest);
+    return task ? json(res, 200, task) : failure(res, 404, 'task_not_found');
+  }
+  failure(res, 404, 'not_found');
+}
+/** Proxy reads Login's readiness through LOGIN_BASE_URL (this fixture); the real Login answers it. */
+async function loginReadiness(req, res) {
+  if (!authorize(req, res, INTERNAL)) return;
+  try {
+    const response = await fetch(`${loginReadinessUrl}/internal/enterprises`, {
+      headers: { 'X-Internal-Token': INTERNAL, Accept: 'application/json' },
+      redirect: 'error',
+      signal: AbortSignal.timeout(5000),
+    });
+    const text = await response.text();
+    if (text.length > 64 * 1024) return failure(res, 502, 'login_readiness_too_large');
+    res.writeHead(response.status, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+    });
+    res.end(text);
+  } catch {
+    failure(res, 503, 'login_readiness_unavailable');
+  }
 }
 function parseControl(value, marker = false) {
   if (!record(value) || Object.keys(value).some(key => !['status', 'retryAfter', 'streamMode', ...(process.env.MYSQL_STABILITY_FIXTURE === '1' ? ['delayMs'] : []), ...(marker ? ['id'] : [])].includes(key))) throw Object.assign(new Error('invalid_control'), { status: 400 });
@@ -315,12 +559,11 @@ async function stream(res, path, data, control, log) {
   }
   end(control.streamMode === 'error' ? 'in_band_error' : 'complete');
 }
-async function upstream(req, res, url) {
-  const auth = req.headers.authorization;
-  const member = typeof auth === 'string' && auth.startsWith('Bearer ') ? tokens.get(auth.slice(7)) : undefined;
+async function upstream(tenant, req, res, url) {
+  const member = tokenMember(tenant, req);
   if (!member) return failure(res, 401, 'invalid_fixture_token');
   if (url.pathname === '/models' && req.method === 'GET') {
-    counters.modelLists++;
+    tenant.counters.modelLists++;
     return json(res, 200, { object: 'list',       data: [...new Set([RAW_MODEL, 'claude-opus-5.2'])].map(id => ({ id, object: 'model', name: 'Local fixture model', vendor: 'Anthropic', capabilities: { type: 'chat', endpoints: ['/v1/messages', '/chat/completions', '/responses'] } })) });
   }
   if (url.pathname === '/v1/messages/count_tokens' && req.method === 'POST') { await bodyJson(req); return json(res, 200, { input_tokens: 4 }); }
@@ -330,8 +573,8 @@ async function upstream(req, res, url) {
   const marker = bodyControl(body), control = marker ?? nextControl ?? parseControl({});
   if (!marker) nextControl = undefined;
   const log = { seq: ++sequence, identity: member.identity, path: url.pathname, model: body.model, stream: body.stream === true, marker: marker?.id ?? null, status: control.status, streamMode: control.streamMode, startedAt: Date.now(), endedAt: null, outcome: 'pending' };
-  inference.push(log);
-  if (inference.length > 10000) inference.shift();
+  tenant.inference.push(log);
+  if (tenant.inference.length > 10000) tenant.inference.shift();
   res.once('close', () => { if (log.outcome === 'pending') { log.outcome = 'cancelled'; log.endedAt = Date.now(); } });
   if (control.status !== 200) {
     log.outcome = 'http_error'; log.endedAt = Date.now();
@@ -344,6 +587,45 @@ async function upstream(req, res, url) {
   if (control.streamMode !== 'success') return failure(res, 400, 'stream_mode_requires_stream');
   log.outcome = 'complete'; log.endedAt = Date.now();
   return json(res, 200, data);
+}
+const UPSTREAM_PATHS = ['/models', '/v1/messages', '/v1/messages/count_tokens', '/chat/completions', '/responses'];
+/** A GHE.com tenant answers only on its own hosts: web pages, the REST API (SCIM, seats, /user) or Copilot. */
+async function tenantRequest(tenant, kind, req, res, url) {
+  if (kind === 'web') return await tenant.ghe.handle(req, res, url);
+  if (kind === 'api') {
+    tenant.ghe.recordHost('api', req);
+    if (url.pathname === tenant.scimRoot || url.pathname.startsWith(`${tenant.scimRoot}/`)) {
+      return await scim(tenant, req, res, url);
+    }
+    if (url.pathname.startsWith(`${tenant.billingRoot}/`) || url.pathname.startsWith(tenant.membersPrefix)) {
+      return await billing(tenant, req, res, url);
+    }
+    if (url.pathname === '/user' && req.method === 'GET') return githubUser(tenant, req, res);
+    return failure(res, 404, 'not_found');
+  }
+  tenant.ghe.recordHost('copilot', req);
+  if (UPSTREAM_PATHS.includes(url.pathname)) return await upstream(tenant, req, res, url);
+  failure(res, 404, 'not_found');
+}
+function tenantState(tenant) {
+  return {
+    enterpriseId: tenant.enterpriseId,
+    slug: tenant.slug,
+    host: tenant.gheHost ?? null,
+    counters: tenant.counters,
+    audit: tenant.audit,
+    users: [...tenant.users.values()].map(({ id, userName, githubLogin, active }) => ({
+      id,
+      userName,
+      githubLogin,
+      active,
+      githubId: tenant.userIds.get(id) ?? null,
+    })),
+    seats: [...tenant.seats],
+    tasks: [...tenant.tasks.values()],
+    inference: tenant.inference,
+    ghe: tenant.ghe && tenant !== defaultTenant ? tenant.ghe.evidence : undefined,
+  };
 }
 const server = http.createServer(async (req, res) => {
   try {
@@ -363,7 +645,30 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/test/state' && req.method === 'GET') {
       if (!authorize(req, res, INTERNAL)) return;
-      return json(res, 200, { fixture: true, counters, concurrency, loginQueue: loginQueue?.snapshot() ?? null, users: [...users.values()].map(({ id, userName, githubLogin, active }) => ({ id, userName, githubLogin, active })), seats: [...seats], tasks: [...tasks.values()], inference, otherInference, nextControl: nextControl ?? null });
+      const tenantsEvidence = gheTenants.length
+        ? {
+          audit: defaultTenant.audit,
+          tenants: Object.fromEntries(gheTenants.map(tenant => [tenant.enterpriseId, tenantState(tenant)])),
+        }
+        : {};
+      return json(res, 200, {
+        fixture: true,
+        counters,
+        concurrency,
+        loginQueue: loginQueue?.snapshot() ?? null,
+        users: [...users.values()].map(({ id, userName, githubLogin, active }) => ({
+          id,
+          userName,
+          githubLogin,
+          active,
+        })),
+        seats: [...seats],
+        tasks: [...tasks.values()],
+        inference,
+        otherInference,
+        nextControl: nextControl ?? null,
+        ...tenantsEvidence,
+      });
     }
     if (url.pathname === '/test/control' && req.method === 'POST') {
       if (!authorize(req, res, INTERNAL)) return;
@@ -387,18 +692,27 @@ const server = http.createServer(async (req, res) => {
       res.once('close', complete);
       await new Promise(resolve => setTimeout(resolve, stageDelay));
     }
-    if (url.pathname === SCIM_ROOT || url.pathname.startsWith(`${SCIM_ROOT}/`)) {
+    const { tenant, kind } = routeOf(req);
+    if (tenant !== defaultTenant) return await tenantRequest(tenant, kind, req, res, url);
+    if (url.pathname === defaultTenant.scimRoot || url.pathname.startsWith(`${defaultTenant.scimRoot}/`)) {
       ghe?.recordHost('scim', req);
-      return await scim(req, res, url);
+      return await scim(defaultTenant, req, res, url);
     }
-    if (url.pathname.startsWith(`${BILLING_ROOT}/`) || url.pathname.startsWith('/enterprises/local-test/members/')) {
+    if (url.pathname.startsWith(`${defaultTenant.billingRoot}/`)
+      || url.pathname.startsWith(defaultTenant.membersPrefix)) {
       ghe?.recordHost('seats', req);
-      return await billing(req, res, url);
+      return await billing(defaultTenant, req, res, url);
     }
+    if (url.pathname === '/user' && req.method === 'GET') return githubUser(defaultTenant, req, res);
     if (url.pathname === '/api/tasks' || url.pathname.startsWith('/api/tasks/')) return await fakeLogin(req, res, url);
-    if (['/models', '/v1/messages', '/v1/messages/count_tokens', '/chat/completions', '/responses'].includes(url.pathname)) {
+    const scopedTasks = /^\/api\/enterprises\/([^/]+)\/tasks(?:\/(.+))?$/.exec(url.pathname);
+    if (scopedTasks && ENTERPRISE_ID.test(scopedTasks[1])) return await scopedLogin(req, res, url, scopedTasks);
+    if (loginReadinessUrl && url.pathname === '/internal/enterprises' && req.method === 'GET') {
+      return await loginReadiness(req, res);
+    }
+    if (UPSTREAM_PATHS.includes(url.pathname)) {
       ghe?.recordHost('copilot', req);
-      return await upstream(req, res, url);
+      return await upstream(defaultTenant, req, res, url);
     }
     failure(res, 404, 'not_found');
   } catch (error) {

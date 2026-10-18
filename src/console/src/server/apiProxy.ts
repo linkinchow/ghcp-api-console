@@ -1,15 +1,21 @@
 import type { Request, Response } from 'express';
 import { apiError, errorFields, INTERNAL_AUTH_HEADER, loggerFor } from '@ghcp/shared';
 import { config } from './config.js';
+import { isSameOriginWrite, rejectCrossSite } from './sameOrigin.js';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
 const logger = loggerFor('console', 'api-proxy');
 /** Models lookups wait on GitHub and Copilot; bound them a little above Proxy's own 35 s deadline. */
 const MODELS_READ_TIMEOUT_MS = 40_000;
+const MODELS_PATH = /^(?:\/enterprises\/[^/?]+)?\/models(?:\?|$)/;
 
 export function serviceProxy(target: 'proxy' | 'sso' | 'login', mountPath: string) {
   return async (req: Request, res: Response): Promise<void> => {
+    if (!isSameOriginWrite(req)) {
+      rejectCrossSite(res);
+      return;
+    }
     const baseUrl = targetBaseUrl(target);
     const suffix = req.originalUrl.slice(mountPath.length) || '/';
     const url = `${baseUrl.replace(/\/+$/, '')}/api${suffix}`;
@@ -35,7 +41,7 @@ export function serviceProxy(target: 'proxy' | 'sso' | 'login', mountPath: strin
     const controller = new AbortController();
     const abort = () => { if (!res.writableEnded) controller.abort(); };
     res.once('close', abort);
-    const isModelsRead = target === 'proxy' && req.method === 'GET' && /^\/models(?:\?|$)/.test(suffix);
+    const isModelsRead = target === 'proxy' && req.method === 'GET' && MODELS_PATH.test(suffix);
     const modelsTimeout = isModelsRead ? setTimeout(() => controller.abort(), MODELS_READ_TIMEOUT_MS) : undefined;
     modelsTimeout?.unref();
     logger.info('proxy-request', 'Forwarding console API request', {

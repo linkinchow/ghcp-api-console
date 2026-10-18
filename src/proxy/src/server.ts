@@ -1,6 +1,6 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import type { Server } from 'node:http';
-import { installGracefulShutdown, managementErrorHandler, shouldRedact } from '@ghcp/shared';
+import { installGracefulShutdown, managementErrorHandler, releaseLine, shouldRedact } from '@ghcp/shared';
 import { config } from './config.js';
 import { closeStorage, initializeStorage, pingStorage } from './db/connection.js';
 import { pruneAllRequestStats } from './db/requestStatsRepo.js';
@@ -31,7 +31,7 @@ export function buildApp(): express.Express {
   app.use(captureRawRequestBody);
   app.use(express.json({ limit: '20mb' }));
   app.get('/healthz', (_req, res) => {
-    res.json({ status: 'ok', service: 'proxy' });
+    res.json({ status: 'ok', service: 'proxy', releaseLine: releaseLine() });
   });
   app.get('/readyz', async (_req, res) => {
     try {

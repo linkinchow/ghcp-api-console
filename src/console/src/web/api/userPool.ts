@@ -1,9 +1,10 @@
 import { api } from './client.js';
+import { enterprisePath } from './enterprises.js';
 
+/** Global pool settings; each enterprise's account cap lives in its pool policy. */
 export interface UserPoolSettings {
   version: number;
   idle_target: number;
-  max_accounts: number;
   lease_seconds: number;
   paused: number;
 }
@@ -60,47 +61,68 @@ export interface UserPoolLimits {
   minLeaseSeconds: number;
   maxLeaseSeconds: number;
 }
+/** `GET /user-pool/overview`: process-wide settings and counts across every enterprise. */
 export interface UserPoolOverview {
   enabled: true;
   poolId: 'default';
   observedAt: number;
   settings: UserPoolSettings;
   counts: UserPoolCounts;
-  accounts: UserPoolAccount[];
-  leases: UserPoolLease[];
-  events: UserPoolEvent[];
   limits: UserPoolLimits;
   listLimits: { accounts: number; leases: number; events: number };
 }
-export type UserPoolAccountAction = 'disable' | 'resume' | 'retry';
-const BASE = '/api/console/proxy/user-pool';
-
-export function getUserPoolSummary(signal?: AbortSignal): Promise<UserPoolOverview> {
-  return api<UserPoolOverview>(`${BASE}/summary`, { signal, cache: 'no-store' });
+/** `GET /enterprises/:id/user-pool/summary`: one enterprise's member counts. */
+export interface EnterprisePoolSummary {
+  enabled: true;
+  enterpriseId: string;
+  observedAt: number;
+  counts: UserPoolCounts;
+  listLimits: { accounts: number; leases: number; events: number };
 }
+export type UserPoolAccountAction = 'disable' | 'resume' | 'retry';
 export interface UserPoolPageResult {
   items: Array<UserPoolAccount | UserPoolLease | UserPoolEvent>;
   total: number;
   page: number;
   pageSize: number;
 }
-export function getUserPoolPage(kind: 'accounts' | 'leases' | 'events', page: number, pageSize: number,
-  q: string, state: string, signal?: AbortSignal): Promise<UserPoolPageResult> {
-  const query = new URLSearchParams({ page: String(page), pageSize: String(pageSize), q, state });
-  return api(`${BASE}/page/${kind}?${query}`, { signal, cache: 'no-store' });
+
+/** Settings, the overview and reconcile are global; members, leases and events need an enterprise. */
+const GLOBAL = '/api/console/proxy/user-pool';
+
+function scoped(enterpriseId: string): string {
+  return `${enterprisePath('proxy', enterpriseId)}/user-pool`;
 }
+
 export function getUserPoolOverview(signal?: AbortSignal): Promise<UserPoolOverview> {
-  return api<UserPoolOverview>(BASE, { signal, cache: 'no-store' });
+  return api<UserPoolOverview>(`${GLOBAL}/overview`, { signal, cache: 'no-store' });
 }
-export function updateUserPoolSettings(expectedVersion: number, changes: Partial<UserPoolSettingsChanges>): Promise<UserPoolSettings> {
-  return api<UserPoolSettings>(`${BASE}/settings`, { method: 'PATCH', body: JSON.stringify({ expectedVersion, changes }) });
+export function updateUserPoolSettings(
+  expectedVersion: number,
+  changes: Partial<UserPoolSettingsChanges>,
+): Promise<UserPoolSettings> {
+  const body = JSON.stringify({ expectedVersion, changes });
+  return api<UserPoolSettings>(`${GLOBAL}/settings`, { method: 'PATCH', body });
 }
 export function reconcileUserPool(): Promise<{ scheduled: true }> {
-  return api(`${BASE}/reconcile`, { method: 'POST' });
+  return api(`${GLOBAL}/reconcile`, { method: 'POST' });
 }
-export function updateUserPoolAccount(identity: string, action: UserPoolAccountAction): Promise<{ accepted: true }> {
-  return api(`${BASE}/accounts/${encodeURIComponent(identity)}/${action}`, { method: 'POST' });
+export function getEnterprisePoolSummary(enterpriseId: string, signal?: AbortSignal): Promise<EnterprisePoolSummary> {
+  return api<EnterprisePoolSummary>(`${scoped(enterpriseId)}/summary`, { signal, cache: 'no-store' });
 }
-export function releaseUserPoolLease(leaseId: string): Promise<{ released: true }> {
-  return api(`${BASE}/leases/${encodeURIComponent(leaseId)}/release`, { method: 'POST', body: JSON.stringify({ confirm: true }) });
+export function getUserPoolPage(enterpriseId: string, kind: 'accounts' | 'leases' | 'events', page: number,
+  pageSize: number, q: string, state: string, signal?: AbortSignal): Promise<UserPoolPageResult> {
+  const query = new URLSearchParams({ page: String(page), pageSize: String(pageSize), q, state });
+  return api(`${scoped(enterpriseId)}/page/${kind}?${query}`, { signal, cache: 'no-store' });
+}
+export function updateUserPoolAccount(
+  enterpriseId: string,
+  identity: string,
+  action: UserPoolAccountAction,
+): Promise<{ accepted: true }> {
+  return api(`${scoped(enterpriseId)}/accounts/${encodeURIComponent(identity)}/${action}`, { method: 'POST' });
+}
+export function releaseUserPoolLease(enterpriseId: string, leaseId: string): Promise<{ released: true }> {
+  const path = `${scoped(enterpriseId)}/leases/${encodeURIComponent(leaseId)}/release`;
+  return api(path, { method: 'POST', body: JSON.stringify({ confirm: true }) });
 }

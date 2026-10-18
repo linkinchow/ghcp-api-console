@@ -1,38 +1,36 @@
 import type {
-  AiCreditsUsageDto, BatchResult, ImportCopilotOauthTokenRow, ImportEmuPlanDto,
-  ImportEmuUserRow, ImportEmuUserStatus, LoginRuntimeSettingsDto, LoginRuntimeSettingsValues,
-  LoginTaskDto, ManagementSummary, ProxyAccountDto, ProxyErrorDiagnosticDetailDto,
-  ProxyErrorDiagnosticsListResponse, ProxyErrorDiagnosticSummaryDto, ProxyRequestStatDto,
-  SsoRuntimeSettingsDto, SsoRuntimeSettingsValues, SsoType, SsoUserCapacityDto, SsoUserDto,
+  BatchResult, ImportCopilotOauthTokenRow, ImportEmuPlanDto, ImportEmuUserRow, ImportEmuUserStatus,
+  LoginTaskDto, ProxyAccountDto, ProxyRequestStatDto, SsoType, SsoUserCapacityDto, SsoUserDto,
 } from '@ghcp/shared';
-import { useEffect, useId, useRef, useState, type FormEvent, type InputHTMLAttributes, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import {
-  Activity, AlertTriangle, BarChart3, Boxes, Eye, EyeOff, KeyRound, Layers, LayoutDashboard, ListChecks,
+  Activity, AlertTriangle, BarChart3, Boxes, Building2, Eye, EyeOff, KeyRound, Layers, LayoutDashboard, ListChecks,
   Loader2, Lock, LogOut, RefreshCw, Settings as SettingsIcon, ShieldCheck, UserRound, Users, Wallet,
 } from 'lucide-react';
-import { api, ConsoleApiError } from './api/client.js';
-import { getLoginRuntimeSettings, listLoginTasks, updateLoginRuntimeSettings } from './api/login.js';
-import { clearErrorDiagnostics, downloadErrorDiagnostic, getErrorDiagnostic, getProxyAccount, importCopilotOauthTokens, listRequestStats, reauthorizeCopilotOauth } from './api/proxy.js';
+import { api } from './api/client.js';
+import { DEFAULT_ENTERPRISE, isEnterpriseId } from './api/enterprises.js';
+import { loginPath } from './api/login.js';
+import {
+  getProxyAccount, importCopilotOauthTokens, listRequestStats, proxyPath, reauthorizeCopilotOauth,
+} from './api/proxy.js';
 import {
   applyEmuImportPlan,
   createEmuImportPlan,
   createSsoUser,
   deleteEmuImportPlan,
-  getSsoRuntimeSettings,
   getSsoUserCapacity,
   importSsoUsers,
   listEmuImportPlanRows,
   patchSsoUser,
-  readAiCreditsUsage,
-  refreshAiCreditsUsage,
   runSsoUserBatch,
-  updateSsoRuntimeSettings,
+  ssoPath,
 } from './api/sso.js';
 import { LoginTaskDetails, QueueOverview } from './components/LoginTaskDetails.js';
-import { CopyValue, ManagedList, resetManagedListState } from './components/ManagedList.js';
+import { clearListSelections, CopyValue, ManagedList, resetManagedListState } from './components/ManagedList.js';
+import { ErrorState, Info, LoadingState } from './components/PageState.js';
 import { Badge } from './components/ui/badge.js';
-import { Button, ButtonLink } from './components/ui/button.js';
-import { Card, CardDescription, CardTitle } from './components/ui/card.js';
+import { Button } from './components/ui/button.js';
+import { Card, CardTitle } from './components/ui/card.js';
 import { ConfirmDialog, Dialog } from './components/ui/dialog.js';
 import { Checkbox } from './components/ui/checkbox.js';
 import { Dropdown } from './components/ui/dropdown.js';
@@ -42,34 +40,82 @@ import { Select } from './components/ui/select.js';
 import { Table, Th, Td } from './components/ui/table.js';
 import { Textarea } from './components/ui/textarea.js';
 import { formatCopilotSeat, formatDate, formatNumber, statusTone, tokenTotal } from './lib/format.js';
+import { hashFor, readHash } from './lib/hashState.js';
+import { EnterpriseScopeContext, scopeText, useEnterpriseScope, type EnterpriseScope } from './lib/scope.js';
 import { RequestFailure } from './components/RequestFailure.js';
+import { AiCreditsUsagePage } from './pages/AiCreditsUsagePage.js';
+import { DashboardPage } from './pages/DashboardPage.js';
+import { EnterprisePoolPage } from './pages/EnterprisePoolPage.js';
+import { EnterpriseSelector, useEnterpriseList, type EnterpriseListState } from './pages/EnterpriseSelector.js';
+import { ErrorDiagnosticsPage } from './pages/ErrorDiagnosticsPage.js';
 import { ModelsPage } from './pages/ModelsPage.js';
+import { SettingsPage } from './pages/SettingsPage.js';
 import { UserPoolPage } from './pages/UserPoolPage.js';
 
 interface SetupState {
   initialized: boolean;
 }
 
-type Page = 'dashboard' | 'users' | 'budgets' | 'stats' | 'accounts' | 'models' | 'user-pool' | 'tasks' | 'settings' | 'error-diagnostics' | 'diagnostics';
+type Page = 'dashboard' | 'users' | 'budgets' | 'stats' | 'accounts' | 'models' | 'pool-overview' | 'user-pool'
+  | 'tasks' | 'settings' | 'error-diagnostics' | 'diagnostics';
+/** `enterprise` pages remount per enterprise; `mixed` pages hold global and per-enterprise sections. */
+type PageScope = 'enterprise' | 'global' | 'mixed';
 type Notify = (message: string, tone?: 'success' | 'warning' | 'error') => void;
+interface PageEntry { id: Page; label: string; description: string; icon: typeof LayoutDashboard; scope: PageScope }
 const pageViews = new Map<Page, string>();
 const EMU_IMPORT_ROW_STATUSES: (ImportEmuUserStatus | '')[] = ['', 'pending_create', 'pending_update', 'created', 'updated', 'skipped', 'conflict', 'failed'];
 
 
-const pages: { id: Page; label: string; description: string; icon: typeof LayoutDashboard }[] = [
-  { id: 'dashboard', label: 'Dashboard', description: 'Health, failures, and top operational signals.', icon: LayoutDashboard },
-  { id: 'users', label: 'SSO Users', description: 'Create, import, sync, suspend, and manage SSO accounts.', icon: Users },
-  { id: 'budgets', label: 'AI Credits Usage', description: 'Review enterprise AI Credits consumption and Copilot seat cost.', icon: Wallet },
-  { id: 'stats', label: 'Request Stats', description: 'Review request failures and input/output/cache token usage.', icon: BarChart3 },
-  { id: 'accounts', label: 'Proxy Accounts', description: 'Inspect identity mappings and refresh GitHub or Copilot tokens.', icon: KeyRound },
-  { id: 'models', label: 'Models', description: 'Browse the Copilot model catalog of the configured GitHub enterprise admin.', icon: Boxes },
-  { id: 'user-pool', label: 'User pool', description: 'Manage idle capacity, exclusive caller leases, and account recovery.', icon: Layers },
-  { id: 'tasks', label: 'Login Tasks', description: 'Monitor automatic login and GitHub-token refresh tasks.', icon: ListChecks },
-  { id: 'settings', label: 'Settings', description: 'Change the Console password and update runtime service settings.', icon: SettingsIcon },
-  { id: 'error-diagnostics', label: 'Error Diagnostics', description: 'Inspect complete Copilot upstream failure snapshots.', icon: AlertTriangle },
-  { id: 'diagnostics', label: 'Diagnostics', description: 'Check console-to-service API connectivity.', icon: Activity },
+const pages: PageEntry[] = [
+  {
+    id: 'dashboard', label: 'Dashboard', scope: 'global', icon: LayoutDashboard,
+    description: 'Health and signals of every enterprise.',
+  },
+  {
+    id: 'users', label: 'SSO Users', scope: 'enterprise', icon: Users,
+    description: 'Create, import, sync, suspend, and manage SSO accounts.',
+  },
+  {
+    id: 'budgets', label: 'AI Credits Usage', scope: 'enterprise', icon: Wallet,
+    description: 'Review enterprise AI Credits consumption and Copilot seat cost.',
+  },
+  {
+    id: 'stats', label: 'Request Stats', scope: 'enterprise', icon: BarChart3,
+    description: 'Review request failures and input/output/cache token usage.',
+  },
+  {
+    id: 'accounts', label: 'Proxy Accounts', scope: 'enterprise', icon: KeyRound,
+    description: 'Inspect identity mappings and refresh GitHub or Copilot tokens.',
+  },
+  {
+    id: 'models', label: 'Models', scope: 'enterprise', icon: Boxes,
+    description: 'Browse the Copilot model catalog of the enterprise admin.',
+  },
+  {
+    id: 'pool-overview', label: 'Pool overview', scope: 'global', icon: Building2,
+    description: 'Global pool settings, enterprise caps and lifecycle.',
+  },
+  {
+    id: 'user-pool', label: 'Pool members', scope: 'enterprise', icon: Layers,
+    description: 'Manage pool accounts, exclusive caller leases, and account recovery.',
+  },
+  {
+    id: 'tasks', label: 'Login Tasks', scope: 'enterprise', icon: ListChecks,
+    description: 'Monitor automatic login and GitHub-token refresh tasks.',
+  },
+  {
+    id: 'settings', label: 'Settings', scope: 'mixed', icon: SettingsIcon,
+    description: 'Change the Console password and update runtime service settings.',
+  },
+  {
+    id: 'error-diagnostics', label: 'Error Diagnostics', scope: 'global', icon: AlertTriangle,
+    description: 'Inspect complete Copilot upstream failure snapshots.',
+  },
+  {
+    id: 'diagnostics', label: 'Diagnostics', scope: 'mixed', icon: Activity,
+    description: 'Check console-to-service API connectivity.',
+  },
 ];
-
 export function App() {
   const [initialized, setInitialized] = useState<boolean | undefined>();
   const [authed, setAuthed] = useState(false);
@@ -183,10 +229,69 @@ function AuthScreen(props: { children: ReactNode }) {
   );
 }
 
+interface Location {
+  page: Page;
+  /** From the hash; the UI shows `default` when it is absent. */
+  enterpriseId: string;
+}
+
+/** Neither field while the enterprise list is still loading. */
+type ScopeResolution = { scope?: EnterpriseScope; problem?: string };
+
+function readLocation(): Location {
+  const state = readHash(window.location.hash);
+  const page = pages.some((entry) => entry.id === state.page) ? state.page as Page : 'dashboard';
+  return { page, enterpriseId: state.enterpriseId ?? DEFAULT_ENTERPRISE };
+}
+
+/** The selected enterprise, never replaced by another one: an unknown id blocks the scoped page. */
+function resolveScope(id: string, enterprises: EnterpriseListState): ScopeResolution {
+  if (!isEnterpriseId(id)) return { problem: `"${id}" is not a valid enterprise ID. Choose an enterprise.` };
+  if (!enterprises.list && !enterprises.error) return {};
+  const item = enterprises.list?.items.find((entry) => entry.id === id);
+  if (item) return { scope: { id, slug: item.slug, displayName: item.displayName } };
+  if (enterprises.list) return { problem: `Enterprise "${id}" is not configured in Proxy. Choose an enterprise.` };
+  return { scope: { id, slug: null, displayName: id } };
+}
+
+const PAGE_VIEWS: Record<Page, (notify: Notify) => ReactNode> = {
+  dashboard: () => <DashboardPage />,
+  users: (notify) => <UsersPage notify={notify} />,
+  budgets: (notify) => <AiCreditsUsagePage notify={notify} />,
+  stats: () => <RequestStatsPage />,
+  accounts: (notify) => <ProxyAccountsPage notify={notify} />,
+  models: (notify) => <ModelsPage notify={notify} />,
+  'pool-overview': (notify) => <EnterprisePoolPage notify={notify} />,
+  'user-pool': (notify) => <UserPoolPage notify={notify} />,
+  tasks: (notify) => <LoginTasksPage notify={notify} />,
+  settings: (notify) => <SettingsPage notify={notify} />,
+  'error-diagnostics': (notify) => <ErrorDiagnosticsPage notify={notify} />,
+  diagnostics: () => <DiagnosticsPage />,
+};
+
+/**
+ * Scoped pages are keyed by `${enterpriseId}:${page}`, so switching enterprise unmounts the old page: its reads are
+ * aborted and late responses are dropped. Settings keeps its global cards and keys its SSO card itself.
+ */
+function PageContent(props: { entry: PageEntry; resolution: ScopeResolution; notify: Notify }) {
+  const { entry, resolution } = props;
+  const content = PAGE_VIEWS[entry.id](props.notify);
+  if (entry.scope === 'global') return <>{content}</>;
+  if (resolution.problem) return <ErrorState message={resolution.problem} />;
+  if (!resolution.scope) return <LoadingState label="Loading enterprises..." />;
+  const key = entry.id === 'settings' ? entry.id : `${resolution.scope.id}:${entry.id}`;
+  return (
+    <EnterpriseScopeContext.Provider key={key} value={resolution.scope}>{content}</EnterpriseScopeContext.Provider>
+  );
+}
+
 function AdminApp(props: { onLogout: () => void }) {
-  const [page, setPage] = useState<Page>(() => readPageFromHash());
+  const [location, setLocation] = useState<Location>(() => readLocation());
   const [toast, setToast] = useState<{ message: string; tone: 'success' | 'warning' | 'error' }>();
   const header = useRef<HTMLElement>(null);
+  const enterprises = useEnterpriseList();
+  const { page, enterpriseId } = location;
+  const lastEnterprise = useRef(enterpriseId);
 
   useEffect(() => {
     const element = header.current;
@@ -200,11 +305,14 @@ function AdminApp(props: { onLogout: () => void }) {
 
   useEffect(() => {
     const onHash = () => {
-      const next = readPageFromHash();
-      pageViews.set(next, window.location.hash);
-      setPage(next);
+      const next = readLocation();
+      // Selections are drafts of one enterprise, whichever way the hash changed.
+      if (next.enterpriseId !== lastEnterprise.current) clearListSelections();
+      lastEnterprise.current = next.enterpriseId;
+      pageViews.set(next.page, window.location.hash);
+      setLocation(next);
     };
-    pageViews.set(readPageFromHash(), window.location.hash);
+    pageViews.set(readLocation().page, window.location.hash);
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, []);
@@ -219,12 +327,19 @@ function AdminApp(props: { onLogout: () => void }) {
   }, [toast]);
 
   const navigate = (next: Page) => {
-    window.location.hash = pageViews.get(next) ?? next;
-    setPage(next);
+    const saved = pageViews.get(next);
+    const keep = saved !== undefined && (readHash(saved).enterpriseId ?? DEFAULT_ENTERPRISE) === enterpriseId;
+    window.location.hash = keep ? saved : hashFor(next, enterpriseId);
+    setLocation(readLocation());
+  };
+  // A new enterprise starts the page from a clean hash: list filters and drafts belong to the old one.
+  const selectEnterprise = (next: string) => {
+    window.location.hash = hashFor(page, next);
   };
 
   const current = pages.find((entry) => entry.id === page) ?? pages[0]!;
   const CurrentIcon = current.icon;
+  const resolution = resolveScope(enterpriseId, enterprises);
   return (
     <div className="console-admin min-h-screen bg-slate-50"><NotificationProvider>
       <aside className="fixed inset-y-0 left-0 hidden w-64 border-r border-slate-200 bg-white p-4 lg:block">
@@ -264,26 +379,20 @@ function AdminApp(props: { onLogout: () => void }) {
               </div>
               <p className="text-sm text-slate-600">{current.description}</p>
             </div>
-            <div className="flex flex-wrap gap-2">
+            <div className="flex min-w-0 flex-wrap gap-2">
+              {current.scope === 'global' ? null : (
+                <EnterpriseSelector items={enterprises.list?.items} value={enterpriseId} onChange={selectEnterprise} />
+              )}
               <Select aria-label="Management page" className="max-w-full lg:hidden" value={page} onChange={(event) => navigate(event.target.value as Page)}>
                 {pages.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
               </Select>
               <Button variant="secondary" onClick={async () => { await api('/api/console/logout', { method: 'POST' }); resetManagedListState(); props.onLogout(); }}><LogOut size={16} /> Logout</Button>
             </div>
           </div>
+          {enterprises.error && current.scope !== 'global' ? <EnterpriseListWarning error={enterprises.error} /> : null}
         </header>
         <main className="min-w-0 p-4 lg:p-6">
-          {page === 'dashboard' ? <DashboardPage notify={notify} /> : null}
-          {page === 'users' ? <UsersPage notify={notify} /> : null}
-          {page === 'budgets' ? <AiCreditsUsagePage notify={notify} /> : null}
-          {page === 'stats' ? <RequestStatsPage /> : null}
-          {page === 'accounts' ? <ProxyAccountsPage notify={notify} /> : null}
-          {page === 'models' ? <ModelsPage notify={notify} /> : null}
-          {page === 'user-pool' ? <UserPoolPage notify={notify} /> : null}
-          {page === 'tasks' ? <LoginTasksPage notify={notify} /> : null}
-          {page === 'settings' ? <SettingsPage notify={notify} /> : null}
-          {page === 'error-diagnostics' ? <ErrorDiagnosticsPage notify={notify} /> : null}
-          {page === 'diagnostics' ? <DiagnosticsPage /> : null}
+          <PageContent entry={current} resolution={resolution} notify={notify} />
         </main>
       </div>
       {toast ? <Notification tone={toast.tone} onClose={() => setToast(undefined)}>{toast.message}</Notification> : null}
@@ -291,63 +400,16 @@ function AdminApp(props: { onLogout: () => void }) {
   );
 }
 
-function DashboardPage(_props: { notify: Notify }) {
-  const [accounts, setAccounts] = useState<ManagementSummary>();
-  const [users, setUsers] = useState<ManagementSummary>();
-  const [taskSummary, setTaskSummary] = useState<ManagementSummary>();
-  const [tasks, setTasks] = useState<LoginTaskDto[]>([]);
-  const [stats, setStats] = useState<ProxyRequestStatDto[]>([]);
-  const [errors, setErrors] = useState<Record<string, string>>({});
-  const [loading, setLoading] = useState(true);
-  const [revision, setRevision] = useState(0);
-  const [checkedAt, setCheckedAt] = useState<string>();
-  useEffect(() => {
-    let mounted = true;
-    setLoading(true);
-    void Promise.allSettled([
-      api<ManagementSummary>('/api/console/proxy/accounts/summary'),
-      api<ManagementSummary>('/api/console/sso/users/summary'),
-      api<ManagementSummary>('/api/console/login-service/tasks/summary'),
-      listLoginTasks(20),
-      listRequestStats({ limit: 100 }),
-    ]).then(([accountResult, userResult, summaryResult, taskResult, statsResult]) => {
-      if (!mounted) return;
-      const nextErrors: Record<string, string> = {};
-      if (accountResult.status === 'fulfilled') setAccounts(accountResult.value);
-      else nextErrors.accounts = String(accountResult.reason);
-      if (userResult.status === 'fulfilled') setUsers(userResult.value);
-      else nextErrors.users = String(userResult.reason);
-      if (summaryResult.status === 'fulfilled') setTaskSummary(summaryResult.value);
-      else nextErrors.tasks = String(summaryResult.reason);
-      if (taskResult.status === 'fulfilled') setTasks(taskResult.value);
-      else nextErrors.recentTasks = String(taskResult.reason);
-      if (statsResult.status === 'fulfilled') setStats(statsResult.value);
-      else nextErrors.stats = String(statsResult.reason);
-      setErrors(nextErrors); setCheckedAt(new Date().toLocaleTimeString()); setLoading(false);
-    });
-    return () => { mounted = false; };
-  }, [revision]);
-  const counts = (summary?: ManagementSummary) => summary ? Object.entries(summary.counts).map(([status, count]) => `${status}: ${count}`).join(' / ') : 'Loading counts';
-  const recentTokens = stats.reduce((total, stat) => total + (tokenTotal(stat.inputTokens, stat.outputTokens, statCacheTokens(stat)) ?? 0), 0);
-  return <div className="space-y-4">
-    <div className="flex flex-wrap items-center justify-between gap-2">
-      <span className="text-xs text-slate-600">{checkedAt ? `Last checked ${checkedAt}` : 'Loading overview...'}</span>
-      <Button variant="secondary" disabled={loading} onClick={() => setRevision((value) => value + 1)}><RefreshCw size={14} className={loading ? 'animate-spin' : ''} />Refresh dashboard</Button>
-    </div>
-    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-      <MetricCard title="Proxy accounts" value={errors.accounts ? 'Unavailable' : accounts?.total ?? '-'} detail={counts(accounts)} error={errors.accounts} />
-      <MetricCard title="SSO users" value={errors.users ? 'Unavailable' : users?.total ?? '-'} detail={counts(users)} error={errors.users} />
-      <MetricCard title="Current failed tasks" value={errors.tasks ? 'Unavailable' : taskSummary?.counts.failed ?? (taskSummary ? 0 : '-')} detail={taskSummary ? `Across all ${taskSummary.total} retained tasks` : 'Loading counts'} error={errors.tasks} />
-      <MetricCard title="Recent tokens" value={errors.stats ? 'Unavailable' : formatNumber(recentTokens)} detail={`Based on ${stats.length} recent retained requests, not lifetime usage`} error={errors.stats} />
-    </div>
-    {loading && !checkedAt ? <LoadingState label="Loading dashboard..." /> : null}
-    {errors.recentTasks ? <ErrorState message={errors.recentTasks} /> : null}
-    <Card className="overflow-x-auto"><div className="mb-3 flex flex-wrap items-start justify-between gap-2"><CardTitle>Failed tasks in the latest 20 tasks</CardTitle><ButtonLink variant="secondary" size="sm" href="#tasks?status=failed">All failed tasks</ButtonLink></div><LoginTasksTable tasks={tasks.filter((task) => task.status === 'failed').slice(0, 5)} /></Card>
-    <Card className="overflow-x-auto"><div className="mb-3 flex flex-wrap items-start justify-between gap-2"><CardTitle>Recent failed requests</CardTitle><ButtonLink variant="secondary" size="sm" href="#stats?success=false">All retained failures</ButtonLink></div><RequestStatsTable stats={stats.filter((stat) => !stat.success).slice(0, 5)} /></Card>
-  </div>;
+function EnterpriseListWarning(props: { error: string }) {
+  return (
+    <p role="status" className="mt-2 text-xs text-amber-800">
+      Enterprise list unavailable ({props.error}). Requests still name the selected enterprise explicitly.
+    </p>
+  );
 }
 
 function UsersPage(props: { notify: Notify }) {
+  const scope = useEnterpriseScope();
   const [revision, setRevision] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
@@ -364,13 +426,14 @@ function UsersPage(props: { notify: Notify }) {
     {capacityError ? <ErrorState message={capacityError} /> : null}
     <p className="text-xs text-slate-600">Copilot seats show enterprise direct assignments only, not organization or team access. States reflect the last GitHub sync; use Import from GH or Remove seat to confirm a cancellation after its date.</p>
     <ManagedList<SsoUserDto>
-      scope="users" path="/api/console/sso/users" identify={(user) => user.ssoUser} refreshKey={revision} onNotify={props.notify}
+      scope="users" path={`${ssoPath(scope.id)}/users`} identify={(user) => user.ssoUser} refreshKey={revision}
+      onNotify={props.notify}
       followSubmittedActions
       onResult={() => {
         capacityRequest.current?.abort();
         const controller = new AbortController();
         capacityRequest.current = controller;
-        void getSsoUserCapacity(controller.signal).then((value) => {
+        void getSsoUserCapacity(scope.id, controller.signal).then((value) => {
           if (!controller.signal.aborted) { setCapacity(value); setCapacityError(undefined); }
         }).catch((err: Error) => { if (!controller.signal.aborted) setCapacityError(`User capacity may be stale: ${err.message}`); });
       }}
@@ -440,78 +503,12 @@ function CopilotSeatCell(props: { user: SsoUserDto }) {
 
 
 
-function AiCreditsUsagePage(props: { notify: Notify }) {
-  const [usage, setUsage] = useState<AiCreditsUsageDto>();
-  const [error, setError] = useState<string>();
-  const [loading, setLoading] = useState(false);
-
-  const load = async (refresh = false) => {
-    setLoading(true);
-    setError(undefined);
-    try {
-      const next = refresh ? await refreshAiCreditsUsage() : await readAiCreditsUsage();
-      setUsage(next);
-      if (refresh) props.notify('AI Credits usage refreshed.');
-    } catch (err) {
-      if (!refresh) {
-        try {
-          const next = await refreshAiCreditsUsage();
-          setUsage(next);
-          return;
-        } catch (refreshErr) {
-          setError((refreshErr as Error).message);
-          return;
-        }
-      }
-      setError((err as Error).message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void load(false);
-  }, []);
-
-  return (
-    <div className="space-y-4">
-      <Card>
-        <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-          <div>
-            <CardTitle className="mb-1">AI Credits Usage</CardTitle>
-            <p className="text-sm text-slate-600">Enterprise-level Copilot AI Credits consumption from GitHub billing usage summary.</p>
-          </div>
-          <Button variant="secondary" onClick={() => void load(true)} disabled={loading}><RefreshCw size={14} className={loading ? 'animate-spin' : ''} />{loading ? 'Refreshing...' : 'Refresh usage'}</Button>
-        </div>
-      </Card>
-      {loading && !usage ? <LoadingState label="Loading AI Credits usage..." /> : null}
-      {error ? <ErrorState message={error} /> : null}
-      {usage ? (
-        <>
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
-            <MetricCard title={`${periodLabel(usage.lastMonth)} usage`} value={formatAiUnits(usage.lastMonth.quantity)} detail={usage.lastMonth.unitType ?? 'AI Credits'} />
-            <MetricCard title={`${periodLabel(usage.currentMonth)} usage`} value={formatAiUnits(usage.currentMonth.quantity)} detail={usage.currentMonth.unitType ?? 'AI Credits'} />
-            <MetricCard title="Projected this month" value={formatAiUnits(usage.projectedCurrentMonthQuantity)} detail="Based on daily average so far" />
-            <MetricCard title="Assigned seats" value={usage.assignedSeatCount} detail="Last-synced enterprise direct seats, including pending cancellations; may be stale." />
-            <MetricCard title="Seat monthly cost" value={formatCurrency(usage.assignedSeatMonthlyCost)} detail={`${formatCurrency(usage.seatPricePerMonth)} x ${usage.assignedSeatCount} seat(s). Local estimate, not a GitHub invoice.`} />
-          </div>
-          <Card>
-            <div className="grid gap-3 text-sm md:grid-cols-3">
-              <Info label="Enterprise" value={usage.enterprise} />
-              <Info label="Last fetched" value={formatDate(usage.fetchedAt)} />
-              <Info label="Source" value="GitHub billing usage summary / copilot_ai_unit" />
-            </div>
-          </Card>
-        </>
-      ) : null}
-    </div>
-  );
-}
-
 function RequestStatsPage() {
+  const scope = useEnterpriseScope();
   return <div className="space-y-3">
     <p className="text-sm text-slate-600">Searches all retained requests, not only the latest 1000. Records already removed by retention are not included.</p>
-    <ManagedList<ProxyRequestStatDto> scope="stats" path="/api/console/proxy/request-stats" identify={(stat) => stat.id}
+    <ManagedList<ProxyRequestStatDto> scope="stats" path={`${proxyPath(scope.id)}/request-stats`}
+      identify={(stat) => stat.id}
       filters={[
         { key: 'identity', label: 'Exact identity' }, { key: 'model', label: 'Model' },
         { key: 'success', label: 'Success', options: ['true', 'false'] },
@@ -534,13 +531,15 @@ function RequestStatsPage() {
 }
 
 function ProxyAccountsPage(props: { notify: Notify }) {
+  const scope = useEnterpriseScope();
   const [revision, setRevision] = useState(0);
   const [detail, setDetail] = useState<ProxyAccountDto>();
   const [reauthorizing, setReauthorizing] = useState<ProxyAccountDto>();
   const [importOpen, setImportOpen] = useState(false);
   const reload = async () => { setRevision((value) => value + 1); };
   return <div className="space-y-4">
-    <ManagedList<ProxyAccountDto> scope="accounts" path="/api/console/proxy/accounts" identify={(account) => account.identity} refreshKey={revision} onNotify={props.notify}
+    <ManagedList<ProxyAccountDto> scope="accounts" path={`${proxyPath(scope.id)}/accounts`}
+      identify={(account) => account.identity} refreshKey={revision} onNotify={props.notify}
       filters={[
         { key: 'status', label: 'OAuth status', options: ['valid', 'expired', 'missing', 'refreshing', 'failed'] },
       ]}
@@ -564,6 +563,7 @@ function ProxyAccountsPage(props: { notify: Notify }) {
 
 
 function ImportCopilotOauthTokensDialog(props: { open: boolean; onClose: () => void; onDone: () => Promise<void> }) {
+  const scope = useEnterpriseScope();
   const [csvText, setCsvText] = useState('name,copilotOauthToken\n');
   const [result, setResult] = useState<BatchResult<ImportCopilotOauthTokenRow>>();
   const [error, setError] = useState<string>();
@@ -573,7 +573,7 @@ function ImportCopilotOauthTokensDialog(props: { open: boolean; onClose: () => v
     setSaving(true);
     setError(undefined);
     try {
-      const importResult = await importCopilotOauthTokens(csvText);
+      const importResult = await importCopilotOauthTokens(scope.id, csvText);
       setResult(importResult);
       await props.onDone();
     } catch (err) {
@@ -613,6 +613,7 @@ function ImportCopilotOauthTokensDialog(props: { open: boolean; onClose: () => v
 }
 
 function LoginTasksPage(props: { notify: Notify }) {
+  const scope = useEnterpriseScope();
   const [detail, setDetail] = useState<LoginTaskDto>();
   const [queueRevision, setQueueRevision] = useState(0);
   const [queueLoading, setQueueLoading] = useState(false);
@@ -620,7 +621,7 @@ function LoginTasksPage(props: { notify: Notify }) {
   const refreshQueue = () => setQueueRevision((value) => value + 1);
   return <div className="space-y-4">
     <QueueOverview refreshKey={queueRevision} onLoadingChange={setQueueLoading} />
-    <ManagedList<LoginTaskDto> scope="tasks" path="/api/console/login-service/tasks" identify={(task) => task.id}
+    <ManagedList<LoginTaskDto> scope="tasks" path={`${loginPath(scope.id)}/tasks`} identify={(task) => task.id}
       onRowDetails={setDetail} onNotify={props.notify}
       onRefresh={refreshQueue} onMutation={refreshQueue} refreshDisabled={queueLoading} onResult={() => setSnapshotAt(Date.now())}
       filters={[
@@ -628,7 +629,7 @@ function LoginTasksPage(props: { notify: Notify }) {
         { key: 'minAttempts', label: 'Min executions', type: 'number' }, { key: 'failureCode', label: 'Failure code' },
         { key: 'minWaitSeconds', label: 'Waiting at least (s)', type: 'number' }, { key: 'minRunSeconds', label: 'Running at least (s)', type: 'number' },
       ]}
-      toolbar={<><span className="mr-auto text-xs text-slate-600">Manual snapshots · Durations as of last refresh</span><a className="ui-filter-chip" href="#tasks?status=failed">Failed tasks</a><a className="ui-filter-chip" href="#tasks?status=pending,running,cancelling">Active tasks</a></>}
+      toolbar={<TaskQuickFilters enterpriseId={scope.id} />}
       actions={[
         { id: 'retry', label: 'Retry failed tasks', rowLabel: 'Retry', canRun: (task) => task.status === 'failed' && task.stage !== 'deleting' },
         { id: 'cancel', label: 'Cancel selected', rowLabel: 'Cancel', canRun: (task) => task.status === 'pending' || task.status === 'running' },
@@ -656,400 +657,26 @@ function LoginTasksPage(props: { notify: Notify }) {
 
 
 
-function SettingsPage(props: { notify: Notify }) {
-  return (
-    <div className="space-y-6">
-      <SsoRuntimeSettingsCard notify={props.notify} />
-      <LoginRuntimeSettingsCard notify={props.notify} />
-      <AdminPasswordCard notify={props.notify} />
-    </div>
-  );
-}
-
-function SettingsSection(props: { id: string; title: string; description: string; note: string; icon: ReactNode; busy?: boolean; children: ReactNode }) {
-  return <Card aria-labelledby={`${props.id}-title`} aria-busy={props.busy}>
-    <div className="grid gap-6 xl:grid-cols-[14rem_minmax(0,1fr)]">
-      <div className="border-b border-slate-200 pb-5 xl:border-r xl:border-b-0 xl:pr-6 xl:pb-0">
-        <span aria-hidden="true" className="mb-3 inline-flex rounded-md bg-slate-100 p-2 text-slate-600">{props.icon}</span>
-        <CardTitle id={`${props.id}-title`}>{props.title}</CardTitle>
-        <CardDescription>{props.description}</CardDescription>
-        <p className="text-xs leading-relaxed text-slate-500">{props.note}</p>
-      </div>
-      <div className="min-w-0">{props.children}</div>
-    </div>
-  </Card>;
-}
-
-function SettingsField({ label, hint, ...input }: InputHTMLAttributes<HTMLInputElement> & { label: string; hint?: string }) {
-  const id = useId();
-  return <div className="min-w-0">
-    <label htmlFor={id} className="mb-1.5 block text-sm font-medium text-slate-700">{label}</label>
-    <Input {...input} id={id} className="w-full" aria-describedby={hint ? `${id}-hint` : undefined} />
-    {hint ? <p id={`${id}-hint`} className="mt-1.5 text-xs leading-relaxed text-slate-500">{hint}</p> : null}
-  </div>;
-}
-
-function SettingsToggle(props: { label: string; description: string; checked: boolean; onChange: (checked: boolean) => void }) {
-  const id = useId();
-  return <label className="flex cursor-pointer items-start gap-3 rounded-md border border-slate-200 bg-slate-50 p-3">
-    <Checkbox aria-label={props.label} aria-describedby={id} checked={props.checked} onChange={(event) => props.onChange(event.target.checked)} />
-    <span className="min-w-0">
-      <span className="block text-sm font-medium text-slate-800">{props.label}</span>
-      <span id={id} className="mt-1 block text-xs leading-relaxed text-slate-600">{props.description}</span>
-    </span>
-  </label>;
-}
-
-function AdminPasswordCard(props: { notify: Notify }) {
-  const [currentPassword, setCurrentPassword] = useState('');
-  const [newPassword, setNewPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string>();
-
-  const save = async () => {
-    setError(undefined);
-    if (!currentPassword || !newPassword || !confirmPassword) {
-      setError('Current password, new password, and confirmation are required.');
-      return;
-    }
-    if (newPassword !== confirmPassword) {
-      setError('New password and confirmation do not match.');
-      return;
-    }
-    if (newPassword === currentPassword) {
-      setError('New password must be different from the current password.');
-      return;
-    }
-    setSaving(true);
-    try {
-      await api('/api/console/password', {
-        method: 'PATCH',
-        body: JSON.stringify({ currentPassword, newPassword }),
-      });
-      setCurrentPassword('');
-      setNewPassword('');
-      setConfirmPassword('');
-      props.notify('Console administrator password changed.');
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <SettingsSection id="settings-password" title="Console administrator password" icon={<ShieldCheck size={20} />}
-      description="Secure access to this Console."
-      note="Only the currently signed-in administrator is affected. Service credentials are unchanged." busy={saving}>
-      {error ? <ErrorState message={error} /> : null}
-      <div className="grid gap-4 md:grid-cols-3">
-        <SettingsField label="Current password" type="password" autoComplete="current-password"
-          value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} />
-        <SettingsField label="New password" type="password" autoComplete="new-password" hint="Must differ from your current password."
-          value={newPassword} onChange={(event) => setNewPassword(event.target.value)} />
-        <SettingsField label="Confirm new password" type="password" autoComplete="new-password"
-          value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} />
-      </div>
-      <div className="mt-6 flex flex-col gap-3 border-t border-slate-200 pt-4 sm:flex-row sm:items-center sm:justify-between">
-        <p className="text-xs text-slate-500">Your current session stays signed in.</p>
-        <Button className="w-full sm:w-auto" onClick={() => void save()} disabled={saving}>{saving ? 'Changing...' : 'Change password'}</Button>
-      </div>
-    </SettingsSection>
-  );
-}
-
-interface SsoSettingsDraft {
-  maxSsoUsers: string;
-  userPrefix: string;
-  emailDomain: string;
-  bulkSyncConcurrency: string;
-  scimRequestDelayMs: string;
-  scimMaxRetries: string;
-  scimRetryBaseDelayMs: string;
-}
-
-function SsoRuntimeSettingsCard(props: { notify: Notify }) {
-  const [settings, setSettings] = useState<SsoRuntimeSettingsDto>();
-  const [draft, setDraft] = useState<SsoSettingsDraft>();
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string>();
-
-  const load = async () => {
-    setLoading(true);
-    setError(undefined);
-    try {
-      const next = await getSsoRuntimeSettings();
-      setSettings(next);
-      setDraft(toSsoSettingsDraft(next));
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void load();
-  }, []);
-
-  const save = async () => {
-    if (!settings || !draft) return;
-    setSaving(true);
-    setError(undefined);
-    try {
-      const changes: SsoRuntimeSettingsValues = {
-        maxSsoUsers: draft.maxSsoUsers.trim() ? Number(draft.maxSsoUsers) : null,
-        userPrefix: draft.userPrefix,
-        emailDomain: draft.emailDomain,
-        bulkSyncConcurrency: Number(draft.bulkSyncConcurrency),
-        scimRequestDelayMs: Number(draft.scimRequestDelayMs),
-        scimMaxRetries: Number(draft.scimMaxRetries),
-        scimRetryBaseDelayMs: Number(draft.scimRetryBaseDelayMs),
-      };
-      const next = await updateSsoRuntimeSettings({ expectedVersion: settings.version, changes });
-      setSettings(next);
-      setDraft(toSsoSettingsDraft(next));
-      props.notify('SSO settings saved and applied.');
-    } catch (err) {
-      if (err instanceof ConsoleApiError && err.status === 409) {
-        await load();
-        setError('SSO settings changed in another session. The latest values were reloaded.');
-      } else {
-        setError((err as Error).message);
-      }
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <SettingsSection id="settings-sso" title="SSO runtime settings" icon={<Users size={20} />}
-      description="Manage account defaults and GitHub synchronization."
-      note="Saved in sso.sqlite. Applies to new users, SCIM operations and new sync batches without restarting SSO." busy={loading || saving}>
-      {loading ? <LoadingState label="Loading SSO settings..." /> : null}
-      {error ? <ErrorState message={error} /> : null}
-      {settings && draft ? (
-        <>
-          <fieldset className="min-w-0">
-            <legend className="mb-3 text-sm font-semibold text-slate-900">Account defaults</legend>
-            <div className="grid gap-4 md:grid-cols-3">
-              <SettingsField label="Maximum SSO users" hint="Leave blank for unlimited." value={draft.maxSsoUsers} placeholder="Unlimited" type="number" min={1} max={1_000_000} onChange={(event) => setDraft({ ...draft, maxSsoUsers: event.target.value })} />
-              <SettingsField label="Fallback user prefix" hint="Up to 32 characters." value={draft.userPrefix} onChange={(event) => setDraft({ ...draft, userPrefix: event.target.value })} />
-              <SettingsField label="Default email domain" hint="Domain only, without @." value={draft.emailDomain} onChange={(event) => setDraft({ ...draft, emailDomain: event.target.value })} />
-            </div>
-          </fieldset>
-          <fieldset className="mt-6 min-w-0 border-t border-slate-200 pt-4">
-            <legend className="pr-2 text-sm font-semibold text-slate-900">Synchronization and retries</legend>
-            <div className="grid gap-4 sm:grid-cols-2">
-              <SettingsField label="Sync EMU concurrency" hint="1-20 concurrent workers." value={draft.bulkSyncConcurrency} type="number" min={1} max={20} onChange={(event) => setDraft({ ...draft, bulkSyncConcurrency: event.target.value })} />
-              <SettingsField label="SCIM request delay (ms)" hint="0-60,000 ms between requests." value={draft.scimRequestDelayMs} type="number" min={0} max={60_000} onChange={(event) => setDraft({ ...draft, scimRequestDelayMs: event.target.value })} />
-              <SettingsField label="SCIM max retries" hint="0-10 retries." value={draft.scimMaxRetries} type="number" min={0} max={10} onChange={(event) => setDraft({ ...draft, scimMaxRetries: event.target.value })} />
-              <SettingsField label="SCIM retry base delay (ms)" hint="0-60,000 ms for retry backoff." value={draft.scimRetryBaseDelayMs} type="number" min={0} max={60_000} onChange={(event) => setDraft({ ...draft, scimRetryBaseDelayMs: event.target.value })} />
-            </div>
-          </fieldset>
-          <SettingsFooter settings={settings} saving={saving} onSave={save} />
-        </>
-      ) : null}
-    </SettingsSection>
-  );
-}
-
-function LoginRuntimeSettingsCard(props: { notify: Notify }) {
-  const [settings, setSettings] = useState<LoginRuntimeSettingsDto>();
-  const [draft, setDraft] = useState<LoginRuntimeSettingsValues>();
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string>();
-
-  const load = async () => {
-    setLoading(true);
-    setError(undefined);
-    try {
-      const next = await getLoginRuntimeSettings();
-      setSettings(next);
-      setDraft(toLoginSettingsDraft(next));
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void load();
-  }, []);
-
-  const save = async () => {
-    if (!settings || !draft) return;
-    setSaving(true);
-    setError(undefined);
-    try {
-      const next = await updateLoginRuntimeSettings({ expectedVersion: settings.version, changes: draft });
-      setSettings(next);
-      setDraft(toLoginSettingsDraft(next));
-      props.notify('Login settings saved and applied.');
-    } catch (err) {
-      if (err instanceof ConsoleApiError && err.status === 409) {
-        await load();
-        setError('Login settings changed in another session. The latest values were reloaded.');
-      } else {
-        setError((err as Error).message);
-      }
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <SettingsSection id="settings-login" title="Login runtime settings" icon={<ListChecks size={20} />}
-      description="Configure task execution and diagnostic output."
-      note="Saved in login.sqlite. Applies to queued work and newly started tasks; running tasks keep their starting snapshot." busy={loading || saving}>
-      {loading ? <LoadingState label="Loading Login settings..." /> : null}
-      {error ? <ErrorState message={error} /> : null}
-      {settings && draft ? (
-        <>
-          <fieldset className="min-w-0">
-            <legend className="mb-3 text-sm font-semibold text-slate-900">Task execution</legend>
-            <div className="grid gap-4 sm:grid-cols-2">
-              <SettingsField label="Login concurrency" hint="1-20 tasks at a time." value={draft.concurrency} type="number" min={1} max={20} onChange={(event) => setDraft({ ...draft, concurrency: Number(event.target.value) })} />
-              <SettingsField label="Authentication timeout (ms)" hint="5,000-600,000 ms (5 seconds to 10 minutes)." value={draft.authTimeoutMs} type="number" min={5_000} max={600_000} onChange={(event) => setDraft({ ...draft, authTimeoutMs: Number(event.target.value) })} />
-            </div>
-          </fieldset>
-          <fieldset className="mt-6 min-w-0 border-t border-slate-200 pt-4">
-            <legend className="pr-2 text-sm font-semibold text-slate-900">Debugging</legend>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <SettingsToggle label="Account debug logs" description="Enable per-account debug logs for new tasks." checked={draft.authDebugLogs} onChange={(checked) => setDraft({ ...draft, authDebugLogs: checked })} />
-              <SettingsToggle label="Debug artifacts" description="Save debugging artifacts for new tasks." checked={draft.authDebugArtifacts} onChange={(checked) => setDraft({ ...draft, authDebugArtifacts: checked })} />
-            </div>
-          </fieldset>
-          <SettingsFooter settings={settings} saving={saving} onSave={save} />
-        </>
-      ) : null}
-    </SettingsSection>
-  );
-}
-
-function SettingsFooter(props: { settings: { version: number; updatedAt: string }; saving: boolean; onSave: () => void }) {
-  return (
-    <div className="mt-6 flex flex-col gap-3 border-t border-slate-200 pt-4 sm:flex-row sm:items-center sm:justify-between">
-      <p className="text-xs leading-relaxed text-slate-500"><span className="font-medium text-slate-700">Version {props.settings.version}</span><span className="block">Updated {formatDate(props.settings.updatedAt)}</span></p>
-      <Button className="w-full sm:w-auto" onClick={props.onSave} disabled={props.saving}>{props.saving ? 'Saving...' : 'Save and apply'}</Button>
-    </div>
-  );
-}
-
-function toSsoSettingsDraft(settings: SsoRuntimeSettingsDto): SsoSettingsDraft {
-  return {
-    maxSsoUsers: settings.maxSsoUsers === null ? '' : String(settings.maxSsoUsers),
-    userPrefix: settings.userPrefix,
-    emailDomain: settings.emailDomain,
-    bulkSyncConcurrency: String(settings.bulkSyncConcurrency),
-    scimRequestDelayMs: String(settings.scimRequestDelayMs),
-    scimMaxRetries: String(settings.scimMaxRetries),
-    scimRetryBaseDelayMs: String(settings.scimRetryBaseDelayMs),
-  };
-}
-
-function toLoginSettingsDraft(settings: LoginRuntimeSettingsDto): LoginRuntimeSettingsValues {
-  return {
-    concurrency: settings.concurrency,
-    authTimeoutMs: settings.authTimeoutMs,
-    authDebugLogs: settings.authDebugLogs,
-    authDebugArtifacts: settings.authDebugArtifacts,
-  };
-}
-
-function ErrorDiagnosticsPage(props: { notify: Notify }) {
-  const [result, setResult] = useState<ProxyErrorDiagnosticsListResponse>();
-  const [revision, setRevision] = useState(0);
-  const [selectedId, setSelectedId] = useState<string>();
-  const [detail, setDetail] = useState<ProxyErrorDiagnosticDetailDto>();
-  const [detailLoading, setDetailLoading] = useState(false);
-  const [clearOpen, setClearOpen] = useState(false);
-  const [clearing, setClearing] = useState(false);
-  const [clearError, setClearError] = useState<string>();
-  const detailRequest = useRef<AbortController | undefined>(undefined);
-  useEffect(() => () => detailRequest.current?.abort(), []);
-  const openDetail = async (id: string) => {
-    detailRequest.current?.abort();
-    const controller = new AbortController();
-    detailRequest.current = controller;
-    setSelectedId(id); setDetail(undefined); setDetailLoading(true);
-    try {
-      const next = await getErrorDiagnostic(id, controller.signal);
-      if (!controller.signal.aborted) setDetail(next);
-    }
-    catch (err) { if (!controller.signal.aborted) { props.notify((err as Error).message, 'error'); setSelectedId(undefined); } }
-    finally { if (!controller.signal.aborted) setDetailLoading(false); }
-  };
-  const download = async (id: string) => {
-    try {
-      const result = await downloadErrorDiagnostic(id);
-      const url = URL.createObjectURL(result.blob);
-      const link = document.createElement('a'); link.href = url; link.download = result.filename; link.click(); URL.revokeObjectURL(url);
-    } catch (err) { props.notify((err as Error).message, 'error'); }
-  };
-  const clear = async () => {
-    if (clearing) return;
-    setClearing(true); setClearError(undefined);
-    try {
-      await clearErrorDiagnostics(); detailRequest.current?.abort(); setSelectedId(undefined); setClearOpen(false); setRevision((value) => value + 1); props.notify('Diagnostics cleared.');
-    } catch (err) { setClearError((err as Error).message); }
-    finally { setClearing(false); }
-  };
-  return <div className="space-y-4">
-    {result ? <div className="flex gap-2"><Badge tone={result.enabled ? 'success' : 'warning'}>{result.enabled ? 'Collection enabled' : 'Collection disabled'}</Badge><Badge tone={result.redacted ? 'info' : 'warning'}>{result.redacted ? 'Sensitive data redacted' : 'Unredacted records'}</Badge></div> : null}
-    <ManagedList<ProxyErrorDiagnosticSummaryDto, ProxyErrorDiagnosticsListResponse> scope="error-diagnostics" path="/api/console/proxy/error-diagnostics"
-      identify={(record) => record.id} onResult={setResult} refreshKey={revision}
-      filters={[
-        { key: 'model', label: 'Model' }, { key: 'status', label: 'HTTP status' },
-        { key: 'failureCode', label: 'Failure kind', options: ['http', 'fetch', 'stream'] },
-        { key: 'from', label: 'Recorded from', type: 'datetime-local' }, { key: 'to', label: 'Recorded before', type: 'datetime-local' },
-      ]}
-      toolbar={<Button type="button" variant="dangerOutline" disabled={!result?.enabled} onClick={() => { setClearError(undefined); setClearOpen(true); }}>Clear all diagnostics</Button>}
-      columns={[
-        { key: 'time', label: 'Time', nowrap: true, render: (record) => formatDate(record.timestamp) },
-        { key: 'identity', label: 'Identity', render: (record) => record.identity },
-        { key: 'path', label: 'Route / model', render: (record) => <div>{record.path}<p className="text-xs">{record.model}</p></div> },
-        { key: 'failure', label: 'Failure', render: (record) => <Badge>{record.failureKind}</Badge> },
-        { key: 'status', label: 'HTTP status', render: (record) => record.status ?? '-' },
-        { key: 'sizes', label: 'Body sizes', render: (record) => `in ${formatBytes(record.inboundRequestBodyBytes)} / sent ${formatBytes(record.upstreamRequestBodyBytes)} / received ${formatBytes(record.upstreamResponseBodyBytes)}` },
-        { key: 'actions', label: 'Actions', render: (record) => <div className="flex gap-2"><Button size="sm" variant="secondary" onClick={() => void openDetail(record.id)}>Details</Button><Button size="sm" variant="secondary" onClick={() => void download(record.id)}>Download</Button></div> },
-      ]}
-    />
-    <Dialog title="Proxy error diagnostic" description={selectedId} open={selectedId !== undefined} onClose={() => { detailRequest.current?.abort(); setSelectedId(undefined); setDetail(undefined); setDetailLoading(false); }}>
-      {detailLoading ? <LoadingState label="Loading diagnostic..." /> : null}
-      {detail ? <div className="space-y-3"><pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-all rounded bg-slate-950 p-3 text-xs text-slate-100">{previewText(detail.content)}</pre><Button onClick={() => void download(detail.id)}>Download complete log</Button></div> : null}
-    </Dialog>
-    <ConfirmDialog open={clearOpen} onClose={() => setClearOpen(false)} onConfirm={clear} busy={clearing} error={clearError}
-      title="Clear all diagnostics" confirmLabel="Clear all diagnostics" danger
-      description="Clear all stored proxy error diagnostics, not only the filtered results? This cannot be undone." />
-  </div>;
-}
-
-const DIAGNOSTIC_PREVIEW_CHARS = 20_000;
-
-function previewText(value: string, alreadyTruncated = false): string {
-  const truncated = alreadyTruncated || value.length > DIAGNOSTIC_PREVIEW_CHARS;
-  return `${value.slice(0, DIAGNOSTIC_PREVIEW_CHARS)}${truncated ? '\n\n[Preview truncated; download the record for complete data.]' : ''}`;
-}
-
-function formatBytes(value: number): string {
-  if (value < 1024) return `${value} B`;
-  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
-  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+function TaskQuickFilters(props: { enterpriseId: string }) {
+  return <>
+    <span className="mr-auto text-xs text-slate-600">Manual snapshots · Durations as of last refresh</span>
+    <a className="ui-filter-chip" href={hashFor('tasks', props.enterpriseId, 'status=failed')}>Failed tasks</a>
+    <a className="ui-filter-chip" href={hashFor('tasks', props.enterpriseId, 'status=pending,running,cancelling')}>
+      Active tasks
+    </a>
+  </>;
 }
 
 function DiagnosticsPage() {
+  const scope = useEnterpriseScope();
   const [results, setResults] = useState<{ name: string; ok: boolean; message: string }[]>([]);
   const [loading, setLoading] = useState(false);
   const checks = [
-    { name: 'Proxy accounts', path: '/api/console/proxy/accounts' },
-    { name: 'SSO users', path: '/api/console/sso/users' },
-    { name: 'Login tasks', path: '/api/console/login-service/tasks' },
-    { name: 'Request stats', path: '/api/console/proxy/request-stats' },
+    { name: 'Enterprise list', path: '/api/console/proxy/enterprises' },
+    { name: 'Proxy accounts', path: `${proxyPath(scope.id)}/accounts` },
+    { name: 'SSO users', path: `${ssoPath(scope.id)}/users` },
+    { name: 'Login tasks', path: `${loginPath(scope.id)}/tasks` },
+    { name: 'Request stats', path: `${proxyPath(scope.id)}/request-stats` },
   ];
 
   const run = async () => {
@@ -1075,7 +702,9 @@ function DiagnosticsPage() {
       <Card className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <CardTitle className="mb-1">Service connectivity</CardTitle>
-          <p className="text-sm text-slate-600">Confirms console proxy routes and internal service token alignment.</p>
+          <p className="text-sm text-slate-600">
+            Confirms console proxy routes and internal service token alignment for enterprise {scope.id}.
+          </p>
         </div>
         <Button variant="secondary" disabled={loading} onClick={run}><RefreshCw size={14} className={loading ? 'animate-spin' : ''} />Run checks</Button>
       </Card>
@@ -1096,6 +725,7 @@ function DiagnosticsPage() {
 }
 
 function CreateUserDialog(props: { open: boolean; onClose: () => void; onDone: () => Promise<void> }) {
+  const scope = useEnterpriseScope();
   const [ssoUser, setSsoUser] = useState('');
   const [password, setPassword] = useState('');
   const [email, setEmail] = useState('');
@@ -1107,7 +737,7 @@ function CreateUserDialog(props: { open: boolean; onClose: () => void; onDone: (
     setSaving(true);
     setError(undefined);
     try {
-      await createSsoUser({ ssoUser, password: password || undefined, email: email || undefined, role });
+      await createSsoUser(scope.id, { ssoUser, password: password || undefined, email: email || undefined, role });
       setSsoUser('');
       setPassword('');
       setEmail('');
@@ -1133,6 +763,7 @@ function CreateUserDialog(props: { open: boolean; onClose: () => void; onDone: (
 }
 
 function EditUserDialog(props: { user?: SsoUserDto; onClose: () => void; onDone: () => Promise<void> }) {
+  const scope = useEnterpriseScope();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [role, setRole] = useState<'user' | 'admin'>('user');
@@ -1152,7 +783,7 @@ function EditUserDialog(props: { user?: SsoUserDto; onClose: () => void; onDone:
     setSaving(true);
     setError(undefined);
     try {
-      await patchSsoUser(props.user.ssoUser, { email, role, password: password || undefined });
+      await patchSsoUser(scope.id, props.user.ssoUser, { email, role, password: password || undefined });
       await props.onDone();
     } catch (err) {
       setError((err as Error).message);
@@ -1174,6 +805,7 @@ function EditUserDialog(props: { user?: SsoUserDto; onClose: () => void; onDone:
 }
 
 function ImportUsersDialog(props: { open: boolean; onClose: () => void; onDone: () => Promise<void> }) {
+  const scope = useEnterpriseScope();
   const [csvText, setCsvText] = useState('ssoUser,password\n');
   const [result, setResult] = useState<ReactNode>();
   const [error, setError] = useState<string>();
@@ -1183,7 +815,7 @@ function ImportUsersDialog(props: { open: boolean; onClose: () => void; onDone: 
     setSaving(true);
     setError(undefined);
     try {
-      const importResult = await importSsoUsers(csvText);
+      const importResult = await importSsoUsers(scope.id, csvText);
       setResult(
         <div className="mt-4 rounded-md bg-slate-50 p-3 text-sm">
           <p className="font-medium">Batch {importResult.batchId}: {importResult.summary.success} success, {importResult.summary.failed} failed</p>
@@ -1213,6 +845,7 @@ function ImportUsersDialog(props: { open: boolean; onClose: () => void; onDone: 
 }
 
 function ImportEmuUsersDialog(props: { open: boolean; onClose: () => void; onDone: () => Promise<void> }) {
+  const scope = useEnterpriseScope();
   const [ssoUser, setSsoUser] = useState('');
   const [plan, setPlan] = useState<ImportEmuPlanDto>();
   const [rows, setRows] = useState<ImportEmuUserRow[]>([]);
@@ -1235,7 +868,8 @@ function ImportEmuUsersDialog(props: { open: boolean; onClose: () => void; onDon
     setSaving('rows');
     setError(undefined);
     try {
-      const result = await listEmuImportPlanRows(planId, { page: nextPage, pageSize: nextSize, status: nextStatus }, controller.signal);
+      const query = { page: nextPage, pageSize: nextSize, status: nextStatus };
+      const result = await listEmuImportPlanRows(scope.id, planId, query, controller.signal);
       setRows(result.items);
       setRowTotal(result.total);
       setRowPage(result.page);
@@ -1252,7 +886,7 @@ function ImportEmuUsersDialog(props: { open: boolean; onClose: () => void; onDon
     setSaving('preview');
     setError(undefined);
     try {
-      const nextPlan = await createEmuImportPlan({ ssoUser: ssoUser.trim() || undefined });
+      const nextPlan = await createEmuImportPlan(scope.id, { ssoUser: ssoUser.trim() || undefined });
       setPlan(nextPlan);
       setStatusFilter('');
       await loadRows(nextPlan.planId, 1, '');
@@ -1267,7 +901,7 @@ function ImportEmuUsersDialog(props: { open: boolean; onClose: () => void; onDon
     setSaving('apply');
     setError(undefined);
     try {
-      const nextPlan = await applyEmuImportPlan(plan.planId);
+      const nextPlan = await applyEmuImportPlan(scope.id, plan.planId);
       setPlan(nextPlan);
       await loadRows(nextPlan.planId, rowPage, statusFilter);
       await props.onDone();
@@ -1282,7 +916,7 @@ function ImportEmuUsersDialog(props: { open: boolean; onClose: () => void; onDon
     setSaving('delete');
     setError(undefined);
     try {
-      await deleteEmuImportPlan(plan.planId);
+      await deleteEmuImportPlan(scope.id, plan.planId);
       setPlan(undefined);
       setRows([]);
       setRowTotal(0);
@@ -1358,9 +992,12 @@ function ImportEmuUsersDialog(props: { open: boolean; onClose: () => void; onDon
     </Dialog>
     <ConfirmDialog open={props.open && deleteOpen} onClose={() => setDeleteOpen(false)} onConfirm={deletePlan} busy={saving === 'delete'} error={error}
       title="Delete import plan data" confirmLabel="Delete plan data" danger
-      description="Delete this GH import plan data? This only removes preview/apply rows and does not delete SSO users or GH logins." /></>
+      description={`${scopeText(scope)} ${DELETE_PLAN_WARNING}`} /></>
   );
 }
+
+const DELETE_PLAN_WARNING = 'Delete this GH import plan data? This only removes preview/apply rows and does not '
+  + 'delete SSO users or GH logins.';
 
 function EmuImportResult(props: {
   plan: ImportEmuPlanDto;
@@ -1407,6 +1044,7 @@ function EmuImportResult(props: {
 }
 
 function BatchCreateDialog(props: { open: boolean; remaining: number | null; onClose: () => void; onDone: () => Promise<void> }) {
+  const scope = useEnterpriseScope();
   const [prefix, setPrefix] = useState('user');
   const [start, setStart] = useState(1);
   const [count, setCount] = useState(5);
@@ -1427,10 +1065,11 @@ function BatchCreateDialog(props: { open: boolean; remaining: number | null; onC
       const createdSsoUsers: string[] = [];
       for (let index = 0; index < count; index += 1) {
         const ssoUser = `${prefix}${start + index}`;
-        await createSsoUser({ ssoUser, role });
+        await createSsoUser(scope.id, { ssoUser, role });
         createdSsoUsers.push(ssoUser);
       }
-      if (syncAfterCreate && createdSsoUsers.length > 0) await runSsoUserBatch({ operation: 'sync_emu', ssoUsers: createdSsoUsers });
+      const sync = { operation: 'sync_emu' as const, ssoUsers: createdSsoUsers };
+      if (syncAfterCreate && createdSsoUsers.length > 0) await runSsoUserBatch(scope.id, sync);
       await props.onDone();
     } catch (err) {
       setError((err as Error).message);
@@ -1462,6 +1101,7 @@ function BatchCreateDialog(props: { open: boolean; remaining: number | null; onC
 }
 
 function CopilotOauthReauthorizationDialog(props: { account?: ProxyAccountDto; onClose: () => void; onDone: () => Promise<void> }) {
+  const scope = useEnterpriseScope();
   const passwordHelpId = useId();
   const [ssoPassword, setSsoPassword] = useState('');
   const [usingDefault, setUsingDefault] = useState(true);
@@ -1485,7 +1125,7 @@ function CopilotOauthReauthorizationDialog(props: { account?: ProxyAccountDto; o
     setSaving(true);
     setError(undefined);
     try {
-      await reauthorizeCopilotOauth(props.account.identity, usingDefault
+      await reauthorizeCopilotOauth(scope.id, props.account.identity, usingDefault
         ? { credentialMode: 'default', ssoType }
         : { credentialMode: 'override', ssoPassword, ssoType });
       await props.onDone();
@@ -1525,6 +1165,7 @@ function CopilotOauthReauthorizationDialog(props: { account?: ProxyAccountDto; o
 
 
 function ProxyAccountDetailDialog(props: { account?: ProxyAccountDto; onClose: () => void }) {
+  const scope = useEnterpriseScope();
   const [stats, setStats] = useState<ProxyRequestStatDto[]>([]);
   const [snapshot, setSnapshot] = useState<ProxyAccountDto>();
   const [error, setError] = useState<string>();
@@ -1539,8 +1180,8 @@ function ProxyAccountDetailDialog(props: { account?: ProxyAccountDto; onClose: (
     const controller = new AbortController();
     setLoading(true);
     void Promise.all([
-      getProxyAccount(identity, controller.signal),
-      listRequestStats({ identity, limit: 20 }, controller.signal),
+      getProxyAccount(scope.id, identity, controller.signal),
+      listRequestStats(scope.id, { identity, limit: 20 }, controller.signal),
     ]).then(([account, requests]) => {
       if (controller.signal.aborted) return;
       setSnapshot(account); setStats(requests); setError(undefined); setUpdatedAt(new Date().toLocaleTimeString());
@@ -1571,32 +1212,6 @@ function ProxyAccountDetailDialog(props: { account?: ProxyAccountDto; onClose: (
         </div>
       ) : null}
     </Dialog>
-  );
-}
-
-function LoginTasksTable(props: { tasks: LoginTaskDto[] }) {
-  return (
-    <Table compact>
-      <thead>
-        <tr>
-          <Th>Identity</Th>
-          <Th>SSO user</Th>
-          <Th>Status</Th>
-          <Th>Failure</Th>
-        </tr>
-      </thead>
-      <tbody>
-        {props.tasks.map((task) => (
-          <tr key={task.id}>
-            <Td>{task.identity}</Td>
-            <Td>{task.ssoUser}</Td>
-            <Td><Badge tone={statusTone(task.status)}>{task.status}</Badge></Td>
-            <Td><FailureSummary value={task.failureReason} /></Td>
-          </tr>
-        ))}
-        {props.tasks.length === 0 ? <EmptyRow colSpan={4} label="No login tasks found." /> : null}
-      </tbody>
-    </Table>
   );
 }
 
@@ -1638,32 +1253,6 @@ function statCacheTokens(stat: ProxyRequestStatDto): number | undefined {
   return stat.cacheTokens ?? tokenTotal(stat.cacheInputTokens, stat.cacheWriteTokens);
 }
 
-function FailureSummary({ value }: { value?: string }) {
-  return value ? <details><summary className="max-w-xs cursor-pointer truncate" title={value}>{value}</summary><p className="mt-1 whitespace-pre-wrap break-words">{value}</p></details> : <>-</>;
-}
-
-function periodLabel(period: { year: number; month: number }): string {
-  return `${period.year}-${String(period.month).padStart(2, '0')}`;
-}
-
-function formatAiUnits(value: number): string {
-  return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
-}
-
-function formatCurrency(value: number): string {
-  return value.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
-}
-
-function MetricCard(props: { title: string; value: string | number; detail: string; error?: string }) {
-  return (
-    <Card>
-      <p className="text-sm font-medium text-slate-600">{props.title}</p>
-      <p className="mt-2 text-3xl font-semibold tabular-nums text-slate-950">{props.error ? '-' : props.value}</p>
-      <p className={`mt-2 break-words text-sm ${props.error ? 'text-red-600' : 'text-slate-600'}`}>{props.error ?? props.detail}</p>
-    </Card>
-  );
-}
-
 function StatusWithDate(props: { status: string; date?: string }) {
   return (
     <div className="flex flex-col gap-1">
@@ -1702,25 +1291,8 @@ function Label(props: { text: string; children: ReactNode }) {
   return <label className="flex flex-col gap-1 text-sm font-medium text-slate-700"><span>{props.text}</span>{props.children}</label>;
 }
 
-function Info(props: { label: string; value: ReactNode }) {
-  return (
-    <div className="rounded-md border border-slate-200 p-3">
-      <p className="text-xs font-medium uppercase tracking-wide text-slate-500">{props.label}</p>
-      <div className="mt-1 break-words text-sm text-slate-950">{props.value}</div>
-    </div>
-  );
-}
-
 function EmptyRow(props: { colSpan: number; label: string }) {
   return <tr><td colSpan={props.colSpan} className="px-3 py-8 text-center text-sm text-slate-500">{props.label}</td></tr>;
-}
-
-function LoadingState(props: { label: string }) {
-  return <p role="status" className="flex min-h-10 items-center gap-2 text-sm text-slate-600"><Loader2 size={16} className="animate-spin" />{props.label}</p>;
-}
-
-function ErrorState(props: { message: string }) {
-  return <p role="alert" className="break-words rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{props.message}</p>;
 }
 
 function Pagination(props: { page: number; total: number; pageSize: number; onPage: (page: number) => void; onPageSize?: (size: number) => void }) {
@@ -1735,9 +1307,4 @@ function Pagination(props: { page: number; total: number; pageSize: number; onPa
       </div>
     </div>
   );
-}
-
-function readPageFromHash(): Page {
-  const raw = window.location.hash.replace(/^#/, '').split('?')[0];
-  return pages.some((entry) => entry.id === raw) ? raw as Page : 'dashboard';
 }
