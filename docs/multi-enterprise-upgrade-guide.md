@@ -156,6 +156,6 @@
 
 ## 12. 验证范围说明
 
-- 发布前资格测试覆盖：r4 → 多企业版原地升级（MySQL 与 SQLite，同一数据卷，无 registry、配置不变）、升级前后数据逐项一致、r4 在已迁移的 MySQL 上被拒绝启动、备份恢复后 r4 正常运行、迁移中途中断后继续完成、添加一个 GHE.com mock 企业并完成激活、补货和推理，以及跨企业隔离检查。结果见发布验证记录：`<to be filled after release>`。
+- 发布前资格测试覆盖：r4 → 多企业版原地升级（MySQL 与 SQLite，同一数据卷，无 registry、配置不变）、升级前后数据逐项一致、r4 在已迁移的 MySQL 上被拒绝启动、备份恢复后 r4 正常运行、迁移中途中断后继续完成、添加一个 GHE.com mock 企业并完成激活、补货和推理，以及跨企业隔离检查。结果见 [多企业版发布验证记录](multi-enterprise-release-validation.md)。
 - **GHE.com 企业只用 mock 验证**（网页、OAuth 设备授权、SCIM、席位、Copilot 均为 mock），**尚未在真实 GHE.com 环境验收**；也没有调用真实 GitHub/Copilot。首次接入真实 GHE.com 企业前，请先在预发布环境验证，可设置 `AUTH_DEBUG_ARTIFACT_DIR` 保存登录过程截图。
 - 不支持新旧版本混跑；未验证客户环境的网络、性能和大数据量下的迁移时长。请在客户预发布环境用同一 digest、同等规模的数据副本完成升级演练后再上线。

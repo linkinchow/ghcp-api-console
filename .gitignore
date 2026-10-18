@@ -36,6 +36,7 @@ curl.http
 !docs/models-admin-guide.md
 !docs/multi-enterprise-design.md
 !docs/multi-enterprise-registry.md
+!docs/multi-enterprise-release-validation.md
 !docs/multi-enterprise-upgrade-guide.md
 !docs/repo-map.md
 !docs/user-pool-*.md
