@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import test, { type TestContext } from 'node:test';
 import express from 'express';
+import { requireEnterprise } from '@ghcp/shared';
 import { GithubSubjectError } from '../accounts/githubSubject.js';
+import { findProxyEnterprise } from '../enterprises.js';
 import { CopilotApiError, type ModelsCatalog } from '../copilot/copilotClient.js';
 import { ModelsAdminError, type ModelsAdminCredential } from '../copilot/modelsAdmin.js';
 import { createModelsApiRouter, type ModelsApiDependencies } from './modelsApi.js';
@@ -10,6 +12,7 @@ import { createModelsApiRouter, type ModelsApiDependencies } from './modelsApi.j
 const TOKEN = 'synthetic-admin-copilot-token';
 const FETCHED_AT = Date.parse('2026-10-17T08:00:00.000Z');
 const ADMIN: ModelsAdminCredential = { githubLogin: 'admin_synthetic', githubUserId: '101', accessToken: TOKEN };
+const SCOPE = '/api/enterprises/:enterpriseId';
 
 function catalog(cacheStatus: ModelsCatalog['cacheStatus'] = 'fresh'): ModelsCatalog {
   return {
@@ -35,7 +38,7 @@ async function fixture(t: TestContext, overrides: Partial<ModelsApiDependencies>
   let verifyCalls = 0;
   const catalogCalls: Fixture['catalogCalls'] = [];
   const deps: Partial<ModelsApiDependencies> = {
-    admin: () => { adminCalls++; return (overrides.admin ?? (() => ADMIN))(); },
+    admin: (enterprise) => { adminCalls++; return (overrides.admin ?? (() => ADMIN))(enterprise); },
     verifySubject: async (...args) => {
       verifyCalls++;
       return (overrides.verifySubject ?? (async () => ({ login: 'Admin_Synthetic', id: '101' })))(...args);
@@ -46,14 +49,14 @@ async function fixture(t: TestContext, overrides: Partial<ModelsApiDependencies>
     },
   };
   const app = express();
-  app.use('/api', createModelsApiRouter(deps));
+  app.use(SCOPE, requireEnterprise(findProxyEnterprise), createModelsApiRouter(deps));
   const server = app.listen(0, '127.0.0.1');
   await new Promise<void>((resolve) => server.once('listening', resolve));
   t.after(() => new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()); }));
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   return {
     async get(query = '') {
-      const response = await fetch(`${origin}/api/models${query}`);
+      const response = await fetch(`${origin}/api/enterprises/default/models${query}`);
       const text = await response.text();
       assert.equal(text.includes(TOKEN), false, 'the admin token must never appear in a response');
       return { status: response.status, body: JSON.parse(text), text, headers: response.headers };
@@ -76,7 +79,7 @@ test('returns the admin catalog with a dedicated cache identity and allow-listed
   assert.equal(response.text.includes('private_token'), false);
 
   const [auth, options] = f.catalogCalls[0]!;
-  assert.equal(auth.identity, 'models-admin:101');
+  assert.equal(auth.identity, 'models-admin:default:101', 'the cache key names the enterprise and the admin');
   assert.equal(auth.accessToken, TOKEN);
   assert.equal(options?.useCache, true);
 
@@ -165,7 +168,7 @@ test('closing the request aborts the outstanding catalog lookup', async (t) => {
   let entered!: () => void;
   const lookupStarted = new Promise<void>((resolve) => { entered = resolve; });
   const app = express();
-  app.use('/api', createModelsApiRouter({
+  app.use(SCOPE, requireEnterprise(findProxyEnterprise), createModelsApiRouter({
     admin: () => ADMIN,
     verifySubject: async () => ({ login: 'admin_synthetic', id: '101' }),
     catalog: (_auth, options) => new Promise((_resolve, reject) => {
@@ -177,8 +180,8 @@ test('closing the request aborts the outstanding catalog lookup', async (t) => {
   await new Promise<void>((resolve) => server.once('listening', resolve));
   t.after(() => new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()); }));
   const controller = new AbortController();
-  const request = fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/api/models`, { signal: controller.signal })
-    .catch(() => undefined);
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/enterprises/default/models`;
+  const request = fetch(url, { signal: controller.signal }).catch(() => undefined);
   await lookupStarted;
   controller.abort();
   await Promise.all([lookupAborted, request]);
@@ -196,6 +199,10 @@ test('the Models API is mounted behind the internal token', async (t) => {
   const server = buildApp().listen(0, '127.0.0.1');
   await new Promise<void>((resolve) => server.once('listening', resolve));
   t.after(() => new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()); }));
-  const response = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/api/models`);
-  assert.equal(response.status, 401);
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  assert.equal((await fetch(`${origin}/api/enterprises/default/models`)).status, 401);
+  assert.equal((await fetch(`${origin}/api/models`)).status, 401);
+  const unscoped = await fetch(`${origin}/api/models`, { headers: { 'X-Internal-Token': 'synthetic-internal' } });
+  assert.equal(unscoped.status, 400, 'Models are scoped by enterprise; the unscoped path is refused');
+  assert.equal((await unscoped.json() as { error: { code: string } }).error.code, 'enterprise_scope_required');
 });

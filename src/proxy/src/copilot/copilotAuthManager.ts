@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import {
-  DEFAULT_ENTERPRISE_ID,
   HttpApiError,
   readLoginCredentials,
   type CreateLoginTaskRequest,
   type EnsureSsoUserResponse,
+  type EnterpriseId,
   type LoginTaskDto,
   type SsoType,
 } from '@ghcp/shared';
@@ -17,8 +17,9 @@ import {
   releaseIdentityInitialization,
 } from '../db/accountsRepo.js';
 import { ensureSsoUser, syncEmuUser } from '../clients/ssoClient.js';
-import { createLoginTask } from '../clients/loginClient.js';
+import { createLoginTask, type LoginTaskSubmission } from '../clients/loginClient.js';
 import { config } from '../config.js';
+import { directModeEnterprise, requireProxyEnterprise, type ProxyEnterprise } from '../enterprises.js';
 import { Logger } from '../logger.js';
 import type { CopilotAuthContext } from './copilotAuth.js';
 import { prepareLoginAuthorization } from '../accounts/loginAuthorization.js';
@@ -62,28 +63,31 @@ class CopilotAuthManager {
           : 'Copilot OAuth authorization is required for this identity.',
       );
     }
+    const enterprise = requireProxyEnterprise(account.enterpriseId);
     return {
       identity,
       accessToken: account.copilotOauthToken,
-      api: config.copilotApiBaseUrl,
+      api: enterprise.endpoints.copilotApiBaseUrl,
+      enterpriseId: enterprise.id,
     };
   }
 
-  async triggerOauthRefresh(identity: string, options: { ssoPassword?: string; ssoType?: SsoType; credentialMode?: 'default' | 'override' } = {}): Promise<LoginTaskDto> {
+  async triggerOauthRefresh(identity: string, options: OauthRefreshOptions = {}): Promise<LoginTaskDto> {
     const account = await getAccount(identity);
     if (!account) throw new Error(`Unknown identity "${identity}".`);
     if (!account.ssoUser) throw new Error(`Identity "${identity}" is missing an SSO user.`);
     if (!account.ghLogin) throw new Error(`Identity "${identity}" is missing a GitHub login.`);
     const oauthAttemptId = randomUUID();
+    const enterprise = requireProxyEnterprise(account.enterpriseId);
     const payload = await prepareLoginAuthorization(identity, oauthAttemptId, {
-      ...readLoginCredentials(options), ssoUser: account.ssoUser, ghLogin: account.ghLogin,
-      ssoType: options.ssoType ?? 'custom', force: true,
+      ...readLoginCredentials(options), enterpriseId: enterprise.id, ssoUser: account.ssoUser,
+      ghLogin: account.ghLogin, ssoType: effectiveSsoType(enterprise, options.ssoType), force: true,
     });
-    return this.submitLogin(payload);
+    return this.submitLogin(enterprise, payload);
   }
 
-  private async submitLogin(payload: CreateLoginTaskRequest): Promise<LoginTaskDto> {
-    try { return await createLoginTask(payload); }
+  private async submitLogin(enterprise: ProxyEnterprise, payload: CreateLoginTaskRequest): Promise<LoginTaskDto> {
+    try { return await createLoginTask(enterprise.id, loginSubmission(enterprise, payload)); }
     catch (err) {
       // Login did not accept the task, so the account must not stay `refreshing`. The rollback is
       // fenced on the attempt id: if Login did accept it and already wrote the token, this is a no-op.
@@ -102,23 +106,26 @@ class CopilotAuthManager {
     return invalidateCopilotOauthToken(identity, expectedToken, 'expired');
   }
 
+  /** New direct-mode identities belong to DIRECT_MODE_ENTERPRISE_ID (design §5.1). */
   private async beginIdentityInitialization(identity: string): Promise<void> {
     const existing = this.initializing.get(identity);
     if (existing) return existing.prepared;
 
+    const enterprise = directModeEnterprise();
     const claimId = randomUUID();
     const claimed = await claimIdentityInitialization(
-      DEFAULT_ENTERPRISE_ID,
+      enterprise.id,
       identity,
       claimId,
       config.identityInitLeaseSeconds,
     );
     if (!claimed) return;
 
-    this.logger.info('identity-init', 'Initializing unknown identity', { identity });
-    const ensured = ensureSsoUser({ identity, preferredSsoUser: ssoUserFromIdentity(identity) });
+    this.logger.info('identity-init', 'Initializing unknown identity', { identity, enterpriseId: enterprise.id });
+    const preferredSsoUser = ssoUserFromIdentity(identity, enterprise);
+    const ensured = ensureSsoUser(enterprise.id, { identity, preferredSsoUser });
     const prepared = ensured.then(() => undefined);
-    const completed = ensured.then((result) => this.initializeEnsuredIdentity(identity, result));
+    const completed = ensured.then((result) => this.initializeEnsuredIdentity(enterprise, identity, result));
     const state = { prepared, completed };
     this.initializing.set(identity, state);
     void completed
@@ -142,13 +149,18 @@ class CopilotAuthManager {
     return prepared;
   }
 
-  private async initializeEnsuredIdentity(identity: string, ensured: EnsureSsoUserResponse): Promise<void> {
-    const synced = await syncEmuUser(ensured.user.ssoUser, { assignCopilotSeat: true });
+  private async initializeEnsuredIdentity(
+    enterprise: ProxyEnterprise,
+    identity: string,
+    ensured: EnsureSsoUserResponse,
+  ): Promise<void> {
+    const enterpriseId = enterprise.id;
+    const synced = await syncEmuUser(enterpriseId, ensured.user.ssoUser, { assignCopilotSeat: true });
     if (!synced.ghLogin) throw new Error(`SSO user "${ensured.user.ssoUser}" did not return a GH login.`);
     const oauthAttemptId = randomUUID();
     const ssoPassword = ensured.passwordForLogin;
     await createAccount({
-      enterpriseId: DEFAULT_ENTERPRISE_ID,
+      enterpriseId,
       identity,
       ssoUser: ensured.user.ssoUser,
       ghLogin: synced.ghLogin,
@@ -159,24 +171,45 @@ class CopilotAuthManager {
     }
     // The row was created (or re-created) by this initialization, so there is no earlier attempt to respect.
     const payload = await prepareLoginAuthorization(identity, oauthAttemptId, {
-      credentialMode: 'override', ssoPassword, ssoUser: ensured.user.ssoUser, ghLogin: synced.ghLogin, ssoType: 'custom', force: true,
+      credentialMode: 'override', ssoPassword, enterpriseId, ssoUser: ensured.user.ssoUser,
+      ghLogin: synced.ghLogin, ssoType: effectiveSsoType(enterprise, undefined), force: true,
     });
-    await this.submitLogin(payload);
+    await this.submitLogin(enterprise, payload);
   }
 }
 
-function ssoUserFromIdentity(identity: string): string {
+interface OauthRefreshOptions {
+  ssoPassword?: string;
+  ssoType?: SsoType;
+  credentialMode?: 'default' | 'override';
+}
+
+/**
+ * The SSO provider of one Login task. A profile that sets `login.ssoProvider` decides it; otherwise each task
+ * chooses, as r4 did (design §5.7).
+ */
+function effectiveSsoType(enterprise: ProxyEnterprise, requested: SsoType | undefined): SsoType {
+  return enterprise.profile.login.ssoProvider ?? requested ?? 'custom';
+}
+
+/** `ssoType` is sent only while the profile leaves the choice to the task; Login applies the profile's own. */
+function loginSubmission(enterprise: ProxyEnterprise, payload: CreateLoginTaskRequest): LoginTaskSubmission {
+  const { ssoType, ...task } = payload;
+  return enterprise.profile.login.ssoProvider ? task : { ...task, ssoType };
+}
+
+function ssoUserFromIdentity(identity: string, enterprise: ProxyEnterprise): string {
   const normalized = identity
     .trim()
     .toLowerCase()
     .replace(/@.*$/, '')
     .replace(/[^a-z0-9._-]+/g, '-')
     .replace(/^-+|-+$/g, '');
-  return stripEnterpriseShortcode(normalized).slice(0, 32);
+  return stripEnterpriseShortcode(normalized, enterprise.endpoints.shortcode).slice(0, 32);
 }
 
-function stripEnterpriseShortcode(value: string): string {
-  const shortcode = config.enterpriseShortcode.trim().toLowerCase();
+function stripEnterpriseShortcode(value: string, enterpriseShortcode: string): string {
+  const shortcode = enterpriseShortcode.trim().toLowerCase();
   if (!shortcode) return value;
   const suffix = `_${shortcode}`;
   if (!value.endsWith(suffix)) return value;

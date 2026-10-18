@@ -11,12 +11,17 @@ import { Logger } from './logger.js';
 import { compatibleRouter } from './routes/compatible.js';
 import { resolveClaudeCodeOptimized } from './routes/claudeCodeMode.js';
 import { adminApiRouter } from './routes/adminApi.js';
-import { internalApiRouter } from './routes/internalApi.js';
+import {
+  createEnterpriseApiRouter,
+  createEnterpriseInternalRouter,
+  createLegacyAccountsRouter,
+  rejectUnscoped,
+} from './routes/enterpriseRoutes.js';
+import { createEnterprisesApiRouter } from './routes/enterprisesApi.js';
 import { userPoolApiRouter } from './routes/userPoolApi.js';
 import { assertUserPoolOwner, getUserPool, routeUserPool, startUserPool, stopUserPool } from './userPool/runtime.js';
 import { readPoolConfig } from './userPool/config.js';
-import { accountOperationsRouter } from './routes/operationsApi.js';
-import { createModelsApiRouter } from './routes/modelsApi.js';
+import { directModeEnterprise, proxyEnterprises, proxyRegistryWarnings, type ProxyEnterprise } from './enterprises.js';
 
 const requestLogger = new Logger('request');
 
@@ -40,9 +45,7 @@ export function buildApp(): express.Express {
       res.status(503).json({ status: 'unavailable', service: 'proxy' });
     }
   });
-  app.use('/api/accounts/operations', requireInternalToken, accountOperationsRouter, managementErrorHandler('proxy'));
-  app.use('/api', requireInternalToken, createModelsApiRouter(), adminApiRouter, userPoolApiRouter, managementErrorHandler('proxy'));
-  app.use('/internal', requireInternalToken, internalApiRouter, managementErrorHandler('proxy'));
+  mountManagementRouters(app);
   app.use(requireApiKey, requireIdentityHeader, routeUserPool, compatibleRouter);
   app.use((req, res) => {
     const claudeCodeOptimized = resolveClaudeCodeOptimized(req);
@@ -60,6 +63,21 @@ export function buildApp(): express.Express {
     res.status(404).json({ error: { message, type: 'invalid_request_error' } });
   });
   return app;
+}
+
+/**
+ * Management and internal routes (design §5.1): enterprise-scoped routers, the global enterprise list, pool
+ * settings and diagnostics, and the deprecated direct `/api/accounts`. Everything else unscoped answers 400.
+ */
+function mountManagementRouters(app: express.Express): void {
+  const errors = managementErrorHandler('proxy');
+  // The enterprise list router passes every path it does not own on to the scoped router.
+  app.use('/api/enterprises', requireInternalToken, createEnterprisesApiRouter(), errors);
+  app.use('/api/enterprises/:enterpriseId', requireInternalToken, createEnterpriseApiRouter(), errors);
+  app.use('/api', requireInternalToken, adminApiRouter, userPoolApiRouter, createLegacyAccountsRouter(), errors);
+  app.use('/api', requireInternalToken, rejectUnscoped);
+  app.use('/internal/enterprises/:enterpriseId', requireInternalToken, createEnterpriseInternalRouter(), errors);
+  app.use('/internal', requireInternalToken, rejectUnscoped);
 }
 
 export function captureRawRequestBody(req: Request, _res: Response, next: NextFunction): void {
@@ -106,6 +124,22 @@ function supportedPathsMessage(claudeCodeOptimized: boolean): string {
   return `Supported paths: ${paths.join(', ')}.`;
 }
 
+/** Fails startup when DIRECT_MODE_ENTERPRISE_ID names no registry enterprise; logs each enterprise once. */
+function logEnterprises(): void {
+  const direct = directModeEnterprise();
+  for (const warning of proxyRegistryWarnings()) console.warn(`[proxy] enterprise registry: ${warning}`);
+  for (const enterprise of proxyEnterprises()) logEnterprise(enterprise, enterprise === direct);
+}
+
+function logEnterprise(enterprise: ProxyEnterprise, direct: boolean): void {
+  const { endpoints } = enterprise;
+  const role = direct ? ' (direct mode)' : '';
+  const urls = `GitHub ${endpoints.baseUrl}, Copilot ${endpoints.copilotApiBaseUrl}`;
+  console.log(`[proxy] enterprise ${enterprise.id}${role}: ${urls}`);
+  const blockers = enterprise.profile.blockers.map((blocker) => `${blocker.code}:${blocker.field}`);
+  if (blockers.length) console.warn(`[proxy] enterprise ${enterprise.id} is not ready: ${blockers.join(', ')}`);
+}
+
 function sendInvalidRequestError(req: Request, res: Response, message: string): void {
   if (req.path.startsWith('/v1/messages')) {
     res.status(400).json({ type: 'error', error: { type: 'invalid_request_error', message } });
@@ -121,6 +155,7 @@ export async function startServer(): Promise<Server> {
     if (poolOptions.enabled && (!config.apiKey || !config.internalApiToken)) {
       throw new Error('User pool requires authenticated Proxy/internal APIs');
     }
+    logEnterprises();
     await initializeStorage();
     await getUserPool();
     await pruneAllRequestStats();

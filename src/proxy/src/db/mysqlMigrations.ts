@@ -16,6 +16,7 @@ import {
   recordedMigrations,
   recordMigration,
   runMysqlMigrationSteps,
+  syncMysqlRegistryEnterprises,
   tableExists,
   verifyDefaultEnterprise,
 } from './mysqlEnterpriseMigrations.js';
@@ -84,6 +85,12 @@ export async function prepareMysqlEnterprises(pool: Pool, seed: EnterpriseSeed,
     await verifyDefaultEnterprise(connection, seed);
     await recordMigration(connection, ENTERPRISE_MIGRATION_IDS.seedDefault);
   }, lockWaitSeconds);
+}
+
+/** Every registry enterprise besides `default` (design §3.6), in the migration lock; data only, never DDL. */
+export async function syncMysqlEnterprises(pool: Pool, seeds: readonly EnterpriseSeed[],
+  lockWaitSeconds: number = MYSQL_MIGRATION_LOCK_WAIT.defaultSeconds): Promise<void> {
+  await withMysqlMigrationLock(pool, (connection) => syncMysqlRegistryEnterprises(connection, seeds), lockWaitSeconds);
 }
 
 export async function runMysqlMigrations(pool: Pool, seed: EnterpriseSeed,

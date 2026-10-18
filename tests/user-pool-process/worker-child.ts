@@ -27,7 +27,7 @@ try {
   ]);
   const pool = createPool({ uri: url.toString(), connectionLimit: 4, connectTimeout: 5000,
     timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true });
-  const storage = new MysqlStorage(pool, 2, true, await enterpriseSeed());
+  const storage = new MysqlStorage(pool, 2, true, [await enterpriseSeed()]);
   const store = await storage.userPool(options);
   const claimOwner = store.claimOwner.bind(store);
   store.claimOwner = async owner => {

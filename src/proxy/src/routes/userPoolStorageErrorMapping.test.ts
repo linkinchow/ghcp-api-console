@@ -16,6 +16,7 @@ import { getUserPool, stopUserPool } from '../userPool/runtime.js';
 import { UserPoolStore } from '../userPool/store.js';
 import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
+import { defaultProxyEnterprise } from '../enterprises.js';
 
 const originalFetch = globalThis.fetch;
 const caller = `sha256:${'d'.repeat(64)}`;
@@ -27,7 +28,7 @@ function failingStorage(cause: unknown) {
     async execute() { throw cause; }, release() {}, destroy() {},
   } as unknown as PoolConnection;
   const pool = { async getConnection() { calls++; return connection; } } as unknown as Pool;
-  return { storage: new MysqlStorage(pool, 100, true, defaultEnterpriseSeed({})), calls: () => calls };
+  return { storage: new MysqlStorage(pool, 100, true, [defaultEnterpriseSeed({})]), calls: () => calls };
 }
 
 async function fixture(t: TestContext, direct = false) {
@@ -45,7 +46,7 @@ async function fixture(t: TestContext, direct = false) {
   let member = 'direct-storage-mapping';
   if (!direct) {
     assert.ok(pool instanceof UserPoolStore);
-    member = pool.reserve()!.identity;
+    member = pool.reserve([DEFAULT_ENTERPRISE_ID])!.identity;
     await importCopilotOauthToken({
       enterpriseId: DEFAULT_ENTERPRISE_ID,
       identity: member,
@@ -138,7 +139,9 @@ for (const status of [401, 429]) {
 test('direct models invalidation connectivity failure uses safe JSON too', async t => {
   const f = await fixture(t, true);
   const failed = failingStorage(rawConnectionError());
-  t.mock.method(copilotAuthManager, 'getAuth', async () => ({ identity: f.member, accessToken: 'synthetic-token', api: config.copilotApiBaseUrl }));
+  const api = defaultProxyEnterprise().endpoints.copilotApiBaseUrl;
+  const auth = { identity: f.member, accessToken: 'synthetic-token', api };
+  t.mock.method(copilotAuthManager, 'getAuth', async () => auth);
   t.mock.method(copilotAuthManager, 'invalidate', async () => { await failed.storage.getAccount(f.member); });
   t.mock.method(globalThis, 'fetch', async () => new Response('{}', { status: 401, headers: { 'Content-Type': 'application/json' } }));
   await assertStorageUnavailable(await f.request());

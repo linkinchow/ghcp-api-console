@@ -17,6 +17,9 @@ import { MysqlConnectionError, MysqlDeadlineError } from './mysqlDeadline.js';
 export interface PrewarmStore extends Pick<PoolStore,
   'now' | 'claimOwner' | 'releaseOwner' | 'reclaim' | 'settings' | 'pending' | 'reserveDeficit' | 'hasHolds'
   | 'event' | 'inventory' | 'update' | 'fail' | 'mutateWorkerCredential'> {
+  /** Hourly `N_e` drift correction (design §5.8); optional for injected test stores. */
+  correctInventoryDrift?: PoolStore['correctInventoryDrift'];
+  enterprisePolicies?: PoolStore['enterprisePolicies'];
   claimLoginDispatch?: PoolStore['claimLoginDispatch'];
   /** At most 100 rows, ordered stably; only exhausted failed/disabled dispatch/wait rows. */
   listLoginReservations?(): Awaitable<ProvisionInventory[]>;
@@ -30,6 +33,9 @@ export interface PrewarmStore extends Pick<PoolStore,
 
 const HEARTBEAT_MS = 5000;
 const OWNER_TTL_MS = 30000;
+const DRIFT_CORRECTION_MS = 60 * 60 * 1000;
+/** Bounds the whole eligibility round; each enterprise also has its own, shorter deadline. */
+const ELIGIBILITY_TIMEOUT_MS = 10_000;
 interface Tenure { id: string; renewedAt: number }
 export interface PrewarmWorkerOptions {
   multiReplica?: boolean;
@@ -70,6 +76,8 @@ export class PrewarmWorker {
   private reservationTask?: Promise<void>;
   private lastReservationPoll = -Infinity;
   private reservationOffset = 0;
+  private lastDriftCorrection: number;
+  private eligibilityController?: AbortController;
   private scheduling?: Promise<Promise<void>[]>;
   private ownership?: Promise<boolean>;
   private starting?: Promise<void>;
@@ -97,6 +105,8 @@ export class PrewarmWorker {
     if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 20) throw new Error('Invalid prewarm concurrency');
     if (options.multiReplica && !store.renewOwner) throw new Error('Multi-replica pool requires fenced owner renewal');
     this.wallClockNow = options.wallClockNow ?? Date.now;
+    // Storage corrects drift when it opens, so the first hourly correction is due an hour after start.
+    this.lastDriftCorrection = monotonicNow();
   }
 
   async start(): Promise<void> {
@@ -188,7 +198,10 @@ export class PrewarmWorker {
     // Login GETs can take the full request deadline. They must not hold the ordinary
     // scheduler single-flight or consume its provisioning concurrency slots.
     this.observeLoginReservations(tenure);
-    await storage(() => this.store.reserveDeficit(tenure.id));
+    await this.correctDriftHourly(tenure);
+    const eligible = await this.eligibleEnterprises();
+    if (!this.isCurrentTenure(tenure)) return [];
+    await storage(() => this.store.reserveDeficit(tenure.id, eligible));
     const launched: Promise<void>[] = [];
     const excluded = [...this.active.keys()];
     while (this.isCurrentTenure(tenure) && this.active.size < this.concurrency) {
@@ -209,6 +222,41 @@ export class PrewarmWorker {
       launched.push(promise);
     }
     return launched;
+  }
+
+  /**
+   * Readiness is evaluated before, never inside, the reservation transaction (design §3.8). A failed or late
+   * readiness answer makes no enterprise eligible, so nothing new is created (fail closed). Adapters without a
+   * readiness view (tests and tools; production always uses `realProvisioner`) rely on lifecycle state alone.
+   */
+  private async eligibleEnterprises(): Promise<readonly string[]> {
+    if (!this.adapter.eligibleEnterprises) return this.activeEnterprises();
+    const controller = new AbortController();
+    this.eligibilityController = controller;
+    const timeout = () => controller.abort(new ProvisionFailure('provision_timeout'));
+    const deadline = setTimeout(timeout, ELIGIBILITY_TIMEOUT_MS);
+    deadline.unref();
+    try {
+      return await untilAborted(this.adapter.eligibleEnterprises(controller.signal), controller.signal);
+    } catch {
+      return [];
+    } finally {
+      clearTimeout(deadline);
+      if (this.eligibilityController === controller) this.eligibilityController = undefined;
+    }
+  }
+
+  private async activeEnterprises(): Promise<readonly string[]> {
+    if (!this.store.enterprisePolicies) return [];
+    const policies = await this.store.enterprisePolicies();
+    return policies.filter((policy) => policy.state === 'active').map((policy) => policy.id);
+  }
+
+  private async correctDriftHourly(tenure: Tenure): Promise<void> {
+    if (!this.store.correctInventoryDrift) return;
+    if (this.monotonicNow() - this.lastDriftCorrection < DRIFT_CORRECTION_MS) return;
+    this.lastDriftCorrection = this.monotonicNow();
+    await this.storageOperation(tenure, () => this.store.correctInventoryDrift!());
   }
 
   private observeLoginReservations(tenure: Tenure): void {
@@ -511,6 +559,7 @@ export class PrewarmWorker {
     this.tenure = undefined;
     for (const { controller } of this.active.values()) controller.abort();
     this.reservationController?.abort();
+    this.eligibilityController?.abort();
     this.stopping = (async () => {
       // Pending elections clean up their own UUID. Awaiting them prevents shutdown from
       // leaking an owner whose claim completed after stop began.

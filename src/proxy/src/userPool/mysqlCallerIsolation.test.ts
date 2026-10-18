@@ -58,9 +58,13 @@ function fixture(ready = false) {
         if (sql.includes('RELEASE_LOCK')) return [[{ released: 1 }]];
         if (sql.startsWith('SELECT TIMESTAMPDIFF')) return [[{ now: 1800000000000 }]];
         if (sql.includes('SELECT id FROM user_pool_settings')) return [[{ id: 1 }]];
-        if (ready && sql.includes('SELECT * FROM user_pool_leases WHERE caller_id=')) return [[{
-          caller_id: caller(1), member_identity: 'member', lease_id: 'lease', phase: 'active',
+        if (ready && sql.includes('WHERE l.caller_id=')) return [[{
+          caller_id: caller(1), member_identity: 'member', enterprise_id: 'default', lease_id: 'lease', phase: 'active',
           assigned_at: 1800000000000, last_success_at: 1800000000000, expires_at: 1800003600000,
+        }]];
+        if (sql.includes('SELECT state')) return [[{ state: 'active' }]];
+        if (sql.includes('FROM proxy_enterprises')) return [[{
+          id: 'default', state: 'active', max_accounts: 10, inventory_count: 1,
         }]];
         if (ready && sql.includes('FROM proxy_accounts WHERE identity=')) return [[{
           identity: 'member', copilot_oauth_status: 'valid', copilot_oauth_token: 'synthetic-token',
@@ -68,7 +72,7 @@ function fixture(ready = false) {
         if (ready && sql.includes('SELECT * FROM user_pool_accounts WHERE identity=')) return [[{
           identity: 'member', state: 'ready', verified_at: 1800000000000, generation: 1,
         }]];
-        if (sql.includes('MAX(id)')) return [[{ n: -9999 }]];
+        if (sql.includes('CAST(id AS SIGNED)')) return [[{ n: -9999 }]];
         if (sql.includes('SELECT 1 FROM user_pool_holds')) return [[{ 1: 1 }]];
         if (sql.trimStart().startsWith('SELECT')) return [[]];
         return [{ affectedRows: 1 }];

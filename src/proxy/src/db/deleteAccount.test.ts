@@ -28,7 +28,7 @@ test('deletes one Proxy account and its request stats without affecting other id
   });
   assert.equal(await getAccount('alice'), undefined);
   assert.notEqual(await getAccount('bob'), undefined);
-  assert.equal((await listRequestStats('alice')).length, 0);
-  assert.equal((await listRequestStats('bob')).length, 1);
+  assert.equal((await listRequestStats(DEFAULT_ENTERPRISE_ID, 'alice')).length, 0);
+  assert.equal((await listRequestStats(DEFAULT_ENTERPRISE_ID, 'bob')).length, 1);
   assert.equal(await deleteAccount('alice'), undefined);
 });

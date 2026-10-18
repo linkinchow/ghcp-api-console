@@ -49,11 +49,11 @@ test('provides MySQL repository parity and cross-instance claims', {
     dateStrings: true,
     decimalNumbers: true,
   });
-  const first = new MysqlStorage(firstPool, 2, true, seed);
-  const second = new MysqlStorage(secondPool, 2, true, seed);
-  const third = new MysqlStorage(thirdPool, 2, true, seed);
-  const fourth = new MysqlStorage(fourthPool, 2, true, seed);
-  const runtime = new MysqlStorage(runtimePool, 2, false, seed);
+  const first = new MysqlStorage(firstPool, 2, true, [seed]);
+  const second = new MysqlStorage(secondPool, 2, true, [seed]);
+  const third = new MysqlStorage(thirdPool, 2, true, [seed]);
+  const fourth = new MysqlStorage(fourthPool, 2, true, [seed]);
+  const runtime = new MysqlStorage(runtimePool, 2, false, [seed]);
   const contenders = [first, second, third, fourth];
   try {
     await Promise.all(contenders.map((storage) => storage.initialize()));
@@ -89,7 +89,7 @@ test('provides MySQL repository parity and cross-instance claims', {
       VALUES ('unknown-enterprise', 'unknown-enterprise', UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), 'missing')
     `), /foreign key/i);
     assert.equal(await second.getAccount('alice'), undefined);
-    assert.equal((await first.listAccounts({ q: 'ALICE' })).total, 1);
+    assert.equal((await first.listAccounts(DEFAULT_ENTERPRISE_ID, { q: 'ALICE' })).total, 1);
 
     assert.equal(await first.beginCopilotOauthAuthorization('Alice', 'attempt-1'), true);
     assert.equal(await second.saveCopilotOauthToken('Alice', 'stale-attempt', 'stale-token'), undefined);
@@ -110,18 +110,18 @@ test('provides MySQL repository parity and cross-instance claims', {
       assert.equal(account?.copilotOauthStatus, saved ? 'valid' : 'failed');
     }
     await first.withReadSnapshot(async (reader) => {
-      assert.equal((await reader.listAccounts()).total, 1);
+      assert.equal((await reader.listAccounts(DEFAULT_ENTERPRISE_ID)).total, 1);
       await second.createAccount({ enterpriseId, identity: 'snapshot-extra', ssoUser: 'snapshot-extra' });
-      assert.equal((await reader.listAccounts()).total, 1);
-      assert.equal((await second.listAccounts()).total, 2);
+      assert.equal((await reader.listAccounts(DEFAULT_ENTERPRISE_ID)).total, 1);
+      assert.equal((await second.listAccounts(DEFAULT_ENTERPRISE_ID)).total, 2);
       await second.deleteAccount('snapshot-extra');
     });
     for (let index = 0; index < 137; index++) {
       await first.createAccount({ enterpriseId, identity: `summary-${index}`, ssoUser: `summary-${index}`,
         copilotOauthStatus: index % 2 ? 'valid' : 'failed' });
     }
-    assert.equal((await first.summarizeAccounts()).total, 138);
-    assert.equal((await second.listAccounts({ q: 'summary-', status: 'failed' })).total, 69);
+    assert.equal((await first.summarizeAccounts(DEFAULT_ENTERPRISE_ID)).total, 138);
+    assert.equal((await second.listAccounts(DEFAULT_ENTERPRISE_ID, { q: 'summary-', status: 'failed' })).total, 69);
     await first.createAccount({ enterpriseId, identity: 'query-account', ssoUser: 'query-account' });
     await firstPool.query(`
       INSERT INTO proxy_request_stats (id, identity, requested_at, path, success, model, enterprise_id)
@@ -130,11 +130,15 @@ test('provides MySQL repository parity and cross-instance claims', {
         new Date(Date.UTC(2020, 0, 1, 0, 0, index)), '/v1/models', index === 0 ? 0 : 1,
         index === 0 ? 'older-only' : 'recent', enterpriseId]),
     ]);
-    assert.equal((await first.listRequestStats('query-account', 1000)).some((stat) => stat.model === 'older-only'), false);
-    const older = await second.listRequestStatsPage({ identity: 'query-account', model: 'older-only', success: 'false' });
+    const recent = await first.listRequestStats(DEFAULT_ENTERPRISE_ID, 'query-account', 1000);
+    assert.equal(recent.some((stat) => stat.model === 'older-only'), false);
+    const older = await second.listRequestStatsPage(DEFAULT_ENTERPRISE_ID,
+      { identity: 'query-account', model: 'older-only', success: 'false' });
     assert.equal(older.total, 1);
     assert.equal(older.items[0]?.model, 'older-only');
-    assert.equal((await second.listRequestStatsPage({ identity: 'query-account', page: 16, pageSize: 100 })).items.length, 1);
+    const last = await second.listRequestStatsPage(DEFAULT_ENTERPRISE_ID,
+      { identity: 'query-account', page: 16, pageSize: 100 });
+    assert.equal(last.items.length, 1);
 
     const claims = await Promise.all([
       first.claimIdentityInitialization(enterpriseId, 'new-user', 'claim-a', 60),
@@ -189,7 +193,7 @@ test('provides MySQL repository parity and cross-instance claims', {
         inputTokens: index,
       });
     }
-    const stats = await second.listRequestStats('Alice', 10);
+    const stats = await second.listRequestStats(DEFAULT_ENTERPRISE_ID, 'Alice', 10);
     assert.equal(stats.length, 2);
     assert.deepEqual(stats.map((stat) => stat.inputTokens).sort(), [1, 2]);
     await first.pruneAllRequestStats();
@@ -204,7 +208,7 @@ test('provides MySQL repository parity and cross-instance claims', {
     assert.equal((await runtime.getAccount('runtime-user'))?.ssoUser, 'runtime-user');
     assert.equal(await runtime.beginCopilotOauthAuthorization('runtime-user', 'runtime-attempt'), true);
     await runtime.recordRequestStat({ enterpriseId, identity: 'runtime-user', path: '/v1/models', success: true });
-    assert.equal((await runtime.listRequestStats('runtime-user')).length, 1);
+    assert.equal((await runtime.listRequestStats(DEFAULT_ENTERPRISE_ID, 'runtime-user')).length, 1);
     await runtime.pruneAllRequestStats();
     assert.equal(await runtime.claimIdentityInitialization(enterpriseId, 'runtime-user', 'runtime-claim', 60), true);
     assert.equal(await runtime.releaseIdentityInitialization('runtime-user', 'runtime-claim'), true);
@@ -222,7 +226,7 @@ test('an existing identity never moves to another enterprise', {
   skip: mysqlUrl ? false : 'Set MYSQL_TEST_URL to run MySQL integration tests.',
 }, async () => {
   const pool = createPool({ uri: mysqlUrl!, connectionLimit: 2, timezone: 'Z', dateStrings: true });
-  const storage = new MysqlStorage(pool, 2, true, seed);
+  const storage = new MysqlStorage(pool, 2, true, [seed]);
   const identity = `immutable-${randomUUID()}`;
   const other = `immutable-${randomUUID().slice(0, 8)}` as EnterpriseId;
   try {

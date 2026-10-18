@@ -63,7 +63,7 @@ async function withDatabase(run: (f: Fixture) => Promise<void>) {
 }
 
 async function ready(f: Fixture) {
-  const row = await f.first.reserve();
+  const row = await f.first.reserve(['default']);
   assert.ok(row);
   await f.db.execute(`UPDATE proxy_accounts SET copilot_oauth_status='valid', copilot_oauth_token=?, gh_login=? WHERE identity=?`,
     [`SyntheticToken-${row.identity}`, row.identity, row.identity]);
@@ -118,14 +118,14 @@ test('MySQL inference timeout: legacy observer retains 600s hold and renews afte
     await code(f.observer.acquire(caller(2)), 'pool_exhausted');
     await age(f, 49000);
     await f.observer.finish(extended, true);
-    const active = (await f.observer.leases())[0];
+    const active = (await f.observer.leases('default'))[0];
     assert.equal(active.lease_id, extended.lease_id);
     assert.equal(active.phase, 'active');
     assert.ok(active.last_success_at);
     assert.equal(active.expires_at - active.last_success_at, options.leaseSeconds * 1000);
     assert.equal(await hold(f, extended.request_id), undefined);
     await f.first.finish(extended, true);
-    assert.deepEqual((await f.first.leases())[0], active);
+    assert.deepEqual((await f.first.leases('default'))[0], active);
   }));
 
 test('MySQL inference timeout: invalid overrides/canceled admission never mutate SQL; failed long hold cleans up',
@@ -145,7 +145,7 @@ test('MySQL inference timeout: invalid overrides/canceled admission never mutate
     assert.deepEqual(await snapshot(f), before);
     await f.observer.finish(held, false);
     assert.equal(await hold(f, held.request_id), undefined);
-    assert.equal((await f.observer.leases()).length, 0);
+    assert.equal((await f.observer.leases('default')).length, 0);
     assert.equal((await f.observer.acquire(caller(2))).member_identity, member);
   }));
 
@@ -163,7 +163,7 @@ test('MySQL inference timeout: 600s expiry drains before reassignment and genera
     assert.equal(await f.observer.hasHolds(member), false);
     const replacement = await f.observer.acquire(caller(2), undefined, 600000);
     await f.first.finish(held, true);
-    assert.equal((await f.first.leases())[0].lease_id, replacement.lease_id);
+    assert.equal((await f.first.leases('default'))[0].lease_id, replacement.lease_id);
     await age(f, 350000);
     await f.db.execute('UPDATE user_pool_accounts SET generation=generation+1 WHERE identity=?', [member]);
     assert.equal(await f.first.heartbeat(replacement), false);
@@ -171,5 +171,5 @@ test('MySQL inference timeout: 600s expiry drains before reassignment and genera
     assert.equal(await f.first.quarantine(member, 'synthetic_stale', replacement), false);
     await f.first.finish(replacement, true);
     assert.equal(await hold(f, replacement.request_id), undefined);
-    assert.equal((await f.first.leases()).length, 0);
+    assert.equal((await f.first.leases('default')).length, 0);
   }));

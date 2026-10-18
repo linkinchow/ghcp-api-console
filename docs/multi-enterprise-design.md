@@ -239,7 +239,7 @@
   - `shortcode` 在 Proxy 与 SSO 之间相同；
   - `slug` 在 SSO 与 Login 之间相同（Login 有值时）；
   - 三方都没有 blocker。
-- 结果在每个 Proxy 副本内存缓存 60 秒。只用于以下场景：激活企业、worker 为该企业补货前的判断、Console 展示。**结果不落库，也不作为“证据 JSON”存储**，旧分支的 `validation_evidence_json` 机制删除。
+- 结果在每个 Proxy 副本内存缓存：ready 缓存 60 秒，not ready 或探测失败只缓存 10 秒（SSO/Login 短暂不可用不会让补货停一分钟）；激活和恢复时强制实时检查。只用于以下场景：激活企业、worker 为该企业补货前的判断、Console 展示。**结果不落库，也不作为“证据 JSON”存储**，旧分支的 `validation_evidence_json` 机制删除。
 
 ---
 
@@ -535,7 +535,7 @@ SAML 会话**不建表**（§5.5）。
 - 建号候选需满足 `N_e < C_e`。租号候选必须有合格的 idle。
 - 全局补货量 `D = max(0, T − I − P)`。全局 pause 优先；`I ≥ T` 时不建号。
 - 已有 lease 或 catalog hold 时，保持原企业和原 member，不重新按比例选择。
-- `draining` 企业：不新建 lease、不新建 catalog hold、不补货，已有 lease 保留。只有 catalog hold 的 caller 落在 draining 企业时，返回 503 `enterprise_draining`，不换企业。
+- `draining` 企业：不新建 lease、不新建 catalog hold、不补货，已有 lease 保留。只有 catalog hold 的 caller 落在 draining 企业时，返回 503 `enterprise_draining`，不换企业。已在开通中的 member 继续完成（外部系统已建用户，中途放弃会留下半成品）。
 - 临时不健康的企业不能被选为候选，但仍计入分母。
 
 #### 本次变化
@@ -553,6 +553,7 @@ SAML 会话**不建表**（§5.5）。
 - 锁顺序固定：`user_pool_settings` 行 → `proxy_enterprises` 行（按 id 排序）→ member 行。Console 改 cap 与补货使用同样的锁顺序。
 - 改 cap 时在事务内校验 `ΣC_e ≤ NAME_CAPACITY`。
 - `PATCH /api/user-pool/settings` 只接受 `idle_target`、`lease_seconds`、`paused`。传入 `max_accounts` 返回 409 `use_enterprise_cap`。
+- 基线 `GET /api/user-pool`（含成员列表的总览）由 `/api/user-pool/overview`（全局设置与计数）和企业作用域路由取代；旧直连 `/api/accounts*` 保留一个版本，响应带 `Deprecation: true`。
 
 ---
 

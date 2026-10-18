@@ -573,7 +573,7 @@ test('isolated MySQL 8 import of a single-enterprise (r4) source assigns every r
       await assertDefaultEnterprise(pool);
       // The Proxy starts on the imported target: same identity, same pool configuration.
       const { MysqlStorage } = await import('../../src/proxy/src/db/mysqlStorage.js');
-      const storage = new MysqlStorage(pool, 2, true, enterpriseSeed);
+      const storage = new MysqlStorage(pool, 2, true, [enterpriseSeed]);
       await storage.initialize();
       await (await storage.userPool(poolConfig)).settings();
     } finally { f.close(); }

@@ -110,7 +110,7 @@ test('all POST routes accept canonical and dotted aliases and send the live raw 
     { path: '/responses', model: 'claude-opus-5.2' },
   ]);
 
-  const stats = await listRequestStats(identity, 20);
+  const stats = await listRequestStats(DEFAULT_ENTERPRISE_ID, identity, 20);
   const routed = stats.filter((stat) => stat.path !== '/v1/models');
   assert.equal(routed.length, 4);
   assert.ok(routed.every((stat) => stat.model === 'claude-opus-5-2'));
@@ -151,7 +151,7 @@ test('canonicalizes new and historical request-stat model values at the reposito
     model: 'claude-opus-5-2-20260101',
     success: true,
   });
-  const stats = await listRequestStats(statsIdentity, 10);
+  const stats = await listRequestStats(DEFAULT_ENTERPRISE_ID, statsIdentity, 10);
   assert.equal(stats[0]?.model, 'claude-opus-5-2');
 });
 

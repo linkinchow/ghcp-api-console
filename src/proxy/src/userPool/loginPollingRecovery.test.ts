@@ -10,6 +10,7 @@ import type { Awaitable, PoolStore } from './storage.js';
 import type { Inventory } from './store.js';
 import type { PrewarmStore, PrewarmWorker as Worker } from './worker.js';
 import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
+import { unscopedUrl } from '../testing/scopedPaths.js';
 
 // Capture explicit shell opt-in before importing anything that could load dotenv.
 const mysqlUrl = process.env.MYSQL_TEST_URL;
@@ -68,10 +69,11 @@ async function fixture(t: TestContext, driver: Driver) {
   const options = readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease', STORAGE_DRIVER: driver,
     POOL_ACCOUNT_EMAIL_DOMAIN: 'polling-recovery.test', POOL_WARMUP_MODEL: 'synthetic',
     READY_IDLE_TARGET: '1', POOL_MAX_ACCOUNTS: '7', POOL_LOGIN_MAX_PENDING: '1', PREWARM_POLL_SECONDS: '1' });
+  (await import('../testing/enterpriseFixture.js')).installDefaultPoolDomain(options.accountDomain);
   let mysqlDb: ReturnType<typeof createPool> | undefined;
   let storage: InstanceType<typeof SqliteStorage> | InstanceType<typeof MysqlStorage>;
   if (driver === 'sqlite') {
-    storage = new SqliteStorage(':memory:', 100, defaultEnterpriseSeed({}));
+    storage = new SqliteStorage(':memory:', 100, [defaultEnterpriseSeed({})]);
     cleanup.push(() => storage.close());
   } else {
     // No default DB, remote address, URL options, or caller-named database is ever used.
@@ -90,7 +92,7 @@ async function fixture(t: TestContext, driver: Driver) {
     url.pathname = '/' + database;
     mysqlDb = createPool({ uri: url.toString(), connectionLimit: 4, connectTimeout: 5000,
       dateStrings: true, timezone: 'Z', supportBigNumbers: true, bigNumberStrings: true });
-    storage = new MysqlStorage(mysqlDb, 100, true, defaultEnterpriseSeed({}));
+    storage = new MysqlStorage(mysqlDb, 100, true, [defaultEnterpriseSeed({})]);
     cleanup.push(async () => {
       try { await storage.close(); }
       finally { await admin.query(`DROP DATABASE \`${database}\``); }
@@ -111,7 +113,8 @@ async function fixture(t: TestContext, driver: Driver) {
     releaseOwner: owner => later(() => store.releaseOwner(owner)),
     reclaim: () => later(() => store.reclaim()),
     settings: () => later(() => store.settings()),
-    reserveDeficit: owner => later(() => store.reserveDeficit(owner)),
+    reserveDeficit: (owner, eligible) => later(() => store.reserveDeficit(owner, eligible)),
+    enterprisePolicies: () => later(() => store.enterprisePolicies()),
     pending: excluded => later(() => store.pending(excluded)),
     hasHolds: id => later(() => store.hasHolds(id)),
     inventory: id => later(() => store.inventory(id)),
@@ -145,11 +148,12 @@ async function fixture(t: TestContext, driver: Driver) {
   let worker: Worker;
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
   const adapter = realProvisioner(asyncStore, options, {
+    isReady: async () => true,
     getAccount: id => storage.getAccount(id),
     fetch: (input, init) => recordMock(async () => {
       // All transport is synthetic; there is no delegation to global fetch.
       await yieldTurn();
-      const url = new URL(String(input)), method = init?.method ?? 'GET';
+      const url = unscopedUrl(input), method = init?.method ?? 'GET';
       requests.push(`${method} ${url.pathname}`);
       const body = () => JSON.parse(String(init?.body));
       if (url.pathname === '/api/users' && method === 'POST') {
@@ -194,7 +198,7 @@ async function fixture(t: TestContext, driver: Driver) {
         const row = (await store.inventory(request.identity))!, user = users.get(row.identity)!;
         assert.equal(row.stage, 'oauth-dispatch', 'real capacity transaction precedes Login POST');
         assert.deepEqual(request, { identity: row.identity, ssoUser: row.identity, ghLogin: user.ghLogin,
-          oauthAttemptId: row.oauth_attempt_id, ssoType: 'custom', ssoPassword: 'synthetic-password' });
+          oauthAttemptId: row.oauth_attempt_id, ssoPassword: 'synthetic-password' });
         const account = await storage.getAccount(row.identity);
         assert.equal(account?.copilotOauthAttemptId, request.oauthAttemptId);
         assert.equal(account?.copilotOauthStatus, 'refreshing');
@@ -287,7 +291,7 @@ async function fixture(t: TestContext, driver: Driver) {
     settings = await store.updateSettings(settings.version, { idle_target: 7 });
     const identities: string[] = [];
     for (let n = 0; n < count; n++) {
-      const member = await store.reserve();
+      const member = await store.reserve(['default']);
       assert.ok(member);
       identities.push(member.identity);
     }

@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { createPool, type Pool, type PoolConnection, type RowDataPacket } from 'mysql2/promise';
-import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
+import { DEFAULT_ENTERPRISE_ID, type EnterpriseId } from '@ghcp/shared';
 import type { PoolConfig } from '../userPool/config.js';
 import { POOL_SCHEMA_MIGRATION, poolConfigFingerprint,
   singleEnterprisePoolConfigFingerprint } from '../userPool/mysqlMigrations.js';
@@ -68,23 +68,23 @@ test('after an upgrade, reservations write enterprise_id and maintain the invent
     await createR4Database(db);
     const storage = await startProxy(db);
     const pool = await storage.userPool(options);
-    const member = await pool.reserve();
+    const member = await pool.reserve([DEFAULT_ENTERPRISE_ID]);
     assert.equal(member?.enterprise_id, DEFAULT_ENTERPRISE_ID);
     const [enterprise] = await storage.listEnterprises();
     assert.equal(enterprise.inventoryCount, 3);
-    const settings = await pool.settings();
-    const updated = await pool.updateSettings(settings.version, { max_accounts: 9 });
-    assert.equal(updated.max_accounts, 9);
+    const policy = await pool.updateEnterprisePolicy(DEFAULT_ENTERPRISE_ID, enterprise.policyVersion,
+      { maxAccounts: 9 });
+    assert.equal(policy.maxAccounts, 9);
     const [capped] = await storage.listEnterprises();
     assert.deepEqual([capped.maxAccounts, capped.policyVersion], [9, enterprise.policyVersion + 1]);
     const [events] = await db.query<RowDataPacket[]>(`
       SELECT action, enterprise_id
       FROM user_pool_events
-      WHERE action IN ('name_reserved', 'settings_updated') AND at > 5
+      WHERE action IN ('name_reserved', 'enterprise_policy_updated') AND at > 5
       ORDER BY id
     `);
     assert.deepEqual(events.map((row) => [row.action, row.enterprise_id]),
-      [['name_reserved', DEFAULT_ENTERPRISE_ID], ['settings_updated', null]]);
+      [['name_reserved', DEFAULT_ENTERPRISE_ID], ['enterprise_policy_updated', DEFAULT_ENTERPRISE_ID]]);
   });
 });
 
@@ -136,7 +136,7 @@ test('MYSQL_AUTO_MIGRATE=false on an r4 database names the upgrade script, then 
     await withDatabase(async (db) => {
       await createR4Database(db);
       const before = await snapshot(db);
-      await assert.rejects(new MysqlStorage(db, 2, false, seed).initialize(),
+      await assert.rejects(new MysqlStorage(db, 2, false, [seed]).initialize(),
         /scripts\/proxy-mysql-enterprise-upgrade\.sql/);
       await runScript(db, renderMysqlEnterpriseUpgradeSql());
       const recorder = recordStatements(db);
@@ -163,12 +163,63 @@ test('the default enterprise identity may change only while it has no pool membe
     const changed = { ...seed, fingerprint: 'b'.repeat(64) };
     await startProxy(db, true, changed);
     assert.equal((await storage.listEnterprises())[0].profileFingerprint, changed.fingerprint);
-    await (await storage.userPool(options)).reserve();
+    await (await storage.userPool(options)).reserve([DEFAULT_ENTERPRISE_ID]);
     for (const autoMigrate of [true, false]) {
-      await assert.rejects(new MysqlStorage(db, 2, autoMigrate, seed).initialize(),
+      await assert.rejects(new MysqlStorage(db, 2, autoMigrate, [seed]).initialize(),
         /^Error: enterprise_identity_changed/);
     }
     assert.equal((await storage.listEnterprises())[0].profileFingerprint, changed.fingerprint);
+  });
+});
+
+test('registry enterprises start as drafts; identity and removal are checked per enterprise', { skip }, async () => {
+  await withDatabase(async (db) => {
+    const beta: EnterpriseSeed = { id: 'beta' as EnterpriseId, fingerprint: 'b'.repeat(64), maxAccounts: 20 };
+    const storage = new MysqlStorage(db, 2, true, [seed, beta]);
+    await storage.initialize();
+    const states = (await storage.listEnterprises()).map(({ id, state, maxAccounts }) => ({ id, state, maxAccounts }));
+    assert.deepEqual(states, [
+      { id: beta.id, state: 'draft', maxAccounts: 20 },
+      { id: DEFAULT_ENTERPRISE_ID, state: 'active', maxAccounts: 50 },
+    ]);
+    await new MysqlStorage(db, 2, false, [seed, { ...beta, maxAccounts: 30 }]).initialize();
+    assert.equal((await storage.listEnterprises())[0].maxAccounts, 20, 'the initial cap only seeds a new row');
+    const adopted = { ...beta, fingerprint: 'c'.repeat(64) };
+    await new MysqlStorage(db, 2, true, [seed, adopted]).initialize();
+    assert.equal((await storage.listEnterprises())[0].profileFingerprint, adopted.fingerprint);
+    const pool = await storage.userPool(options);
+    await pool.updateEnterprisePolicy(beta.id, 1, { state: 'active' });
+    assert.equal((await pool.reserve([beta.id]))?.enterprise_id, beta.id);
+    for (const autoMigrate of [true, false]) {
+      await assert.rejects(new MysqlStorage(db, 2, autoMigrate, [seed, beta]).initialize(),
+        /^Error: enterprise_identity_changed: enterprise "beta"/);
+      await assert.rejects(new MysqlStorage(db, 2, autoMigrate, [seed]).initialize(),
+        /^Error: enterprise_missing_from_registry: enterprise "beta"/);
+    }
+  });
+});
+
+test('management reads and SSO-user deletion stay inside one enterprise', { skip }, async () => {
+  await withDatabase(async (db) => {
+    const beta: EnterpriseSeed = { id: 'beta' as EnterpriseId, fingerprint: 'b'.repeat(64), maxAccounts: 20 };
+    const storage = new MysqlStorage(db, 2, true, [seed, beta]);
+    await storage.initialize();
+    await storage.createAccount({ enterpriseId: DEFAULT_ENTERPRISE_ID, identity: 'default-user', ssoUser: 'Shared' });
+    await storage.createAccount({ enterpriseId: beta.id, identity: 'beta-user', ssoUser: 'shared' });
+    for (const [enterpriseId, identity] of [[DEFAULT_ENTERPRISE_ID, 'default-user'], [beta.id, 'beta-user']]) {
+      await storage.recordRequestStat({ enterpriseId: enterpriseId as EnterpriseId, identity, path: '/v1/models',
+        success: true });
+    }
+    assert.deepEqual((await storage.listAccounts(beta.id)).items.map((row) => row.identity), ['beta-user']);
+    assert.equal((await storage.summarizeAccounts(beta.id)).total, 1);
+    assert.deepEqual((await storage.listRequestStats(beta.id)).map((row) => row.identity), ['beta-user']);
+    assert.equal((await storage.listRequestStatsPage(DEFAULT_ENTERPRISE_ID)).total, 1);
+    await storage.withReadSnapshot(async (reader) => {
+      assert.equal((await reader.listAccounts(beta.id)).total, 1);
+    });
+    const deleted = await storage.deleteAccountsBySsoUser(beta.id, 'SHARED');
+    assert.deepEqual(deleted, { ssoUser: 'SHARED', matchedAccounts: 1, deletedAccounts: 1, deletedRequestStats: 1 });
+    assert.ok(await storage.getAccount('default-user'), 'the same SSO user in another enterprise is untouched');
   });
 });
 
@@ -194,7 +245,7 @@ async function withDatabase(run: (db: Pool) => Promise<void>): Promise<void> {
 }
 
 async function startProxy(db: Pool, autoMigrate = true, enterprise = seed): Promise<MysqlStorage> {
-  const storage = new MysqlStorage(db, 2, autoMigrate, enterprise);
+  const storage = new MysqlStorage(db, 2, autoMigrate, [enterprise]);
   await storage.initialize();
   await storage.userPool(options);
   return storage;

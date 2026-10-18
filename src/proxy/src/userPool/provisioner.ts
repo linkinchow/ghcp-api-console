@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
+  abortable,
   INTERNAL_AUTH_HEADER,
   type SsoUserLoginCredentialsResponse,
   type LoginTaskDto,
@@ -8,6 +9,8 @@ import {
   type EnterpriseId,
 } from '@ghcp/shared';
 import { config } from '../config.js';
+import { enterpriseReadiness } from '../clients/enterpriseReadiness.js';
+import { findProxyEnterprise, type ProxyEnterprise } from '../enterprises.js';
 import type { getAccount, beginCopilotOauthAuthorization, invalidateCopilotOauthToken } from '../db/accountsRepo.js';
 import {
   prepareCopilotRequest,
@@ -59,12 +62,21 @@ export type LoginReservationOutcome = 'success' | 'failed';
 export interface ProvisionAdapter {
   readonly stepTimeoutMs?: number;
   step(row: ProvisionInventory, context: ProvisionContext): Promise<ProvisionPatch>;
+  /**
+   * Active enterprises that may receive new members now (design §3.8, §5.8). Evaluated outside any storage
+   * transaction; an enterprise whose readiness does not answer in time is left out, never waited for.
+   */
+  eligibleEnterprises?(signal: AbortSignal): Promise<readonly string[]>;
   /** Observe only: never retry, cancel, begin OAuth, warm up, or modify credentials. */
   reconcileLoginReservation?(row: ProvisionInventory, context: LoginReservationContext): Promise<LoginReservationOutcome | undefined>;
 }
 
 interface ProvisionDependencies {
   fetch: typeof fetch;
+  /** Live-enough cross-service readiness of one enterprise; the worker bounds each call. */
+  isReady(enterpriseId: string, signal: AbortSignal): Promise<boolean>;
+  enterprise(enterpriseId: string): ProxyEnterprise | undefined;
+  readinessDeadlineMs: number;
   getAccount: typeof getAccount;
   createAccount(input: CreateAccountInput): Promise<ProxyAccountRecord>;
   beginAuthorization: typeof beginCopilotOauthAuthorization;
@@ -74,23 +86,41 @@ interface ProvisionDependencies {
 }
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
+/** One enterprise's readiness answer; a slower one only removes that enterprise from this round. */
+export const ENTERPRISE_READINESS_DEADLINE_MS = 3000;
 const LOGIN_TASK_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_TASK_PAGES = 10;
 
 export function realProvisioner(
-  store: Pick<PoolStore, 'now'>,
+  store: Pick<PoolStore, 'now'> & Partial<Pick<PoolStore, 'enterprisePolicies'>>,
   options: PoolConfig,
   dependencies: Partial<ProvisionDependencies> = {},
 ): ProvisionAdapter {
   const deps = {
     fetch: (...args: Parameters<typeof fetch>) => fetch(...args),
+    isReady: async (id: string, signal: AbortSignal) => (await enterpriseReadiness.readiness(id, { signal })).ready,
+    enterprise: findProxyEnterprise,
+    readinessDeadlineMs: ENTERPRISE_READINESS_DEADLINE_MS,
     // Reads may use either storage driver. Production writes use the atomic context.
     getAccount: (identity: string) => getStorage().getAccount(identity),
     resolveModel: resolveCopilotModel,
     executeRequest: executePreparedCopilotRequest,
     ...dependencies,
   };
-  const email = (row: ProvisionInventory) => `${row.identity}@${options.accountDomain}`;
+  const enterpriseOf = (row: ProvisionInventory): ProxyEnterprise => {
+    const enterprise = deps.enterprise(row.enterprise_id);
+    if (!enterprise) throw new ProvisionFailure('enterprise_not_found', true);
+    return enterprise;
+  };
+  /**
+   * Pool members of each enterprise use that enterprise's account domain (design §3.3); the registry merges
+   * POOL_ACCOUNT_EMAIL_DOMAIN into `default`. Without one the enterprise is not ready and gets no new members.
+   */
+  const email = (row: ProvisionInventory) => {
+    const domain = enterpriseOf(row).profile.pool.accountDomain;
+    if (!domain) throw new ProvisionFailure('enterprise_not_ready');
+    return `${row.identity}@${domain}`;
+  };
 
   async function mutate(row: ProvisionInventory, context: ProvisionContext, mutation: WorkerCredentialMutation): Promise<boolean> {
     await context.assertCurrent();
@@ -123,15 +153,18 @@ export function realProvisioner(
     throw new ProvisionFailure('provision_storage_incompatible', true);
   }
 
+  /** SSO and Login calls of a member always use its enterprise's scoped API (design §5.3). */
   async function request<T>(
     context: LoginReservationContext,
+    row: ProvisionInventory,
     service: 'sso' | 'login',
     path: string,
     body?: unknown,
   ): Promise<T> {
     await context.assertCurrent();
     const baseUrl = service === 'sso' ? config.ssoBaseUrl : config.loginBaseUrl;
-    const response = await deps.fetch(`${baseUrl.replace(/\/+$/, '')}${path}`, {
+    const scoped = `/api/enterprises/${encodeURIComponent(enterpriseOf(row).id)}${path}`;
+    const response = await deps.fetch(`${baseUrl.replace(/\/+$/, '')}${scoped}`, {
       method: body === undefined ? 'GET' : 'POST',
       headers: {
         Accept: 'application/json',
@@ -166,7 +199,8 @@ export function realProvisioner(
   }
 
   async function knownUser(row: ProvisionInventory, context: ProvisionContext): Promise<SsoUserDto> {
-    return checkUser(row, await request<SsoUserDto>(context, 'sso', `/api/users/${encodeURIComponent(row.identity)}`));
+    const path = `/users/${encodeURIComponent(row.identity)}`;
+    return checkUser(row, await request<SsoUserDto>(context, row, 'sso', path));
   }
 
   function checkEntitlement(user: SsoUserDto): void {
@@ -186,20 +220,30 @@ export function realProvisioner(
     return account;
   }
 
+  /** Pool tasks leave the provider to the enterprise profile; without one Login uses `custom` (design §5.7). */
+  function expectedSsoType(row: ProvisionInventory): string {
+    return enterpriseOf(row).profile.login.ssoProvider ?? 'custom';
+  }
+
   function checkTask(row: ProvisionInventory, task: LoginTaskDto, ghLogin: string): LoginTaskDto {
     if (!task || !task.id || row.task_id && task.id !== row.task_id
       || task.identity !== row.identity || task.ssoUser !== row.identity
-      || task.ghLogin !== ghLogin || task.oauthAttemptId !== row.oauth_attempt_id || task.ssoType !== 'custom') {
+      || task.ghLogin !== ghLogin || task.oauthAttemptId !== row.oauth_attempt_id
+      || task.ssoType !== expectedSsoType(row)) {
       throw new ProvisionFailure('oauth_task_mismatch', true);
     }
     return task;
   }
 
+  function loginTask(row: ProvisionInventory, context: LoginReservationContext, taskId: string): Promise<LoginTaskDto> {
+    return request<LoginTaskDto>(context, row, 'login', `/tasks/${encodeURIComponent(taskId)}`);
+  }
+
   async function findTask(row: ProvisionInventory, context: LoginReservationContext, ghLogin: string): Promise<LoginTaskDto | undefined> {
     let found: LoginTaskDto | undefined;
     for (let page = 1; page <= MAX_TASK_PAGES; page++) {
-      const result = await request<PageResponse<LoginTaskDto>>(context, 'login',
-        `/api/tasks?q=${encodeURIComponent(row.identity)}&page=${page}&pageSize=100`);
+      const result = await request<PageResponse<LoginTaskDto>>(context, row, 'login',
+        `/tasks?q=${encodeURIComponent(row.identity)}&page=${page}&pageSize=100`);
       if (!Array.isArray(result.items) || !Number.isSafeInteger(result.total) || result.total < 0) {
         throw new ProvisionFailure('oauth_task_list_invalid');
       }
@@ -218,7 +262,7 @@ export function realProvisioner(
     await context.assertCurrent();
     if (row.stage === 'new') {
       try {
-        await request(context, 'sso', `/api/users/${encodeURIComponent(row.identity)}`);
+        await request(context, row, 'sso', `/users/${encodeURIComponent(row.identity)}`);
         throw new ProvisionFailure('sso_name_conflict', true);
       } catch (error) {
         if (!(error instanceof ProvisionFailure && error.code === 'sso_http_404')) throw error;
@@ -227,7 +271,7 @@ export function realProvisioner(
       // reconciliation, even if a later GET happens to find the expected name/email.
       row = await context.checkpoint({ stage: 'sso-creating', sso_created_at: null });
       try {
-        const user = checkUser(row, await request<SsoUserDto>(context, 'sso', '/api/users', {
+        const user = checkUser(row, await request<SsoUserDto>(context, row, 'sso', '/users', {
           ssoUser: row.identity, email: email(row), role: 'user', poolManaged: true,
         }), true);
         return { stage: 'sso-created', sso_created_at: user.createdAt };
@@ -245,7 +289,7 @@ export function realProvisioner(
       if (row.stage === 'scim-syncing') throw new ProvisionFailure('scim_sync_unconfirmed');
       row = await context.checkpoint({ stage: 'scim-syncing' });
       const result = await request<{ rows: { ssoUser: string; status: string; user?: SsoUserDto }[] }>(
-        context, 'sso', '/api/users/batch', {
+        context, row, 'sso', '/users/batch', {
           operation: 'sync_emu', ssoUsers: [row.identity], assignCopilotSeat: false, createOnly: true,
         });
       const item = result.rows?.[0];
@@ -263,8 +307,8 @@ export function realProvisioner(
       if (user.copilotSeatStatus !== 'assigned') {
         if (row.stage === 'seat-assigning') throw new ProvisionFailure('seat_assignment_unconfirmed');
         row = await context.checkpoint({ stage: 'seat-assigning' });
-        user = checkUser(row, await request<SsoUserDto>(context, 'sso',
-          `/api/users/${encodeURIComponent(row.identity)}/copilot-seat`, {}));
+        user = checkUser(row, await request<SsoUserDto>(context, row, 'sso',
+          `/users/${encodeURIComponent(row.identity)}/copilot-seat`, {}));
       }
       checkEntitlement(user);
       await accountFor(row, context, user);
@@ -287,8 +331,8 @@ export function realProvisioner(
       const user = await knownUser(row, context);
       checkEntitlement(user);
       const account = await accountFor(row, context, user);
-      const credentials = await request<SsoUserLoginCredentialsResponse>(context, 'sso',
-        `/api/users/${encodeURIComponent(row.identity)}/login-credentials`, {
+      const credentials = await request<SsoUserLoginCredentialsResponse>(context, row, 'sso',
+        `/users/${encodeURIComponent(row.identity)}/login-credentials`, {
           expectedCreatedAt: row.sso_created_at, expectedEmail: email(row),
         });
       checkUser(row, credentials.user);
@@ -306,9 +350,9 @@ export function realProvisioner(
         if (context.mutateCredentials) throw new ProvisionFailure('provision_storage_incompatible', true);
         row = await context.checkpoint({ stage: 'oauth-dispatch' });
       }
-      const task = checkTask(row, await request<LoginTaskDto>(context, 'login', '/api/tasks', {
+      const task = checkTask(row, await request<LoginTaskDto>(context, row, 'login', '/tasks', {
         identity: row.identity, ssoUser: row.identity, ghLogin: user.ghLogin,
-        ssoPassword: credentials.passwordForLogin, oauthAttemptId: row.oauth_attempt_id, ssoType: 'custom',
+        ssoPassword: credentials.passwordForLogin, oauthAttemptId: row.oauth_attempt_id,
       }), user.ghLogin!);
       return { stage: 'oauth-wait', task_id: task.id };
     }
@@ -318,7 +362,7 @@ export function realProvisioner(
       const user = await knownUser(row, context);
       checkEntitlement(user);
       const task = row.task_id
-        ? checkTask(row, await request<LoginTaskDto>(context, 'login', `/api/tasks/${encodeURIComponent(row.task_id)}`), user.ghLogin!)
+        ? checkTask(row, await loginTask(row, context, row.task_id), user.ghLogin!)
         : await findTask(row, context, user.ghLogin!);
       // A bounded read-only retry allows an accepted POST to become visible. It must
       // never convert an uncertain dispatch into a new OAuth attempt.
@@ -357,7 +401,13 @@ export function realProvisioner(
         await context.checkpoint({ stage: 'synced', task_id: null, oauth_attempt_id: null });
         throw new ProvisionFailure('credential_not_valid');
       }
-      const auth = { identity: account.identity, accessToken: account.copilotOauthToken, api: config.copilotApiBaseUrl };
+      const enterprise = enterpriseOf(row);
+      const auth = {
+        identity: account.identity,
+        accessToken: account.copilotOauthToken,
+        api: enterprise.endpoints.copilotApiBaseUrl,
+        enterpriseId: enterprise.id,
+      };
       let resolved: ResolvedCopilotModel | undefined;
       let path: CopilotApiPath = '/v1/messages';
       for (const candidate of ['/v1/messages', '/chat/completions', '/responses'] as const) {
@@ -410,8 +460,30 @@ export function realProvisioner(
     throw new ProvisionFailure('unknown_provision_stage', true);
   }
 
+  /** False when the enterprise does not answer within its own deadline; the worker's stop still aborts. */
+  async function readyWithinDeadline(enterpriseId: string, signal: AbortSignal): Promise<boolean> {
+    const deadline = AbortSignal.any([signal, AbortSignal.timeout(deps.readinessDeadlineMs)]);
+    try {
+      return await abortable(deps.isReady(enterpriseId, deadline), deadline);
+    } catch {
+      signal.throwIfAborted();
+      return false;
+    }
+  }
+
+  /** Only `active` enterprises are probed; draft and draining ones never receive new members. */
+  async function eligibleEnterprises(signal: AbortSignal): Promise<readonly string[]> {
+    if (!store.enterprisePolicies) return [];
+    const policies = await store.enterprisePolicies();
+    const active = policies.filter((policy) => policy.state === 'active').map((policy) => policy.id);
+    const ready = await Promise.all(active.map((id) => readyWithinDeadline(id, signal)));
+    signal.throwIfAborted();
+    return active.filter((_id, index) => ready[index]);
+  }
+
   return {
     stepTimeoutMs: options.requestTimeoutMs,
+    eligibleEnterprises,
     async reconcileLoginReservation(row, context) {
       if (!isExhaustedLoginReservation(row) || !row.oauth_attempt_id) return undefined;
       const signal = AbortSignal.any([context.signal, AbortSignal.timeout(options.requestTimeoutMs)]);
@@ -424,7 +496,7 @@ export function realProvisioner(
       const account = await accountFor(row, observation);
       if (!account.ghLogin) return undefined;
       const task = row.task_id
-        ? checkTask(row, await request<LoginTaskDto>(observation, 'login', `/api/tasks/${encodeURIComponent(row.task_id)}`), account.ghLogin)
+        ? checkTask(row, await loginTask(row, observation, row.task_id), account.ghLogin)
         : await findTask(row, observation, account.ghLogin);
       await observation.assertCurrent();
       // cancelled is only a DB marker in Login, not proof that Playwright stopped.

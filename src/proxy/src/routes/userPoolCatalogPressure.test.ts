@@ -13,7 +13,7 @@ import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 // Intentionally one process: two real Express listeners share real SQLite storage
 // and the production process-local model cache. This is NOT a MySQL/replica test.
 // Import application modules only after preventing dotenv from reading real secrets.
-// The enterprise registry accepts only an origin, so the path-prefixed upstream is set on config directly.
+// The `default` enterprise takes its path-prefixed Copilot API root from COPILOT_API_BASE_URL.
 const upstreamBaseUrl = 'http://127.0.0.1:1/catalog-pressure-upstream';
 const safeEnv = {
   DOTENV_CONFIG_PATH: join(tmpdir(), `catalog-pressure-no-dotenv-${randomUUID()}.env`),
@@ -21,7 +21,7 @@ const safeEnv = {
   MYSQL_URL: '', MYSQL_SSL_MODE: 'disabled', MYSQL_SSL_CA_PATH: '',
   API_KEY: 'catalog-pressure-synthetic-key', INTERNAL_API_TOKEN: 'catalog-pressure-internal',
   IDENTITY_HEADER: 'X-User-Identity', IDENTITY_HEADER_REQUIRED: 'true', CLAUDE_CODE_OPTIMIZED: 'true',
-  COPILOT_API_BASE_URL: 'http://127.0.0.1:1',
+  COPILOT_API_BASE_URL: upstreamBaseUrl,
   SSO_BASE_URL: 'http://127.0.0.1:1', LOGIN_BASE_URL: 'http://127.0.0.1:1',
   PROXY_ERROR_DIAGNOSTICS_ENABLED: 'false',
   POOL_ACCOUNT_EMAIL_DOMAIN: 'catalog-pressure.test', POOL_WARMUP_MODEL: 'claude-opus-5-2',
@@ -50,7 +50,7 @@ before(async () => {
   modules = await loadModules();
   savedConfig = { ...modules.config };
   Object.assign(modules.config, { storageDriver: 'sqlite', dbPath: ':memory:', apiKey: safeEnv.API_KEY,
-    copilotApiBaseUrl: upstreamBaseUrl, errorDiagnosticsEnabled: false, claudeCodeOptimized: true,
+    errorDiagnosticsEnabled: false, claudeCodeOptimized: true,
     requestStatsPerAccountLimit: 100 });
 });
 after(() => {
@@ -134,7 +134,7 @@ async function fixture(t: TestContext) {
   });
 
   for (let i = 0; i < 2; i++) {
-    const member = store.reserve()!;
+    const member = store.reserve([DEFAULT_ENTERPRISE_ID])!;
     members.push(member.identity);
     tokens.set(`Bearer catalog-pressure-token-${i}`, member.identity);
     clearModelsCache(member.identity);
@@ -262,7 +262,7 @@ async function fixture(t: TestContext) {
     await until(() => live.size === 0, 'all persisted holds finish');
     assert.ok(members.every(member => !store.hasHolds(member)));
     assert.equal(store.counts().catalog_requests, 0);
-    assert.ok(store.leases().every(lease => lease.active_requests === 0));
+    assert.ok(store.leases(DEFAULT_ENTERPRISE_ID).every(lease => lease.active_requests === 0));
     assert.deepEqual(overlap, [], 'Different callers never share a live member');
   }
   return { store, members, tokens, models, calls, admitted, waiters, finished, request, until, drain,
@@ -290,7 +290,7 @@ test('catalog pressure: GET/HEAD/count share refreshes, isolate callers and surv
   await f.until(() => f.waiters.size === requests.length, '24 catalog waiters joined');
   assert.equal(f.models.length, 2, 'Exactly one cold refresh per exclusive member across both listeners');
   assert.equal(f.store.counts().catalog_requests, 24);
-  assert.equal(f.store.leases().length, 0, 'Catalog-only callers never allocate leases');
+  assert.equal(f.store.leases(DEFAULT_ENTERPRISE_ID).length, 0, 'Catalog-only callers never allocate leases');
   assert.equal(f.store.counts().ready_idle, 0);
   for (const caller of callers.slice(0, 2)) {
     assert.equal(new Set([...f.admitted.values()].filter(c => c.held.caller_id === caller).map(c => c.held.member_identity)).size, 1);
@@ -307,7 +307,7 @@ test('catalog pressure: GET/HEAD/count share refreshes, isolate callers and surv
   f.releaseModels();
   for (const result of await Promise.all(requests.slice(1).map(request => request.response))) success(result);
   await f.drain();
-  assert.equal(f.store.leases().length, 0);
+  assert.equal(f.store.leases(DEFAULT_ENTERPRISE_ID).length, 0);
   assert.equal(f.calls.filter(call => call.path === '/v1/messages/count_tokens').length, 8);
   assert.equal(f.calls.filter(call => call.path === '/v1/messages').length, 0);
 });
@@ -320,23 +320,24 @@ test('catalog pressure: same-caller inference converges and later catalog traffi
   const inference = callers.slice(0, 2).flatMap(caller => Array.from({ length: 4 }, () => f.request(caller, 'inference')));
   await f.until(() => f.waiters.size === 14, 'inference joins existing catalog refreshes');
   assert.equal(f.models.length, 2);
-  assert.equal(f.store.leases().length, 2);
+  assert.equal(f.store.leases(DEFAULT_ENTERPRISE_ID).length, 2);
   for (const caller of callers.slice(0, 2)) {
     const contexts = [...f.admitted.values()].filter(context => context.held.caller_id === caller);
     assert.equal(new Set(contexts.map(context => context.held.member_identity)).size, 1);
-    const lease = f.store.leases().find(lease => lease.caller_id === caller)!;
+    const lease = f.store.leases(DEFAULT_ENTERPRISE_ID).find(lease => lease.caller_id === caller)!;
     assert.equal(lease.member_identity, contexts[0].held.member_identity);
     assert.equal(lease.phase, 'provisional');
   }
   f.releaseModels();
   await f.until(() => f.calls.filter(call => call.path === '/v1/messages').length === 8, 'all inference calls are simultaneously upstream');
   for (const result of await Promise.all(catalog.map(request => request.response))) success(result);
-  assert.ok(f.store.leases().every(lease => lease.phase === 'provisional'), 'Successful catalog/count requests do not promote inference leases');
+  assert.ok(f.store.leases(DEFAULT_ENTERPRISE_ID).every(lease => lease.phase === 'provisional'),
+    'Successful catalog/count requests do not promote inference leases');
   f.releaseInference();
   for (const result of await Promise.all(inference.map(request => request.response))) success(result);
   await f.drain();
-  assert.ok(f.store.leases().every(lease => lease.phase === 'active'));
-  const before = f.store.leases();
+  assert.ok(f.store.leases(DEFAULT_ENTERPRISE_ID).every(lease => lease.phase === 'active'));
+  const before = f.store.leases(DEFAULT_ENTERPRISE_ID);
   f.advance(1000);
   f.clearCache();
   const later = callers.slice(0, 2).flatMap(caller => (['GET', 'HEAD', 'count'] as const).map(kind => f.request(caller, kind)));
@@ -345,7 +346,8 @@ test('catalog pressure: same-caller inference converges and later catalog traffi
   f.releaseModels();
   for (const result of await Promise.all(later.map(request => request.response))) success(result);
   await f.drain();
-  assert.deepEqual(f.store.leases(), before, 'Catalog GET, HEAD and token counts change neither expiry nor last success');
+  assert.deepEqual(f.store.leases(DEFAULT_ENTERPRISE_ID), before,
+    'Catalog GET, HEAD and token counts change neither expiry nor last success');
   const expectedForwards = new Map(inference.map(request => {
     const held = f.admitted.get(request.id)!.held;
     return [request.id, held.member_identity];
@@ -371,14 +373,14 @@ test('catalog pressure: all cancelled waiters abort a partial body, drain holds 
   await f.until(() => f.models[0].cancelled, 'shared body reader cancelled after its last waiter leaves');
   assert.equal(f.models[0].signal.aborted, true);
   await f.drain();
-  assert.equal(f.store.leases().length, 0);
+  assert.equal(f.store.leases(DEFAULT_ENTERPRISE_ID).length, 0);
   const retry = f.request(callers[0]);
   await f.until(() => f.waiters.has(retry.id) && f.models.length === 2, 'retry starts a new refresh, not the detached cancelled one');
   assert.equal(f.models[1].signal.aborted, false);
   f.releaseModels();
   success(await retry.response);
   await f.drain();
-  assert.equal(f.store.leases().length, 0);
+  assert.equal(f.store.leases(DEFAULT_ENTERPRISE_ID).length, 0);
 });
 
 test('catalog pressure: oversized partial model response fails all waiters within the 8 MiB body bound', options, async t => {
@@ -399,7 +401,7 @@ test('catalog pressure: oversized partial model response fails all waiters withi
   assert.ok(f.models[0].emitted > 8 * 1024 * 1024);
   assert.ok(f.models[0].emitted <= 8 * 1024 * 1024 + 64 * 1024, 'At most the crossing chunk is consumed');
   await f.drain();
-  assert.equal(f.store.leases().length, 0);
+  assert.equal(f.store.leases(DEFAULT_ENTERPRISE_ID).length, 0);
   f.mode('partial');
   const retry = f.request(callers[0]);
   await f.until(() => f.models.length === 2, 'oversized result was not cached');
@@ -424,5 +426,5 @@ test('catalog pressure: stalled shared partial body hits HTTP request deadlines 
   assert.equal(f.models[0].signal.aborted, true);
   assert.equal(f.models.length, 1);
   await f.drain();
-  assert.equal(f.store.leases().length, 0);
+  assert.equal(f.store.leases(DEFAULT_ENTERPRISE_ID).length, 0);
 });

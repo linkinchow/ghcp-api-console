@@ -1,5 +1,7 @@
 export type PoolList = 'accounts' | 'leases' | 'events';
 export interface PoolPageQuery {
+  /** Every pool page is scoped to one enterprise (design §5.1). */
+  enterpriseId: string;
   page: number;
   pageSize: number;
   q?: string;
@@ -42,17 +44,19 @@ export function poolPageSql(kind: PoolList, input: PoolPageQuery, now: number): 
       state: '', order: 'e.id DESC', states: [],
     },
   };
+  const scopes = { accounts: 'p.enterprise_id = ?', leases: 'p.enterprise_id = ?', events: 'e.enterprise_id = ?' };
   const d = definitions[kind];
   if (!d || state && !(d.states as string[]).includes(state)) throw new Error('Invalid pool state');
-  const conditions: string[] = [];
-  const values: unknown[] = [];
+  if (typeof input.enterpriseId !== 'string' || !input.enterpriseId) throw new Error('Invalid pool enterprise');
+  const conditions: string[] = [scopes[kind]];
+  const values: unknown[] = [input.enterpriseId];
   if (q) {
     const pattern = `%${q.replace(/[!%_]/g, '!$&')}%`;
     conditions.push(`(${d.search.map(column => `LOWER(${column}) LIKE LOWER(?) ESCAPE '!'`).join(' OR ')})`);
     values.push(...d.search.map(() => pattern));
   }
   if (state) { conditions.push(`(${d.state}) = ?`); values.push(state); }
-  const where = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
+  const where = ` WHERE ${conditions.join(' AND ')}`;
   return {
     countSql: `SELECT COUNT(*) AS total FROM ${d.from}${where}`,
     itemsSql: `SELECT ${d.select} FROM ${d.from}${where} ORDER BY ${d.order} LIMIT ? OFFSET ?`,

@@ -117,7 +117,7 @@ function migratePoolAccounts(db: Database.Database): void {
   `);
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_user_pool_accounts_enterprise_state
-      ON user_pool_accounts(enterprise_id, state)
+      ON user_pool_accounts(enterprise_id, state, updated_at, ordinal)
   `);
   createPoolAccountGuards(db);
 }

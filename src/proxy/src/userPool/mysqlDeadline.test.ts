@@ -27,7 +27,7 @@ function fixture() {
       calls.queries.push(sql);
       if (sql.includes('SELECT id FROM user_pool_settings')) return [[{ id: 1 }]];
       if (sql.startsWith('SELECT') && sql.includes('TIMESTAMPDIFF')) return [[{ now: '1800000000000' }]];
-      if (sql.includes('MAX(id)')) return [[{ n: -9999 }]];
+      if (sql.includes('CAST(id AS SIGNED)')) return [[{ n: -9999 }]];
       if (sql.startsWith('SELECT')) return [[]];
       return [{ affectedRows: 1 }];
     },
@@ -119,7 +119,7 @@ for (const mode of ['sync', 'async'] as const) {
     assert.equal(f.calls.destroyed, 0);
     const sql = fixture();
     sql.raw.query = fail;
-    await assert.rejects(sql.store.events(), error => error === cause);
+    await assert.rejects(sql.store.events('default'), error => error === cause);
     assert.equal(sql.calls.destroyed, 0);
     assert.equal(sql.calls.released, 1);
     await assert.rejects(new MysqlDeadline().run('application', fail), error => error === cause);
@@ -142,7 +142,7 @@ for (const mode of ['sync', 'async'] as const) {
       assert.equal(f.calls.released, 0);
       const leased = fixture();
       leased.raw.query = fail;
-      await assert.rejects(leased.store.events(), (error) => error === cause);
+      await assert.rejects(leased.store.events('default'), (error) => error === cause);
       assert.equal(leased.calls.destroyed, 0);
       assert.equal(leased.calls.released, 1);
       assert.equal(isMysqlStorageUnavailable(cause), false);
@@ -163,7 +163,7 @@ test('driver failure cause survives even if socket destruction throws', async ()
   const cause = connectionFailure();
   f.raw.query = async () => { throw cause; };
   f.raw.destroy = () => { f.calls.destroyed++; throw new Error('already closed'); };
-  await assert.rejects(f.store.events(), assertConnectionFailure(cause));
+  await assert.rejects(f.store.events('default'), assertConnectionFailure(cause));
   assert.equal(f.calls.destroyed, 1);
   assert.equal(f.calls.released, 0);
 });
@@ -236,7 +236,7 @@ test('late failed acquisition is observed after timeout', async () => {
   const f = fixture();
   const pending = deferred<PoolConnection>();
   f.pool.getConnection = () => pending.promise;
-  await assert.rejects(f.store.events(), MysqlDeadlineError);
+  await assert.rejects(f.store.events('default'), MysqlDeadlineError);
   pending.reject(new Error('late connection failure'));
   await tick();
   assert.equal(f.calls.destroyed, 0);
@@ -245,7 +245,7 @@ test('late failed acquisition is observed after timeout', async () => {
 test('nontransaction reads destroy the actual leased connection when query stalls', async () => {
   const f = fixture();
   f.raw.query = () => never();
-  await assert.rejects(f.store.events(), MysqlDeadlineError);
+  await assert.rejects(f.store.events('default'), MysqlDeadlineError);
   assert.equal(f.calls.acquisitions, 1);
   assert.equal(f.calls.destroyed, 1);
   assert.equal(f.calls.released, 0);
@@ -256,7 +256,7 @@ test('multi-query reads use one connection and a shared deadline', async () => {
   const f = fixture();
   const query = f.raw.query.bind(f.raw);
   f.raw.query = async (sql) => sql.includes('TIMESTAMPDIFF') ? query(sql) : never();
-  await assert.rejects(f.store.accounts(), MysqlDeadlineError);
+  await assert.rejects(f.store.accounts('default'), MysqlDeadlineError);
   assert.equal(f.calls.acquisitions, 1);
   assert.equal(f.calls.destroyed, 1);
 });

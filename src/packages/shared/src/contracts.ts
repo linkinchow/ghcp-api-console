@@ -16,6 +16,8 @@ export interface RequestIdentity {
 
 export interface ProxyAccountDto {
   identity: string;
+  /** Set by the enterprise-aware Proxy routes; the deprecated global `/api/accounts/:identity` needs it. */
+  enterpriseId?: string;
   ssoUser: string;
   ghLogin?: string;
   copilotOauthStatus: CopilotOauthStatus;
@@ -104,6 +106,8 @@ export interface ProxyErrorDiagnosticRecordDto {
   timestamp: string;
   failureKind: ProxyErrorDiagnosticFailureKind;
   identity: string;
+  /** The enterprise whose account served the request, once it was resolved. */
+  enterpriseId?: string;
   path: ProxyRequestStatDto['path'];
   model?: string;
   redacted: boolean;
@@ -118,6 +122,7 @@ export interface ProxyErrorDiagnosticSummaryDto {
   timestamp: string;
   failureKind: ProxyErrorDiagnosticFailureKind;
   identity: string;
+  enterpriseId?: string;
   path: ProxyRequestStatDto['path'];
   model?: string;
   status?: number;

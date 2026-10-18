@@ -135,7 +135,7 @@ export class Fixture {
       timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true });
     this.pool.on('connection', connection => this.sockets.add(connection));
     this.enterprise = await enterpriseSeed();
-    this.storage = new MysqlStorage(this.pool, 2, true, this.enterprise);
+    this.storage = new MysqlStorage(this.pool, 2, true, [this.enterprise]);
     await bounded(this.storage.initialize(), 'migrate isolated sibling', 25000);
     this.signal.throwIfAborted(); assert.equal(this.closing, false);
     this.store = await bounded(this.storage.userPool(options), 'initialize pool store', 20000);

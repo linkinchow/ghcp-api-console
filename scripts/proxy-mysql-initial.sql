@@ -144,7 +144,7 @@ CREATE TABLE IF NOT EXISTS `user_pool_accounts` (
   INDEX idx_user_pool_available (state, updated_at, ordinal),
   INDEX idx_user_pool_cooling (state, cooldown_until),
   INDEX idx_user_pool_verification (state, verified_at),
-  INDEX idx_user_pool_accounts_enterprise_state (enterprise_id, state),
+  INDEX idx_user_pool_accounts_enterprise_state (enterprise_id, state, updated_at, ordinal),
   INDEX idx_user_pool_accounts_member_enterprise (identity, enterprise_id),
   CHECK (state IN ('provisioning', 'ready', 'cooling', 'failed', 'disabled'))
 ) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;

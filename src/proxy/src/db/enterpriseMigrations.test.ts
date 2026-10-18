@@ -19,6 +19,7 @@ type Snapshot = Record<string, Row[]>;
 
 const SEED: EnterpriseSeed = { id: DEFAULT_ENTERPRISE_ID, fingerprint: 'a'.repeat(64), maxAccounts: 50 };
 const CHANGED_SEED: EnterpriseSeed = { ...SEED, fingerprint: 'b'.repeat(64) };
+const ENTERPRISES = [DEFAULT_ENTERPRISE_ID];
 const POOL_OPTIONS = readPoolConfig({
   ACCOUNT_ROUTING_MODE: 'caller-lease',
   POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test',
@@ -287,7 +288,7 @@ test('an r4 database keeps every row and assigns all of them to the default ente
     assert.equal(enterprise.inventory_count, 2);
     assert.equal(enterprise.policy_version, 1);
     assert.equal(enterprise.profile_fingerprint, SEED.fingerprint);
-    assert.equal(store.settings().max_accounts, 7);
+    assert.equal(store.enterprisePolicies()[0].maxAccounts, 7);
     assert.deepEqual(db.pragma('foreign_key_check'), []);
   } finally {
     db.close();
@@ -434,7 +435,7 @@ function insertEnterprise(db: Database.Database, id: string): void {
 test('a changed identity fails closed once the enterprise has pool members', () => {
   const db = openDb();
   try {
-    start(db).reserve();
+    start(db).reserve(ENTERPRISES);
     assert.throws(() => runMigrations(db, CHANGED_SEED), (error: Error) => {
       assert.match(error.message, /^enterprise_identity_changed: enterprise "default"/);
       assert.ok(!error.message.includes(SEED.fingerprint) && !error.message.includes(CHANGED_SEED.fingerprint));
@@ -471,7 +472,7 @@ test('switching from direct mode to a caller-lease pool keeps working', () => {
       POOL_WARMUP_MODEL: 'test-model',
     };
     runMigrations(db, defaultEnterpriseSeed(poolEnv));
-    new UserPoolStore(db, POOL_OPTIONS).reserve();
+    new UserPoolStore(db, POOL_OPTIONS).reserve(ENTERPRISES);
     const changedDomain = { ...poolEnv, POOL_ACCOUNT_EMAIL_DOMAIN: 'other.example.test' };
     assert.throws(() => runMigrations(db, defaultEnterpriseSeed(changedDomain)), /^Error: enterprise_identity_changed/);
   } finally {
@@ -483,8 +484,8 @@ test('reservations increment the inventory counter and a restart corrects drift'
   const db = openDb();
   try {
     const store = start(db);
-    store.reserve();
-    store.reserve();
+    store.reserve(ENTERPRISES);
+    store.reserve(ENTERPRISES);
     assert.equal(defaultEnterprise(db).inventory_count, 2);
     db.prepare('UPDATE proxy_enterprises SET inventory_count = 9').run();
     start(db);
@@ -504,15 +505,14 @@ test('the pool cap lives on the default enterprise and events carry the member e
   const db = r4Database();
   try {
     const store = start(db);
-    const settings = store.settings();
-    const updated = store.updateSettings(settings.version, { max_accounts: 5 });
-    assert.equal(updated.max_accounts, 5);
-    assert.equal(updated.version, settings.version + 1);
+    const policy = store.updateEnterprisePolicy(DEFAULT_ENTERPRISE_ID, 1, { maxAccounts: 5 });
+    assert.equal(policy.maxAccounts, 5);
     assert.equal(defaultEnterprise(db).max_accounts, 5);
     assert.equal(defaultEnterprise(db).policy_version, 2);
     const legacy = db.prepare('SELECT max_accounts FROM user_pool_settings').get() as { max_accounts: number };
     assert.equal(legacy.max_accounts, 7, 'the legacy column is no longer written');
-    store.updateSettings(updated.version, { paused: 1 });
+    const settings = store.settings();
+    store.updateSettings(settings.version, { paused: 1 });
     assert.equal(defaultEnterprise(db).policy_version, 2, 'other settings do not touch the enterprise policy');
     store.event('member_retry', accountName(1));
     const events = db.prepare(`
@@ -522,7 +522,7 @@ test('the pool cap lives on the default enterprise and events carry the member e
       ORDER BY id
     `).all();
     assert.deepEqual(events, [
-      { action: 'settings_updated', enterprise_id: null },
+      { action: 'enterprise_policy_updated', enterprise_id: DEFAULT_ENTERPRISE_ID },
       { action: 'settings_updated', enterprise_id: null },
       { action: 'member_retry', enterprise_id: DEFAULT_ENTERPRISE_ID },
     ]);
@@ -534,7 +534,7 @@ test('the pool cap lives on the default enterprise and events carry the member e
 test('SQLite storage records enterprises on accounts, claims and statistics', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'proxy-enterprise-storage-'));
   const path = join(directory, 'proxy.sqlite');
-  const storage = new SqliteStorage(path, 10, SEED);
+  const storage = new SqliteStorage(path, 10, [SEED]);
   try {
     await storage.initialize();
     const account = await storage.createAccount({ enterpriseId: DEFAULT_ENTERPRISE_ID, identity: 'a', ssoUser: 'a' });
@@ -554,7 +554,7 @@ test('SQLite storage records enterprises on accounts, claims and statistics', as
       path: '/v1/models',
       success: true,
     });
-    const stat = await storage.listRequestStats('a');
+    const stat = await storage.listRequestStats(DEFAULT_ENTERPRISE_ID, 'a');
     assert.equal(stat.length, 1);
     const enterprises = await storage.listEnterprises();
     assert.deepEqual(enterprises.map(({ id, state, maxAccounts }) => ({ id, state, maxAccounts })), [
@@ -563,7 +563,7 @@ test('SQLite storage records enterprises on accounts, claims and statistics', as
   } finally {
     await storage.close();
   }
-  const changed = new SqliteStorage(path, 10, CHANGED_SEED);
+  const changed = new SqliteStorage(path, 10, [CHANGED_SEED]);
   try {
     await changed.initialize();
     const [enterprise] = await changed.listEnterprises();

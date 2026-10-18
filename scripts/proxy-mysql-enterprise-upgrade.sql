@@ -95,7 +95,7 @@ ALTER TABLE user_pool_accounts
   ADD COLUMN enterprise_id VARCHAR(32) COLLATE ascii_bin NOT NULL DEFAULT 'default';
 
 ALTER TABLE user_pool_accounts
-  ADD INDEX idx_user_pool_accounts_enterprise_state (enterprise_id, state);
+  ADD INDEX idx_user_pool_accounts_enterprise_state (enterprise_id, state, updated_at, ordinal);
 
 ALTER TABLE user_pool_accounts
   ADD INDEX idx_user_pool_accounts_member_enterprise (identity, enterprise_id);

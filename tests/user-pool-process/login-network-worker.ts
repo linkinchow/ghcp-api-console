@@ -18,7 +18,7 @@ try {
   ]);
   const pool = createPool({ uri: url.toString(), connectionLimit: 4, queueLimit: 16, connectTimeout: 5000,
     timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true });
-  const storage = new MysqlStorage(pool, 2, true, await enterpriseSeed());
+  const storage = new MysqlStorage(pool, 2, true, [await enterpriseSeed()]);
   const store = await storage.userPool(options);
   // Bind only the account READ to this isolated DB; all mutation, HTTP and warmup is production code.
   const adapter = realProvisioner(store, options, { getAccount: storage.getAccount.bind(storage) });

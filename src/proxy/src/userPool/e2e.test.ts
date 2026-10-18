@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
-import type { SsoUserDto, LoginTaskDto } from '@ghcp/shared';
+import { DEFAULT_GITHUB_BASE_URL, type SsoUserDto, type LoginTaskDto } from '@ghcp/shared';
 import { config } from '../config.js';
 import { getStorage, closeStorage } from '../db/connection.js';
 import { buildApp } from '../server.js';
@@ -11,11 +11,13 @@ import { readPoolConfig } from './config.js';
 import { PrewarmWorker } from './worker.js';
 import { realProvisioner } from './provisioner.js';
 import { UserPoolStore } from './store.js';
+import { setProxyEnterprisesForTesting } from '../enterprises.js';
 
 test('empty SQLite prewarms, serves exclusive HTTP callers, replenishes idle inventory and recycles expired leases', async () => {
   const settings = {
     ACCOUNT_ROUTING_MODE: 'caller-lease', STORAGE_DRIVER: 'sqlite', POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test',
     POOL_WARMUP_MODEL: 'claude-test-5-2', READY_IDLE_TARGET: '2', POOL_MAX_ACCOUNTS: '5', CALLER_LEASE_TTL_SECONDS: '60',
+    COPILOT_API_BASE_URL: 'http://copilot.mock.test',
   };
   const savedEnv = Object.fromEntries(Object.keys(settings).map((key) => [key, process.env[key]]));
   const savedConfig = { ...config };
@@ -27,7 +29,7 @@ test('empty SQLite prewarms, serves exclusive HTTP callers, replenishes idle inv
   config.internalApiToken = 'mock-internal-key';
   config.ssoBaseUrl = 'http://sso.mock.test';
   config.loginBaseUrl = 'http://login.mock.test';
-  config.copilotApiBaseUrl = 'http://copilot.mock.test';
+  setProxyEnterprisesForTesting(undefined);
   const store = await getUserPool();
   assert.ok(store instanceof UserPoolStore);
   let now = Date.now();
@@ -40,8 +42,9 @@ test('empty SQLite prewarms, serves exclusive HTTP callers, replenishes idle inv
     const url = new URL(String(input));
     const body = init?.body ? JSON.parse(String(init.body)) : {};
     if (url.hostname !== 'copilot.mock.test') assert.equal(new Headers(init?.headers).get('x-internal-token'), config.internalApiToken);
+    if (url.pathname === '/internal/enterprises') return json([readinessRow(url.hostname === 'sso.mock.test')]);
     if (url.hostname === 'sso.mock.test') {
-      if (url.pathname === '/api/users' && init?.method === 'POST') {
+      if (url.pathname === '/api/enterprises/default/users' && init?.method === 'POST') {
         assert.equal(body.role, 'user');
         const createdAt = new Date(now).toISOString();
         const user: SsoUserDto = { ssoUser: body.ssoUser, email: body.email, role: 'user', emuStatus: 'not_synced', copilotSeatStatus: 'unassigned', createdAt, updatedAt: createdAt };
@@ -49,14 +52,14 @@ test('empty SQLite prewarms, serves exclusive HTTP callers, replenishes idle inv
         users.set(user.ssoUser, user);
         return json(user, 201);
       }
-      if (url.pathname === '/api/users/batch') {
+      if (url.pathname === '/api/enterprises/default/users/batch') {
         assert.equal(body.createOnly, true);
         assert.equal(body.assignCopilotSeat, false);
         const user = users.get(body.ssoUsers[0])!;
         user.emuStatus = 'active'; user.ghScimId = `scim-${user.ssoUser}`; user.ghLogin = `${user.ssoUser}_test`;
         return json({ rows: [{ ssoUser: user.ssoUser, status: 'success', user }] });
       }
-      const [, , , identity, action] = url.pathname.split('/');
+      const [, , , , , identity, action] = url.pathname.split('/');
       const user = users.get(identity);
       if (!user) return json({}, 404);
       if (action === 'copilot-seat') { user.copilotSeatStatus = 'assigned'; return json(user); }
@@ -132,5 +135,18 @@ test('empty SQLite prewarms, serves exclusive HTTP callers, replenishes idle inv
     for (const [key, value] of Object.entries(savedEnv)) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
+    setProxyEnterprisesForTesting(undefined);
   }
 });
+
+/** `GET /internal/enterprises` of SSO (with the shortcode) and Login (without it) for the env-only `default`. */
+function readinessRow(sso: boolean) {
+  return {
+    id: 'default',
+    githubBaseUrl: DEFAULT_GITHUB_BASE_URL,
+    slug: 'acme',
+    shortcode: sso ? 'octo' : null,
+    configured: true,
+    blockers: [],
+  };
+}

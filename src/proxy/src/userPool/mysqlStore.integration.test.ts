@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
-import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
+import { createPool, type Pool, type PoolConnection, type RowDataPacket } from 'mysql2/promise';
 import { runMysqlMigrations } from '../db/mysqlMigrations.js';
 import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import { UserPoolError, type PoolConfig } from './config.js';
@@ -9,6 +9,7 @@ import { MysqlPoolStore } from './mysqlStore.js';
 import { MysqlConnectionError } from './mysqlDeadline.js';
 import { accountName, NAME_CAPACITY } from './names.js';
 import type { HeldLease, Inventory } from './store.js';
+import { storeContract, type ContractBackend } from './storeContract.js';
 
 const options: PoolConfig = {
   enabled: true, accountDomain: 'synthetic.example.test', idleTarget: 4, maxAccounts: 8,
@@ -68,7 +69,7 @@ test('MySQL user pool: isolated real multi-connection contract', {
     const ready = async (count = 1): Promise<string[]> => {
       const identities: string[] = [];
       for (let i = 0; i < count; i++) {
-        const member = await first.reserve();
+        const member = await first.reserve(['default']);
         assert.ok(member);
         await db.execute(`UPDATE proxy_accounts SET copilot_oauth_status='valid', copilot_oauth_token=?, gh_login=? WHERE identity=?`,
           [`SyntheticToken-${member.identity}`, member.identity, member.identity]);
@@ -90,7 +91,7 @@ test('MySQL user pool: isolated real multi-connection contract', {
       assert.equal(typeof inventory.updated_at, 'number');
       assert.equal(typeof inventory.generation, 'number');
       assert.equal(await first.inventory(member.toUpperCase()), undefined);
-      assert.equal(await first.managesSsoUser(member.toUpperCase()), true);
+      assert.equal(await first.managesSsoUser(DEFAULT_ENTERPRISE_ID, member.toUpperCase()), true);
       await assert.rejects(db.execute('DELETE FROM proxy_accounts WHERE identity=?', [member]),
         (e: unknown) => (e as { code?: string }).code === 'ER_ROW_IS_REFERENCED_2');
       const writes = await Promise.allSettled([first.updateSettings(1, { paused: 1 }), second.updateSettings(1, { idle_target: 1 })]);
@@ -106,13 +107,14 @@ test('MySQL user pool: isolated real multi-connection contract', {
       // The account domain is per enterprise: its identity fingerprint (MysqlStorage), not the pool's, guards it.
       await new MysqlPoolStore(otherDb, { ...options, accountDomain: 'other.test' }).initialize();
       await assert.rejects(new MysqlPoolStore(otherDb, { ...options, requestTimeoutMs: 5000 }).initialize(), /configuration differs/);
-      assert.equal(JSON.stringify(await first.accounts()).includes('SyntheticToken'), false);
-      const page = await first.page('accounts', { page: 1, pageSize: 1, q: member.toUpperCase(), state: 'ready_idle' });
+      assert.equal(JSON.stringify(await first.accounts('default')).includes('SyntheticToken'), false);
+      const page = await first.page('accounts',
+        { enterpriseId: 'default', page: 1, pageSize: 1, q: member.toUpperCase(), state: 'ready_idle' });
       assert.equal(page.total, 1);
       assert.equal(page.items.length, 1);
       assert.equal(JSON.stringify(page).includes('SyntheticToken'), false);
-      assert.equal((await second.page('accounts', { page: 2, pageSize: 1 })).items.length, 0);
-      assert.equal(JSON.stringify(await first.events()).includes('SyntheticToken'), false);
+      assert.equal((await second.page('accounts', { enterpriseId: 'default', page: 2, pageSize: 1 })).items.length, 0);
+      assert.equal(JSON.stringify(await first.events('default')).includes('SyntheticToken'), false);
     });
 
     await t.test('same caller races converge; distinct callers never share a member', async () => {
@@ -127,7 +129,8 @@ test('MySQL user pool: isolated real multi-connection contract', {
       assert.notEqual(winner.value.member_identity, holds[0].member_identity);
       assert.equal(races.filter((r) => r.status === 'rejected' && r.reason.code === 'pool_exhausted').length, 1);
       await Promise.all(holds.map((h) => first.finish(h, false)));
-      assert.equal((await second.leases()).find((l) => l.caller_id === caller(1))!.expires_at, holds[0].expires_at);
+      const lease = (await second.leases('default')).find((l) => l.caller_id === caller(1))!;
+      assert.equal(lease.expires_at, holds[0].expires_at);
       await rejectsCode(first.acquire('not-a-hash'), 'invalid_caller_identity');
     });
 
@@ -135,24 +138,24 @@ test('MySQL user pool: isolated real multi-connection contract', {
       await reset();
       await ready(2);
       const discovery = await first.acquireCatalog(caller(1));
-      assert.equal((await first.leases()).length, 0);
+      assert.equal((await first.leases('default')).length, 0);
       assert.equal((await second.counts()).catalog_requests, 1);
       const [inference, parallelCatalog] = await Promise.all([second.acquire(caller(1)), first.acquireCatalog(caller(1))]);
       assert.equal(inference.member_identity, discovery.member_identity);
       assert.equal(parallelCatalog.member_identity, discovery.member_identity);
-      const before = await first.leases();
+      const before = await first.leases('default');
       await first.finish(discovery, true);
       await second.finish(parallelCatalog, true);
       assert.equal(before[0].active_requests, 3);
-      assert.deepEqual(await first.leases(), before.map(row => ({ ...row, active_requests: 1 })));
+      assert.deepEqual(await first.leases('default'), before.map(row => ({ ...row, active_requests: 1 })));
       await first.finish(inference, true);
-      const active = (await first.leases())[0];
+      const active = (await first.leases('default'))[0];
       assert.equal(active.phase, 'active');
       assert.equal(active.expires_at - active.last_success_at!, 172800000);
       const catalog = await second.acquireCatalog(caller(1));
       await first.finish(catalog, true);
       await second.finish(inference, true);
-      assert.deepEqual((await first.leases())[0], active, 'duplicate success cannot renew');
+      assert.deepEqual((await first.leases('default'))[0], active, 'duplicate success cannot renew');
     });
 
     await t.test('provisional expiry drains and successful live request may promote after TTL', async () => {
@@ -165,15 +168,15 @@ test('MySQL user pool: isolated real multi-connection contract', {
       await rejectsCode(second.acquire(caller(2)), 'pool_exhausted');
       await rejectsCode(first.release(held.lease_id), 'lease_in_use');
       await first.releaseInactive(identity);
-      assert.equal((await first.leases()).length, 1);
+      assert.equal((await first.leases('default')).length, 1);
       await first.finish(held, true);
-      assert.equal((await first.leases())[0].phase, 'active');
+      assert.equal((await first.leases('default'))[0].phase, 'active');
       const catalog = await second.acquireCatalog(caller(1));
       await expireLease(held);
       await first.reclaim();
-      assert.equal((await first.leases()).length, 1, 'catalog also pins an expired lease');
+      assert.equal((await first.leases('default')).length, 1, 'catalog also pins an expired lease');
       await first.finish(catalog, true);
-      assert.equal((await first.leases()).length, 0);
+      assert.equal((await first.leases('default')).length, 0);
       assert.equal((await second.counts()).ready_idle, 1);
     });
 
@@ -200,8 +203,8 @@ test('MySQL user pool: isolated real multi-connection contract', {
       await first.reclaim();
       const replacement = await second.acquire(caller(2));
       await first.finish(held, true);
-      assert.equal((await first.leases())[0].lease_id, replacement.lease_id);
-      assert.equal((await first.leases())[0].phase, 'provisional');
+      assert.equal((await first.leases('default'))[0].lease_id, replacement.lease_id);
+      assert.equal((await first.leases('default'))[0].phase, 'provisional');
     });
 
     await t.test('credential ABA fences all stale reports and failed admission preserves quarantine', async () => {
@@ -223,7 +226,7 @@ test('MySQL user pool: isolated real multi-connection contract', {
       assert.equal(quarantined.last_error, 'credential_not_verified', 'savepoint rejection cannot undo reclaim');
       assert.equal(await first.pending(), undefined, 'hold still pins work');
       await first.finish(held, true);
-      assert.equal((await first.leases()).length, 0);
+      assert.equal((await first.leases('default')).length, 0);
       assert.equal((await first.pending())!.identity, identity);
     });
 
@@ -292,7 +295,7 @@ test('MySQL user pool: isolated real multi-connection contract', {
       assert.equal(await first.cool(other.member_identity, 60, other), true);
       await expireLease(other);
       await first.finish(other, true);
-      assert.equal((await first.leases()).length, 1, 'cooling pins even expired lease');
+      assert.equal((await first.leases('default')).length, 1, 'cooling pins even expired lease');
       await rejectsCode(first.acquire(caller(2)), 'member_cooling');
       await db.execute('UPDATE user_pool_accounts SET cooldown_until=0');
       await db.execute('UPDATE user_pool_catalog_cooldowns SET expires_at=0');
@@ -303,7 +306,8 @@ test('MySQL user pool: isolated real multi-connection contract', {
 
     await t.test('multi-writer reservations obey hard cap, retries count toward future inventory', async () => {
       await reset({ idle_target: 3, max_accounts: 3 });
-      const reserved = await Promise.all(Array.from({ length: 12 }, (_, n) => (n % 2 ? first : second).reserve()));
+      const reserve = (n: number) => (n % 2 ? first : second).reserve(['default']);
+      const reserved = await Promise.all(Array.from({ length: 12 }, (_, n) => reserve(n)));
       assert.equal(reserved.filter(Boolean).length, 3);
       assert.equal(new Set(reserved.filter(Boolean).map((i) => i!.identity)).size, 3);
       const row = reserved.find(Boolean)!;
@@ -311,9 +315,11 @@ test('MySQL user pool: isolated real multi-connection contract', {
       const failed = (await first.inventory(row.identity))!;
       assert.equal(failed.attempts, 1);
       assert.ok(failed.retry_at > await first.now());
-      assert.equal(await second.reserve(), undefined);
-      await first.updateSettings(1, { idle_target: 3, max_accounts: 8 });
-      assert.equal(await second.reserve(), undefined, 'backing-off repair already represents capacity');
+      assert.equal(await second.reserve(['default']), undefined);
+      await first.updateSettings(1, { idle_target: 3 });
+      const [policy] = await first.enterprisePolicies();
+      await first.updateEnterprisePolicy(DEFAULT_ENTERPRISE_ID, policy.policyVersion, { maxAccounts: 8 });
+      assert.equal(await second.reserve(['default']), undefined, 'backing-off repair already represents capacity');
       await first.disable(row.identity);
       assert.equal((await first.inventory(row.identity))!.state, 'disabled');
       assert.equal(await first.update(row.identity, { state: 'ready' }), false);
@@ -328,20 +334,20 @@ test('MySQL user pool: isolated real multi-connection contract', {
       await reset({ idle_target: 80, max_accounts: 80 });
       const owner = randomUUID();
       assert.equal(await first.claimOwner(owner), true);
-      const count = await second.reserveDeficit(owner);
+      const count = await second.reserveDeficit(owner, ['default']);
       assert.ok(count > 0 && count <= 32);
       assert.equal((await first.counts()).total, count);
-      assert.equal(await first.reserveDeficit(randomUUID()), 0);
+      assert.equal(await first.reserveDeficit(randomUUID(), ['default']), 0);
       await reset();
       await db.execute(`INSERT INTO proxy_accounts(identity,sso_user,created_at,updated_at,enterprise_id)
         VALUES (?, 'direct', UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), 'default'),
           ('direct-alias', ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), 'default')`,
       [accountName(0).toUpperCase(), accountName(1).toUpperCase()]);
-      assert.equal((await first.reserve())!.ordinal, 2);
+      assert.equal((await first.reserve(['default']))!.ordinal, 2);
       await db.execute('UPDATE user_pool_settings SET next_ordinal=?', [NAME_CAPACITY - 1]);
-      assert.equal((await first.reserve())!.ordinal, NAME_CAPACITY - 1);
-      await rejectsCode(second.reserve(), 'name_catalog_exhausted');
-      await rejectsCode(first.reserve(), 'name_catalog_exhausted');
+      assert.equal((await first.reserve(['default']))!.ordinal, NAME_CAPACITY - 1);
+      await rejectsCode(second.reserve(['default']), 'name_catalog_exhausted');
+      await rejectsCode(first.reserve(['default']), 'name_catalog_exhausted');
       const [rows] = await db.query<RowDataPacket[]>('SELECT next_ordinal FROM user_pool_settings');
       assert.equal(Number(rows[0].next_ordinal), NAME_CAPACITY);
     });
@@ -353,7 +359,7 @@ test('MySQL user pool: isolated real multi-connection contract', {
       assert.equal(claims.filter(Boolean).length, 1);
       const owner = owners[claims[0] ? 0 : 1];
       assert.equal(await first.claimOwner(owner), true);
-      let row = (await first.reserve())!;
+      let row = (await first.reserve(['default']))!;
       assert.equal(await first.mutateWorkerCredential(row.identity, { ...row, stage: 'wrong' }, owner,
         { type: 'link', ghLogin: 'synthetic-gh' }), false);
       assert.equal(await first.mutateWorkerCredential(row.identity, row, owner, { type: 'link', ghLogin: 'synthetic-gh' }), true);
@@ -416,7 +422,7 @@ test('MySQL user pool: isolated real multi-connection contract', {
           (e: unknown) => (e as { code?: string }).code === 'ER_LOCK_WAIT_TIMEOUT');
         await blocker.rollback();
         assert.equal((await first.settings()).paused, 0);
-        assert.equal((await first.events()).length, 0);
+        assert.equal((await first.events('default')).length, 0);
         assert.equal((await victim.updateSettings(1, { paused: 1 })).version, 2);
       } finally {
         await blocker.rollback();
@@ -438,18 +444,19 @@ test('MySQL user pool: isolated real multi-connection contract', {
       // Seed synthetic audit rows in bulk, then exercise the provider retention boundary.
       for (let offset = 0; offset < 10020; offset += 500) {
         const count = Math.min(500, 10020 - offset);
-        await db.query(`INSERT INTO user_pool_events(at, action) VALUES ${Array(count).fill("(1, 'synthetic')").join(',')}`);
+        const values = Array(count).fill("(1, 'synthetic', 'default')").join(',');
+        await db.query(`INSERT INTO user_pool_events(at, action, enterprise_id) VALUES ${values}`);
       }
       await first.event('last');
       const [rows] = await db.query<RowDataPacket[]>('SELECT COUNT(*) n FROM user_pool_events');
       assert.equal(Number(rows[0].n), 10000);
-      assert.equal((await first.events()).length, 200);
+      assert.equal((await first.events('default')).length, 200);
     });
     await t.test('dispatch backpressure retains uncertain slots and releases only fenced terminal observations', async () => {
       await reset();
       const owner = randomUUID();
       assert.equal(await first.claimOwner(owner), true);
-      const a = (await first.reserve())!, b = (await first.reserve())!;
+      const a = (await first.reserve(['default']))!, b = (await first.reserve(['default']))!;
       for (const row of [a, b]) await first.update(row.identity, { stage: 'oauth-starting', oauth_attempt_id: randomUUID() });
       assert.equal(await first.claimLoginDispatch(a.identity, (await first.inventory(a.identity))!, owner, 1), true);
       assert.equal(await second.claimLoginDispatch(b.identity, (await second.inventory(b.identity))!, owner, 1), false);
@@ -488,7 +495,7 @@ test('MySQL user pool: isolated real multi-connection contract', {
         assert.equal(catalog.member_identity, identity);
         await first.finish(catalog, true);
         await first.finish(held, false);
-        assert.equal((await first.leases())[0].phase, 'active');
+        assert.equal((await first.leases('default'))[0].phase, 'active');
       } finally { await connection.rollback(); connection.release(); }
     });
 
@@ -503,6 +510,86 @@ test('MySQL user pool: isolated real multi-connection contract', {
     } finally { await admin.end(); }
   }
 });
+
+/** Design §9.3: the shared store contract (storeContract.ts) on a fresh database, two pools as two replicas. */
+test('MySQL store contract (design §9.3)', {
+  skip: enabled ? false
+    : 'Requires loopback MYSQL_TEST_URL and MYSQL_POOL_TEST_DISPOSABLE=1; creates a fresh synthetic database.',
+  timeout: 300000,
+}, async (t) => withFreshDatabase(async (uri) => {
+  const pools = [0, 1].map(() => createPool({ uri, connectionLimit: 3, timezone: 'Z', dateStrings: true,
+    supportBigNumbers: true, bigNumberStrings: true }));
+  try {
+    await runMysqlMigrations(pools[0], seed);
+    const [store, replica] = pools.map((pool) => new MysqlPoolStore(pool, options));
+    await store.initialize();
+    await replica.initialize();
+    await storeContract(t, mysqlContractBackend(pools[0], store, replica));
+  } finally {
+    await Promise.all(pools.map((pool) => pool.end()));
+  }
+}));
+
+function mysqlContractBackend(pool: Pool, store: MysqlPoolStore, replica: MysqlPoolStore): ContractBackend {
+  const recorder: { statements?: string[] } = {};
+  recordConnections(pool, recorder);
+  return {
+    store,
+    replica,
+    sql: async (statement, values = []) => {
+      const [rows] = await pool.query(statement, values);
+      return Array.isArray(rows) ? rows as Record<string, unknown>[] : [];
+    },
+    recordStatements: async (run) => {
+      const statements: string[] = [];
+      recorder.statements = statements;
+      try {
+        return { result: await run(), statements };
+      } finally {
+        recorder.statements = undefined;
+      }
+    },
+  };
+}
+
+/** Every connection the store leases from `pool` reports its statements while a recording is active. */
+function recordConnections(pool: Pool, recorder: { statements?: string[] }): void {
+  const getConnection = pool.getConnection.bind(pool);
+  pool.getConnection = (async () => {
+    const connection = await getConnection();
+    const query = connection.query.bind(connection) as (...args: unknown[]) => unknown;
+    const record = (...args: unknown[]) => {
+      const [sql] = args;
+      recorder.statements?.push(typeof sql === 'string' ? sql : String((sql as { sql?: string }).sql));
+      return query(...args);
+    };
+    connection.query = record as PoolConnection['query'];
+    return connection;
+  }) as Pool['getConnection'];
+}
+
+/** Creates a random loopback `ghcp_pool_test_*` database next to MYSQL_TEST_URL's, and always drops it. */
+async function withFreshDatabase(run: (uri: string) => Promise<void>): Promise<void> {
+  const url = new URL(mysqlUrl!);
+  assert.equal(url.protocol, 'mysql:');
+  assert.ok(['localhost', '127.0.0.1', '[::1]'].includes(url.hostname), 'Refusing a non-loopback MySQL test server');
+  assert.match(url.pathname, /^\/ghcp_pool_test_[a-z0-9_]+$/, 'Refusing a non-test MySQL URL');
+  assert.equal(url.search, '', 'Connection overrides are not allowed in the disposable test URL');
+  const name = `ghcp_pool_test_${randomUUID().replaceAll('-', '')}`;
+  url.pathname = '/';
+  const admin = createPool({ uri: url.toString(), connectionLimit: 1 });
+  let created = false;
+  try {
+    await admin.query(`CREATE DATABASE \`${name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`);
+    created = true;
+    url.pathname = `/${name}`;
+    await run(url.toString());
+  } finally {
+    try {
+      if (created) await admin.query(`DROP DATABASE \`${name}\``);
+    } finally { await admin.end(); }
+  }
+}
 
 // These fault-injection tests run without MySQL and never access any network.
 test('MySQL pool destroys an ambiguous COMMIT disconnect without rollback or replay', async () => {
@@ -520,7 +607,7 @@ test('MySQL pool destroys an ambiguous COMMIT disconnect without rollback or rep
         query: async (sql: string) => {
           if (sql.includes('SELECT id FROM user_pool_settings')) return [[{ id: 1 }]];
           if (sql.includes('TIMESTAMPDIFF')) return [[{ now: '1800000000000' }]];
-          if (sql.includes('MAX(id)')) return [[{ n: -9999 }]];
+          if (sql.includes('CAST(id AS SIGNED)')) return [[{ n: -9999 }]];
           return [{ affectedRows: 1 }];
         },
         beginTransaction: async () => { begins++; },
@@ -585,7 +672,7 @@ test('MySQL pool retries only confirmed rollback lock errors with a fresh transa
             return [[{ id: 1 }]];
           }
           if (sql.includes('TIMESTAMPDIFF')) return [[{ now: '1800000000000' }]];
-          if (sql.includes('MAX(id)')) return [[{ n: -9999 }]];
+          if (sql.includes('CAST(id AS SIGNED)')) return [[{ n: -9999 }]];
           return [{ affectedRows: 1 }];
         },
         beginTransaction: async () => {}, commit: async () => { commits++; },

@@ -1,7 +1,7 @@
 import { TextDecoder } from 'node:util';
 import { once } from 'node:events';
 import { Router, type NextFunction, type Request, type Response } from 'express';
-import { apiError, DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
+import { apiError, type EnterpriseId } from '@ghcp/shared';
 import { recordRequestStat as persistRequestStat } from '../db/requestStatsRepo.js';
 import type { RecordRequestStatInput } from '../db/storageTypes.js';
 import { Logger } from '../logger.js';
@@ -38,13 +38,20 @@ import {
 import { resolveClaudeCodeOptimized } from './claudeCodeMode.js';
 import { resolveRequestIntent } from './requestIntent.js';
 import { toCanonicalRequestedModelId, withCanonicalModelIds } from '../copilot/modelIds.js';
-import { poolRequest, statIdentity, withPoolOperation, type PoolRequest } from '../userPool/runtime.js';
+import {
+  poolRequest,
+  rememberAccountEnterprise,
+  statIdentity,
+  withPoolOperation,
+  type PoolRequest,
+} from '../userPool/runtime.js';
 import { UserPoolError } from '../userPool/config.js';
 import { isMysqlStorageUnavailable } from '../userPool/mysqlDeadline.js';
 import { isSuccessfulJson, StreamCompletion } from '../userPool/responseCompletion.js';
 import { getAccount } from '../db/accountsRepo.js';
 import { config } from '../config.js';
 import type { CopilotAuthContext } from '../copilot/copilotAuth.js';
+import { directModeEnterprise, requireProxyEnterprise } from '../enterprises.js';
 import { summarizeHttpFailure } from '../diagnostics/httpFailureSummary.js';
 
 export const compatibleRouter = Router();
@@ -68,10 +75,11 @@ async function handleModels(req: Request, res: Response): Promise<void> {
   let accessToken: string | undefined;
   try {
     const context = poolRequest(res);
-    const copilot = await requestAuth(identity, context);
+    const copilot = await requestAuth(res, identity);
     accessToken = copilot.accessToken;
     const useCache = req.get('x-cache')?.trim().toLowerCase() !== 'false';
     const diagnostics = createErrorDiagnosticContext(req, identity, '/v1/models');
+    diagnostics.enterpriseId = copilot.enterpriseId;
     const models = await listModels(copilot, { useCache, diagnostics, signal: context?.controller.signal });
     context?.controller.signal.throwIfAborted();
     const visibleModels = withCanonicalModelIds(
@@ -165,7 +173,9 @@ async function handleForward(req: Request, res: Response, path: CopilotApiPath):
     }
     const preparedModel = typeof prepared.body.model === 'string' ? prepared.body.model : requestedModel;
     const diagnostics = createErrorDiagnosticContext(req, identity, path, canonicalRequestedModel);
-    const upstream = await forwardAuthenticated(identity, path, prepared.body, preparedModel, diagnostics, prepared.forwardOptions, poolRequest(res));
+    const upstream = await forwardAuthenticated(
+      res, identity, path, prepared.body, preparedModel, diagnostics, prepared.forwardOptions,
+    );
     await pipeAndRecord(upstream.response, upstream.request, res, { ...statIdentity(res, identity), path, model: upstream.canonicalModel }, diagnostics, {
       ...prepared.pipeOptions,
       canonicalModel: upstream.canonicalModel,
@@ -201,7 +211,9 @@ async function handleCountTokens(req: Request, res: Response, claudeCodeOptimize
     }
     const preparedModel = typeof prepared.body.model === 'string' ? prepared.body.model : requestedModel;
     const diagnostics = createErrorDiagnosticContext(req, identity, path, canonicalRequestedModel);
-    const upstream = await forwardAuthenticated(identity, path, prepared.body, preparedModel, diagnostics, prepared.forwardOptions, poolRequest(res));
+    const upstream = await forwardAuthenticated(
+      res, identity, path, prepared.body, preparedModel, diagnostics, prepared.forwardOptions,
+    );
     if (isTokenCountFallbackStatus(upstream.response.status)) {
       await recordTokenCountFallbackFailure(upstream.response, upstream.request, diagnostics);
       const inputTokens = estimateInputTokens(upstream.body);
@@ -274,15 +286,17 @@ function prepareForward(
 }
 
 async function forwardAuthenticated(
+  res: Response,
   identity: string,
   path: CopilotApiPath,
   body: Record<string, unknown>,
   requestedModel: string,
   diagnostics: ErrorDiagnosticContext,
   options?: ForwardCopilotRequestOptions,
-  context?: PoolRequest,
 ): Promise<{ response: globalThis.Response; request: PreparedCopilotRequest; body: Record<string, unknown>; canonicalModel: string }> {
-  const copilot = await requestAuth(identity, context);
+  const context = poolRequest(res);
+  const copilot = await requestAuth(res, identity);
+  diagnostics.enterpriseId = copilot.enterpriseId;
   let resolved;
   try {
     resolved = await resolveCopilotModel(copilot, path, requestedModel, diagnostics, context?.controller.signal);
@@ -312,16 +326,33 @@ async function forwardAuthenticated(
   return { response, request, body: upstreamBody, canonicalModel: resolved.canonicalId };
 }
 
-async function requestAuth(identity: string, context?: PoolRequest): Promise<CopilotAuthContext> {
-  if (!context) return copilotAuthManager.getAuth(identity);
+/**
+ * The Copilot credential and endpoint of the request's account (design §5.4): a caller lease uses its member's
+ * enterprise, direct mode the account row's enterprise. The enterprise is remembered for request statistics.
+ */
+async function requestAuth(res: Response, identity: string): Promise<CopilotAuthContext> {
+  const context = poolRequest(res);
+  const copilot = context ? await leaseAuth(identity, context) : await copilotAuthManager.getAuth(identity);
+  if (copilot.enterpriseId) rememberAccountEnterprise(res, copilot.enterpriseId);
+  return copilot;
+}
+
+async function leaseAuth(identity: string, context: PoolRequest): Promise<CopilotAuthContext> {
   context.controller.signal.throwIfAborted();
   if (!await context.store.heartbeat(context.held)) throw new UserPoolError(503, 'member_unavailable');
   const account = await getAccount(identity);
   context.controller.signal.throwIfAborted();
-  if (!account?.copilotOauthToken || account.copilotOauthStatus !== 'valid' || !await context.store.heartbeat(context.held)) {
+  if (!account?.copilotOauthToken || account.copilotOauthStatus !== 'valid'
+    || account.enterpriseId !== context.held.enterprise_id || !await context.store.heartbeat(context.held)) {
     throw new UserPoolError(503, 'member_unavailable');
   }
-  return { identity, accessToken: account.copilotOauthToken, api: config.copilotApiBaseUrl };
+  const enterprise = requireProxyEnterprise(context.held.enterprise_id);
+  return {
+    identity,
+    accessToken: account.copilotOauthToken,
+    api: enterprise.endpoints.copilotApiBaseUrl,
+    enterpriseId: enterprise.id,
+  };
 }
 
 async function handlePoolFailure(context: PoolRequest | undefined, token: string | undefined, error: unknown): Promise<void> {
@@ -913,10 +944,16 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** Request statistics stay with the `default` enterprise until routing becomes enterprise-aware (M5). */
-async function recordRequestStat(input: Omit<RecordRequestStatInput, 'enterpriseId'>): Promise<void> {
+type RequestStatInput = Omit<RecordRequestStatInput, 'enterpriseId'> & { enterpriseId?: EnterpriseId };
+
+/**
+ * Statistics belong to the enterprise of the account that served the request. A direct request that failed
+ * before its account was resolved falls back to the account row, then to DIRECT_MODE_ENTERPRISE_ID.
+ */
+async function recordRequestStat(input: RequestStatInput): Promise<void> {
   try {
-    await persistRequestStat({ ...input, enterpriseId: DEFAULT_ENTERPRISE_ID });
+    const enterpriseId = input.enterpriseId ?? await directStatEnterprise(input.identity);
+    await persistRequestStat({ ...input, enterpriseId });
   } catch (err) {
     requestStatsLogger.error('write-failed', 'Failed to persist Proxy request statistics', {
       identity: input.identity,
@@ -924,6 +961,10 @@ async function recordRequestStat(input: Omit<RecordRequestStatInput, 'enterprise
       error: errorMessage(err),
     });
   }
+}
+
+async function directStatEnterprise(identity: string): Promise<EnterpriseId> {
+  return (await getAccount(identity))?.enterpriseId ?? directModeEnterprise().id;
 }
 
 async function invalidateUnauthorizedAuth(identity: string, accessToken: string | undefined, err: unknown): Promise<void> {

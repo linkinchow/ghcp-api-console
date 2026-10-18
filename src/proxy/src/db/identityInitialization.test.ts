@@ -10,8 +10,8 @@ import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 test('coordinates identity initialization claims across SQLite connections', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'ghcp-proxy-claims-'));
   const path = join(directory, 'proxy.sqlite');
-  const first = new SqliteStorage(path, 2, defaultEnterpriseSeed({}));
-  const second = new SqliteStorage(path, 2, defaultEnterpriseSeed({}));
+  const first = new SqliteStorage(path, 2, [defaultEnterpriseSeed({})]);
+  const second = new SqliteStorage(path, 2, [defaultEnterpriseSeed({})]);
   try {
     await Promise.all([first.initialize(), second.initialize()]);
     const claims = await Promise.all([

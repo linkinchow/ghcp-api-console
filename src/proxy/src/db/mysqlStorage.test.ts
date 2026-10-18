@@ -18,7 +18,7 @@ for (const autoMigrate of [true]) {
     const query = t.mock.method(pool, 'query', async () => {
       assert.fail('Must not fall back to table checks or ping after a migration failure.');
     });
-    const storage = new MysqlStorage(pool, 2, autoMigrate, seed);
+    const storage = new MysqlStorage(pool, 2, autoMigrate, [seed]);
 
     await assert.rejects(storage.initialize(), (error) => error === denied);
     assert.equal(migration.mock.callCount(), 1);
@@ -41,7 +41,7 @@ test('MYSQL_AUTO_MIGRATE=false validates the prepared schema read-only and point
   });
   t.mock.method(pool, 'getConnection', async () => connection.raw);
 
-  await assert.rejects(new MysqlStorage(pool, 2, false, seed).initialize(), (error) => {
+  await assert.rejects(new MysqlStorage(pool, 2, false, [seed]).initialize(), (error) => {
     assert.ok(error instanceof Error);
     assert.match(error.message, /MYSQL_AUTO_MIGRATE=false/);
     assert.match(error.message, /scripts\/proxy-mysql-initial\.sql/);
@@ -58,7 +58,7 @@ test('MYSQL_AUTO_MIGRATE=false reports an unreachable database as unavailable, n
   const refused = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
   t.mock.method(pool, 'getConnection', async () => { throw refused; });
 
-  await assert.rejects(new MysqlStorage(pool, 2, false, seed).initialize(), (error) => {
+  await assert.rejects(new MysqlStorage(pool, 2, false, [seed]).initialize(), (error) => {
     assert.ok(error instanceof MysqlConnectionError);
     assert.equal(error.cause, refused);
     return true;
@@ -76,7 +76,7 @@ test('MYSQL_AUTO_MIGRATE=false on a single-enterprise schema points to the enter
   });
   t.mock.method(pool, 'getConnection', async () => connection.raw);
 
-  await assert.rejects(new MysqlStorage(pool, 2, false, seed).initialize(), (error) => {
+  await assert.rejects(new MysqlStorage(pool, 2, false, [seed]).initialize(), (error) => {
     assert.ok(error instanceof Error);
     assert.match(error.message, /scripts\/proxy-mysql-enterprise-upgrade\.sql/);
     return true;

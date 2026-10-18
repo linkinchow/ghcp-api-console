@@ -29,7 +29,7 @@ try {
   ]);
   const pool = createPool({ uri: url.toString(), connectionLimit: 4, connectTimeout: 5000,
     timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true });
-  const storage = new MysqlStorage(pool, 2, true, await enterpriseSeed());
+  const storage = new MysqlStorage(pool, 2, true, [await enterpriseSeed()]);
   const store = await bounded('child store init', storage.userPool(options), 20000);
   let steps = 0, httpCalls = 0, updates = 0;
   let retained: ProvisionContext | undefined;

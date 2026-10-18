@@ -12,6 +12,8 @@ import { UserPoolStore } from './store.js';
 import { PrewarmWorker, type PrewarmStore } from './worker.js';
 import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
+import { unscopedUrl } from '../testing/scopedPaths.js';
+import { installDefaultPoolDomain } from '../testing/enterpriseFixture.js';
 
 function deferred() {
   let resolve!: () => void;
@@ -35,6 +37,7 @@ test('async worker drains downstream work past 2000 starters and atomically refi
     const options = readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease',
       POOL_ACCOUNT_EMAIL_DOMAIN: 'scheduler.test', POOL_WARMUP_MODEL: 'synthetic',
       READY_IDLE_TARGET: '0', POOL_MAX_ACCOUNTS: '3000', POOL_LOGIN_MAX_PENDING: '5' });
+    installDefaultPoolDomain(options.accountDomain);
     const store = new UserPoolStore(db, options);
     let now = store.now();
     store.now = () => now;
@@ -92,7 +95,8 @@ test('async worker drains downstream work past 2000 starters and atomically refi
       releaseOwner: owner => later(() => store.releaseOwner(owner)),
       reclaim: () => later(() => store.reclaim()),
       settings: () => later(() => store.settings()),
-      reserveDeficit: owner => later(() => store.reserveDeficit(owner)),
+      reserveDeficit: (owner, eligible) => later(() => store.reserveDeficit(owner, eligible)),
+      enterprisePolicies: () => later(() => store.enterprisePolicies()),
       async pending(excluded) {
         peakPending = Math.max(peakPending, ++activePending);
         try { return await later(() => store.pending(excluded)); }
@@ -112,6 +116,7 @@ test('async worker drains downstream work past 2000 starters and atomically refi
     const unexpected: string[] = [];
     const json = (body: unknown) => new Response(JSON.stringify(body));
     const adapter = realProvisioner(asyncStore, options, {
+      isReady: async () => true,
       async getAccount(id): Promise<ProxyAccountRecord | undefined> {
         await yieldTurn();
         const account = db.prepare('SELECT * FROM proxy_accounts WHERE identity=?').get(id) as {
@@ -126,7 +131,7 @@ test('async worker drains downstream work past 2000 starters and atomically refi
       },
       async fetch(input, init) {
         await yieldTurn();
-        const url = new URL(String(input)), method = init?.method ?? 'GET';
+        const url = unscopedUrl(input), method = init?.method ?? 'GET';
         if (url.pathname.startsWith('/api/users/')) {
           const id = decodeURIComponent(url.pathname.split('/')[3]!);
           if (starters.has(id)) starterRequests.push(id);
@@ -148,7 +153,7 @@ test('async worker drains downstream work past 2000 starters and atomically refi
           assert.equal(body.ssoUser, row.identity);
           assert.equal(body.ghLogin, `${row.identity}_emu`);
           assert.equal(body.ssoPassword, 'synthetic-password');
-          assert.equal(body.ssoType, 'custom');
+          assert.equal(body.ssoType, undefined, 'the enterprise profile decides the SSO provider');
           assert.ok(!posted.some(task => task.identity === row.identity), 'no duplicate Login POST');
           const task = makeTask(row.identity, body.oauthAttemptId!);
           tasks.set(task.id, task); posted.push(task);

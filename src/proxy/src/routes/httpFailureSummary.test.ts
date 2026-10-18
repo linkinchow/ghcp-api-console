@@ -9,6 +9,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Response as ExpressResponse } from 'express';
 import type { ErrorDiagnosticContext } from '../diagnostics/errorDiagnostics.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 
 const startup = { ...process.env };
 Object.assign(process.env, { DOTENV_CONFIG_PATH: join(tmpdir(), `missing-http-summary-${randomUUID()}`),
@@ -53,7 +54,7 @@ async function record(status: number, body: string | null, contentType = 'applic
   const headers = { 'Content-Type': contentType, 'Retry-After': '17' };
   await pipeAndRecord(new Response(body, { status, headers }), prepared, recorded.res,
     { identity, path: '/v1/messages', model: 'synthetic-model' }, context(identity));
-  const stats = await listRequestStats(identity, 10);
+  const stats = await listRequestStats(DEFAULT_ENTERPRISE_ID, identity, 10);
   assert.equal(stats.length, 1);
   assert.equal(recorded.result.statusCode, status);
   assert.equal(recorded.headers.get('retry-after'), '17');
@@ -124,7 +125,7 @@ test('upstream HTTP summary integration preserves wire and adds bounded safe det
     await t.test('token-count upstream diagnostic alone creates no failed inference stat', async () => {
       const identity = `count-${randomUUID()}`;
       await recordTokenCountFallbackFailure(new Response('{"error":{"message":"Not implemented"}}', { status: 501 }), prepared, context(identity));
-      assert.deepEqual(await listRequestStats(identity), []);
+      assert.deepEqual(await listRequestStats(DEFAULT_ENTERPRISE_ID, identity), []);
     });
   } finally {
     Object.assign(errorDiagnosticsStore.options, previous);
@@ -185,10 +186,10 @@ test('real loopback HTTP preserves error responses and persists correlatable sta
       assert.equal(response.headers.get('retry-after'), '17');
       assert.equal(await response.text(), body);
       const deadline = Date.now() + 5000;
-      let stats = await listRequestStats(identityByShape[shape]!);
+      let stats = await listRequestStats(DEFAULT_ENTERPRISE_ID, identityByShape[shape]!);
       while (!stats.length && Date.now() < deadline) {
         await new Promise(resolve => setTimeout(resolve, 10));
-        stats = await listRequestStats(identityByShape[shape]!);
+        stats = await listRequestStats(DEFAULT_ENTERPRISE_ID, identityByShape[shape]!);
       }
       assert.equal(stats.length, 1);
       assert.equal(stats[0]!.success, false);

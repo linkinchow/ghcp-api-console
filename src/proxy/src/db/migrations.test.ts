@@ -114,7 +114,7 @@ test('existing OAuth accounts preserve credentials and duplicate identity aliase
     const pool = new UserPoolStore(db, readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease',
       POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test', POOL_WARMUP_MODEL: 'test-model', READY_IDLE_TARGET: '0' }));
     assert.equal(pool.counts().total, 0);
-    assert.equal(pool.reserve(), undefined);
+    assert.equal(pool.reserve(['default']), undefined);
     assert.deepEqual(db.prepare('SELECT identity,sso_user,gh_login,copilot_oauth_token,copilot_oauth_status,copilot_oauth_updated_at,created_at,updated_at FROM proxy_accounts ORDER BY identity').all(), before);
   } finally { db.close(); }
 });

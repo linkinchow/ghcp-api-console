@@ -23,7 +23,8 @@ function fixture(mode: 'execute' | 'commit' | 'rollback' = 'execute') {
   } as unknown as PoolConnection;
   const pool = { async getConnection() { return connection; } } as unknown as Pool;
   const seed = { id: DEFAULT_ENTERPRISE_ID, fingerprint: 'f'.repeat(64), maxAccounts: 8 };
-  return { storage: new MysqlStorage(pool, 2, true, seed), counts: () => ({ destroyed, released, rollbacks }), calls };
+  const storage = new MysqlStorage(pool, 2, true, [seed]);
+  return { storage, counts: () => ({ destroyed, released, rollbacks }), calls };
 }
 
 for (const operation of ['getAccount', 'recordRequestStat', 'ping'] as const) {

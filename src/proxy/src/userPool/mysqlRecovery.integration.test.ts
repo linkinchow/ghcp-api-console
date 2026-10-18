@@ -45,7 +45,7 @@ test('MySQL production regressions: bounded backlog, defaults and terminal callb
       } finally { await c.query("SET time_zone='+00:00'"); c.release(); }
     });
     await t.test('credential callback after atomic terminal fail cannot hide the reservation', async () => {
-      const member = (await store.reserve())!;
+      const member = (await store.reserve(['default']))!;
       await store.update(member.identity, { stage: 'oauth-wait', task_id: 'synthetic-task', oauth_attempt_id: 'synthetic-nonce' });
       const fail = store.fail.bind(store);
       store.fail = async (...args) => {
@@ -100,12 +100,14 @@ test('MySQL production regressions: bounded backlog, defaults and terminal callb
       await db.query('DELETE FROM user_pool_holds');
       await db.execute('UPDATE user_pool_settings SET idle_target=100 WHERE id=1');
       await db.execute("UPDATE proxy_enterprises SET max_accounts=2100 WHERE id='default'");
-      assert.equal(await store.reserve(), undefined, 'Expired reusable inventory prevents unnecessary provisioning before all batches drain');
+      assert.equal(await store.reserve(['default']), undefined,
+        'Expired reusable inventory prevents unnecessary provisioning before all batches drain');
       for (let pass = 0; pass < 10 && await remaining(); pass++) await store.reclaim();
       assert.equal(await remaining(), 0);
       assert.equal((await store.counts()).ready_idle, 2000);
       await db.query("UPDATE proxy_accounts SET copilot_oauth_token='synthetic-refreshed-token'");
-      assert.equal(await store.reserve(), undefined, 'Unprocessed credential verification backlog counts toward future capacity');
+      assert.equal(await store.reserve(['default']), undefined,
+        'Unprocessed credential verification backlog counts toward future capacity');
       assert.equal(Number((await db.query<RowDataPacket[]>('SELECT COUNT(*) total FROM user_pool_accounts'))[0][0].total), 2000);
     });
   } finally {

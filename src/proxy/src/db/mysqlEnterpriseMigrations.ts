@@ -1,5 +1,5 @@
 import type { PoolConnection, RowDataPacket } from 'mysql2/promise';
-import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
+import { ACCOUNT_NAME_CAPACITY, DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import { ENTERPRISE_MIGRATION_IDS as IDS } from './enterpriseMigrationIds.js';
 import type { EnterpriseSeed } from './enterpriseSeed.js';
 import { MYSQL_SCHEMA, mysqlCreateTable, mysqlForeignKey, mysqlUniqueKey, parseMysqlKey } from './mysqlSchema.js';
@@ -129,14 +129,87 @@ export async function verifyDefaultEnterprise(connection: PoolConnection, seed: 
   assertDefaultSeed(seed);
   const row = await enterpriseIdentity(connection, seed.id);
   if (!row) throw new Error(`The "${seed.id}" enterprise is missing from proxy_enterprises.`);
-  if (row.profile_fingerprint === seed.fingerprint) return;
   if (row.profile_fingerprint === PENDING_ENTERPRISE_FINGERPRINT) return completePendingEnterprise(connection, seed);
+  await verifyIdentity(connection, seed, row);
+}
+
+/**
+ * Every start, after the `default` steps: inserts the registry's other enterprises as `draft`, checks each identity,
+ * and fails closed when an enterprise with pool members left the registry. An enterprise without members may stay in
+ * the table; nothing schedules it, because only registry enterprises can be activated.
+ */
+export async function syncMysqlRegistryEnterprises(connection: PoolConnection,
+  seeds: readonly EnterpriseSeed[]): Promise<void> {
+  for (const seed of seeds.filter((candidate) => candidate.id !== DEFAULT_ENTERPRISE_ID)) {
+    await insertDraftEnterprise(connection, seed);
+    const row = await enterpriseIdentity(connection, seed.id);
+    await verifyIdentity(connection, seed, row!);
+  }
+  await assertRegistryCoversEnterprises(connection, seeds);
+}
+
+async function verifyIdentity(connection: PoolConnection, seed: EnterpriseSeed, row: RowDataPacket): Promise<void> {
+  if (row.profile_fingerprint === seed.fingerprint) return;
   if (Number(row.inventory_count) > 0) throw identityChanged(seed.id);
   await connection.query(`
     UPDATE proxy_enterprises
     SET profile_fingerprint = ?, updated_at = ${DB_NOW_MS}
     WHERE id = ? AND inventory_count = 0
   `, [seed.fingerprint, seed.id]);
+}
+
+async function insertDraftEnterprise(connection: PoolConnection, seed: EnterpriseSeed): Promise<void> {
+  if (await enterpriseIdentity(connection, seed.id)) return;
+  await assertNameCapacity(connection, seed.maxAccounts);
+  await connection.query(`
+    INSERT IGNORE INTO proxy_enterprises (
+      id, state, max_accounts, inventory_count, profile_fingerprint, created_at, updated_at
+    )
+    VALUES (?, 'draft', ?, 0, ?, ${DB_NOW_MS}, ${DB_NOW_MS})
+  `, [seed.id, seed.maxAccounts, seed.fingerprint]);
+}
+
+/** ΣC_e must stay within the shared name catalog (design §3.6), also when a new enterprise is seeded. */
+async function assertNameCapacity(connection: PoolConnection, cap: number): Promise<void> {
+  const [rows] = await connection.query<RowDataPacket[]>(`
+    SELECT max_accounts
+    FROM proxy_enterprises
+  `);
+  const total = rows.reduce((sum, row) => sum + Number(row.max_accounts), cap);
+  if (total <= ACCOUNT_NAME_CAPACITY) return;
+  throw new Error(`name_capacity_exceeded: enterprise caps would sum to ${total}, more than ${ACCOUNT_NAME_CAPACITY}.`);
+}
+
+async function assertRegistryCoversEnterprises(connection: PoolConnection,
+  seeds: readonly EnterpriseSeed[]): Promise<void> {
+  const registered = new Set<string>(seeds.map((seed) => seed.id));
+  const [rows] = await connection.query<RowDataPacket[]>(`
+    SELECT id, inventory_count
+    FROM proxy_enterprises
+    ORDER BY id
+  `);
+  for (const row of rows.filter((candidate) => !registered.has(String(candidate.id)))) {
+    if (Number(row.inventory_count) > 0 || await hasPoolMembers(connection, String(row.id))) {
+      throw missingFromRegistry(String(row.id));
+    }
+  }
+}
+
+async function hasPoolMembers(connection: PoolConnection, id: string): Promise<boolean> {
+  if (!await tableExists(connection, 'user_pool_accounts')) return false;
+  if (!await enterpriseColumn(connection, 'user_pool_accounts')) return false;
+  const [rows] = await connection.query<RowDataPacket[]>(`
+    SELECT 1
+    FROM user_pool_accounts
+    WHERE enterprise_id = ?
+    LIMIT 1
+  `, [id]);
+  return rows.length > 0;
+}
+
+function missingFromRegistry(id: string): Error {
+  return new Error(`enterprise_missing_from_registry: enterprise "${id}" has pool members but is not in the `
+    + 'enterprise registry. Restore its registry entry.');
 }
 
 function identityChanged(id: string): Error {

@@ -1,5 +1,10 @@
 import type Database from 'better-sqlite3';
-import { DEFAULT_ENTERPRISE_ID, type EnterpriseId, type EnterpriseLifecycleState } from '@ghcp/shared';
+import {
+  ACCOUNT_NAME_CAPACITY,
+  DEFAULT_ENTERPRISE_ID,
+  type EnterpriseId,
+  type EnterpriseLifecycleState,
+} from '@ghcp/shared';
 import type { EnterpriseSeed } from './enterpriseSeed.js';
 import type { ProxyEnterpriseRecord } from './storageTypes.js';
 
@@ -39,24 +44,45 @@ export const CREATE_PROXY_ENTERPRISES_SQL = `
 
 /**
  * Inserts the seeded enterprise when it is missing (design §4.2 step 02). An upgraded single-enterprise pool keeps
- * its persisted cap and starts with its current member count. Returns whether a row was inserted.
+ * its persisted cap and starts with its current member count. `default` starts `active`, every other enterprise
+ * `draft` (design §3.7). Returns whether a row was inserted.
  */
 export function ensureEnterprise(db: Database.Database, seed: EnterpriseSeed): boolean {
   if (enterpriseRow(db, seed.id)) return false;
+  const cap = initialCap(db, seed);
+  assertNameCapacity(db, cap);
   const now = Date.now();
   return db.prepare(`
     INSERT OR IGNORE INTO proxy_enterprises (
       id, state, max_accounts, inventory_count, policy_version, profile_fingerprint, created_at, updated_at
     )
-    VALUES (?, 'active', ?, ?, 1, ?, ?, ?)
+    VALUES (?, ?, ?, ?, 1, ?, ?, ?)
   `).run(
     seed.id,
-    initialCap(db, seed),
+    initialState(seed),
+    cap,
     poolMemberCount(db, seed.id),
     seed.fingerprint,
     now,
     now,
   ).changes === 1;
+}
+
+/**
+ * Every start (design §3.6): inserts the registry's missing enterprises, checks each identity, and fails closed
+ * when an enterprise with pool members left the registry. An enterprise without members may stay in the table;
+ * nothing schedules it, because only registry enterprises can be activated.
+ */
+export function syncRegistryEnterprises(db: Database.Database, seeds: readonly EnterpriseSeed[]): void {
+  for (const seed of seeds) {
+    ensureEnterprise(db, seed);
+    verifyEnterpriseIdentity(db, seed);
+  }
+  const registered = new Set<string>(seeds.map((seed) => seed.id));
+  for (const row of listEnterpriseRecords(db)) {
+    if (registered.has(row.id)) continue;
+    if (row.inventoryCount > 0 || hasPoolMembers(db, row.id)) throw missingFromRegistry(row.id);
+  }
 }
 
 /**
@@ -128,6 +154,39 @@ export function correctInventoryCounts(db: Database.Database): InventoryDrift[] 
   return drifts;
 }
 
+function initialState(seed: EnterpriseSeed): EnterpriseLifecycleState {
+  return seed.id === DEFAULT_ENTERPRISE_ID ? 'active' : 'draft';
+}
+
+/** ΣC_e must stay within the shared name catalog (design §3.6), also when a new enterprise is seeded. */
+function assertNameCapacity(db: Database.Database, cap: number): void {
+  const rows = db.prepare(`
+    SELECT max_accounts
+    FROM proxy_enterprises
+  `).all() as Array<{ max_accounts: number }>;
+  const total = rows.reduce((sum, row) => sum + row.max_accounts, cap);
+  if (total <= ACCOUNT_NAME_CAPACITY) return;
+  throw new Error(`name_capacity_exceeded: enterprise caps would sum to ${total}, more than ${ACCOUNT_NAME_CAPACITY}.`);
+}
+
+function hasPoolMembers(db: Database.Database, id: string): boolean {
+  if (!tableExists(db, 'user_pool_accounts') || !hasColumn(db, 'user_pool_accounts', 'enterprise_id')) return false;
+  const row = db.prepare(`
+    SELECT 1
+    FROM user_pool_accounts
+    WHERE enterprise_id = ?
+    LIMIT 1
+  `).get(id);
+  return row !== undefined;
+}
+
+function missingFromRegistry(id: string): Error {
+  return new Error(
+    `enterprise_missing_from_registry: enterprise "${id}" has pool accounts but is not in the enterprise registry. `
+    + 'Restore its registry entry.',
+  );
+}
+
 function enterpriseRow(db: Database.Database, id: string): EnterpriseRow | undefined {
   return db.prepare(`
     SELECT *
@@ -136,16 +195,17 @@ function enterpriseRow(db: Database.Database, id: string): EnterpriseRow | undef
   `).get(id) as EnterpriseRow | undefined;
 }
 
-function toEnterpriseRecord(row: EnterpriseRow): ProxyEnterpriseRecord {
+/** Maps a `proxy_enterprises` row of either backend; MySQL may return BIGINT columns as strings. */
+export function toEnterpriseRecord(row: EnterpriseRow | Record<keyof EnterpriseRow, unknown>): ProxyEnterpriseRecord {
   return {
-    id: row.id as EnterpriseId,
-    state: row.state,
-    maxAccounts: row.max_accounts,
-    inventoryCount: row.inventory_count,
-    policyVersion: row.policy_version,
-    profileFingerprint: row.profile_fingerprint,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    id: String(row.id) as EnterpriseId,
+    state: row.state as EnterpriseLifecycleState,
+    maxAccounts: Number(row.max_accounts),
+    inventoryCount: Number(row.inventory_count),
+    policyVersion: Number(row.policy_version),
+    profileFingerprint: String(row.profile_fingerprint),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
   };
 }
 

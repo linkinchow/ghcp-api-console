@@ -20,9 +20,12 @@ export type {
   ProxyAccountRecord,
 } from './storageTypes.js';
 
-export async function listAccounts(query: AccountListQuery = {}): Promise<PageResponse<ProxyAccountRecord>> {
+export async function listAccounts(
+  enterpriseId: EnterpriseId,
+  query: AccountListQuery = {},
+): Promise<PageResponse<ProxyAccountRecord>> {
   await initializeStorage();
-  return getStorage().listAccounts(query);
+  return getStorage().listAccounts(enterpriseId, query);
 }
 
 export async function getAccount(identity: string): Promise<ProxyAccountRecord | undefined> {
@@ -35,9 +38,12 @@ export async function deleteAccount(identity: string): Promise<DeleteProxyAccoun
   return getStorage().deleteAccount(identity);
 }
 
-export async function deleteAccountsBySsoUser(ssoUser: string): Promise<DeleteAccountsBySsoUserResult> {
+export async function deleteAccountsBySsoUser(
+  enterpriseId: EnterpriseId,
+  ssoUser: string,
+): Promise<DeleteAccountsBySsoUserResult> {
   await initializeStorage();
-  return getStorage().deleteAccountsBySsoUser(ssoUser);
+  return getStorage().deleteAccountsBySsoUser(enterpriseId, ssoUser);
 }
 
 export async function createAccount(input: CreateAccountInput): Promise<ProxyAccountRecord> {

@@ -16,12 +16,13 @@ import {
   withSqliteReadSnapshot,
 } from '@ghcp/shared';
 import { runMigrations } from './migrations.js';
-import { listEnterpriseRecords } from './enterpriseRepo.js';
-import type { EnterpriseSeed } from './enterpriseSeed.js';
+import { listEnterpriseRecords, syncRegistryEnterprises } from './enterpriseRepo.js';
+import { requireDefaultSeed, type EnterpriseSeed } from './enterpriseSeed.js';
 import { UserPoolStore } from '../userPool/store.js';
 import type { PoolConfig } from '../userPool/config.js';
 import { managementSql } from './managementQueries.js';
 import type {
+  SnapshotReader,
   AccountListQuery,
   CreateAccountInput,
   DeleteAccountsBySsoUserResult,
@@ -71,17 +72,18 @@ export class SqliteStorage implements ProxyStorage {
     return this.poolStore ??= new UserPoolStore(this.database(), options);
   }
 
-  withReadSnapshot<T>(read: (reader: Pick<ProxyStorage, 'listAccounts' | 'listRequestStatsPage'>) => Promise<T>): Promise<T> {
+  withReadSnapshot<T>(read: (reader: SnapshotReader) => Promise<T>): Promise<T> {
     return withSqliteReadSnapshot(this.database(), (database) => read({
-      listAccounts: (query) => this.listAccounts(query, database),
-      listRequestStatsPage: (query) => this.listRequestStatsPage(query, database),
+      listAccounts: (enterpriseId, query) => this.listAccounts(enterpriseId, query, database),
+      listRequestStatsPage: (enterpriseId, query) => this.listRequestStatsPage(enterpriseId, query, database),
     }));
   }
 
+  /** `seeds`: every registry enterprise, `default` first. */
   constructor(
     private readonly path: string,
     private readonly requestStatsPerAccountLimit: number,
-    private readonly enterpriseSeed: EnterpriseSeed,
+    private readonly seeds: readonly EnterpriseSeed[],
   ) { }
 
   async initialize(): Promise<void> {
@@ -92,7 +94,8 @@ export class SqliteStorage implements ProxyStorage {
     db.pragma('foreign_keys = ON');
     db.pragma('busy_timeout = 5000');
     try {
-      runMigrations(db, this.enterpriseSeed);
+      runMigrations(db, requireDefaultSeed(this.seeds));
+      db.transaction(() => syncRegistryEnterprises(db, this.seeds)).immediate();
     } catch (error) {
       db.close();
       throw error;
@@ -110,10 +113,14 @@ export class SqliteStorage implements ProxyStorage {
     this.poolStore = undefined;
   }
 
-  async listAccounts(query: AccountListQuery = {}, database = this.database()): Promise<PageResponse<ProxyAccountRecord>> {
+  async listAccounts(
+    enterpriseId: EnterpriseId,
+    query: AccountListQuery = {},
+    database = this.database(),
+  ): Promise<PageResponse<ProxyAccountRecord>> {
     let page = Math.max(1, Math.trunc(query.page ?? 1));
     const pageSize = Math.max(1, Math.min(Math.trunc(query.pageSize ?? 25), 100));
-    const { where, args, order } = managementSql('accounts', query);
+    const { where, args, order } = managementSql('accounts', enterpriseId, query);
     const total = (database
       .prepare(`SELECT COUNT(*) AS count FROM proxy_accounts ${where}`)
       .get(...args) as { count: number }).count;
@@ -124,9 +131,13 @@ export class SqliteStorage implements ProxyStorage {
     return pageResponse(rows.map(mapAccountRow), total, page, pageSize);
   }
 
-  async summarizeAccounts(): Promise<ManagementSummary> {
-    const rows = this.database().prepare('SELECT copilot_oauth_status AS status, COUNT(*) AS count FROM proxy_accounts GROUP BY copilot_oauth_status')
-      .all() as Array<{ status: string; count: number }>;
+  async summarizeAccounts(enterpriseId: EnterpriseId): Promise<ManagementSummary> {
+    const rows = this.database().prepare(`
+      SELECT copilot_oauth_status AS status, COUNT(*) AS count
+      FROM proxy_accounts
+      WHERE enterprise_id = ?
+      GROUP BY copilot_oauth_status
+    `).all(enterpriseId) as Array<{ status: string; count: number }>;
     return { total: rows.reduce((total, row) => total + row.count, 0), counts: Object.fromEntries(rows.map((row) => [row.status, row.count])), updatedAt: nowIso() };
   }
 
@@ -154,13 +165,17 @@ export class SqliteStorage implements ProxyStorage {
     })();
   }
 
-  async deleteAccountsBySsoUser(ssoUser: string): Promise<DeleteAccountsBySsoUserResult> {
+  /** `sso_user` is unique only within an enterprise (design §5.3). */
+  async deleteAccountsBySsoUser(enterpriseId: EnterpriseId, ssoUser: string): Promise<DeleteAccountsBySsoUserResult> {
     const target = ssoUser.trim();
     if (!target) return { ssoUser: target, matchedAccounts: 0, deletedAccounts: 0, deletedRequestStats: 0 };
     return this.database().transaction(() => {
-      const accounts = this.database()
-        .prepare('SELECT identity FROM proxy_accounts WHERE lower(sso_user) = lower(?)')
-        .all(target) as Array<{ identity: string }>;
+      const accounts = this.database().prepare(`
+        SELECT identity
+        FROM proxy_accounts
+        WHERE enterprise_id = ?
+          AND lower(sso_user) = lower(?)
+      `).all(enterpriseId, target) as Array<{ identity: string }>;
       const identities = accounts.map((account) => account.identity);
       let deletedRequestStats = 0;
       if (identities.length > 0) {
@@ -169,9 +184,11 @@ export class SqliteStorage implements ProxyStorage {
           .prepare(`DELETE FROM proxy_request_stats WHERE identity IN (${placeholders})`)
           .run(...identities).changes;
       }
-      const deletedAccounts = this.database()
-        .prepare('DELETE FROM proxy_accounts WHERE lower(sso_user) = lower(?)')
-        .run(target).changes;
+      const deletedAccounts = this.database().prepare(`
+        DELETE FROM proxy_accounts
+        WHERE enterprise_id = ?
+          AND lower(sso_user) = lower(?)
+      `).run(enterpriseId, target).changes;
       return {
         ssoUser: target,
         matchedAccounts: accounts.length,
@@ -362,20 +379,26 @@ export class SqliteStorage implements ProxyStorage {
     this.pruneStats(input.identity);
   }
 
-  async listRequestStats(identity?: string, limit = 100): Promise<ProxyRequestStatDto[]> {
+  async listRequestStats(enterpriseId: EnterpriseId, identity?: string, limit = 100): Promise<ProxyRequestStatDto[]> {
     const boundedLimit = Math.max(1, Math.min(limit, 1000));
-    const rows = identity
-      ? this.database()
-        .prepare('SELECT * FROM proxy_request_stats WHERE identity = ? ORDER BY requested_at DESC, id DESC LIMIT ?')
-        .all(identity, boundedLimit)
-      : this.database()
-        .prepare('SELECT * FROM proxy_request_stats ORDER BY requested_at DESC, id DESC LIMIT ?')
-        .all(boundedLimit);
+    const identityFilter = identity ? 'AND identity = ?' : '';
+    const rows = this.database().prepare(`
+      SELECT *
+      FROM proxy_request_stats
+      WHERE enterprise_id = ?
+        ${identityFilter}
+      ORDER BY requested_at DESC, id DESC
+      LIMIT ?
+    `).all(enterpriseId, ...(identity ? [identity] : []), boundedLimit);
     return (rows as StatRow[]).map(mapStatRow);
   }
 
-  async listRequestStatsPage(query: ManagementQuery = {}, database = this.database()): Promise<PageResponse<ProxyRequestStatDto>> {
-    const { where, args, order } = managementSql('requests', query);
+  async listRequestStatsPage(
+    enterpriseId: EnterpriseId,
+    query: ManagementQuery = {},
+    database = this.database(),
+  ): Promise<PageResponse<ProxyRequestStatDto>> {
+    const { where, args, order } = managementSql('requests', enterpriseId, query);
     const total = (database.prepare(`SELECT COUNT(*) AS count FROM proxy_request_stats ${where}`).get(...args) as { count: number }).count;
     const pageSize = Math.max(1, Math.min(query.pageSize ?? 25, 100));
     const page = Math.min(Math.max(1, query.page ?? 1), Math.max(1, Math.ceil(total / pageSize)));

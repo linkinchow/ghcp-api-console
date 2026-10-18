@@ -19,7 +19,7 @@ test('SQLite dispatch slots are atomic, fenced and retained for uncertain Login 
   const { db, store } = fixture();
   try {
     store.claimOwner('owner');
-    const first = store.reserve()!, second = store.reserve()!;
+    const first = store.reserve(['default'])!, second = store.reserve(['default'])!;
     for (const row of [first, second]) store.update(row.identity, { stage: 'oauth-starting', oauth_attempt_id: 'test-attempt' });
     let fence = store.inventory(first.identity)!;
     assert.equal(store.claimLoginDispatch(first.identity, fence, 'other-owner', 1), false);
@@ -53,14 +53,15 @@ test('SQLite pagination reaches beyond 1000 members and escapes wildcard searche
         inventory.run(identity, n, `attempt-${n}`, 1);
       }
     })();
-    const page = store.page('accounts', { page: 21, pageSize: 50 });
+    const page = store.page('accounts', { enterpriseId: 'default', page: 21, pageSize: 50 });
     assert.equal(page.total, 2000);
     assert.equal(page.items.length, 50);
     assert.equal((page.items[0] as { identity: string }).identity, 'synthetic-1000');
-    assert.equal(store.page('accounts', { page: 1, pageSize: 25, q: 'SYNTHETIC-1999' }).total, 1);
-    assert.equal(store.page('accounts', { page: 1, pageSize: 25, q: '%' }).total, 0);
-    assert.equal(store.page('accounts', { page: 1, pageSize: 25, state: 'ready_idle' }).total, 0);
-    assert.throws(() => store.page('accounts', { page: 0, pageSize: 25 }));
-    assert.throws(() => store.page('events', { page: 1, pageSize: 25, state: 'active' }));
+    const scope = { enterpriseId: 'default', page: 1, pageSize: 25 };
+    assert.equal(store.page('accounts', { ...scope, q: 'SYNTHETIC-1999' }).total, 1);
+    assert.equal(store.page('accounts', { enterpriseId: 'default', page: 1, pageSize: 25, q: '%' }).total, 0);
+    assert.equal(store.page('accounts', { ...scope, state: 'ready_idle' }).total, 0);
+    assert.throws(() => store.page('accounts', { enterpriseId: 'default', page: 0, pageSize: 25 }));
+    assert.throws(() => store.page('events', { enterpriseId: 'default', page: 1, pageSize: 25, state: 'active' }));
   } finally { db.close(); }
 });

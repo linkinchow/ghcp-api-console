@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { parseGithubBaseUrl } from '@ghcp/shared';
+import { DEFAULT_ENTERPRISE_ID, parseEnterpriseId, type EnterpriseId } from '@ghcp/shared';
 import { assertMysqlMigrationLockWait, MYSQL_MIGRATION_LOCK_WAIT } from './db/mysqlMigrationLock.js';
 
 export interface ProxyConfig {
@@ -18,15 +18,11 @@ export interface ProxyConfig {
   identityHeader: string;
   identityHeaderRequired: boolean;
   claudeCodeOptimized: boolean;
-  githubApiBaseUrl: string;
-  modelsAdminGithubLogin?: string;
-  modelsAdminGithubUserId?: string;
-  modelsAdminCopilotTokenFile?: string;
+  /** DIRECT_MODE_ENTERPRISE_ID: the enterprise of new direct-mode identities; it must be in the registry. */
+  directModeEnterpriseId: EnterpriseId;
   internalApiToken: string;
   ssoBaseUrl: string;
   loginBaseUrl: string;
-  /** Effective EMU login suffix stripped from new identities; always empty on GHE.com. */
-  enterpriseShortcode: string;
   requestStatsPerAccountLimit: number;
   errorDiagnosticsEnabled: boolean;
   errorDiagnosticsDir: string;
@@ -35,7 +31,6 @@ export interface ProxyConfig {
   errorDiagnosticsMaxFiles: number;
   errorDiagnosticsShared: boolean;
   errorDiagnosticsInstanceId: string;
-  copilotApiBaseUrl: string;
   opencodeUserAgent: string;
   githubApiVersion: string;
 }
@@ -55,17 +50,10 @@ export const config: ProxyConfig = {
   identityHeader: process.env.IDENTITY_HEADER ?? 'X-User-Identity',
   identityHeaderRequired: readBoolean(process.env.IDENTITY_HEADER_REQUIRED, true),
   claudeCodeOptimized: readBoolean(process.env.CLAUDE_CODE_OPTIMIZED, false),
-  githubApiBaseUrl: (readOptionalString(process.env.GITHUB_API_BASE_URL) ?? 'https://api.github.com').replace(/\/+$/, ''),
-  modelsAdminGithubLogin: readOptionalString(process.env.MODELS_ADMIN_GITHUB_LOGIN),
-  modelsAdminGithubUserId: readOptionalString(process.env.MODELS_ADMIN_GITHUB_USER_ID),
-  modelsAdminCopilotTokenFile: readOptionalString(process.env.MODELS_ADMIN_COPILOT_TOKEN_FILE),
+  directModeEnterpriseId: readEnterpriseId(process.env.DIRECT_MODE_ENTERPRISE_ID),
   internalApiToken: process.env.INTERNAL_API_TOKEN ?? '',
   ssoBaseUrl: process.env.SSO_BASE_URL ?? 'http://localhost:7001',
   loginBaseUrl: process.env.LOGIN_BASE_URL ?? 'http://localhost:7003',
-  // GHE.com logins carry no visible shortcode suffix, so ENTERPRISE_SHORTCODE is ignored there.
-  enterpriseShortcode: parseGithubBaseUrl(process.env.GITHUB_BASE_URL).isGheCom
-    ? ''
-    : readOptionalString(process.env.ENTERPRISE_SHORTCODE) ?? 'octo',
   requestStatsPerAccountLimit: readPositiveInteger(process.env.REQUEST_STATS_PER_ACCOUNT_LIMIT, 2),
   errorDiagnosticsEnabled: readBoolean(process.env.PROXY_ERROR_DIAGNOSTICS_ENABLED, true),
   errorDiagnosticsDir: readOptionalString(process.env.PROXY_ERROR_DIAGNOSTICS_DIR) ?? './data/error-diagnostics',
@@ -76,7 +64,6 @@ export const config: ProxyConfig = {
   errorDiagnosticsInstanceId: readOptionalString(process.env.PROXY_INSTANCE_ID)
     ?? readOptionalString(process.env.HOSTNAME)
     ?? 'proxy',
-  copilotApiBaseUrl: readOptionalString(process.env.COPILOT_API_BASE_URL) ?? 'https://api.githubcopilot.com',
   opencodeUserAgent: readOptionalString(process.env.OPENCODE_USER_AGENT)
     ?? `opencode/${readOptionalString(process.env.OPENCODE_VERSION) ?? '1.0.0'}`,
   githubApiVersion: readOptionalString(process.env.GITHUB_API_VERSION) ?? '2026-06-01',
@@ -123,6 +110,16 @@ function readMysqlSslMode(value: string | undefined): ProxyConfig['mysqlSslMode'
   const normalized = value?.trim().toLowerCase() || 'disabled';
   if (normalized === 'disabled' || normalized === 'required' || normalized === 'verify-ca') return normalized;
   throw new Error(`Invalid MYSQL_SSL_MODE "${value}". Expected "disabled", "required", or "verify-ca".`);
+}
+
+function readEnterpriseId(value: string | undefined): EnterpriseId {
+  const id = readOptionalString(value);
+  if (id === undefined) return DEFAULT_ENTERPRISE_ID;
+  try {
+    return parseEnterpriseId(id);
+  } catch {
+    throw new Error(`Invalid DIRECT_MODE_ENTERPRISE_ID "${value}".`);
+  }
 }
 
 function readOptionalString(value: string | undefined): string | undefined {

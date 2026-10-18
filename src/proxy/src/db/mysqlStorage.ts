@@ -17,9 +17,14 @@ import {
   type ManagementQuery,
   type ManagementSummary,
 } from '@ghcp/shared';
-import { prepareMysqlEnterprises, runMysqlMigrations, validateMysqlTables } from './mysqlMigrations.js';
+import {
+  prepareMysqlEnterprises,
+  runMysqlMigrations,
+  syncMysqlEnterprises,
+  validateMysqlTables,
+} from './mysqlMigrations.js';
 import { MYSQL_MIGRATION_LOCK_WAIT } from './mysqlMigrationLock.js';
-import type { EnterpriseSeed } from './enterpriseSeed.js';
+import { requireDefaultSeed, type EnterpriseSeed } from './enterpriseSeed.js';
 import { managementSql } from './managementQueries.js';
 import { MysqlPoolStore } from '../userPool/mysqlStore.js';
 import type { PoolConfig } from '../userPool/config.js';
@@ -33,6 +38,7 @@ import type {
   ProxyEnterpriseRecord,
   ProxyStorage,
   RecordRequestStatInput,
+  SnapshotReader,
 } from './storageTypes.js';
 
 interface AccountRow extends RowDataPacket {
@@ -99,7 +105,7 @@ export class MysqlStorage implements ProxyStorage {
     });
   }
 
-  async withReadSnapshot<T>(read: (reader: Pick<ProxyStorage, 'listAccounts' | 'listRequestStatsPage'>) => Promise<T>): Promise<T> {
+  async withReadSnapshot<T>(read: (reader: SnapshotReader) => Promise<T>): Promise<T> {
     // Snapshot reads page through whole tables for exports, so they get a longer budget than single statements.
     const lease = await leaseMysqlConnection(this.pool, new MysqlDeadline(SNAPSHOT_READ_DEADLINE_MS, SNAPSHOT_READ_DEADLINE_MS));
     const { connection } = lease;
@@ -107,8 +113,8 @@ export class MysqlStorage implements ProxyStorage {
       await connection.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
       await connection.beginTransaction();
       return await read({
-        listAccounts: (query) => this.listAccounts(query, connection),
-        listRequestStatsPage: (query) => this.listRequestStatsPage(query, connection),
+        listAccounts: (enterpriseId, query) => this.listAccounts(enterpriseId, query, connection),
+        listRequestStatsPage: (enterpriseId, query) => this.listRequestStatsPage(enterpriseId, query, connection),
       });
     } finally {
       try {
@@ -121,22 +127,27 @@ export class MysqlStorage implements ProxyStorage {
     }
   }
 
-  /** `migrationLockWaitSeconds`: MYSQL_MIGRATION_LOCK_WAIT_SECONDS. */
+  /**
+   * `seeds`: every registry enterprise, `default` first.
+   * `migrationLockWaitSeconds`: MYSQL_MIGRATION_LOCK_WAIT_SECONDS.
+   */
   constructor(
     private readonly pool: Pool,
     private readonly requestStatsPerAccountLimit: number,
     private readonly autoMigrate: boolean,
-    private readonly seed: EnterpriseSeed,
+    private readonly seeds: readonly EnterpriseSeed[],
     private readonly migrationLockWaitSeconds: number = MYSQL_MIGRATION_LOCK_WAIT.defaultSeconds,
   ) { }
 
   async initialize(): Promise<void> {
+    const seed = requireDefaultSeed(this.seeds);
     if (this.autoMigrate) {
-      await runMysqlMigrations(this.pool, this.seed, this.migrationLockWaitSeconds);
+      await runMysqlMigrations(this.pool, seed, this.migrationLockWaitSeconds);
     } else {
       await validateMysqlTables(this.pool);
-      await prepareMysqlEnterprises(this.pool, this.seed, this.migrationLockWaitSeconds);
+      await prepareMysqlEnterprises(this.pool, seed, this.migrationLockWaitSeconds);
     }
+    await syncMysqlEnterprises(this.pool, this.seeds, this.migrationLockWaitSeconds);
     await this.ping();
   }
 
@@ -148,10 +159,14 @@ export class MysqlStorage implements ProxyStorage {
     await this.pool.end();
   }
 
-  async listAccounts(query: AccountListQuery = {}, connection: Pick<Pool, 'execute'> = { execute: this.execute }): Promise<PageResponse<ProxyAccountRecord>> {
+  async listAccounts(
+    enterpriseId: EnterpriseId,
+    query: AccountListQuery = {},
+    connection: Pick<Pool, 'execute'> = { execute: this.execute },
+  ): Promise<PageResponse<ProxyAccountRecord>> {
     let page = Math.max(1, Math.trunc(query.page ?? 1));
     const pageSize = Math.max(1, Math.min(Math.trunc(query.pageSize ?? 25), 100));
-    const { where, args, order } = managementSql('accounts', query, mysqlTimestamp);
+    const { where, args, order } = managementSql('accounts', enterpriseId, query, mysqlTimestamp);
     const [countRows] = await connection.execute<Array<RowDataPacket & { count: number }>>(
       `SELECT COUNT(*) AS count FROM proxy_accounts ${where}`,
       args,
@@ -165,10 +180,13 @@ export class MysqlStorage implements ProxyStorage {
     return pageResponse(rows.map(mapAccountRow), total, page, pageSize);
   }
 
-  async summarizeAccounts(): Promise<ManagementSummary> {
-    const [rows] = await this.execute<Array<RowDataPacket & { status: string; count: number }>>(
-      'SELECT copilot_oauth_status AS status, COUNT(*) AS count FROM proxy_accounts GROUP BY copilot_oauth_status',
-    );
+  async summarizeAccounts(enterpriseId: EnterpriseId): Promise<ManagementSummary> {
+    const [rows] = await this.execute<Array<RowDataPacket & { status: string; count: number }>>(`
+      SELECT copilot_oauth_status AS status, COUNT(*) AS count
+      FROM proxy_accounts
+      WHERE enterprise_id = ?
+      GROUP BY copilot_oauth_status
+    `, [enterpriseId]);
     return { total: rows.reduce((total, row) => total + Number(row.count), 0), counts: Object.fromEntries(rows.map((row) => [row.status, Number(row.count)])), updatedAt: nowIso() };
   }
 
@@ -202,14 +220,18 @@ export class MysqlStorage implements ProxyStorage {
     });
   }
 
-  async deleteAccountsBySsoUser(ssoUser: string): Promise<DeleteAccountsBySsoUserResult> {
+  /** `sso_user` is unique only within an enterprise (design §5.3). */
+  async deleteAccountsBySsoUser(enterpriseId: EnterpriseId, ssoUser: string): Promise<DeleteAccountsBySsoUserResult> {
     const target = ssoUser.trim();
     if (!target) return { ssoUser: target, matchedAccounts: 0, deletedAccounts: 0, deletedRequestStats: 0 };
     return this.transaction(async (connection) => {
-      const [accounts] = await connection.execute<Array<RowDataPacket & { identity: string }>>(
-        'SELECT identity FROM proxy_accounts WHERE LOWER(sso_user) = LOWER(?) FOR UPDATE',
-        [target],
-      );
+      const [accounts] = await connection.execute<Array<RowDataPacket & { identity: string }>>(`
+        SELECT identity
+        FROM proxy_accounts
+        WHERE enterprise_id = ?
+          AND LOWER(sso_user) = LOWER(?)
+        FOR UPDATE
+      `, [enterpriseId, target]);
       const identities = accounts.map((account) => account.identity);
       let deletedRequestStats = 0;
       if (identities.length > 0) {
@@ -220,10 +242,11 @@ export class MysqlStorage implements ProxyStorage {
         );
         deletedRequestStats = statsResult.affectedRows;
       }
-      const [accountResult] = await connection.execute<ResultSetHeader>(
-        'DELETE FROM proxy_accounts WHERE LOWER(sso_user) = LOWER(?)',
-        [target],
-      );
+      const [accountResult] = await connection.execute<ResultSetHeader>(`
+        DELETE FROM proxy_accounts
+        WHERE enterprise_id = ?
+          AND LOWER(sso_user) = LOWER(?)
+      `, [enterpriseId, target]);
       return {
         ssoUser: target,
         matchedAccounts: accounts.length,
@@ -425,22 +448,26 @@ export class MysqlStorage implements ProxyStorage {
     await this.pruneStats(input.identity);
   }
 
-  async listRequestStats(identity?: string, limit = 100): Promise<ProxyRequestStatDto[]> {
+  async listRequestStats(enterpriseId: EnterpriseId, identity?: string, limit = 100): Promise<ProxyRequestStatDto[]> {
     const boundedLimit = Math.max(1, Math.min(limit, 1000));
-    const [rows] = identity
-      ? await this.execute<StatRow[]>(
-          'SELECT * FROM proxy_request_stats WHERE identity = ? ORDER BY requested_at DESC, id DESC LIMIT ?',
-          [identity, boundedLimit],
-        )
-      : await this.execute<StatRow[]>(
-          'SELECT * FROM proxy_request_stats ORDER BY requested_at DESC, id DESC LIMIT ?',
-          [boundedLimit],
-        );
+    const identityFilter = identity ? 'AND identity = ?' : '';
+    const [rows] = await this.execute<StatRow[]>(`
+      SELECT *
+      FROM proxy_request_stats
+      WHERE enterprise_id = ?
+        ${identityFilter}
+      ORDER BY requested_at DESC, id DESC
+      LIMIT ?
+    `, [enterpriseId, ...(identity ? [identity] : []), boundedLimit]);
     return rows.map(mapStatRow);
   }
 
-  async listRequestStatsPage(query: ManagementQuery = {}, connection: Pick<Pool, 'execute'> = { execute: this.execute }): Promise<PageResponse<ProxyRequestStatDto>> {
-    const { where, args, order } = managementSql('requests', query, mysqlTimestamp);
+  async listRequestStatsPage(
+    enterpriseId: EnterpriseId,
+    query: ManagementQuery = {},
+    connection: Pick<Pool, 'execute'> = { execute: this.execute },
+  ): Promise<PageResponse<ProxyRequestStatDto>> {
+    const { where, args, order } = managementSql('requests', enterpriseId, query, mysqlTimestamp);
     const [counts] = await connection.execute<Array<RowDataPacket & { count: number }>>(`SELECT COUNT(*) AS count FROM proxy_request_stats ${where}`, args);
     const total = Number(counts[0]?.count ?? 0);
     const pageSize = Math.max(1, Math.min(query.pageSize ?? 25, 100));

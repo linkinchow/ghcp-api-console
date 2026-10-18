@@ -14,12 +14,15 @@ import type { PoolConfig } from './config.js';
 import type { ProvisionAdapter } from './provisioner.js';
 import type { PrewarmStore } from './worker.js';
 import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
+import { unscopedUrl } from '../testing/scopedPaths.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 
 // Capture opt-in BEFORE application imports; never load the checkout's .env or
 // use application credentials. Restore the whole environment even on import failure.
 const mysqlUrl = process.env.MYSQL_TEST_URL;
 const mysqlEnabled = Boolean(mysqlUrl) && process.env.MYSQL_POOL_TEST_DISPOSABLE === '1';
 const savedEnv = { ...process.env };
+const ACCOUNT_DOMAIN = 'owner.synthetic.test';
 const application = await (async () => {
   for (const key of Object.keys(process.env)) delete process.env[key];
   Object.assign(process.env, {
@@ -29,6 +32,8 @@ const application = await (async () => {
     COPILOT_API_BASE_URL: 'http://copilot.synthetic.test', PROXY_ERROR_DIAGNOSTICS_ENABLED: 'false',
   });
   try {
+    // The registry is read once; load it while the synthetic Copilot endpoint is in the environment.
+    (await import('../testing/enterpriseFixture.js')).installDefaultPoolDomain(ACCOUNT_DOMAIN);
     return {
       ...await import('../db/sqliteStorage.js'), ...await import('../db/mysqlStorage.js'),
       ...await import('./worker.js'), ...await import('./provisioner.js'),
@@ -40,7 +45,7 @@ const application = await (async () => {
 })();
 const { SqliteStorage, MysqlStorage, PrewarmWorker, realProvisioner } = application;
 const options: PoolConfig = {
-  enabled: true, accountDomain: 'owner.synthetic.test', idleTarget: 1, maxAccounts: 1,
+  enabled: true, accountDomain: ACCOUNT_DOMAIN, idleTarget: 1, maxAccounts: 1,
   leaseSeconds: 600, provisionalSeconds: 30, pollMs: 1000, prewarmConcurrency: 1,
   loginMaxPending: 1, retryAfterSeconds: 1, warmupModel: 'synthetic-model', requestTimeoutMs: 5000,
 };
@@ -104,8 +109,8 @@ async function withDatabase(driver: 'SQLite' | 'MySQL', run: (f: Fixture) => Pro
   if (driver === 'SQLite') {
     const directory = mkdtempSync(join(tmpdir(), 'owner-side-effects-'));
     const path = join(directory, 'test.sqlite');
-    const storage = new SqliteStorage(path, 10, defaultEnterpriseSeed({}));
-    const other = new SqliteStorage(path, 10, defaultEnterpriseSeed({}));
+    const storage = new SqliteStorage(path, 10, [defaultEnterpriseSeed({})]);
+    const other = new SqliteStorage(path, 10, [defaultEnterpriseSeed({})]);
     try {
       await storage.initialize(); await other.initialize();
       const first = storage.userPool(options), second = other.userPool(options);
@@ -161,8 +166,8 @@ async function withDatabase(driver: 'SQLite' | 'MySQL', run: (f: Fixture) => Pro
     for (let i = 0; i < 2; i++) pools.push(createPool({ uri: url.toString(), connectionLimit: 4,
       connectTimeout: 5000, timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true }));
     const [db, otherDb] = pools;
-    const storage = new MysqlStorage(tracedPool(db, writes), 10, true, defaultEnterpriseSeed({}));
-    const other = new MysqlStorage(otherDb, 10, true, defaultEnterpriseSeed({}));
+    const storage = new MysqlStorage(tracedPool(db, writes), 10, true, [defaultEnterpriseSeed({})]);
+    const other = new MysqlStorage(otherDb, 10, true, [defaultEnterpriseSeed({})]);
     await storage.initialize();
     const first = await storage.userPool(options), second = await other.userPool(options);
     await run({ first, second, storage, writes,
@@ -197,7 +202,7 @@ function services(f: Fixture, target: Stage, timing: Timing, observable: boolean
   let user: SsoUserDto | undefined, visible: SsoUserDto | undefined;
   let warms = 0;
   const read = async () => {
-    const rows = (await f.storage.listAccounts()).items;
+    const rows = (await f.storage.listAccounts(DEFAULT_ENTERPRISE_ID)).items;
     assert.equal(rows.length, 1);
     const row = await f.first.inventory(rows[0].identity);
     assert.ok(row);
@@ -209,10 +214,11 @@ function services(f: Fixture, target: Stage, timing: Timing, observable: boolean
   };
   const adapter = (store: PoolStore): ProvisionAdapter => {
     const real = realProvisioner(store, options, {
+      isReady: async () => true,
       getAccount: id => f.storage.getAccount(id),
       async fetch(input, init) {
         try {
-          const url = new URL(String(input)), path = url.pathname, method = init?.method ?? 'GET';
+          const url = unscopedUrl(input), path = url.pathname, method = init?.method ?? 'GET';
           assert.equal(url.origin, path.startsWith('/api/tasks') ? 'http://login.synthetic.test' : 'http://sso.synthetic.test');
           assert.equal(new Headers(init?.headers).get('x-internal-token'), 'synthetic-internal');
           assert.equal(init?.redirect, 'error'); assert.ok(init?.signal);
@@ -252,7 +258,7 @@ function services(f: Fixture, target: Stage, timing: Timing, observable: boolean
             assert.equal(++posts.login, 1, 'Login POST is NOT idempotent, even for the same nonce');
             assert.equal(row.stage, 'oauth-dispatch'); assert.ok(row.oauth_attempt_id);
             assert.deepEqual(body, { identity: row.identity, ssoUser: row.identity, ghLogin: user.ghLogin,
-              oauthAttemptId: row.oauth_attempt_id, ssoPassword: 'synthetic-password', ssoType: 'custom' });
+              oauthAttemptId: row.oauth_attempt_id, ssoPassword: 'synthetic-password' });
             const account = await f.storage.getAccount(row.identity);
             assert.equal(account?.copilotOauthStatus, 'refreshing');
             assert.equal(account.copilotOauthAttemptId, row.oauth_attempt_id);
@@ -431,7 +437,7 @@ async function contract(f: Fixture, target: Stage, timing: Timing, observable = 
       assert.equal((await f.first.counts()).ready_idle, 0); assert.equal(service.warms(), 0);
     }
     assert.equal((await f.first.counts()).total, 1);
-    assert.equal((await f.storage.listAccounts()).total, 1);
+    assert.equal((await f.storage.listAccounts(DEFAULT_ENTERPRISE_ID)).total, 1);
     assert.equal(new Set(service.trace.map(request => request.attempt)).size, 1);
     assert.equal(new Set(service.trace.map(request => request.nonce).filter(Boolean)).size, service.tasks.length ? 1 : 0);
     assert.deepEqual(service.errors, []);

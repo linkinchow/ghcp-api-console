@@ -15,12 +15,29 @@ export interface EnterpriseSeed {
   maxAccounts: number;
 }
 
-/** The `default` enterprise as the Proxy's registry (or, without one, its environment) describes it. */
-export function defaultEnterpriseSeed(env: NodeJS.ProcessEnv = process.env): EnterpriseSeed {
+/** Every enterprise of the Proxy's registry (or, without one, its environment), `default` first. */
+export function enterpriseSeeds(env: NodeJS.ProcessEnv = process.env): EnterpriseSeed[] {
   const registry = loadRegistry({ service: 'proxy', env });
-  const profile = registry.enterprises.find((enterprise) => enterprise.id === DEFAULT_ENTERPRISE_ID);
-  if (!profile) throw new Error('The enterprise registry has no default enterprise.');
-  return enterpriseSeed(profile);
+  const seeds = registry.enterprises.map(enterpriseSeed);
+  const defaultSeed = seeds.find(isDefaultSeed);
+  if (!defaultSeed) throw new Error('The enterprise registry has no default enterprise.');
+  return [defaultSeed, ...seeds.filter((seed) => !isDefaultSeed(seed))];
+}
+
+/** The `default` enterprise alone; single-enterprise tests and the base migrations use it. */
+export function defaultEnterpriseSeed(env: NodeJS.ProcessEnv = process.env): EnterpriseSeed {
+  return enterpriseSeeds(env)[0];
+}
+
+/** The `default` seed of a registry seed list; storage constructors require one. */
+export function requireDefaultSeed(seeds: readonly EnterpriseSeed[]): EnterpriseSeed {
+  const seed = seeds.find(isDefaultSeed);
+  if (!seed) throw new Error('The enterprise seeds have no default enterprise.');
+  return seed;
+}
+
+function isDefaultSeed(seed: EnterpriseSeed): boolean {
+  return seed.id === DEFAULT_ENTERPRISE_ID;
 }
 
 export function enterpriseSeed(profile: EnterpriseProfile): EnterpriseSeed {

@@ -71,7 +71,7 @@ export const MYSQL_SCHEMA: Record<string, TableSchema> = {
   checks: ["state IN ('provisioning', 'ready', 'cooling', 'failed', 'disabled')"],
   indexes: ['idx_user_pool_pending (state, retry_at, ordinal)', 'idx_user_pool_available (state, updated_at, ordinal)',
     'idx_user_pool_cooling (state, cooldown_until)', 'idx_user_pool_verification (state, verified_at)',
-    'idx_user_pool_accounts_enterprise_state (enterprise_id, state)',
+    'idx_user_pool_accounts_enterprise_state (enterprise_id, state, updated_at, ordinal)',
     // Backs the composite foreign key; MySQL would otherwise create an unnamed-by-us index for it.
     'idx_user_pool_accounts_member_enterprise (identity, enterprise_id)'] },
   user_pool_leases: { pool: true, primary: 'caller_id', unique: ['member_identity', 'lease_id'], columns: {

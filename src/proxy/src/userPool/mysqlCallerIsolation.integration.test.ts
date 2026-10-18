@@ -117,8 +117,10 @@ test('MySQL caller isolation: local FIFO protects unrelated callers and shares t
       for (const table of ['user_pool_holds', 'user_pool_catalog_holds', 'user_pool_catalog_cooldowns',
         'user_pool_leases', 'user_pool_accounts', 'user_pool_events', 'proxy_accounts']) await pool.query(`DELETE FROM ${table}`);
       await pool.query('UPDATE user_pool_settings SET next_ordinal=0, owner=NULL, owner_until=0 WHERE id=1');
+      // The rows were deleted behind the store's back: reset N_e with them.
+      await pool.query('UPDATE proxy_enterprises SET inventory_count=0');
       for (let i = 0; i < 2; i++) {
-        const member = await store.reserve();
+        const member = await store.reserve(['default']);
         assert.ok(member);
         await pool.execute("UPDATE proxy_accounts SET copilot_oauth_status='valid', copilot_oauth_token='SyntheticToken' WHERE identity=?", [member.identity]);
         await store.update(member.identity, { state: 'ready', stage: 'ready', verified_at: await store.now() });
@@ -216,7 +218,7 @@ test('MySQL caller isolation: local FIFO protects unrelated callers and shares t
       assert.deepEqual(rows.map(row => row.request_id).sort(), survivors.map(h => h.request_id).sort(), 'Only surviving requests have persisted holds');
       assert.equal(rows.filter(row => row.kind === 'catalog').length, 4);
       assert.ok(rows.every(row => row.caller_id === a && row.member_identity === survivors[0].member_identity));
-      const leases = await store.leases();
+      const leases = await store.leases('default');
       assert.equal(leases.length, 2);
       const aLease = leases.find(lease => lease.caller_id === a)!;
       assert.equal(aLease.phase, 'provisional');

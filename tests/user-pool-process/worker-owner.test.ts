@@ -123,7 +123,7 @@ test('prepared independent-process worker owner-death acceptance', {
       timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true });
     pool.on('connection', track);
     const enterprise = await enterpriseSeed();
-    const storage = new MysqlStorage(pool, 2, true, enterprise);
+    const storage = new MysqlStorage(pool, 2, true, [enterprise]);
     await storage.initialize();
     const store = await storage.userPool(options);
     t.signal.throwIfAborted();
@@ -153,7 +153,7 @@ test('prepared independent-process worker owner-death acceptance', {
         await pool!.query({ sql: 'DELETE FROM user_pool_events', timeout: 5000 });
         await pool!.query({ sql: 'DELETE FROM user_pool_accounts', timeout: 5000 });
         await pool!.query({ sql: 'DELETE FROM proxy_accounts', timeout: 5000 });
-        const seed = await store.reserve();
+        const seed = await store.reserve(['default']);
         assert.ok(seed);
         await storage.createAccount({ enterpriseId: enterprise.id, identity: seed.identity, ssoUser: seed.identity,
           ghLogin: `${seed.identity}_synthetic` });

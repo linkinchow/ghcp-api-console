@@ -8,7 +8,7 @@ import { defaultEnterpriseSeed } from './enterpriseSeed.js';
 import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 
 test('the account attempt id fences late writes, stale retries and superseded attempts', async (t) => {
-  const storage = new SqliteStorage(':memory:', 2000, defaultEnterpriseSeed({}));
+  const storage = new SqliteStorage(':memory:', 2000, [defaultEnterpriseSeed({})]);
   await storage.initialize();
   t.after(() => storage.close());
   await storage.createAccount({
@@ -45,21 +45,21 @@ test('the account attempt id fences late writes, stale retries and superseded at
 
 test('SQLite export snapshots do not change while matching records are inserted or removed', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'proxy-snapshot-'));
-  const storage = new SqliteStorage(join(directory, 'snapshot.sqlite'), 1000, defaultEnterpriseSeed({}));
+  const storage = new SqliteStorage(join(directory, 'snapshot.sqlite'), 1000, [defaultEnterpriseSeed({})]);
   await storage.initialize();
   t.after(async () => { await storage.close(); await rm(directory, { recursive: true, force: true }); });
   await storage.createAccount({ enterpriseId: DEFAULT_ENTERPRISE_ID, identity: 'before', ssoUser: 'before' });
   await storage.withReadSnapshot(async (reader) => {
-    assert.equal((await reader.listAccounts()).total, 1);
+    assert.equal((await reader.listAccounts(DEFAULT_ENTERPRISE_ID)).total, 1);
     await storage.deleteAccount('before');
     await storage.createAccount({ enterpriseId: DEFAULT_ENTERPRISE_ID, identity: 'after', ssoUser: 'after' });
-    assert.equal((await reader.listAccounts()).items[0]?.identity, 'before');
-    assert.equal((await storage.listAccounts()).items[0]?.identity, 'after');
+    assert.equal((await reader.listAccounts(DEFAULT_ENTERPRISE_ID)).items[0]?.identity, 'before');
+    assert.equal((await storage.listAccounts(DEFAULT_ENTERPRISE_ID)).items[0]?.identity, 'after');
   });
 });
 
 test('management counts and request filters cover data beyond old page and sample limits', async (t) => {
-  const storage = new SqliteStorage(':memory:', 2000, defaultEnterpriseSeed({}));
+  const storage = new SqliteStorage(':memory:', 2000, [defaultEnterpriseSeed({})]);
   await storage.initialize();
   t.after(() => storage.close());
   for (let index = 0; index < 137; index++) {
@@ -69,14 +69,15 @@ test('management counts and request filters cover data beyond old page and sampl
       copilotOauthStatus: index % 2 === 0 ? 'failed' : 'valid',
     });
   }
-  const summary = await storage.summarizeAccounts();
+  const summary = await storage.summarizeAccounts(DEFAULT_ENTERPRISE_ID);
   assert.equal(summary.total, 137);
   assert.equal(summary.counts.failed, 69);
-  const page = await storage.listAccounts({ page: 999, pageSize: 50, sort: 'identity', dir: 'asc' });
+  const page = await storage.listAccounts(DEFAULT_ENTERPRISE_ID,
+    { page: 999, pageSize: 50, sort: 'identity', dir: 'asc' });
   assert.equal(page.page, 3);
   assert.equal(page.items.length, 37);
-  assert.equal((await storage.listAccounts({ status: 'failed' })).total, 69);
-  await assert.rejects(storage.listAccounts({ status: 'invalid' }), /Invalid OAuth status/);
+  assert.equal((await storage.listAccounts(DEFAULT_ENTERPRISE_ID, { status: 'failed' })).total, 69);
+  await assert.rejects(storage.listAccounts(DEFAULT_ENTERPRISE_ID, { status: 'invalid' }), /Invalid OAuth status/);
 
   for (let index = 0; index < 1501; index++) {
     await storage.recordRequestStat({
@@ -85,9 +86,12 @@ test('management counts and request filters cover data beyond old page and sampl
       success: index !== 0, inputTokens: index,
     });
   }
-  assert.equal((await storage.listRequestStats(undefined, 1000)).some((row) => row.model === 'old-only'), false);
-  const old = await storage.listRequestStatsPage({ model: 'old-only', success: 'false', pageSize: 10 });
+  const recent = await storage.listRequestStats(DEFAULT_ENTERPRISE_ID, undefined, 1000);
+  assert.equal(recent.some((row) => row.model === 'old-only'), false);
+  const old = await storage.listRequestStatsPage(DEFAULT_ENTERPRISE_ID,
+    { model: 'old-only', success: 'false', pageSize: 10 });
   assert.equal(old.total, 1);
   assert.equal(old.items[0]?.model, 'old-only');
-  assert.equal((await storage.listRequestStatsPage({ pageSize: 100, page: 16 })).items.length, 1);
+  const last = await storage.listRequestStatsPage(DEFAULT_ENTERPRISE_ID, { pageSize: 100, page: 16 });
+  assert.equal(last.items.length, 1);
 });

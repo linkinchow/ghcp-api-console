@@ -124,11 +124,11 @@ test('SIGSTOP expires real owner TTL; SIGCONT checkpoint is SQL/local fenced; su
       timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true });
     pool.on('connection', track);
     const enterprise = await enterpriseSeed();
-    const storage = new MysqlStorage(pool, 2, true, enterprise);
+    const storage = new MysqlStorage(pool, 2, true, [enterprise]);
     await bounded('fixture migration', storage.initialize(), 20000);
     const store = await bounded('fixture store init', storage.userPool(options), 20000);
     t.signal.throwIfAborted();
-    const seed = await bounded('seed reserve', store.reserve(), 20000);
+    const seed = await bounded('seed reserve', store.reserve(['default']), 20000);
     t.signal.throwIfAborted();
     assert.ok(seed);
     const seedAccount = { enterpriseId: enterprise.id, identity: seed.identity, ssoUser: seed.identity,

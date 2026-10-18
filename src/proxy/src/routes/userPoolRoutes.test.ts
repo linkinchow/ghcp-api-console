@@ -44,7 +44,7 @@ beforeEach(async () => {
   store.now = () => now;
   members = [];
   for (let i = 0; i < 2; i++) {
-    const row = store.reserve()!;
+    const row = store.reserve([DEFAULT_ENTERPRISE_ID])!;
     members.push(row.identity);
     clearModelsCache(row.identity);
     await importCopilotOauthToken({
@@ -137,7 +137,7 @@ test('storage deadline during credential checks uses the same safe 503 envelope'
 test('Login task protection keeps dispatch and waiting evidence until consumed', async () => {
   const saved = config.internalApiToken;
   config.internalApiToken = 'test-task-protection';
-  const url = `${baseUrl}/internal/accounts/${members[0]}/login-task-protection`;
+  const url = `${baseUrl}/internal/enterprises/default/accounts/${members[0]}/login-task-protection`;
   const headers = { 'X-Internal-Token': config.internalApiToken };
   try {
     assert.equal((await originalFetch(url)).status, 401);
@@ -152,7 +152,8 @@ test('Login task protection keeps dispatch and waiting evidence until consumed',
     store.update(members[0], { stage: 'warmup' });
     response = await originalFetch(`${url}?taskId=task-test&oauthAttemptId=attempt-test`, { headers });
     assert.deepEqual(await response.json(), { managed: true, referenced: false });
-    response = await originalFetch(`${baseUrl}/internal/accounts/direct-user/login-task-protection?taskId=other`, { headers });
+    const direct = `${baseUrl}/internal/enterprises/default/accounts/direct-user/login-task-protection`;
+    response = await originalFetch(`${direct}?taskId=other`, { headers });
     assert.deepEqual(await response.json(), { managed: false, referenced: false });
   } finally { config.internalApiToken = saved; }
 });
@@ -167,14 +168,14 @@ test('pool route exclusively maps hashes, reuses members, promotes and records c
   assert.equal(second.status, 200);
   await second.text();
   await settled();
-  assert.equal(store.leases().length, 2);
-  const firstLease = store.leases().find((lease) => lease.caller_id === callers[0])!;
+  assert.equal(store.leases(DEFAULT_ENTERPRISE_ID).length, 2);
+  const firstLease = store.leases(DEFAULT_ENTERPRISE_ID).find((lease) => lease.caller_id === callers[0])!;
   assert.equal(firstLease.phase, 'active');
   assert.equal(firstLease.expires_at, now + 172800000);
   assert.equal(new Set(upstreamCalls.slice(0, 3).map((call) => call.token)).size, 1);
   assert.notEqual(upstreamCalls[0].token, upstreamCalls[3].token);
   assert.ok(upstreamCalls.every((call) => call.body.model === 'claude-opus-5.2'));
-  const stats = await listRequestStats(firstLease.member_identity);
+  const stats = await listRequestStats(DEFAULT_ENTERPRISE_ID, firstLease.member_identity);
   assert.equal(stats.length, 3);
   assert.ok(stats.every((stat) => stat.callerId === callers[0] && stat.leaseId === firstLease.lease_id));
   assert.equal(await getAccount(callers[0]), undefined);
@@ -199,7 +200,7 @@ test('hash identity fails closed and malformed models do not allocate', async ()
   const response = await request(callers[0], '/v1/messages', { model: null });
   assert.equal(response.status, 400);
   await response.text();
-  assert.equal(store.leases().length, 0);
+  assert.equal(store.leases(DEFAULT_ENTERPRISE_ID).length, 0);
   assert.equal(upstreamCalls.length, 0);
 });
 
@@ -212,14 +213,14 @@ test('Express case-insensitive, trailing-slash and HEAD routes cannot bypass poo
   });
   assert.equal(head.status, 200);
   assert.equal(await getAccount(callers[0]), undefined);
-  assert.ok(store.leases().every((lease) => lease.member_identity !== callers[0]));
+  assert.ok(store.leases(DEFAULT_ENTERPRISE_ID).every((lease) => lease.member_identity !== callers[0]));
 });
 
 test('same caller concurrent requests use one exclusive member', async () => {
   const responses = await Promise.all(Array.from({ length: 30 }, () => request()));
   await Promise.all(responses.map(async (response) => { assert.equal(response.status, 200); await response.text(); }));
   await settled();
-  assert.equal(store.leases().length, 1);
+  assert.equal(store.leases(DEFAULT_ENTERPRISE_ID).length, 1);
   assert.equal(new Set(upstreamCalls.map((call) => call.token)).size, 1);
   assert.equal(store.counts().ready_idle, 1);
 });
@@ -247,7 +248,7 @@ test('model discovery 401 schedules automatic repair without a caller lease', as
   assert.equal(response.status, 401);
   await response.text();
   await waitForHoldsToDrain();
-  assert.equal(store.leases().length, 0);
+  assert.equal(store.leases(DEFAULT_ENTERPRISE_ID).length, 0);
   assert.equal(store.inventory(members[0])?.stage, 'synced');
   assert.equal(store.inventory(members[0])?.attempts, 0);
   assert.equal(store.pending()?.identity, members[0]);
@@ -290,7 +291,8 @@ test('independent admin reauthorization cannot race a managed pool member', asyn
   const token = config.internalApiToken;
   config.internalApiToken = 'test-internal-only';
   try {
-    const response = await originalFetch(`${baseUrl}/api/accounts/${members[0]}/copilot-oauth/reauthorize`, {
+    const reauthorize = `${baseUrl}/api/enterprises/default/accounts/${members[0]}/copilot-oauth/reauthorize`;
+    const response = await originalFetch(reauthorize, {
       method: 'POST', headers: { 'X-Internal-Token': config.internalApiToken, 'Content-Type': 'application/json' },
       body: JSON.stringify({ ssoPassword: 'unused-test-password' }),
     });
@@ -307,7 +309,7 @@ test('upstream batch reauthorization and Login retry preparation cannot start Lo
   const headers = { 'X-Internal-Token': config.internalApiToken, 'Content-Type': 'application/json' };
   try {
     const before = await getAccount(members[0]);
-    const preview = await originalFetch(`${baseUrl}/api/accounts/operations/preview`, {
+    const preview = await originalFetch(`${baseUrl}/api/enterprises/default/accounts/operations/preview`, {
       method: 'POST', headers,
       body: JSON.stringify({ action: 'reauthorize', selection: { ids: [members[0]] } }),
     });
@@ -316,7 +318,8 @@ test('upstream batch reauthorization and Login retry preparation cannot start Lo
     assert.equal(item?.status, 'skipped');
     assert.match(item?.detail ?? '', /User pool recovery controls/);
 
-    const prepare = await originalFetch(`${baseUrl}/internal/accounts/${members[0]}/oauth-attempts/${randomUUID()}/prepare`, {
+    const account = `${baseUrl}/internal/enterprises/default/accounts/${members[0]}`;
+    const prepare = await originalFetch(`${account}/oauth-attempts/${randomUUID()}/prepare`, {
       method: 'POST', headers,
       body: JSON.stringify({
         ssoUser: before?.ssoUser, ghLogin: before?.ghLogin, ssoType: 'custom',
@@ -335,7 +338,7 @@ test('pool mode blocks credential import before validating or overwriting any to
   config.internalApiToken = 'test-import-internal';
   try {
     const before = await getAccount(members[1]);
-    const response = await originalFetch(`${baseUrl}/api/accounts/copilot-oauth-token/import`, {
+    const response = await originalFetch(`${baseUrl}/api/enterprises/default/accounts/copilot-oauth-token/import`, {
       method: 'POST', headers: { 'X-Internal-Token': config.internalApiToken, 'Content-Type': 'application/json' },
       body: JSON.stringify({ csvText: `name,copilotOauthToken\n${members[1]},test-token-0` }),
     });
@@ -343,16 +346,18 @@ test('pool mode blocks credential import before validating or overwriting any to
     assert.equal((await response.json() as any).error.code, 'pool_member_managed');
     assert.deepEqual(await getAccount(members[1]), before);
     assert.equal(upstreamCalls.length, 0);
-    const membership = await originalFetch(`${baseUrl}/internal/accounts/by-sso-user/${members[0]}/pool-membership`, { headers: { 'X-Internal-Token': config.internalApiToken } });
+    const bySsoUser = `${baseUrl}/internal/enterprises/default/accounts/by-sso-user`;
+    const internal = { headers: { 'X-Internal-Token': config.internalApiToken } };
+    const membership = await originalFetch(`${bySsoUser}/${members[0]}/pool-membership`, internal);
     assert.deepEqual(await membership.json(), { managed: true });
-    const unknown = await originalFetch(`${baseUrl}/internal/accounts/by-sso-user/not-a-member/pool-membership`, { headers: { 'X-Internal-Token': config.internalApiToken } });
+    const unknown = await originalFetch(`${bySsoUser}/not-a-member/pool-membership`, internal);
     assert.deepEqual(await unknown.json(), { managed: false });
   } finally { config.internalApiToken = saved; }
 });
 
 test('429 retains ownership, enforces cooldown, and never retries another member', async () => {
   await (await request()).text();
-  const lease = store.leases()[0];
+  const lease = store.leases(DEFAULT_ENTERPRISE_ID)[0];
   now += 10000;
   respond = () => json({ error: 'rate limited' }, 429, { 'Retry-After': '90' });
   const failed = await request();
@@ -360,8 +365,8 @@ test('429 retains ownership, enforces cooldown, and never retries another member
   assert.equal(failed.headers.get('retry-after'), '90');
   await failed.text();
   await settled();
-  assert.equal(store.leases()[0].lease_id, lease.lease_id);
-  assert.equal(store.leases()[0].expires_at, lease.expires_at);
+  assert.equal(store.leases(DEFAULT_ENTERPRISE_ID)[0].lease_id, lease.lease_id);
+  assert.equal(store.leases(DEFAULT_ENTERPRISE_ID)[0].expires_at, lease.expires_at);
   const blocked = await request();
   assert.equal(blocked.status, 429);
   assert.equal((await blocked.json() as any).error.code, 'member_cooling');
@@ -376,8 +381,8 @@ test('5xx, generic 403 and invalid 200 bodies never promote provisional leases',
     assert.equal(response.status, status);
     await response.text();
     await settled();
-    assert.equal(store.leases()[0].phase, 'provisional');
-    assert.equal(store.leases()[0].last_success_at, null);
+    assert.equal(store.leases(DEFAULT_ENTERPRISE_ID)[0].phase, 'provisional');
+    assert.equal(store.leases(DEFAULT_ENTERPRISE_ID)[0].last_success_at, null);
   }
   assert.equal(new Set(upstreamCalls.map((call) => call.token)).size, 1);
 });
@@ -390,13 +395,13 @@ test('stream promotes only after valid terminal event and rejects in-band errors
     respond = () => new Response(text, { headers: { 'Content-Type': 'text/event-stream' } });
     await (await request(callers[0], '/v1/messages', { stream: true })).text();
     await settled();
-    assert.equal(store.leases()[0].phase, 'provisional');
+    assert.equal(store.leases(DEFAULT_ENTERPRISE_ID)[0].phase, 'provisional');
   }
   respond = () => new Response('data: {"type":"message_start","message":{"model":"claude-opus-5.2"}}\n\ndata: {"type":"message_stop"}\n\n', { headers: { 'Content-Type': 'text/event-stream' } });
   const text = await (await request(callers[0], '/v1/messages', { stream: true })).text();
   assert.match(text, /claude-opus-5-2/);
   await settled();
-  assert.equal(store.leases()[0].phase, 'active');
+  assert.equal(store.leases(DEFAULT_ENTERPRISE_ID)[0].phase, 'active');
 });
 
 test('request deadline cancels upstream and does not promote or leave an active hold', async () => {
@@ -409,7 +414,7 @@ test('request deadline cancels upstream and does not promote or leave an active 
   assert.equal((await response.json() as any).error.code, 'pool_request_timeout');
   await waitForHoldsToDrain();
   assert.equal(aborted, true);
-  assert.equal(store.leases()[0].phase, 'provisional');
+  assert.equal(store.leases(DEFAULT_ENTERPRISE_ID)[0].phase, 'provisional');
   assert.equal(store.hasHolds(members[0]), false);
 });
 
@@ -433,7 +438,7 @@ test('disconnect cancels an in-flight upstream without renewing or replaying', a
   await assert.rejects(pending);
   await cancel;
   await waitForHoldsToDrain();
-  assert.equal(store.leases()[0].phase, 'provisional');
+  assert.equal(store.leases(DEFAULT_ENTERPRISE_ID)[0].phase, 'provisional');
   assert.equal(store.hasHolds(members[0]), false);
   assert.equal(upstreamCalls.length, 1);
 });
@@ -444,14 +449,14 @@ test('new-caller catalog and count-token requests release inventory without a pr
     assert.equal(response.status, 200);
     await response.text();
     await waitForHoldsToDrain();
-    assert.equal(store.leases().length, 0);
+    assert.equal(store.leases(DEFAULT_ENTERPRISE_ID).length, 0);
     assert.equal(store.counts().ready_idle, 2);
   }
 });
 
 test('model listing and token counting never renew a successful generation lease', async () => {
   await (await request()).text();
-  const lease = store.leases()[0];
+  const lease = store.leases(DEFAULT_ENTERPRISE_ID)[0];
   now += 60000;
   for (const path of ['/v1/models', '/v1/messages/count_tokens']) {
     const response = await request(callers[0], path);
@@ -459,6 +464,6 @@ test('model listing and token counting never renew a successful generation lease
     await response.text();
   }
   await settled();
-  assert.equal(store.leases()[0].expires_at, lease.expires_at);
-  assert.equal(store.leases()[0].last_success_at, lease.last_success_at);
+  assert.equal(store.leases(DEFAULT_ENTERPRISE_ID)[0].expires_at, lease.expires_at);
+  assert.equal(store.leases(DEFAULT_ENTERPRISE_ID)[0].last_success_at, lease.last_success_at);
 });

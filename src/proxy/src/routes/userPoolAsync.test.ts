@@ -31,7 +31,7 @@ async function fixture() {
   const store = await getUserPool();
   assert.ok(store instanceof UserPoolStore);
   let now = store.now(); store.now = () => now;
-  const member = store.reserve()!;
+  const member = store.reserve([DEFAULT_ENTERPRISE_ID])!;
   clearModelsCache(member.identity);
   await importCopilotOauthToken({
     enterpriseId: DEFAULT_ENTERPRISE_ID,
@@ -76,9 +76,9 @@ test('completed inference promotes and drains before unrelated statistics settle
     const response = await f.request(); assert.equal(response.status, 200); await response.text();
     for (let i = 0; i < 100 && f.store.hasHolds(f.member.identity); i++) await sleep(10);
     assert.equal(f.store.hasHolds(f.member.identity), false);
-    assert.equal(f.store.leases()[0].phase, 'active');
+    assert.equal(f.store.leases(DEFAULT_ENTERPRISE_ID)[0].phase, 'active');
     f.advance(); delayed.resolve(); await sleep(30);
-    assert.equal(f.store.leases()[0].phase, 'active');
+    assert.equal(f.store.leases(DEFAULT_ENTERPRISE_ID)[0].phase, 'active');
   } finally { delayed.resolve(); await sleep(30); storage.recordRequestStat = saved; await f.close(); }
 });
 

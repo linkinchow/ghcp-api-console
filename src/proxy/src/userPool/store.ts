@@ -1,19 +1,37 @@
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
-import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
+import { DEFAULT_ENTERPRISE_ID, type EnterpriseId } from '@ghcp/shared';
 import { runPoolEnterpriseMigrations } from '../db/enterpriseMigrations.js';
 import {
   correctInventoryCounts,
   getEnterpriseRecord,
   incrementInventory,
+  listEnterpriseRecords,
   setEnterpriseCap,
 } from '../db/enterpriseRepo.js';
+import type { ProxyEnterpriseRecord } from '../db/storageTypes.js';
 import type { PoolConfig } from './config.js';
 import { normalizeCaller, UserPoolError } from './config.js';
 import { accountName, NAME_CAPACITY } from './names.js';
 import { poolPageSql, type PoolList, type PoolPage, type PoolPageQuery } from './paging.js';
 import type { WorkerCredentialFence, WorkerCredentialMutation } from './storage.js';
-import { LOGIN_CAPACITY_SQL, PendingSelection } from './scheduling.js';
+import {
+  admissionOrder,
+  assertEnterpriseActive,
+  eligibleEnterprises,
+  LOGIN_CAPACITY_SQL,
+  nextPolicy,
+  nextSettings,
+  PendingSelection,
+  planReplenishment,
+  POLICY_ENTERPRISE_SQL,
+  poolSupplyQuery,
+  SCHEDULING_ENTERPRISE_SQL,
+  type PolicyEnterprise,
+  type PolicyPatch,
+  type PoolSupply,
+  type SchedulingEnterprise,
+} from './scheduling.js';
 import { inferenceHoldTimeoutMs } from './inferenceTimeout.js';
 
 export interface Inventory {
@@ -42,6 +60,8 @@ export interface Inventory {
 export interface Lease {
   caller_id: string;
   member_identity: string;
+  /** The member's enterprise; a lease never changes enterprise. */
+  enterprise_id: string;
   lease_id: string;
   phase: string;
   assigned_at: number;
@@ -57,12 +77,24 @@ export interface HeldLease extends Lease {
   deadline_at?: number;
 }
 
+/** Global pool settings; each enterprise's cap lives in `proxy_enterprises` (design §5.8). */
 export interface PoolSettings {
   version: number;
   idle_target: number;
-  max_accounts: number;
   lease_seconds: number;
   paused: number;
+}
+
+/** A member chosen for a new binding, with the enterprise the binding then belongs to. */
+interface PoolMember {
+  identity: string;
+  enterprise_id: string;
+}
+
+/** `WHERE`/`AND` filter on `p.enterprise_id`; empty for global reads. */
+interface MemberScope {
+  sql: string;
+  values: string[];
 }
 
 export type InventoryFence = string | (Pick<Inventory, 'attempt_id' | 'generation'> & Partial<Pick<Inventory, 'stage'>>);
@@ -91,7 +123,6 @@ const MANUAL_ERRORS = ['sso_creation_ambiguous', 'sso_name_conflict', 'oauth_dis
 const HOLD_DRAIN_MS = 10000;
 const REAUTH_WINDOW_MS = 60 * 60 * 1000;
 const REAUTH_MAX_CYCLES = 3;
-const SETTING_KEYS = ['idle_target', 'max_accounts', 'lease_seconds', 'paused'];
 const INVENTORY_KEYS = [
   'state', 'stage', 'attempt_id', 'oauth_attempt_id', 'sso_created_at', 'task_id', 'attempts', 'retry_at',
   'last_error', 'cooldown_until', 'verified_at',
@@ -201,13 +232,58 @@ export class UserPoolStore {
       throw new Error('The default enterprise is missing; run the Proxy migrations first.');
     }
     if (created) setEnterpriseCap(this.db, DEFAULT_ENTERPRISE_ID, this.options.maxAccounts);
-    for (const drift of correctInventoryCounts(this.db)) {
-      this.recordEvent({
-        action: 'enterprise_inventory_drift',
-        enterpriseId: drift.enterpriseId,
-        detail: `stored=${drift.stored} actual=${drift.actual}`,
-      });
-    }
+    this.correctInventoryDrift();
+  }
+
+  /** Design §5.8: recounts N_e (GROUP BY), records each correction and returns how many enterprises drifted. */
+  correctInventoryDrift(): number {
+    return this.db.transaction(() => {
+      const drifts = correctInventoryCounts(this.db);
+      for (const drift of drifts) {
+        this.recordEvent({
+          action: 'enterprise_inventory_drift',
+          enterpriseId: drift.enterpriseId,
+          detail: `stored=${drift.stored} actual=${drift.actual}`,
+        });
+      }
+      return drifts.length;
+    }).immediate();
+  }
+
+  /** Every `proxy_enterprises` row, including enterprises that are no longer in the registry. */
+  enterprisePolicies(): ProxyEnterpriseRecord[] {
+    return listEnterpriseRecords(this.db);
+  }
+
+  /** Compare-and-set on `policy_version`; readiness for activation is the caller's check. */
+  updateEnterprisePolicy(id: string, expectedVersion: number, patch: PolicyPatch): ProxyEnterpriseRecord {
+    return this.db.transaction(() => {
+      const rows = this.db.prepare(POLICY_ENTERPRISE_SQL).all() as PolicyEnterprise[];
+      const current = rows.find((row) => row.id === id);
+      if (!current) throw new UserPoolError(404, 'enterprise_not_found');
+      const next = nextPolicy(current, rows, expectedVersion, patch);
+      this.db.prepare(`
+        UPDATE proxy_enterprises
+        SET max_accounts = ?, state = ?, policy_version = policy_version + 1, updated_at = ?
+        WHERE id = ?
+          AND policy_version = ?
+      `).run(next.maxAccounts, next.state, this.now(), id, expectedVersion);
+      this.recordEvent({ action: 'enterprise_policy_updated', enterpriseId: id, detail: JSON.stringify(next) });
+      return getEnterpriseRecord(this.db, id as EnterpriseId)!;
+    }).immediate();
+  }
+
+  private schedulingEnterprises(): SchedulingEnterprise[] {
+    return this.db.prepare(SCHEDULING_ENTERPRISE_SQL).all() as SchedulingEnterprise[];
+  }
+
+  private enterpriseState(id: string): string | undefined {
+    const row = this.db.prepare(`
+      SELECT state
+      FROM proxy_enterprises
+      WHERE id = ?
+    `).get(id) as { state: string } | undefined;
+    return row?.state;
   }
 
   private addColumn(table: string, name: string, definition: string): void {
@@ -224,35 +300,21 @@ export class UserPoolStore {
 
   settings(): PoolSettings {
     return this.db.prepare(`
-      SELECT s.version, s.idle_target, e.max_accounts, s.lease_seconds, s.paused
-      FROM user_pool_settings s
-      JOIN proxy_enterprises e ON e.id = ?
-      WHERE s.id = 1
-    `).get(DEFAULT_ENTERPRISE_ID) as PoolSettings;
+      SELECT version, idle_target, lease_seconds, paused
+      FROM user_pool_settings
+      WHERE id = 1
+    `).get() as PoolSettings;
   }
 
+  /** Accepts idle_target, lease_seconds and paused; a `max_accounts` key is 409 use_enterprise_cap. */
   updateSettings(version: number, patch: Partial<PoolSettings>): PoolSettings {
     return this.db.transaction(() => {
-      if (!Number.isSafeInteger(version) || !patch || typeof patch !== 'object' || Array.isArray(patch)
-        || Object.keys(patch).some((key) => !SETTING_KEYS.includes(key))) {
-        throw new UserPoolError(400, 'invalid_pool_settings');
-      }
-      const current = this.settings();
-      if (version !== current.version) throw new UserPoolError(409, 'settings_version_conflict');
-      const next = { ...current, ...patch };
-      if (!Number.isInteger(next.idle_target) || next.idle_target < 0 || next.idle_target > next.max_accounts
-        || !Number.isInteger(next.max_accounts) || next.max_accounts < 1 || next.max_accounts > NAME_CAPACITY
-        || !Number.isInteger(next.lease_seconds) || next.lease_seconds < 60 || next.lease_seconds > 2592000
-        || ![0, 1].includes(next.paused)) {
-        throw new UserPoolError(400, 'invalid_pool_settings');
-      }
-      // Lowering the cap stops growth; it never deletes accounts or evicts active callers.
+      const next = nextSettings(version, this.settings(), patch);
       this.db.prepare(`
         UPDATE user_pool_settings
         SET idle_target = ?, lease_seconds = ?, paused = ?, version = version + 1
         WHERE id = 1
       `).run(next.idle_target, next.lease_seconds, next.paused);
-      if (patch.max_accounts !== undefined) setEnterpriseCap(this.db, DEFAULT_ENTERPRISE_ID, next.max_accounts);
       this.event('settings_updated');
       return this.settings();
     }).immediate();
@@ -352,8 +414,15 @@ export class UserPoolStore {
       detail: fields.detail ?? null,
       enterpriseId: fields.enterpriseId ?? null,
     });
+    // An index lookup, not an aggregate: replenishment and admission write events too.
     this.db.prepare(`
-      DELETE FROM user_pool_events WHERE id <= (SELECT COALESCE(MAX(id), 0) - 10000 FROM user_pool_events)
+      DELETE FROM user_pool_events
+      WHERE id <= (
+        SELECT id
+        FROM user_pool_events
+        ORDER BY id DESC
+        LIMIT 1
+      ) - 10000
     `).run();
   }
 
@@ -366,64 +435,120 @@ export class UserPoolStore {
     })();
   }
 
-  events(): unknown[] {
-    return this.db.prepare('SELECT * FROM user_pool_events ORDER BY id DESC LIMIT 200').all();
+  /** The enterprise's events; global events (settings, ownership) have no enterprise and are not listed. */
+  events(enterpriseId: string): unknown[] {
+    return this.db.prepare(`
+      SELECT *
+      FROM user_pool_events
+      WHERE enterprise_id = ?
+      ORDER BY id DESC
+      LIMIT 200
+    `).all(enterpriseId);
   }
 
-  accounts(): unknown[] {
+  accounts(enterpriseId: string): unknown[] {
     return this.db.prepare(`
       SELECT p.*, a.gh_login, a.copilot_oauth_status, l.caller_id, l.phase, l.expires_at,
         (SELECT COUNT(*) FROM user_pool_holds h WHERE h.lease_id = l.lease_id AND h.expires_at > @now)
         + (SELECT COUNT(*) FROM user_pool_catalog_holds h
            WHERE h.member_identity = p.identity AND h.expires_at > @now) AS active_requests
-      FROM user_pool_accounts p JOIN proxy_accounts a ON a.identity = p.identity
-      LEFT JOIN user_pool_leases l ON l.member_identity = p.identity ORDER BY p.ordinal LIMIT 1000
-    `).all({ now: this.now() });
+      FROM user_pool_accounts p
+      JOIN proxy_accounts a ON a.identity = p.identity
+      LEFT JOIN user_pool_leases l ON l.member_identity = p.identity
+      WHERE p.enterprise_id = @enterpriseId
+      ORDER BY p.ordinal
+      LIMIT 1000
+    `).all({ now: this.now(), enterpriseId });
   }
 
-  leases(): Array<Lease & { active_requests: number }> {
-    return this.db.prepare(`SELECT l.*,
-      (SELECT COUNT(*) FROM user_pool_holds h WHERE h.lease_id=l.lease_id AND h.expires_at>@now)
-      + (SELECT COUNT(*) FROM user_pool_catalog_holds h WHERE h.member_identity=l.member_identity AND h.expires_at>@now) AS active_requests
-      FROM user_pool_leases l ORDER BY assigned_at DESC, lease_id LIMIT 1000`)
-      .all({ now: this.now() }) as Array<Lease & { active_requests: number }>;
+  leases(enterpriseId: string): Array<Lease & { active_requests: number }> {
+    return this.db.prepare(`
+      SELECT l.*, p.enterprise_id,
+        (SELECT COUNT(*) FROM user_pool_holds h WHERE h.lease_id = l.lease_id AND h.expires_at > @now)
+        + (SELECT COUNT(*) FROM user_pool_catalog_holds h
+           WHERE h.member_identity = l.member_identity AND h.expires_at > @now) AS active_requests
+      FROM user_pool_leases l
+      JOIN user_pool_accounts p ON p.identity = l.member_identity
+      WHERE p.enterprise_id = @enterpriseId
+      ORDER BY l.assigned_at DESC, l.lease_id
+      LIMIT 1000
+    `).all({ now: this.now(), enterpriseId }) as Array<Lease & { active_requests: number }>;
   }
 
   inventory(identity: string): Inventory | undefined {
     return this.db.prepare('SELECT * FROM user_pool_accounts WHERE identity = ?').get(identity) as Inventory | undefined;
   }
 
-  managesSsoUser(ssoUser: string): boolean {
-    return Boolean(this.db.prepare(`SELECT 1 FROM user_pool_accounts p JOIN proxy_accounts a ON a.identity=p.identity
-      WHERE lower(a.sso_user)=lower(?) LIMIT 1`).get(ssoUser));
+  /** `sso_user` is unique only within an enterprise (design §5.3). */
+  managesSsoUser(enterpriseId: string, ssoUser: string): boolean {
+    return Boolean(this.db.prepare(`
+      SELECT 1
+      FROM user_pool_accounts p
+      JOIN proxy_accounts a ON a.identity = p.identity
+      WHERE p.enterprise_id = ?
+        AND lower(a.sso_user) = lower(?)
+      LIMIT 1
+    `).get(enterpriseId, ssoUser));
   }
 
-  counts(): Record<string, number> {
+  /** One enterprise's counts, or the whole pool's when `enterpriseId` is undefined. */
+  counts(enterpriseId?: string): Record<string, number> {
     return this.db.transaction(() => {
       this.reclaim();
       const result: Record<string, number> = {
         total: 0, ready_idle: 0, provisioning: 0, failed: 0, cooling: 0,
         disabled: 0, leased: 0, provisional: 0, catalog_requests: 0,
       };
-      const rows = this.db.prepare('SELECT state, COUNT(*) n FROM user_pool_accounts GROUP BY state')
-        .all() as { state: string; n: number }[];
-      for (const row of rows) {
+      for (const row of this.stateCounts(memberScope(enterpriseId, 'WHERE'))) {
         result[row.state] = row.n;
         result.total += row.n;
       }
-      const phases = this.db.prepare('SELECT phase, COUNT(*) n FROM user_pool_leases GROUP BY phase')
-        .all() as { phase: string; n: number }[];
-      for (const row of phases) result[row.phase === 'active' ? 'leased' : 'provisional'] = row.n;
-      result.ready_idle = (this.db.prepare(`
-        SELECT COUNT(*) n FROM user_pool_accounts p JOIN proxy_accounts a ON a.identity = p.identity
-        WHERE p.state = 'ready' AND p.verified_at IS NOT NULL AND a.copilot_oauth_status = 'valid' AND length(a.copilot_oauth_token) > 0
-          AND NOT EXISTS (SELECT 1 FROM user_pool_leases l WHERE l.member_identity = p.identity)
-          AND NOT EXISTS (SELECT 1 FROM user_pool_catalog_holds h WHERE h.member_identity = p.identity)
-      `).get() as { n: number }).n;
-      result.catalog_requests = (this.db.prepare('SELECT COUNT(*) n FROM user_pool_catalog_holds')
-        .get() as { n: number }).n;
+      for (const row of this.phaseCounts(memberScope(enterpriseId, 'WHERE'))) {
+        result[row.phase === 'active' ? 'leased' : 'provisional'] = row.n;
+      }
+      result.ready_idle = this.readyIdleCount(memberScope(enterpriseId, 'AND'));
+      result.catalog_requests = this.catalogCount(memberScope(enterpriseId, 'WHERE'));
       return result;
     }).immediate();
+  }
+
+  private stateCounts(scope: MemberScope): { state: string; n: number }[] {
+    return this.db.prepare(`
+      SELECT p.state, COUNT(*) n
+      FROM user_pool_accounts p
+      ${scope.sql}
+      GROUP BY p.state
+    `).all(...scope.values) as { state: string; n: number }[];
+  }
+
+  private phaseCounts(scope: MemberScope): { phase: string; n: number }[] {
+    return this.db.prepare(`
+      SELECT l.phase, COUNT(*) n
+      FROM user_pool_leases l
+      JOIN user_pool_accounts p ON p.identity = l.member_identity
+      ${scope.sql}
+      GROUP BY l.phase
+    `).all(...scope.values) as { phase: string; n: number }[];
+  }
+
+  private readyIdleCount(scope: MemberScope): number {
+    return (this.db.prepare(`
+      SELECT COUNT(*) n FROM user_pool_accounts p JOIN proxy_accounts a ON a.identity = p.identity
+      WHERE p.state = 'ready' AND p.verified_at IS NOT NULL AND a.copilot_oauth_status = 'valid'
+        AND length(a.copilot_oauth_token) > 0
+        AND NOT EXISTS (SELECT 1 FROM user_pool_leases l WHERE l.member_identity = p.identity)
+        AND NOT EXISTS (SELECT 1 FROM user_pool_catalog_holds h WHERE h.member_identity = p.identity)
+        ${scope.sql}
+    `).get(...scope.values) as { n: number }).n;
+  }
+
+  private catalogCount(scope: MemberScope): number {
+    return (this.db.prepare(`
+      SELECT COUNT(*) n
+      FROM user_pool_catalog_holds h
+      JOIN user_pool_accounts p ON p.identity = h.member_identity
+      ${scope.sql}
+    `).get(...scope.values) as { n: number }).n;
   }
 
   reclaim(): void {
@@ -455,7 +580,7 @@ export class UserPoolStore {
         });
       }
       const expired = this.db.prepare(`
-        SELECT l.* FROM user_pool_leases l JOIN user_pool_accounts p ON p.identity = l.member_identity
+        SELECT l.*, p.enterprise_id FROM user_pool_leases l JOIN user_pool_accounts p ON p.identity = l.member_identity
         WHERE l.expires_at <= ? AND p.state <> 'cooling'
       `).all(now) as Lease[];
       for (const lease of expired) {
@@ -473,26 +598,17 @@ export class UserPoolStore {
     return this.admit(() => {
       this.assertCallerNotCooling(caller);
       const now = this.now();
-      let lease = this.db.prepare('SELECT * FROM user_pool_leases WHERE caller_id = ?')
-        .get(caller) as Lease | undefined;
+      // An existing lease keeps its member and enterprise, even while that enterprise drains.
+      let lease = this.callerLease(caller);
       if (lease) {
         this.assertReady(lease.member_identity);
         // An expired lease stays pinned until its existing requests finish, but cannot
         // admit an endless chain of new requests that circumvents the provisional TTL.
         if (lease.expires_at <= now) throw new UserPoolError(503, 'lease_draining', 1);
       } else {
-        const identity = this.availableMember(caller);
-        this.assertReady(identity);
-        lease = {
-          caller_id: caller, member_identity: identity, lease_id: randomUUID(), phase: 'provisional',
-          assigned_at: now, last_success_at: null, expires_at: now + this.options.provisionalSeconds * 1000,
-        };
-        this.db.prepare(`
-          INSERT INTO user_pool_leases
-            (caller_id, member_identity, lease_id, phase, assigned_at, last_success_at, expires_at)
-          VALUES (?, ?, ?, ?, ?, NULL, ?)
-        `).run(caller, identity, lease.lease_id, lease.phase, now, lease.expires_at);
-        this.event('lease_acquired', identity, caller, lease.lease_id);
+        const member = this.availableMember(caller);
+        this.assertReady(member.identity);
+        lease = this.insertLease(caller, member, now);
       }
       return this.hold(lease, 'lease', holdTimeoutMs);
     });
@@ -504,17 +620,43 @@ export class UserPoolStore {
     signal?.throwIfAborted();
     return this.admit(() => {
       this.assertCallerNotCooling(caller);
-      const existing = this.db.prepare('SELECT * FROM user_pool_leases WHERE caller_id = ?')
-        .get(caller) as Lease | undefined;
-      const identity = existing?.member_identity ?? this.availableMember(caller);
-      this.assertReady(identity);
+      const existing = this.callerLease(caller);
+      // A draining enterprise admits no new catalog hold, not even on an existing lease.
+      if (existing) assertEnterpriseActive(this.enterpriseState(existing.enterprise_id));
+      const member = existing ? leaseMember(existing) : this.availableMember(caller);
+      this.assertReady(member.identity);
       if (existing && existing.expires_at <= this.now()) throw new UserPoolError(503, 'lease_draining', 1);
       const now = this.now();
       return this.hold({
-        caller_id: caller, member_identity: identity, lease_id: randomUUID(), phase: 'provisional',
-        assigned_at: now, last_success_at: null, expires_at: now + this.options.requestTimeoutMs,
+        caller_id: caller, member_identity: member.identity, enterprise_id: member.enterprise_id,
+        lease_id: randomUUID(), phase: 'provisional', assigned_at: now, last_success_at: null,
+        expires_at: now + this.options.requestTimeoutMs,
       }, 'catalog');
     });
+  }
+
+  private callerLease(caller: string): Lease | undefined {
+    return this.db.prepare(`
+      SELECT l.*, p.enterprise_id
+      FROM user_pool_leases l
+      JOIN user_pool_accounts p ON p.identity = l.member_identity
+      WHERE l.caller_id = ?
+    `).get(caller) as Lease | undefined;
+  }
+
+  private insertLease(caller: string, member: PoolMember, now: number): Lease {
+    const lease: Lease = {
+      caller_id: caller, member_identity: member.identity, enterprise_id: member.enterprise_id,
+      lease_id: randomUUID(), phase: 'provisional', assigned_at: now, last_success_at: null,
+      expires_at: now + this.options.provisionalSeconds * 1000,
+    };
+    this.db.prepare(`
+      INSERT INTO user_pool_leases
+        (caller_id, member_identity, lease_id, phase, assigned_at, last_success_at, expires_at)
+      VALUES (?, ?, ?, ?, ?, NULL, ?)
+    `).run(caller, member.identity, lease.lease_id, lease.phase, now, lease.expires_at);
+    this.event('lease_acquired', member.identity, caller, lease.lease_id);
+    return lease;
   }
 
   private admit(acquire: () => HeldLease): HeldLease {
@@ -539,21 +681,49 @@ export class UserPoolStore {
     if (row) throw new UserPoolError(429, 'member_cooling', Math.max(1, Math.ceil((row.expires_at - this.now()) / 1000)));
   }
 
-  private availableMember(caller: string): string {
+  /**
+   * Design §5.8 admission: a catalog hold keeps its member (503 enterprise_draining when its enterprise is no longer
+   * active); otherwise the caller's ranking of the active enterprises, then one indexed pick per enterprise.
+   */
+  private availableMember(caller: string): PoolMember {
     // Parallel discovery and inference for the same caller must converge on one member.
     const catalog = this.db.prepare(`
-      SELECT member_identity FROM user_pool_catalog_holds WHERE caller_id = ? ORDER BY assigned_at LIMIT 1
-    `).get(caller) as { member_identity: string } | undefined;
-    if (catalog) return catalog.member_identity;
+      SELECT h.member_identity AS identity, p.enterprise_id, e.state
+      FROM user_pool_catalog_holds h
+      JOIN user_pool_accounts p ON p.identity = h.member_identity
+      JOIN proxy_enterprises e ON e.id = p.enterprise_id
+      WHERE h.caller_id = ?
+      ORDER BY h.assigned_at
+      LIMIT 1
+    `).get(caller) as (PoolMember & { state: string }) | undefined;
+    if (catalog) {
+      assertEnterpriseActive(catalog.state);
+      return { identity: catalog.identity, enterprise_id: catalog.enterprise_id };
+    }
+    for (const enterpriseId of admissionOrder(this.schedulingEnterprises(), caller)) {
+      const identity = this.idleMember(enterpriseId);
+      if (identity) return { identity, enterprise_id: enterpriseId };
+    }
+    throw new UserPoolError(429, 'pool_exhausted', this.options.retryAfterSeconds);
+  }
+
+  /** The least recently used leasable member of one enterprise (idx_user_pool_accounts_enterprise_state). */
+  private idleMember(enterpriseId: string): string | undefined {
     const row = this.db.prepare(`
-      SELECT p.identity FROM user_pool_accounts p JOIN proxy_accounts a ON a.identity = p.identity
-      WHERE p.state = 'ready' AND p.verified_at IS NOT NULL AND a.copilot_oauth_status = 'valid' AND length(a.copilot_oauth_token) > 0
+      SELECT p.identity
+      FROM user_pool_accounts p
+      JOIN proxy_accounts a ON a.identity = p.identity
+      WHERE p.enterprise_id = ?
+        AND p.state = 'ready'
+        AND p.verified_at IS NOT NULL
+        AND a.copilot_oauth_status = 'valid'
+        AND length(a.copilot_oauth_token) > 0
         AND NOT EXISTS (SELECT 1 FROM user_pool_leases l WHERE l.member_identity = p.identity)
         AND NOT EXISTS (SELECT 1 FROM user_pool_catalog_holds h WHERE h.member_identity = p.identity)
-      ORDER BY p.updated_at, p.ordinal LIMIT 1
-    `).get() as { identity: string } | undefined;
-    if (!row) throw new UserPoolError(429, 'pool_exhausted', this.options.retryAfterSeconds);
-    return row.identity;
+      ORDER BY p.updated_at, p.ordinal
+      LIMIT 1
+    `).get(enterpriseId) as { identity: string } | undefined;
+    return row?.identity;
   }
 
   private assertReady(identity: string): void {
@@ -725,43 +895,57 @@ export class UserPoolStore {
     }).immediate();
   }
 
-  reserve(): Inventory | undefined {
+  /** Reserves at most one member, in the enterprise the shared ranking picks among `eligibleEnterpriseIds`. */
+  reserve(eligibleEnterpriseIds: readonly string[]): Inventory | undefined {
+    const eligible = eligibleEnterprises(eligibleEnterpriseIds);
     const result = this.db.transaction((): Inventory | UserPoolError | undefined => {
-      if (this.reservationDeficit() === 0) return undefined;
-      return this.reserveCandidate();
+      const [enterpriseId] = this.planBatch(eligible, 1);
+      return enterpriseId === undefined ? undefined : this.reserveCandidate(enterpriseId);
     }).immediate();
     if (result instanceof UserPoolError) throw result;
     return result;
   }
 
-  reserveDeficit(owner: string): number {
+  /**
+   * One replenishment batch (design §5.8). `eligibleEnterpriseIds`: active enterprises that may grow now (ready);
+   * every active enterprise still counts in the share denominators. Returns the number of members reserved.
+   */
+  reserveDeficit(owner: string, eligibleEnterpriseIds: readonly string[]): number {
+    const eligible = eligibleEnterprises(eligibleEnterpriseIds);
     return this.db.transaction(() => {
       if (!this.matchesOwner(owner)) return 0;
-      const deficit = this.reservationDeficit();
       let reserved = 0;
-      for (; reserved < deficit; reserved++) {
-        const row = this.reserveCandidate();
-        if (row instanceof UserPoolError) break;
+      for (const enterpriseId of this.planBatch(eligible, NAME_CAPACITY)) {
+        if (this.reserveCandidate(enterpriseId) instanceof UserPoolError) break;
+        reserved++;
       }
       return reserved;
     }).immediate();
   }
 
-  private reservationDeficit(): number {
-    const settings = this.settings();
-    const counts = this.counts();
-    if (settings.paused) return 0;
-    // Backing-off repairs already represent future capacity. Do not reserve a
-    // replacement on each failure and then overfill when those repairs succeed.
-    const retrying = (this.db.prepare(`
-      SELECT COUNT(*) n FROM user_pool_accounts WHERE state = 'failed' AND attempts < 3
-        AND COALESCE(last_error, '') NOT IN ('sso_creation_ambiguous', 'sso_name_conflict', 'oauth_dispatch_ambiguous', 'oauth_task_cancelled_unconfirmed')
-    `).get() as { n: number }).n;
-    return Math.max(0, Math.min(settings.max_accounts - counts.total,
-      settings.idle_target - counts.ready_idle - counts.provisioning - retrying));
+  /**
+   * Lock order settings → enterprises → members (the SQLite write lock covers all). The batch's only aggregate
+   * yields I and P; the enterprises are then chosen with in-memory counters by the shared `planCreations`.
+   */
+  private planBatch(eligible: ReadonlySet<string>, limit: number): string[] {
+    const enterprises = this.schedulingEnterprises();
+    this.reclaim();
+    const query = poolSupplyQuery(this.now());
+    const supply = this.db.prepare(query.sql).get(...query.values) as PoolSupply;
+    const ordinal = this.nextOrdinal();
+    return planReplenishment(enterprises, eligible, { supply, settings: this.settings(), ordinal, limit });
   }
 
-  private reserveCandidate(): Inventory | UserPoolError {
+  private nextOrdinal(): number {
+    const row = this.db.prepare(`
+      SELECT next_ordinal AS n
+      FROM user_pool_settings
+      WHERE id = 1
+    `).get() as { n: number };
+    return row.n;
+  }
+
+  private reserveCandidate(enterpriseId: string): Inventory | UserPoolError {
     let ordinal = (this.db.prepare('SELECT next_ordinal n FROM user_pool_settings WHERE id = 1')
       .get() as { n: number }).n;
     while (ordinal < NAME_CAPACITY) {
@@ -771,26 +955,26 @@ export class UserPoolStore {
         SELECT 1 FROM proxy_accounts WHERE lower(identity) = lower(?) OR lower(sso_user) = lower(?)
       `).get(identity, identity);
       if (collision) continue;
-      this.insertMember(identity, ordinal - 1);
+      this.insertMember(identity, ordinal - 1, enterpriseId);
       this.event('name_reserved', identity);
       return this.inventory(identity)!;
     }
     return new UserPoolError(503, 'name_catalog_exhausted');
   }
 
-  /** Pool scheduling is single-enterprise until M5: every member belongs to `default`. */
-  private insertMember(identity: string, ordinal: number): void {
+  /** The member, its Proxy account and N_e += 1 are one write; names and ordinals stay global. */
+  private insertMember(identity: string, ordinal: number, enterpriseId: string): void {
     const now = this.now();
     const timestamp = new Date(now).toISOString();
     this.db.prepare(`
       INSERT INTO proxy_accounts(identity, enterprise_id, sso_user, copilot_oauth_status, created_at, updated_at)
       VALUES (?, ?, ?, 'missing', ?, ?)
-    `).run(identity, DEFAULT_ENTERPRISE_ID, identity, timestamp, timestamp);
+    `).run(identity, enterpriseId, identity, timestamp, timestamp);
     this.db.prepare(`
       INSERT INTO user_pool_accounts(identity, enterprise_id, ordinal, state, attempt_id, updated_at, retry_at)
       VALUES (?, ?, ?, 'provisioning', ?, ?, ?)
-    `).run(identity, DEFAULT_ENTERPRISE_ID, ordinal, randomUUID(), now, now);
-    incrementInventory(this.db, DEFAULT_ENTERPRISE_ID);
+    `).run(identity, enterpriseId, ordinal, randomUUID(), now, now);
+    incrementInventory(this.db, enterpriseId as EnterpriseId);
   }
 
   pending(excluded: readonly string[] = []): Inventory | undefined {
@@ -894,4 +1078,13 @@ export class UserPoolStore {
       this.event('member_retry', identity);
     }).immediate();
   }
+}
+
+function memberScope(enterpriseId: string | undefined, keyword: 'WHERE' | 'AND'): MemberScope {
+  if (enterpriseId === undefined) return { sql: '', values: [] };
+  return { sql: `${keyword} p.enterprise_id = ?`, values: [enterpriseId] };
+}
+
+function leaseMember(lease: Lease): PoolMember {
+  return { identity: lease.member_identity, enterprise_id: lease.enterprise_id };
 }

@@ -164,8 +164,9 @@ async function fetchModels(copilot: CopilotAuthContext, diagnostics?: ErrorDiagn
   return data.data;
 }
 
-export async function validateCopilotOauthToken(identity: string, accessToken: string): Promise<void> {
-  await fetchModels({ identity, accessToken, api: config.copilotApiBaseUrl });
+/** Checks a token against the Copilot API of the account's enterprise. */
+export async function validateCopilotOauthToken(copilot: CopilotAuthContext): Promise<void> {
+  await fetchModels(copilot);
 }
 
 export function clearModelsCache(identity: string): void {
@@ -390,7 +391,9 @@ function modelPathError(model: string, path: CopilotApiPath, supportedPaths: Cop
 
 function modelsCacheKey(copilot: CopilotAuthContext): ModelsCacheKey {
   // Never retain or log a raw credential, or share a snapshot across credentials/endpoints.
-  return createHash('sha256').update(JSON.stringify([copilot.identity, copilot.api.replace(/\/+$/, ''), copilot.accessToken])).digest('hex');
+  // The enterprise prefix keeps numeric GitHub user IDs of different GitHub instances apart (design §6).
+  const parts = [copilot.enterpriseId ?? '', copilot.identity, copilot.api.replace(/\/+$/, ''), copilot.accessToken];
+  return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
 }
 
 function errorMessage(err: unknown): string {
