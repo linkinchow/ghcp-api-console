@@ -111,7 +111,8 @@ try {
         await runtime.startUserPool(); // The production runtime owns and STARTS the production worker.
         assert.ok(runtime.getLocalUserPoolSchedulerSnapshot()); result = { started: true };
       } else if (req.method === 'POST' && req.url === '/clear-cache') {
-        for (const row of await store.accounts() as Array<{ identity: string }>) client.clearModelsCache(row.identity);
+        const rows = await store.accounts('default') as Array<{ identity: string }>;
+        for (const row of rows) client.clearModelsCache(row.identity);
         result = { cleared: true };
       } else if (req.method === 'POST' && req.url === '/oauth-callback') {
         let text = '';

@@ -163,25 +163,25 @@
 | `github.apiBaseUrl` | 否 | github.com → `https://api.github.com`；`<sub>.ghe.com` → `https://api.<sub>.ghe.com` | SSO（席位、预算），Proxy（`/user` 主体校验、Models） |
 | `github.copilotApiBaseUrl` | 否 | github.com → `https://api.githubcopilot.com`；GHE.com → `https://copilot-api.<sub>.ghe.com` | Proxy |
 | `github.slug` | SSO 必填；GHE.com 时 Login 也必填 | — | SSO、Login |
-| `github.shortcode` | github.com 必填；GHE.com 必须为 `""` 或省略 | — | SSO、Proxy |
+| `github.shortcode` | github.com：缺失时是 Proxy/SSO 的 readiness blocker，显式空串是解析错误；先转小写再校验。GHE.com 必须为 `""` 或省略 | — | SSO、Proxy |
 | `github.oauthClientId` | 否 | `GITHUB_OAUTH_CLIENT_ID` | Login 设备流 |
 | `sso.spEntityId` / `sso.spAcsUrl` | 否 | `<baseUrl>/enterprises/<slug>`、`.../saml/consume` | SSO |
 | `sso.scimBaseUrl` | 否 | `<apiBaseUrl>/scim/v2/enterprises/<slug>` | SSO |
 | `sso.emailDomain` / `sso.userPrefix` | 否 | 只在首次创建该企业的 `sso_runtime_settings` 行时作为种子 | SSO |
 | `sso.signingCert` / `signingKey` / `sessionSecret` | 是 | — | SSO |
 | `sso.scimToken` / `seatPat` / `defaultUserPassword` | 否 | 缺失时，对应功能对该企业报 `enterprise_secret_unconfigured` | SSO |
-| `login.ssoProvider` | 否 | `custom` | Login |
+| `login.ssoProvider` | 否 | 不设：由每个任务选择（基线行为，未指定时为 `custom`）；设置后任务必须一致 | Login |
 | `login.ssoLoginUrl` | 否 | default 企业取 `SSO_URL`；其他企业取 `<SSO_URL origin>/enterprises/<id>/login` | Login |
-| `login.allowedLoginUrls` | 否 | `[ssoLoginUrl]`。最多 16 项，origin 与 path 精确匹配 | Login |
+| `login.allowedLoginUrls` | 否 | `[ssoLoginUrl]`。最多 16 项；origin 相同且路径整段前缀匹配；query、fragment 被去掉 | Login |
 | `login.selectors` | 否 | 全局 `AUTH_*_SELECTOR` | Login |
 | `pool.accountDomain` | 池模式必填 | — | Proxy |
-| `pool.initialMaxAccounts` | 否 | default 企业取 `POOL_MAX_ACCOUNTS`；其他企业取 `10` | Proxy，只在首次插入 `proxy_enterprises` 行时使用 |
+| `pool.initialMaxAccounts` | 否 | default 企业在 caller-lease 模式下取 `POOL_MAX_ACCOUNTS`，否则 `100`；其他企业取 `10` | Proxy，只在首次插入 `proxy_enterprises` 行时使用 |
 | `modelsAdmin.*` | 否 | 未配置时，该企业的 Models 页显示 `models_admin_not_configured` | Proxy |
 
 ### 3.4 Secret 引用
 
 - 格式只有两种：`{ "env": "NAME" }`（`^[A-Z][A-Z0-9_]{0,127}$`）和 `{ "file": "/abs/path" }`（必须是绝对路径）。
-- `env` 引用在启动时读取。`file` 引用在使用时读取，并缓存 60 秒，所以轮换挂载的 Secret 不需要重启。Models 管理员 token 沿用基线做法，每次请求重新读取。
+- `env` 引用在每次使用时读取环境变量（进程内环境不变，效果等同启动时读取）。`file` 引用在使用时读取，并缓存 60 秒，所以轮换挂载的 Secret 不需要重启。Models 管理员 token 沿用基线做法，每次请求重新读取。
 - 内容限制：最大 128 KiB；不允许 `\0`；只去掉一个结尾换行。
 - 只在需要该 secret 的服务内解析，并且是**懒加载**。某个企业缺 secret 只会让该企业 not ready，不阻塞其他企业，也不阻塞启动。
 - secret 值不进日志、DTO 或错误消息。错误消息只给出字段路径，例如 `contoso-eu.sso.scimToken`。
@@ -217,9 +217,11 @@
   - `shortcode` 必须为空；
   - `slug` 必填；
   - `apiBaseUrl` 和 `copilotApiBaseUrl` 的主机必须属于同一 `<sub>.ghe.com`。
-- github.com：`shortcode` 必须匹配 `^[a-z0-9]{3,8}$`；`apiBaseUrl` 默认 `api.github.com`，显式值只能是 http(s) origin（测试 mock 用）。
+- github.com：`shortcode` 必须匹配 `^[a-z0-9]{3,8}$`（大小写不敏感，存小写）；`apiBaseUrl` 默认 `api.github.com`。
+- `apiBaseUrl` 与 `copilotApiBaseUrl` 的显式值可以带网关路径（基线接受任意值，原地升级需要），但仍按可信 URL 规则拒绝 query、userinfo 和穿越。
 - 容量：所有 `initialMaxAccounts` 之和，以及运行时所有 cap 之和，都不能超过 `NAME_CAPACITY`（10,000）。
-- 不可变身份：每个服务的库中记录了每个企业的 `profile_fingerprint`（§4.2）。如果某企业在库中已有数据，而 fingerprint 变化（例如改了 `baseUrl`、`shortcode` 或 `accountDomain`），启动报 `enterprise_identity_changed`。企业没有数据时允许修改。
+- 不可变身份：每个服务的库中记录了每个企业的 `profile_fingerprint`（§4.2）。如果某企业在库中已有数据，而 fingerprint 变化（例如改了 `baseUrl`、`shortcode` 或 `accountDomain`），启动报 `enterprise_identity_changed`。企业没有数据时允许修改，并更新库中的 fingerprint。
+  - Proxy 中“有数据”指该企业已有账号池成员（`inventory_count > 0`）。直连账号从不依赖 `accountDomain` 和 `shortcode`，所以直连部署切换到 caller-lease（首次设置 `POOL_ACCOUNT_EMAIL_DOMAIN`）仍然允许。
 - 删除企业：registry 中去掉的企业如果在库中仍有数据，启动报 `enterprise_missing_from_registry`。
 - 保留 ID：`default` 只能表示升级前的企业。不能在全新部署中把另一个已有企业改名为 `default`。
 
@@ -238,7 +240,7 @@
   - `shortcode` 在 Proxy 与 SSO 之间相同；
   - `slug` 在 SSO 与 Login 之间相同（Login 有值时）；
   - 三方都没有 blocker。
-- 结果在每个 Proxy 副本内存缓存 60 秒。只用于以下场景：激活企业、worker 为该企业补货前的判断、Console 展示。**结果不落库，也不作为“证据 JSON”存储**，旧分支的 `validation_evidence_json` 机制删除。
+- 结果在每个 Proxy 副本内存缓存：ready 缓存 60 秒，not ready 或探测失败只缓存 10 秒（SSO/Login 短暂不可用不会让补货停一分钟）；激活和恢复时强制实时检查。只用于以下场景：激活企业、worker 为该企业补货前的判断、Console 展示。**结果不落库，也不作为“证据 JSON”存储**，旧分支的 `validation_evidence_json` 机制删除。
 
 ---
 
@@ -305,7 +307,7 @@ CREATE TABLE proxy_enterprises (
 
 #### SQLite 迁移步骤
 
-在 `src/proxy/src/db/migrations.ts` 的 `runMigrations` 末尾追加 `runEnterpriseMigrations(db, defaults)`；池表部分在 `UserPoolStore` 构造时执行。整体在一个 `BEGIN IMMEDIATE` 事务中：
+在 `src/proxy/src/db/migrations.ts` 的 `runMigrations` 末尾追加 `runEnterpriseMigrations(db, seed)`；池表部分在 `UserPoolStore` 构造时执行。使用共享的 `runSqliteMigrations`：每个步骤一个 `BEGIN IMMEDIATE` 事务，成功后写入 `schema_migrations`；步骤只补缺失部分，所以“已生效未记录”时重跑安全：
 
 1. `enterprise-v1/01-create-proxy-enterprises`：建表。
 2. `.../02-seed-default`：`INSERT OR IGNORE` 插入 `default`：
@@ -323,7 +325,9 @@ CREATE TABLE proxy_enterprises (
 5. `.../05-initializations-and-stats`：两张表同样执行“加列 → 回填 → 索引 → required trigger”。大量统计行的回填在同一事务内完成。
 6. `.../06-pool-accounts`：仅当池表存在时执行。加列、回填，再建 `user_pool_accounts_enterprise_matches` trigger：INSERT 时校验 `NEW.enterprise_id` 等于 `proxy_accounts` 对应行。
 7. `.../07-pool-events`：仅当池表存在时执行。
-8. 执行 `PRAGMA foreign_key_check`，非空则回滚并报错，然后提交。
+8. 步骤 03 在提交前对 `proxy_accounts` 执行 `PRAGMA foreign_key_check`，非空则回滚并报错。
+
+每次启动还会：`default` 行缺失时补插；执行身份检查（§3.6）；按 `COUNT(*)` 校正 `inventory_count`，有偏差时记录 `enterprise_inventory_drift` 事件。同一 identity 换企业写入在两个后端都失败（`enterprise_id_immutable`）。
 
 新建库直接使用包含新列的 `CREATE TABLE`，迁移步骤的 `isApplied` 会全部为真。
 
@@ -343,8 +347,8 @@ CREATE TABLE proxy_enterprises (
 
 #### `MYSQL_AUTO_MIGRATE=false`
 
-- `scripts/proxy-mysql-initial.sql`：由 `src/proxy/src/db/mysqlInitialSql.ts` 的 `renderMysqlInitialSql()` 生成，包含新表、新列和 `default` 种子行。`mysqlInitialSql.test.ts` 继续做漂移检查。
-- 新增生成脚本 `scripts/proxy-mysql-enterprise-upgrade.sql`：只适用于基线 r4 schema 的 DBA 升级，由同一组步骤定义渲染。
+- `scripts/proxy-mysql-initial.sql`：由 `src/proxy/src/db/mysqlInitialSql.ts` 的 `renderMysqlInitialSql()` 生成，包含新表和新列，**不含** `default` 行：fingerprint 取决于部署配置，由 Proxy 启动时插入并校验（只需 INSERT/UPDATE 权限）。`mysqlInitialSql.test.ts` 继续做漂移检查。
+- 新增生成脚本 `scripts/proxy-mysql-enterprise-upgrade.sql`：只适用于基线 r4 schema 的 DBA 升级，由同一组步骤定义渲染。因外键需要，脚本先插入 fingerprint 为空的 `default` 行，Proxy 下次启动时补全并执行步骤 08。脚本不可重入：中途失败时恢复备份，或用一个开启自动迁移的副本续跑。
 - 只读校验 `validatePreparedMysqlSchema` 覆盖新表和新列；不一致时提示应执行哪个脚本。
 
 ### 4.3 SSO（SQLite，`src/sso/src/db/migrations.ts`）
@@ -374,7 +378,7 @@ SAML 会话**不建表**（§5.5）。
 | 表 | 变化 | 旧行映射 |
 | --- | --- | --- |
 | `schema_migrations`（新） | 同 SSO | — |
-| `login_enterprises`（新） | `id PK, profile_fingerprint, created_at`。fingerprint 字段为 `{ id, githubBaseUrl, slug }` | 插入 `default` |
+| `login_enterprises`（新） | `id PK, profile_fingerprint, created_at`。fingerprint 字段为 `{ id, githubBaseUrl, slug }`，其中 slug 只对 GHE.com 企业计入（Login 只在 GHE.com 使用 slug；r4 的 Login 常不设 `ENTERPRISE_SLUG`，github.com 企业补上 slug 不应算身份变化） | 插入 `default` |
 | `login_tasks` | 加 `enterprise_id`（可空列，FK）→ 回填 → required 与 immutable trigger；`INDEX (enterprise_id, status, created_at)` | `default` |
 | `login_task_attempts` | 不变，通过 `task_id` 继承 | — |
 | `login_runtime_settings` | 不变，仍是全局（并发度是 Login 进程级资源） | — |
@@ -407,7 +411,7 @@ SAML 会话**不建表**（§5.5）。
 | SSO SAML | default 用根路径 `/metadata` `/sso` `/login` `/logout`；其他企业用 `/enterprises/:id/...` | path | 未知 → 404，不回落 |
 | Login 管理 / internal | `/api/enterprises/:id/tasks...` | path，或任务行 | 无作用域 → 400 |
 
-实现方式：每个服务都有一个 `enterpriseRouter(registry)` 中间件，校验 `:enterpriseId` 并挂上 `res.locals.enterprise`（frozen profile）。路由处理函数调用 `requireEnterprise(res)` 取值。repository 函数的第一个参数是**必填**的 `EnterpriseId`，没有可选参数，也没有默认值。旧分支中 `SqliteStorage.enterpriseId(id?)`、`resolveEnterpriseScope(registry, undefined)`、`managesSsoUser(..., enterpriseId = this.enterpriseId)` 这类回落方式一律不写。
+实现方式：企业作用域的路由挂 `requireEnterprise(lookup)` 中间件，校验 `:enterpriseId`（header/query/body 中不一致的企业 ID 返回 400 `enterprise_scope_conflict`），并挂上 `res.locals.enterprise`（frozen profile）。路由处理函数调用 `enterpriseOf(res)` 取值。repository 函数的第一个参数是**必填**的 `EnterpriseId`，没有可选参数，也没有默认值。旧分支中 `SqliteStorage.enterpriseId(id?)`、`resolveEnterpriseScope(registry, undefined)`、`managesSsoUser(..., enterpriseId = this.enterpriseId)` 这类回落方式一律不写。
 
 ### 5.2 Proxy 管理路由
 
@@ -463,7 +467,7 @@ SAML 会话**不建表**（§5.5）。
 
 **会话持久化**
 
-- 采用每个企业一个**签名 cookie**，沿用基线 `cookie-session`。不使用旧分支 `src/sso/src/saml/sessionStore.ts` 的进程内存 store。
+- 采用每个企业一个**签名 cookie**，线上格式与基线 `cookie-session` 完全相同（base64 JSON + keygrip `.sig`），所以基线 cookie 可以原样读取。由 `saml/enterpriseSession.ts` 用 `res.cookie` 写出：`cookie-session` 在 TLS 由前置代理终止时写 Secure cookie 会静默失败。不使用旧分支 `src/sso/src/saml/sessionStore.ts` 的进程内存 store。
 - 会话状态只在客户端 cookie 中，服务端没有内存状态，所以 SSO 重启后会话仍然有效；多实例共用同一 secret 时也可以工作。
 
 | 企业 | cookie 名 | path | 签名 key |
@@ -475,7 +479,8 @@ SAML 会话**不建表**（§5.5）。
 - 载荷中的 `e` 必须等于路由所属企业。基线留下的旧 cookie 没有 `e`，只有 default 路由接受。
 - `user.createdAt` 必须等于 `sso_users` 行的 `created_at`。用户被删除再重建后，旧 cookie 自动失效。
 - `pending` 在 5 分钟后过期，完成一次响应后清除。
-- `POST /login` 和 `POST /logout` 校验 `Origin`，并拒绝 `Sec-Fetch-Site: cross-site`（从旧分支移植）。
+- `POST /login` 和 `POST /logout` 校验 `Origin`，并拒绝 `Sec-Fetch-Site: cross-site`（从旧分支移植）。Origin 的 host 等于 `BASE_URL` 的 host 或请求的 Host 头即为同源（内网地址打开登录页仍可用）；没有 Origin 时接受（与基线相同）；`Origin: null` 拒绝。
+- 基线 cookie（没有 `e`、没有 `createdAt`）只在 default 路由上接受：用户存在时接受一次并改写为新格式；基线的 pending 字段映射为 5 分钟的 pending。
 - 登录时按 `(enterpriseId, ssoUser)` 查用户。另一企业的同名用户无法登录本企业。
 
 ### 5.6 SSO 用户、SCIM、席位、预算
@@ -496,19 +501,22 @@ SAML 会话**不建表**（§5.5）。
   - `service.ts` 的 `assertDestructiveOperationAllowed`，它会调用带作用域的 Proxy pool-membership；
   - 异步 scrypt 密码（`auth/password.ts`）和 `routes/loginCredentials.ts` 的并发上限。
 - 事件日志：default 仍写 `SSO_USER_EVENTS_LOG`；其他企业写 `<dir>/<enterpriseId>/<basename>`。
+- 企业缺少 `scimToken` 或 `seatPat` 时，相关操作返回 503 `enterprise_secret_unconfigured`（基线为 400 或发出空凭据）。
+- 启动时，库中有用户、但 registry 中已不存在的企业，报 `enterprise_missing_from_registry`。
 - 外部写请求使用 `redirect: 'error'`。传输失败或 5xx 视为“结果不确定”（从旧分支 `clients/externalFetch.ts` 移植到 shared）。
 
 ### 5.7 Login 任务绑定
 
 - 创建任务：Proxy 调用 `POST /api/enterprises/:id/tasks`，body 为 `{ identity, ssoUser, ghLogin, oauthAttemptId, ssoType? }`。
-  - `ssoType` 必须等于 `profile.login.ssoProvider`，或者省略。
+  - profile 设置了 `login.ssoProvider` 时，`ssoType` 必须等于它，或者省略；没有设置时（env 合成的 default 即如此）沿用基线，由任务选择 `custom` 或 `azure`。
   - **body 不能覆盖 `ssoUrl` 或 selector**。需要删除基线 `src/login/src/tasks/runner.ts:31` 的 `payload.ssoUrl ?? config.auth.ssoUrl`。
 - 任务行写入 `enterprise_id`。runner 从 profile 构造 `RuntimeAuthConfig`，内容包括：
   - `resolveGithubDeployment(baseUrl, slug)`；
   - `deviceFlowEndpoints()`；
   - `ssoLoginUrl`、`allowedLoginUrls`、`selectors`、`oauthClientId`。
 - 重试（`tasks/retry.ts`）继承原任务的 `enterprise_id`，不接受 body 中的作用域。删除和重试仍先经过 `tasks/poolProtection.ts`。
-- 允许的登录页：在每次填写 SSO 表单前，检查当前 URL 是否与 `allowedLoginUrls` 中某项的 origin 和 path 精确匹配（移植旧分支 `isAllowedLoginUrl`）。GitHub 页面用该企业的 `isGitHubUrl(url, deployment)` 判断。
+- 允许的登录页：在每次填写 SSO 表单前，检查当前 URL 是否与 `allowedLoginUrls` 中某项匹配：origin 相同，且该项的路径段是当前路径段的**整段前缀**（基线用 `startsWith` 接受子路径，这里保留子路径，但 `/login` 不再匹配 `/loginfoo`）；编码穿越、点段、userinfo 一律拒绝；当前页面的 query 和 fragment 不参与比较。
+  - 基线 `SSO_URL` 可能带 query 或 fragment（基线不使用它们），registry 解析 `login.ssoLoginUrl` 和 `allowedLoginUrls` 时去掉这两部分，而不是拒绝，保证原地升级。GitHub 页面用该企业的 `isGitHubUrl(url, deployment)` 判断。
 - 回调：使用 §5.3 的带作用域路径。成功回调前，Proxy 按以下顺序校验：
   1. 路径企业 = 行企业；
   2. `copilot_oauth_attempt_id` CAS（基线已有）；
@@ -528,7 +536,7 @@ SAML 会话**不建表**（§5.5）。
 - 建号候选需满足 `N_e < C_e`。租号候选必须有合格的 idle。
 - 全局补货量 `D = max(0, T − I − P)`。全局 pause 优先；`I ≥ T` 时不建号。
 - 已有 lease 或 catalog hold 时，保持原企业和原 member，不重新按比例选择。
-- `draining` 企业：不新建 lease、不新建 catalog hold、不补货，已有 lease 保留。只有 catalog hold 的 caller 落在 draining 企业时，返回 503 `enterprise_draining`，不换企业。
+- `draining` 企业：不新建 lease、不新建 catalog hold、不补货，已有 lease 保留。只有 catalog hold 的 caller 落在 draining 企业时，返回 503 `enterprise_draining`，不换企业。已在开通中的 member 继续完成（外部系统已建用户，中途放弃会留下半成品）。
 - 临时不健康的企业不能被选为候选，但仍计入分母。
 
 #### 本次变化
@@ -536,7 +544,7 @@ SAML 会话**不建表**（§5.5）。
 | 方面 | 旧实现 | 新设计 |
 | --- | --- | --- |
 | 排名函数 | 写在 Proxy 内，两个存储各自拼 SQL | 纯函数 `rankEnterprisesForCreation` / `rankEnterprisesForAdmission`，放在 `src/packages/shared/src/enterprise/poolRanking.ts`，SQLite 与 MySQL 共用 |
-| `N_e` | 每次决策 GROUP BY `user_pool_accounts ⋈ proxy_accounts` | `proxy_enterprises.inventory_count` 增量计数：插入或删除 member 时在同一事务内 ±1 |
+| `N_e` | 每次决策 GROUP BY `user_pool_accounts ⋈ proxy_accounts` | `proxy_enterprises.inventory_count` 增量计数：预留 member 时在同一事务内 +1（member 不删除，外键 RESTRICT）；每次启动按 `COUNT(*)` 校正 |
 | 建号（`reserveDeficit`） | SQLite 每插入一个成员约做 2 次全表聚合，一个事务内最多约 200 次；MySQL 每批约 64 次 | **每批只做一次聚合**算出 `I`、`P` 和 `D`；锁住 `proxy_enterprises` 行后，用内存计数逐个选择企业并插入 |
 | 租号（`admit`） | 每次准入都做一次全量 snapshot | 只读 `proxy_enterprises`（≤ 32 行）来排名，然后按顺序在每个企业内做带索引的单行挑选（MySQL 用 `FOR UPDATE SKIP LOCKED`），无聚合 |
 | 生命周期 | `draft`/`validated`/`active`/`draining`，加持久化 evidence JSON 和 identity hash | `draft` → `active` → `draining`（可恢复到 `active`）。激活和恢复时做实时 readiness 检查，不持久化证据 |
@@ -546,6 +554,7 @@ SAML 会话**不建表**（§5.5）。
 - 锁顺序固定：`user_pool_settings` 行 → `proxy_enterprises` 行（按 id 排序）→ member 行。Console 改 cap 与补货使用同样的锁顺序。
 - 改 cap 时在事务内校验 `ΣC_e ≤ NAME_CAPACITY`。
 - `PATCH /api/user-pool/settings` 只接受 `idle_target`、`lease_seconds`、`paused`。传入 `max_accounts` 返回 409 `use_enterprise_cap`。
+- 基线 `GET /api/user-pool`（含成员列表的总览）由 `/api/user-pool/overview`（全局设置与计数）和企业作用域路由取代；旧直连 `/api/accounts*` 保留一个版本，响应带 `Deprecation: true`。
 
 ---
 
@@ -558,7 +567,7 @@ SAML 会话**不建表**（§5.5）。
 | web base | `github.baseUrl` | Login `HeadlessPlaywrightAuthStrategy.ts` 的 `isGitHubUrl`、`isGitHubSsoInterstitial`、`isGheComSignInPage`；SSO 中 `saml/saml.ts` 的 SP 默认值 |
 | GHE.com enterprise SSO 入口 | `<baseUrl>/enterprises/<slug>/sso` | Login `completeEnterpriseSsoLogin` |
 | 设备流 | `<baseUrl>/login/device/code`、`<baseUrl>/login/oauth/access_token` | Login `auth/deviceFlow.ts`，使用 `github.oauthClientId` |
-| 设备验证页 | `<baseUrl>/login/device` | Login。旧分支在 `deviceFlow.ts:34` 和 `HeadlessPlaywrightAuthStrategy.ts:133` 写死了 github.com，不带入 |
+| 设备验证页 | `<baseUrl>/login/device` | Login：浏览器始终打开这个计算值；GitHub 返回的 `verification_uri` 不一致时只记 warning。旧分支在 `deviceFlow.ts:34` 和 `HeadlessPlaywrightAuthStrategy.ts:133` 写死了 github.com，不带入 |
 | GitHub 允许的主机 | baseUrl 主机及其子域；GHE.com 额外允许 `auth.ghe.com` | Login。旧分支 `HeadlessPlaywrightAuthStrategy.ts:785` 写死的 `url.origin === 'https://github.com'` 不带入 |
 | REST API | `github.apiBaseUrl` | SSO `copilot/seats.ts`、`budget/budgetService.ts`；Proxy `accounts/githubSubject.ts`（Models、回调主体校验） |
 | SCIM | `sso.scimBaseUrl` | SSO `scim/scimClient.ts` |
@@ -608,14 +617,18 @@ SAML 会话**不建表**（§5.5）。
 
 | 模块 | 内容 | 消除的重复 |
 | --- | --- | --- |
-| `enterprise/registry.ts` | 类型、`parseRegistry`、`parseTrustedUrl` | 旧 `enterprise.ts` 与 `enterpriseV3.ts` 两套解析器 |
+| `enterprise/registry.ts` | 类型、`parseRegistry`（结构、唯一性、容量） | 旧 `enterprise.ts` 与 `enterpriseV3.ts` 两套解析器 |
+| `enterprise/registryFields.ts` | 字段表、单字段校验、`EnterpriseRegistryError` | — |
+| `enterprise/registryDefaults.ts` | §3.3 默认值推导、GHE.com/github.com 规则、blockers | — |
+| `enterprise/trustedUrl.ts` | `parseTrustedUrl`、`sameTrustedUrl`（按路径段精确比较） | — |
 | `enterprise/registryFile.ts` | `loadRegistry({ service, env })`：读文件、与 env 合并、deep-freeze | — |
 | `enterprise/defaultFromEnv.ts` | 各服务的 env→default 映射表（§3.5） | — |
 | `enterprise/secrets.ts` | `readSecret(ref)`，带 60 秒缓存 | — |
-| `enterprise/githubEndpoints.ts` | §6，含从 Login 移入的 `githubUrls.ts` | — |
+| `enterprise/githubEndpoints.ts` | §6，含从 Login 移入的 `githubUrls.ts`；`defaultApiBaseUrls` 是唯一写公共 API 主机名的地方 | — |
 | `enterprise/fingerprint.ts` | `profileFingerprint(fields)`，唯一的 hash 实现 | 旧 `enterpriseRegistryHashV3` 三份、`enterpriseMysqlRegistryHashV3` |
-| `enterprise/scope.ts` | `EnterpriseId` 品牌类型、`enterpriseRouter`、`requireEnterprise`、`EnterpriseScopeError` | 旧 Proxy、SSO、Login 三份 `enterprise.ts` |
-| `enterprise/poolRanking.ts` | §5.8 的纯函数 | — |
+| `enterprise/scope.ts` | `EnterpriseId` 品牌类型、`requireEnterprise(lookup)` 中间件、`enterpriseOf(res)`、`EnterpriseScopeError` | 旧 Proxy、SSO、Login 三份 `enterprise.ts` |
+| `enterprise/poolRanking.ts` | §5.8 的纯函数（含按批次分配的 `planCreations`） | — |
+| `enterprise/dto.ts` | 企业 DTO：`EnterpriseSummaryDto`、`EnterprisePoolPolicyDto`、`EnterpriseReadinessDto` | — |
 | `deepFreeze.ts` | — | 旧 `enterpriseRuntimeV3.ts:40`、`login/db/connection.ts:58` |
 | `abort.ts` | `abortable(promise, signal)` | 旧 `abortable` ×2、`untilSignal`、`untilAborted` |
 | `boundedResponse.ts` | `readBoundedJson(response, maxBytes)` | 旧 `readResponse`、`readJson` 和一份内联 reader |
@@ -649,7 +662,7 @@ MySQL 的 schema 定义仍集中在 `src/proxy/src/db/mysqlSchema.ts`，只服�
 | `src/sso/src/users/enterpriseIsolation.test.ts` | 同名用户的 CRUD、搜索、设置、预算、导入隔离 |
 | `src/sso/src/saml/saml.test.ts`、`sessionStore.test.ts` | 按企业的 metadata 和证书；严格 AuthnRequest；cookie 跨企业无效；重建用户后旧 cookie 失效；重启后会话有效（新增） |
 | `src/sso/src/users/poolSafety.test.ts` | pool-membership 查询带作用域；查询失败时 fail closed |
-| `src/login/src/auth/profileIsolation.test.ts` | allowlist 精确匹配（兄弟前缀、子路径、编码穿越）；GHE.com 主机判断 |
+| `src/login/src/auth/profileIsolation.test.ts` | allowlist 整段前缀匹配（兄弟前缀拒绝、子路径接受、编码穿越拒绝）；GHE.com 主机判断 |
 | `src/login/src/db/poolTaskSafety.test.ts`、`runnerIsolation.test.ts` | body 不能改作用域；重试继承企业；跨企业的变更不会调用 Proxy |
 | `src/console/src/server/apiProxy.test.ts` | **所有**写路由都要求同源（含旧 `/accounts/:id`） |
 | `src/console/src/web/pages/EnterprisePoolPage.browser.test.ts` | 迟到的读写停留在已确认的作用域；切换企业后草稿重置 |
@@ -695,7 +708,7 @@ MySQL 的 schema 定义仍集中在 `src/proxy/src/db/mysqlSchema.ts`，只服�
 ### M1 共享基础（无行为变化）
 
 - **新增**：`src/packages/shared/src/enterprise/{registry,registryFile,defaultFromEnv,secrets,githubEndpoints,fingerprint,scope,poolRanking}.ts`、`deepFreeze.ts`、`abort.ts`、`boundedResponse.ts`、`externalFetch.ts`、`sqliteService.ts`，以及对应的 `*.test.ts`。
-- **修改**：`src/packages/shared/src/index.ts`、`contracts.ts`（企业 DTO：`EnterpriseSummaryDto`、`EnterprisePoolPolicyDto`、`EnterpriseReadinessDto`）；`src/login/src/auth/githubUrls.ts` 改为从 shared 重导出。
+- **修改**：`src/packages/shared/src/index.ts`、`enterprise/dto.ts`（企业 DTO：`EnterpriseSummaryDto`、`EnterprisePoolPolicyDto`、`EnterpriseReadinessDto`）；`src/login/src/auth/githubUrls.ts` 改为从 shared 重导出。
 - **验收**：
   - 所有服务在没有 registry 文件时行为不变，全量测试通过；
   - §9.1 中 registry、排名、端点的单元测试全部通过；
@@ -792,14 +805,14 @@ M1 ──┬── M2 ── M5 ──┐
 ```
 
 - M2、M3、M4 可由三人并行。
-- M5 的 SSO/Login 客户端先对 M3/M4 在 `contracts.ts` 中定好的契约做 mock 开发。
+- M5 的 SSO/Login 客户端先对 M3/M4 在 `enterprise/dto.ts` 中定好的契约做 mock 开发。
 - 每个里程碑单独提交和评审，不一次性合并。
 
 ---
 
 ## 11. 发布与镜像
 
-- 仍使用单一 `deploy/images/Dockerfile.release`。新增 build arg `RELEASE_LINE=single|multi`，只影响 OCI label 和 `/health` 中的 `releaseLine` 字段。
+- 仍使用单一 `deploy/images/Dockerfile.release`。新增 build arg `RELEASE_LINE=single|multi`，只影响 OCI label `com.ghcp.release-line`、环境变量 `GHCP_RELEASE_LINE` 和 `/healthz` 中的 `releaseLine` 字段。
 - 分支：从 `release/proxy-dockerhub`（或其合入的 `main`）切出 `feat/multi-enterprise`。single-slug 发布线继续独立维护。
 - Docker Hub 标签与 single-slug **完全分开**：
   - 发布：`linkinchow/ghcp-{proxy,console,sso,login}:multi-<sha7>-amd64`；
@@ -824,14 +837,16 @@ M1 ──┬── M2 ── M5 ──┐
 
 ---
 
-## 13. 待决问题
+## 13. 已决问题（2026-10-17 用户确认）
 
-1. **default 企业的内部 ID 固定为 `default`**（旧分支用 UUID）。好处是迁移无需映射、URL 和 cookie 稳定。是否同意？
-2. **旧的无作用域管理和 internal 接口**：本设计对非直连路径一律返回 400；只有旧 `/api/accounts*` 直连路由保留一个版本。是否存在外部脚本调用 SSO、Login 或 Proxy 的 `/api` 或 `/internal`，需要更长的兼容期？
-3. **首次升级是否接受短暂停机**（Recreate，或一次性替换四个镜像）？还是必须支持逐个 Deployment 滚动（需要额外的兼容层）？
-4. **GHE.com 的 OAuth client id**：opencode 的 `Ov23li8tweQw6odWQebz` 能否在 `*.ghe.com` 上使用，需要真实环境确认。设计已支持按企业覆盖 `oauthClientId`。
-5. **Login 并发是否需要按企业公平**？本设计保持全局 FIFO 和全局并发度。
-6. **`MYSQL_AUTO_MIGRATE=false` 的客户**：由 DBA 执行生成的 `proxy-mysql-enterprise-upgrade.sql`，是否可以接受？
+| # | 问题 | 决定 |
+| --- | --- | --- |
+| 1 | 升级前企业的内部 ID | 固定为 `default`。 |
+| 2 | 无作用域的旧 `/api`、`/internal` 接口 | 没有外部脚本调用；按设计对非直连路径返回 400，只有旧 `/api/accounts*` 直连路由保留一个版本。 |
+| 3 | 首次升级是否允许短暂停机 | 允许：一次性替换四个镜像或使用 Recreate；不做滚动兼容层。 |
+| 4 | OpenCode OAuth client id 能否用于 `*.ghe.com` | 暂不决定，等真实环境确认；按企业可覆盖 `oauthClientId`。 |
+| 5 | Login 并发是否按企业公平 | 保持全局 FIFO 和全局并发度。 |
+| 6 | `MYSQL_AUTO_MIGRATE=false` 的客户 | 由 DBA 执行生成的 `proxy-mysql-enterprise-upgrade.sql`。 |
 
 ---
 
@@ -845,7 +860,7 @@ M1 ──┬── M2 ── M5 ──┐
 | `.../enterpriseV3.ts` | 重写 → `enterprise/registry.ts`、`scope.ts` | 删除 `allowLegacyOmission`、`legacyEnterpriseId`、per-profile 内部地址；`AuthorizationBinding` 丢弃 |
 | `.../enterpriseRuntimeV3.ts` | 重写 → `registryFile.ts`、`secrets.ts`、`deepFreeze.ts` | secret 引用的格式保留 |
 | `.../enterpriseRuntimeV4.ts` | 丢弃 → `fingerprint.ts` | — |
-| `.../enterprisePoolV4.ts` | 部分移植 → `contracts.ts` 中的 DTO | `validated` 状态、evidence、`validation_kind` 丢弃 |
+| `.../enterprisePoolV4.ts` | 部分移植 → `enterprise/dto.ts` 中的 DTO | `validated` 状态、evidence、`validation_kind` 丢弃 |
 | `.../enterpriseStorage.ts`、`enterpriseStorageV3.ts`、`enterpriseStorageV4.ts` | 丢弃 | 离线 schema、回执、trigger 由运行时迁移替代 |
 | `.../enterpriseMysql.ts`、`enterpriseMysqlV1.ts`、`V3`、`V4`、`SchemaV3`、`SchemaV4` | 丢弃 | MySQL schema 继续集中在 `src/proxy/src/db/mysqlSchema.ts` |
 | `.../enterpriseSqliteV1.ts`、`enterpriseSqliteReadiness.ts` | 丢弃 | 由 `sqliteService.ts` 的迁移加校验替代 |
@@ -875,7 +890,7 @@ M1 ──┬── M2 ── M5 ──┐
 | `src/sso/src/clients/externalFetch.ts` | 移植 → shared `externalFetch.ts` | — |
 | `src/sso/src/db/connection.ts`、`src/login/src/db/connection.ts` | 重写 → shared `sqliteService.ts` | — |
 | `src/login/src/db/tasksRepo.ts`、`routes/tasksApi.ts`、`tasks/queue.ts`、`tasks/runner.ts` | 在基线上重写 | 只加 `enterprise_id` 绑定；`binding_version`、nonce ledger 和 tombstone 表丢弃 |
-| `src/login/src/auth/deviceFlow.ts`、`HeadlessPlaywrightAuthStrategy.ts` 的改动 | 部分移植 | allowlist 精确匹配逻辑保留；写死的 github.com 删除 |
+| `src/login/src/auth/deviceFlow.ts`、`HeadlessPlaywrightAuthStrategy.ts` 的改动 | 部分移植 | allowlist 改为整段前缀匹配；写死的 github.com 删除 |
 | `src/console/src/web/pages/EnterprisePoolPage.tsx` | 重写 | 全局页加企业表；无 validate 步骤 |
 | `src/console/src/server/apiProxy.ts` 的同源保护 | 移植并扩大 | 覆盖所有写路由 |
 | `src/console/src/web/lib/scope.ts` | 移植 | `useScopeLifetime` |

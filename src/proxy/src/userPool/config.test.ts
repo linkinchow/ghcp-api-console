@@ -55,7 +55,11 @@ test('direct mode ignores all pool-only settings and does not restrict storage',
 test('account domain is configurable and strictly validates DNS labels', () => {
   assert.equal(readPoolConfig({ ...enabledEnv, POOL_ACCOUNT_EMAIL_DOMAIN: ' Accts.Sub.Example.COM ' }).accountDomain,
     'accts.sub.example.com');
-  for (const domain of ['', 'localhost', 'user@example.test', '.example.test', 'a..test',
+  assert.equal(readPoolConfig({ ...enabledEnv, POOL_ACCOUNT_EMAIL_DOMAIN: ' ' }).accountDomain, '',
+    'unset or blank: the enterprise registry supplies each domain');
+  const { POOL_ACCOUNT_EMAIL_DOMAIN: _unset, ...withoutDomain } = enabledEnv;
+  assert.equal(readPoolConfig(withoutDomain).accountDomain, '');
+  for (const domain of ['localhost', 'user@example.test', '.example.test', 'a..test',
     'a-.test', '-a.test', 'a_b.test', 'a.test.', 'a.12', `${'a'.repeat(64)}.test`,
     `${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(63)}.test`]) {
     assert.throws(() => readPoolConfig({ ...enabledEnv, POOL_ACCOUNT_EMAIL_DOMAIN: domain }), /email domain/);

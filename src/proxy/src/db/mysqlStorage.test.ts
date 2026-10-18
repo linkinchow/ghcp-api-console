@@ -1,14 +1,16 @@
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
 import { createPool, type Pool, type PoolConnection } from 'mysql2/promise';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import { MysqlStorage } from './mysqlStorage.js';
 import { MYSQL_BASE_TABLES } from './mysqlSchema.js';
 import { MysqlConnectionError } from '../userPool/mysqlDeadline.js';
 
 const testUrl = 'mysql://test:test@127.0.0.1:1/proxy_test';
+const seed = { id: DEFAULT_ENTERPRISE_ID, fingerprint: 'f'.repeat(64), maxAccounts: 8 };
 const SCHEMA_CHANGING_SQL = /\b(CREATE|ALTER|DROP|RENAME|TRUNCATE|GET_LOCK|INSERT|UPDATE|DELETE)\b/i;
 
-for (const autoMigrate of [undefined, true]) {
+for (const autoMigrate of [true]) {
   test(`runs migrations when autoMigrate is ${autoMigrate} and does not fall back on failure`, async (t) => {
     const pool = createTestPool(t);
     const denied = new Error('CREATE command denied');
@@ -16,9 +18,7 @@ for (const autoMigrate of [undefined, true]) {
     const query = t.mock.method(pool, 'query', async () => {
       assert.fail('Must not fall back to table checks or ping after a migration failure.');
     });
-    const storage = autoMigrate === undefined
-      ? new MysqlStorage(pool, 2)
-      : new MysqlStorage(pool, 2, autoMigrate);
+    const storage = new MysqlStorage(pool, 2, autoMigrate, [seed]);
 
     await assert.rejects(storage.initialize(), (error) => error === denied);
     assert.equal(migration.mock.callCount(), 1);
@@ -34,12 +34,14 @@ test('MYSQL_AUTO_MIGRATE=false validates the prepared schema read-only and point
     if (/FROM information_schema\.TABLES/i.test(sql)) {
       return presentTables.map((name) => ({ TABLE_NAME: name, ENGINE: 'InnoDB' }));
     }
+    // The tables the upgrade extends already have enterprise_id: this is not an r4 schema.
+    if (/COLUMN_NAME = \?/.test(sql)) return [{ COLUMN_DEFAULT: null }];
     // Columns etc. are irrelevant: validation stops at the first table that does not match.
     return [];
   });
   t.mock.method(pool, 'getConnection', async () => connection.raw);
 
-  await assert.rejects(new MysqlStorage(pool, 2, false).initialize(), (error) => {
+  await assert.rejects(new MysqlStorage(pool, 2, false, [seed]).initialize(), (error) => {
     assert.ok(error instanceof Error);
     assert.match(error.message, /MYSQL_AUTO_MIGRATE=false/);
     assert.match(error.message, /scripts\/proxy-mysql-initial\.sql/);
@@ -56,11 +58,30 @@ test('MYSQL_AUTO_MIGRATE=false reports an unreachable database as unavailable, n
   const refused = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
   t.mock.method(pool, 'getConnection', async () => { throw refused; });
 
-  await assert.rejects(new MysqlStorage(pool, 2, false).initialize(), (error) => {
+  await assert.rejects(new MysqlStorage(pool, 2, false, [seed]).initialize(), (error) => {
     assert.ok(error instanceof MysqlConnectionError);
     assert.equal(error.cause, refused);
     return true;
   });
+});
+
+test('MYSQL_AUTO_MIGRATE=false on a single-enterprise schema points to the enterprise upgrade script', async (t) => {
+  const pool = createTestPool(t);
+  const connection = fakeConnection((sql) => {
+    if (/FROM information_schema\.TABLES/i.test(sql)) {
+      return MYSQL_BASE_TABLES.filter((name) => name !== 'proxy_enterprises')
+        .map((name) => ({ TABLE_NAME: name, ENGINE: 'InnoDB' }));
+    }
+    return [];
+  });
+  t.mock.method(pool, 'getConnection', async () => connection.raw);
+
+  await assert.rejects(new MysqlStorage(pool, 2, false, [seed]).initialize(), (error) => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /scripts\/proxy-mysql-enterprise-upgrade\.sql/);
+    return true;
+  });
+  assert.deepEqual(connection.statements.filter((sql) => SCHEMA_CHANGING_SQL.test(sql)), []);
 });
 
 function createTestPool(t: TestContext): Pool {

@@ -52,6 +52,28 @@ test('an optional npm registry is passed as a build arg and must be https withou
   }
 });
 
+test('--release-line multi adds the RELEASE_LINE build arg; single is the Dockerfile default', () => {
+  const multi = buildSpec(parseArgs([...valid, '--release-line', 'multi']), 'proxy');
+  assert.equal(multi.args[multi.args.indexOf('--build-arg') + 1], 'RELEASE_LINE=multi');
+  const single = buildSpec(parseArgs([...valid, '--release-line', 'single']), 'proxy');
+  assert.equal(single.args.includes('--build-arg'), false);
+  for (const invalid of ['latest', 'MULTI', '']) {
+    assert.throws(() => parseArgs([...valid, '--release-line', invalid]), /release-line/);
+  }
+});
+
+test('first multi-enterprise upgrade: Proxy Deployments recreate, keep grace period, expose new variables', () => {
+  for (const template of ['rancher.template.yaml', 'kubernetes.template.yaml']) {
+    const yaml = readFileSync(path.join(directory, template), 'utf8');
+    assert.match(yaml, /strategy:\r?\n\s+type: Recreate\r?\n/);
+    assert.doesNotMatch(yaml, /rollingUpdate:/);
+    assert.match(yaml, /terminationGracePeriodSeconds: 45/);
+    assert.match(yaml, /MYSQL_MIGRATION_LOCK_WAIT_SECONDS: "30"/);
+    assert.match(yaml, /# ENTERPRISE_REGISTRY_FILE: \/config\/enterprise-registry\.json/);
+    assert.match(yaml, /# DIRECT_MODE_ENTERPRISE_ID: default/);
+  }
+});
+
 test('refuses existing evidence directories and paths inside checkout', () => {
   assert.throws(() => requireExternalNewOutput(directory, root), /already exist/);
   assert.throws(() => requireExternalNewOutput(path.join(root, `not-created-${randomUUID()}`), root), /outside/);

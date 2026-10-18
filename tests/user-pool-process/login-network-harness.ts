@@ -3,10 +3,12 @@ import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import type { Connection, Pool, RowDataPacket } from 'mysql2/promise';
+import type { EnterpriseSeed } from '../../src/proxy/src/db/enterpriseSeed.js';
 import type { MysqlStorage } from '../../src/proxy/src/db/mysqlStorage.js';
 import type { MysqlPoolStore } from '../../src/proxy/src/userPool/mysqlStore.js';
 import { WorkerMock } from './worker-mock.js';
-import { bounded, childEnv, CLEANUP_MS, gate, options, siblingUrl, until, type Proof } from './login-network-common.js';
+import { bounded, childEnv, CLEANUP_MS, enterpriseSeed, gate, options, siblingUrl, until,
+  type Proof } from './login-network-common.js';
 
 export class Process {
   readonly child: ChildProcess;
@@ -76,6 +78,7 @@ export class Fixture {
   readonly children: Process[] = [];
   readonly upstream: WorkerMock;
   readonly sockets = new Set<Connection>();
+  enterprise!: EnterpriseSeed;
   storage!: MysqlStorage;
   store!: MysqlPoolStore;
   pool?: Pool;
@@ -131,7 +134,8 @@ export class Fixture {
     this.pool = createPool({ uri: this.sibling.url.toString(), connectionLimit: 6, queueLimit: 16, connectTimeout: 5000,
       timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true });
     this.pool.on('connection', connection => this.sockets.add(connection));
-    this.storage = new MysqlStorage(this.pool, 2);
+    this.enterprise = await enterpriseSeed();
+    this.storage = new MysqlStorage(this.pool, 2, true, [this.enterprise]);
     await bounded(this.storage.initialize(), 'migrate isolated sibling', 25000);
     this.signal.throwIfAborted(); assert.equal(this.closing, false);
     this.store = await bounded(this.storage.userPool(options), 'initialize pool store', 20000);

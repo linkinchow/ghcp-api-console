@@ -83,6 +83,7 @@ const [expressModule, runtime, storage, accounts, client, provisioner, workerMod
   import('../../src/proxy/src/auth/identityHeader.js'), import('../../src/proxy/src/routes/compatible.js'),
   import('../../src/proxy/src/userPool/mysqlStore.js'), import('../../src/proxy/src/db/mysqlStorage.js'),
 ]);
+const { DEFAULT_ENTERPRISE_ID } = await import('@ghcp/shared');
 cleanupSteps.push(() => runtime.stopUserPool(), () => storage.closeStorage());
 const store = await runtime.getUserPool();
 assert.ok(store instanceof mysqlStore.MysqlPoolStore);
@@ -116,6 +117,11 @@ const proxy = app.listen(0, '127.0.0.1'); servers.push(proxy);
 await bounded(once(proxy, 'listening'), 'proxy listen');
 let member: string | undefined;
 let seeded = false;
+/** Production credential write; the pool member belongs to the `default` enterprise. */
+function importToken(identity: string, copilotOauthToken: string) {
+  return accounts.importCopilotOauthToken({ enterpriseId: DEFAULT_ENTERPRISE_ID, identity, ssoUser: identity,
+    ghLogin: 'synthetic-gh-process', copilotOauthToken });
+}
 const control = createServer(async (req, res) => {
   if (closing || req.socket.remoteAddress !== '127.0.0.1' || req.headers.authorization !== `Bearer ${controlKey}`) {
     res.writeHead(403).end('Forbidden'); return;
@@ -127,8 +133,8 @@ const control = createServer(async (req, res) => {
       result = { pid: process.pid, instance, member, contexts: Object.fromEntries(contexts) };
     } else if (req.method === 'POST' && path === '/seed') {
       assert.equal(seeded, false); seeded = true;
-      const row = await store.reserve(); assert.ok(row); member = row.identity;
-      await accounts.importCopilotOauthToken({ identity: member, ssoUser: member, ghLogin: 'synthetic-gh-process', copilotOauthToken: tokenA });
+      const row = await store.reserve(['default']); assert.ok(row); member = row.identity;
+      await importToken(member, tokenA);
       assert.equal(await store.update(member, { state: 'provisioning', stage: 'warmup', sso_created_at: createdAt }), true);
       await worker.tick();
       assert.equal((await store.inventory(member))?.state, 'ready');
@@ -136,13 +142,13 @@ const control = createServer(async (req, res) => {
       result = { member };
     } else if (req.method === 'POST' && (path === '/rotate-aba' || path === '/rotate-ab')) {
       assert.ok(member && seeded);
-      for (const token of path === '/rotate-aba' ? [tokenB, tokenA] : [tokenB]) await accounts.importCopilotOauthToken({ identity: member, ssoUser: member,
-        ghLogin: 'synthetic-gh-process', copilotOauthToken: token });
+      for (const token of path === '/rotate-aba' ? [tokenB, tokenA] : [tokenB]) await importToken(member, token);
       result = { generation: (await store.inventory(member))!.generation };
     } else if (req.method === 'POST' && path === '/tick') {
       await worker.tick(); result = { ticked: true };
     } else if (req.method === 'POST' && path === '/clear-cache') {
-      for (const row of await store.accounts() as Array<{ identity: string }>) client.clearModelsCache(row.identity);
+      const rows = await store.accounts('default') as Array<{ identity: string }>;
+      for (const row of rows) client.clearModelsCache(row.identity);
       result = { cleared: true };
     } else { res.writeHead(404).end('Unknown fixture command'); return; }
     res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(result));

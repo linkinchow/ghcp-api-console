@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql2/promise';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import { MYSQL_SCHEMA, validateMysqlCredentialFence, validateMysqlSchema } from '../../src/proxy/src/db/mysqlSchema.js';
 import { normalizePoolConfig, readPoolConfig, type PoolConfig } from '../../src/proxy/src/userPool/config.js';
 import { MysqlDeadline } from '../../src/proxy/src/userPool/mysqlDeadline.js';
+import { poolConfigFingerprint } from '../../src/proxy/src/userPool/mysqlMigrations.js';
 import { NAME_CAPACITY } from '../../src/proxy/src/userPool/names.js';
 
 const ENV_KEYS = ['ACCOUNT_ROUTING_MODE', 'STORAGE_DRIVER', 'POOL_ACCOUNT_EMAIL_DOMAIN', 'READY_IDLE_TARGET',
@@ -35,12 +37,12 @@ function requireSafe(value: unknown, code: string): asserts value {
   if (!value) throw new ReconfigureConcurrencyError(code);
 }
 
-/** Matches current MysqlPoolStore.initialize exactly. Keep regression parity on production upgrades. */
+/**
+ * The fingerprint MysqlPoolStore.initialize stores and compares (multi-enterprise rule: the account domain is
+ * covered by the enterprise identity instead). Reused, not copied, so both always agree.
+ */
 export function concurrencyConfigFingerprint(options: PoolConfig): string {
-  const { idleTarget: _idle, maxAccounts: _max, leaseSeconds: _lease, enabled: _enabled,
-    callerDomain: _legacy, ...invariants } = normalizePoolConfig(options);
-  return createHash('sha256').update(JSON.stringify(Object.entries(invariants)
-    .sort(([a], [b]) => a.localeCompare(b)))).digest('hex');
+  return poolConfigFingerprint(options);
 }
 function explicitConfig(env: NodeJS.ProcessEnv): PoolConfig {
   requireSafe(env && ENV_KEYS.every(key => typeof env[key] === 'string' && env[key]!.length > 0)
@@ -52,6 +54,19 @@ function explicitConfig(env: NodeJS.ProcessEnv): PoolConfig {
 function cell(value: unknown): unknown {
   return Buffer.isBuffer(value) ? ['buffer', value.toString('base64')]
     : value instanceof Date ? ['date', value.toISOString()] : value;
+}
+/**
+ * The pool cap lives in proxy_enterprises (user_pool_settings.max_accounts is no longer maintained). Every member
+ * shares its account's enterprise, and each enterprise's inventory counter equals its member count.
+ */
+function enterprisesConsistent(snapshot: Record<string, Row[]>, idleTarget: number): boolean {
+  const accounts = new Map(snapshot.proxy_accounts.map(row => [row.identity, row]));
+  const enterprises = snapshot.proxy_enterprises;
+  const cap = enterprises.find(row => row.id === DEFAULT_ENTERPRISE_ID)?.max_accounts;
+  const members = (id: unknown) => snapshot.user_pool_accounts.filter(row => row.enterprise_id === id).length;
+  return cap !== undefined && idleTarget <= Number(cap)
+    && snapshot.user_pool_accounts.every(row => accounts.get(row.identity)?.enterprise_id === row.enterprise_id)
+    && enterprises.every(row => Number(row.inventory_count) === members(row.id));
 }
 function digest(rows: Row[]): string {
   return createHash('sha256').update(JSON.stringify(rows.map(row => Object.entries(row)
@@ -89,7 +104,7 @@ export async function reconfigureConcurrency(options: ReconfigureConcurrencyOpti
       && keys.filter(key => !['account_domain', 'owner'].includes(key)).every(key => Number.isSafeInteger(expected[key])
         && Number(expected[key]) >= 0) && expected.id === 1 && expected.paused === 1 && Number(expected.version) >= 1
       && Number(expected.max_accounts) >= 1 && Number(expected.max_accounts) <= NAME_CAPACITY
-      && Number(expected.idle_target) <= Number(expected.max_accounts) && Number(expected.next_ordinal) <= NAME_CAPACITY
+      && Number(expected.next_ordinal) <= NAME_CAPACITY
       && Number(expected.lease_seconds) >= 60 && Number(expected.lease_seconds) <= 2592000
       && expected.account_domain === oldConfig.accountDomain
       && (expected.owner === null || typeof expected.owner === 'string'), 'invalid_expected_settings');
@@ -141,6 +156,7 @@ export async function reconfigureConcurrency(options: ReconfigureConcurrencyOpti
           || (typeof row.task_id === 'string' && row.task_id.length > 0 && typeof row.oauth_attempt_id === 'string' && row.oauth_attempt_id.length > 0))
         && !/ambiguous|unconfirmed|stalled|sso_name_conflict|oauth_task_invalid/i.test(String(row.last_error ?? ''));
     }), 'inventory_not_quiescent_ready');
+    requireSafe(enterprisesConsistent(snapshot, Number(expected.idle_target)), 'enterprise_inventory_inconsistent');
     const before = Object.fromEntries(TABLES.map(table => [table, digest(snapshot[table])]));
     const [updated] = await connection.execute<ResultSetHeader>(`UPDATE user_pool_settings SET config_fingerprint=?
       WHERE id=1 AND config_fingerprint=? AND paused=1 AND owner_until<=${DB_NOW}

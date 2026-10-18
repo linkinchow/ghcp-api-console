@@ -3,6 +3,7 @@ import type { ManagementQuery, OperationItem, PageResponse } from '@ghcp/shared'
 import { ArrowDown, ArrowUp, ArrowUpDown, Check, Copy, Download, Filter, MoreHorizontal, RefreshCw, Search, SlidersHorizontal, X } from 'lucide-react';
 import { api, downloadApi } from '../api/client.js';
 import { filterKey, listQueryString, matchesSelection, readListQuery, selectionForQuery } from '../lib/management.js';
+import { listHash, readHash } from '../lib/hashState.js';
 import { Button, ButtonLink } from './ui/button.js';
 import { Input } from './ui/input.js';
 import { Notification } from './ui/notification.js';
@@ -45,6 +46,11 @@ export function resetManagedListState(): void {
   resetOperationState();
 }
 
+/** Selections are drafts of the current enterprise; an enterprise switch discards them all. */
+export function clearListSelections(): void {
+  selections.clear();
+}
+
 interface Props<T, R extends PageResponse<T>> {
   scope: string;
   path: string;
@@ -78,7 +84,8 @@ export function ManagedList<T, R extends PageResponse<T> = PageResponse<T>>(prop
   queryRef.current = query;
   const [filtersOpen, setFiltersOpen] = useState(() => Boolean(props.filters?.some((filter) => query[filter.key] !== undefined && query[filter.key] !== '')));
   const [result, setResult] = useState<R>();
-  const savedSelection = selections.get(props.scope);
+  // Keyed by API path, which names the enterprise, so a selection never follows an enterprise switch.
+  const savedSelection = selections.get(props.path);
   const [selected, setSelected] = useState(() => savedSelection?.key === filterKey(query) ? savedSelection.ids : new Set<string>());
   const [allMatching, setAllMatching] = useState(savedSelection?.key === filterKey(query) ? savedSelection.all : false);
   const [error, setError] = useState<string>();
@@ -99,7 +106,7 @@ export function ManagedList<T, R extends PageResponse<T> = PageResponse<T>>(prop
   const request = useRef<AbortController | undefined>(undefined);
   const manualRefresh = useRef(false);
   const queryKey = listQueryString(query);
-  const scrollKey = `${props.scope}:${queryKey}`;
+  const scrollKey = `${props.path}:${queryKey}`;
   const savePreference = (name: string, value: string) => {
     try { localStorage.setItem(preference(name), value); }
     catch (err) { console.warn('Cannot save list preferences', err); setPreferenceError('List preferences could not be saved in this browser.'); }
@@ -116,13 +123,15 @@ export function ManagedList<T, R extends PageResponse<T> = PageResponse<T>>(prop
     } catch (err) { console.warn('Cannot read table preferences', err); setPreferenceError('Some table preferences could not be restored.'); }
   }, [props.scope]);
   const clear = () => { setSelected(new Set()); setAllMatching(false); };
-  useEffect(() => { selections.set(props.scope, { key: filterKey(query), ids: selected, all: allMatching }); }, [props.scope, query, selected, allMatching]);
+  useEffect(() => {
+    selections.set(props.path, { key: filterKey(query), ids: selected, all: allMatching });
+  }, [props.path, query, selected, allMatching]);
   const change = (next: ManagementQuery) => {
     if (filterKey(next) !== filterKey(query)) clear();
     const normalized = { ...next, page: next.page ?? 1, pageSize: next.pageSize ?? 25 };
     setQuery(normalized);
     setDraft(normalized);
-    window.location.hash = `${props.scope}?${listQueryString(normalized)}`;
+    window.location.hash = listHash(props.scope, listQueryString(normalized), window.location.hash);
     try { localStorage.setItem(preference('pageSize'), String(normalized.pageSize)); }
     catch (err) { console.warn('Cannot save list preferences', err); setPreferenceError('List preferences could not be saved in this browser.'); }
   };
@@ -147,7 +156,7 @@ export function ManagedList<T, R extends PageResponse<T> = PageResponse<T>>(prop
         const adjusted = { ...query, page: next.page };
         setQuery(adjusted);
         setDraft(adjusted);
-        window.history.replaceState(null, '', `#${props.scope}?${listQueryString(adjusted)}`);
+        window.history.replaceState(null, '', listHash(props.scope, listQueryString(adjusted), window.location.hash));
       }
     } catch (err) {
       if (!controller.signal.aborted) setError(err instanceof Error ? err.message : String(err));
@@ -188,7 +197,7 @@ export function ManagedList<T, R extends PageResponse<T> = PageResponse<T>>(prop
   useEffect(() => { void reload(); return () => request.current?.abort(); }, [reload, props.refreshKey, revision]);
   useEffect(() => {
     const onHash = () => {
-      if (window.location.hash.slice(1).split('?')[0] !== props.scope) return;
+      if (readHash(window.location.hash).page !== props.scope) return;
       // Read the current query from a ref rather than from a setQuery updater: React may invoke an
       // updater twice, and clear()/setDraft() inside one would fire their side effects twice too.
       const current = queryRef.current;

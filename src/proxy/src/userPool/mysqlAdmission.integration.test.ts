@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import { runMysqlMigrations } from '../db/mysqlMigrations.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import { type PoolConfig, UserPoolError } from './config.js';
 import { MysqlPoolStore } from './mysqlStore.js';
 
@@ -11,6 +12,7 @@ const options: PoolConfig = {
   leaseSeconds: 172800, provisionalSeconds: 300, pollMs: 5000, prewarmConcurrency: 2,
   retryAfterSeconds: 30, warmupModel: 'synthetic-no-http', requestTimeoutMs: 120000,
 };
+const seed = { id: DEFAULT_ENTERPRISE_ID, fingerprint: 'f'.repeat(64), maxAccounts: options.maxAccounts };
 const caller = (n: number) => `sha256:${n.toString(16).padStart(64, '0')}`;
 const lockName = (database: string, id: string) => createHash('sha256').update(JSON.stringify([database, id])).digest('hex');
 const mysqlUrl = process.env.MYSQL_TEST_URL;
@@ -39,7 +41,7 @@ test('MySQL admission: caller locks and member-first allocation across replicas'
       timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true }));
     const [db, other] = pools;
     const first = new MysqlPoolStore(db, options), second = new MysqlPoolStore(other, options);
-    await runMysqlMigrations(db);
+    await runMysqlMigrations(db, seed);
     await Promise.all([first.initialize(), second.initialize()]);
     const reset = async (count = 2) => {
       for (const table of ['user_pool_holds', 'user_pool_catalog_holds', 'user_pool_catalog_cooldowns',
@@ -47,7 +49,7 @@ test('MySQL admission: caller locks and member-first allocation across replicas'
       await db.query('UPDATE user_pool_settings SET next_ordinal=0, owner=NULL, owner_until=0');
       const identities: string[] = [];
       for (let i = 0; i < count; i++) {
-        const row = await first.reserve();
+        const row = await first.reserve(['default']);
         assert.ok(row);
         await db.execute("UPDATE proxy_accounts SET copilot_oauth_status='valid', copilot_oauth_token='SyntheticToken' WHERE identity=?", [row.identity]);
         await first.update(row.identity, { state: 'ready', stage: 'ready', verified_at: await first.now() });
@@ -100,7 +102,7 @@ test('MySQL admission: caller locks and member-first allocation across replicas'
       await db.query('UPDATE user_pool_catalog_holds SET deadline_at=0, expires_at=0');
       const inference = await first.acquire(caller(3));
       assert.equal(inference.member_identity, identity);
-      assert.equal((await first.leases()).length, 1);
+      assert.equal((await first.leases('default')).length, 1);
     });
 
     await t.test('finish renewal while admission waits is reread; disable fences admitted holds', async () => {
@@ -127,7 +129,7 @@ test('MySQL admission: caller locks and member-first allocation across replicas'
         assert.equal(await second.heartbeat(catalog), false);
         await rejectCode(second.acquire(caller(1)), 'member_unavailable');
         await first.finish(catalog, true);
-        assert.equal((await first.leases()).length, 0);
+        assert.equal((await first.leases('default')).length, 0);
       } finally { await blocker.rollback(); blocker.release(); }
     });
 
@@ -142,7 +144,7 @@ test('MySQL admission: caller locks and member-first allocation across replicas'
       } else {
         assert.ok(['pool_exhausted', 'member_unavailable'].includes(admission.reason.code));
       }
-      assert.equal((await first.leases()).length, 0);
+      assert.equal((await first.leases('default')).length, 0);
       await rejectCode(first.acquireCatalog(caller(1)), 'pool_exhausted');
     });
 
@@ -156,7 +158,7 @@ test('MySQL admission: caller locks and member-first allocation across replicas'
       assert.equal(quarantined.last_error, 'credential_not_verified');
       assert.equal(await first.hasHolds(identity), true);
       await first.finish(held, true);
-      assert.equal((await first.leases()).length, 0);
+      assert.equal((await first.leases('default')).length, 0);
     });
 
     await t.test('a partitioned caller lock blocks only that caller and remains bounded', async () => {

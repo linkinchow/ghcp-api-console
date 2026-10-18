@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { Pool, PoolConnection } from 'mysql2/promise';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import { MysqlStorage } from './mysqlStorage.js';
 import { MysqlDeadlineError } from '../userPool/mysqlDeadline.js';
 
@@ -21,7 +22,9 @@ function fixture(mode: 'execute' | 'commit' | 'rollback' = 'execute') {
     destroy() { destroyed++; }, release() { released++; },
   } as unknown as PoolConnection;
   const pool = { async getConnection() { return connection; } } as unknown as Pool;
-  return { storage: new MysqlStorage(pool, 2), counts: () => ({ destroyed, released, rollbacks }), calls };
+  const seed = { id: DEFAULT_ENTERPRISE_ID, fingerprint: 'f'.repeat(64), maxAccounts: 8 };
+  const storage = new MysqlStorage(pool, 2, true, [seed]);
+  return { storage, counts: () => ({ destroyed, released, rollbacks }), calls };
 }
 
 for (const operation of ['getAccount', 'recordRequestStat', 'ping'] as const) {
@@ -29,7 +32,8 @@ for (const operation of ['getAccount', 'recordRequestStat', 'ping'] as const) {
     const f = fixture();
     const call = operation === 'getAccount' ? f.storage.getAccount('synthetic')
       : operation === 'ping' ? f.storage.ping()
-        : f.storage.recordRequestStat({ identity: 'synthetic', path: '/v1/messages', success: true });
+        : f.storage.recordRequestStat({ enterpriseId: DEFAULT_ENTERPRISE_ID, identity: 'synthetic',
+          path: '/v1/messages', success: true });
     await assert.rejects(call, error => error instanceof MysqlDeadlineError);
     assert.deepEqual(f.counts(), { destroyed: 1, released: 0, rollbacks: 0 });
   });

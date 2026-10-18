@@ -1,19 +1,19 @@
 import { unlink } from 'node:fs/promises';
-import { HttpApiError, loggerFor } from '@ghcp/shared';
+import { HttpApiError, loggerFor, type EnterpriseId } from '@ghcp/shared';
 import { claimTaskDeletion, deleteTask, getTask, listAttempts, releaseTaskDeletion } from '../db/tasksRepo.js';
 import { assertPoolTaskMutationAllowed } from './poolProtection.js';
 import { resolveAttemptLog } from './taskLogs.js';
 
 const logger = loggerFor('login', 'task-cleanup');
 
-export async function deleteLoginTask(id: string) {
-  const task = getTask(id);
+export async function deleteLoginTask(enterpriseId: EnterpriseId, id: string) {
+  const task = getTask(enterpriseId, id);
   // Pending/running tasks are refused by the deletion claim below, so only terminal tasks ask Proxy.
   if (task && task.status !== 'pending' && task.status !== 'running') await assertPoolTaskMutationAllowed(task, 'delete');
-  const claimed = claimTaskDeletion(id);
+  const claimed = claimTaskDeletion(enterpriseId, id);
   if (claimed !== 'claimed') return claimed;
   try {
-    const paths = await Promise.all(listAttempts(id).map(resolveAttemptLog));
+    const paths = await Promise.all(listAttempts(enterpriseId, id).map(resolveAttemptLog));
     for (const file of paths) {
       if (!file) continue;
       try { await unlink(file); }
@@ -23,6 +23,6 @@ export async function deleteLoginTask(id: string) {
         throw new HttpApiError(500, 'log_cleanup_failed', 'Some logs could not be removed. Task history was retained; retry cleanup after resolving the filesystem error.');
       }
     }
-    return deleteTask(id);
-  } finally { releaseTaskDeletion(id); }
+    return deleteTask(enterpriseId, id);
+  } finally { releaseTaskDeletion(enterpriseId, id); }
 }

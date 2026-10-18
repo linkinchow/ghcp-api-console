@@ -2,7 +2,13 @@ import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import test from 'node:test';
 import express from 'express';
-import { HttpApiError, type CreateLoginTaskRequest, type LoginTaskDto } from '@ghcp/shared';
+import {
+  DEFAULT_ENTERPRISE_ID,
+  HttpApiError,
+  type CreateLoginTaskRequest,
+  type EnterpriseId,
+  type LoginTaskDto,
+} from '@ghcp/shared';
 
 test('lost Login responses reconcile accepted tasks and roll back rejected attempts without touching committed tokens', async (t) => {
   let task: LoginTaskDto | undefined;
@@ -10,13 +16,13 @@ test('lost Login responses reconcile accepted tasks and roll back rejected attem
   let commit: ((payload: CreateLoginTaskRequest) => Promise<void>) | undefined;
   const app = express();
   app.use(express.json());
-  app.post('/api/tasks', async (req, res) => {
+  app.post('/api/enterprises/default/tasks', async (req, res) => {
     const payload = req.body as CreateLoginTaskRequest;
     task = { id: `task-${payload.identity}`, identity: payload.identity, ssoUser: payload.ssoUser, ghLogin: payload.ghLogin, ssoType: payload.ssoType, oauthAttemptId: payload.oauthAttemptId, status: 'pending', attempts: 0, createdAt: new Date().toISOString() };
     await commit?.(payload);
     res.socket?.destroy();
   });
-  app.get('/api/tasks/by-attempt/:attemptId', (_req, res) => {
+  app.get('/api/enterprises/default/tasks/by-attempt/:attemptId', (_req, res) => {
     if (lookupAvailable) res.json(task);
     else res.status(503).json({ error: { code: 'unavailable', message: 'Fixture unavailable' } });
   });
@@ -30,7 +36,12 @@ test('lost Login responses reconcile accepted tasks and roll back rejected attem
   const { copilotAuthManager } = await import('../copilot/copilotAuthManager.js');
   const { createAccount, deleteAccount, getAccount, saveCopilotOauthToken } = await import('../db/accountsRepo.js');
   const credentials = { credentialMode: 'override' as const, ssoPassword: 'fixture-only-password' };
-  for (const identity of ['accepted', 'uncertain', 'committed']) await createAccount({ identity, ssoUser: identity, ghLogin: `${identity}-gh` });
+  for (const identity of ['accepted', 'uncertain', 'committed']) await createAccount({
+    enterpriseId: DEFAULT_ENTERPRISE_ID,
+    identity,
+    ssoUser: identity,
+    ghLogin: `${identity}-gh`,
+  });
   assert.equal((await copilotAuthManager.triggerOauthRefresh('accepted', credentials)).id, 'task-accepted');
   assert.equal((await getAccount('accepted'))?.copilotOauthStatus, 'refreshing');
 
@@ -48,11 +59,16 @@ test('lost Login responses reconcile accepted tasks and roll back rejected attem
   assert.equal(committed?.copilotOauthStatus, 'valid');
   lookupAvailable = true;
   commit = async (payload) => { await deleteAccount(payload.identity); };
-  await createAccount({ identity: 'removed', ssoUser: 'removed', ghLogin: 'removed-gh' });
-  const { adminApiRouter } = await import('../routes/adminApi.js');
+  await createAccount({
+    enterpriseId: DEFAULT_ENTERPRISE_ID,
+    identity: 'removed',
+    ssoUser: 'removed',
+    ghLogin: 'removed-gh',
+  });
+  const { createLegacyAccountsRouter } = await import('../routes/enterpriseRoutes.js');
   const proxy = express();
   proxy.use(express.json());
-  proxy.use('/api', adminApiRouter);
+  proxy.use('/api', createLegacyAccountsRouter());
   const proxyServer = proxy.listen(0, '127.0.0.1');
   await new Promise<void>((resolve) => proxyServer.once('listening', resolve));
   t.after(() => { proxyServer.closeAllConnections(); return new Promise<void>((resolve) => proxyServer.close(() => resolve())); });
@@ -60,5 +76,36 @@ test('lost Login responses reconcile accepted tasks and roll back rejected attem
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(credentials),
   });
   assert.equal(response.status, 409);
+  assert.equal(response.headers.get('deprecation'), 'true');
   assert.equal((await response.json() as { error: { code: string } }).error.code, 'account_removed_after_submission');
+});
+
+test('Login tasks are created under the enterprise path with only the fields Login accepts', async (t) => {
+  let seen: { path: string; body: Record<string, unknown> } | undefined;
+  const app = express();
+  app.use(express.json());
+  app.post('/api/enterprises/:enterpriseId/tasks', (req, res) => {
+    seen = { path: req.path, body: req.body as Record<string, unknown> };
+    res.status(202).json({ id: 'task-ghe', ...req.body, status: 'pending', attempts: 0, createdAt: '' });
+  });
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const { config } = await import('../config.js');
+  config.loginBaseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  // A fresh module instance builds its HTTP client from the updated base URL.
+  const specifier = './loginClient.js?scoped';
+  const { createLoginTask } = await import(specifier) as typeof import('./loginClient.js');
+  const request = {
+    identity: 'ghe-user', ssoUser: 'ghe-user', ssoPassword: 'fixture-only', ghLogin: 'ghe-user',
+    oauthAttemptId: 'attempt', ssoType: 'custom', ssoUrl: 'https://evil.test/login', selectorOverrides: { a: 'b' },
+  } as const;
+  await createLoginTask('contoso-eu' as EnterpriseId, request);
+  assert.equal(seen?.path, '/api/enterprises/contoso-eu/tasks');
+  assert.deepEqual(Object.keys(seen!.body).sort(), [
+    'ghLogin', 'identity', 'oauthAttemptId', 'ssoPassword', 'ssoType', 'ssoUser',
+  ]);
 });

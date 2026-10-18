@@ -31,8 +31,17 @@ data:
   REQUEST_STATS_PER_ACCOUNT_LIMIT: REPLACE_STATS_RETENTION
   SSO_BASE_URL: REPLACE_EXISTING_SSO_SERVICE_ROOT
   LOGIN_BASE_URL: REPLACE_EXISTING_LOGIN_SERVICE_ROOT
+  # 以下两项（及上面的POOL_*）合成 default 企业。registry文件若也写了 default 的同名字段，
+  # 两边必须相同，否则启动报 enterprise_env_conflict；见 docs/multi-enterprise-registry.md。
   ENTERPRISE_SHORTCODE: REPLACE_EXISTING_ENTERPRISE_SHORTCODE
   COPILOT_API_BASE_URL: REPLACE_EXISTING_COPILOT_API_ROOT
+  # 多企业版：其他副本等待迁移锁的秒数（1–3600，默认30）。大统计表首次升级可调高，
+  # 或由DBA先执行 scripts/proxy-mysql-enterprise-upgrade.sql。
+  MYSQL_MIGRATION_LOCK_WAIT_SECONDS: "30"
+  # 多企业版，仅直连模式：新 identity 归属的企业（默认 default）。
+  # DIRECT_MODE_ENTERPRISE_ID: default
+  # 多企业版，可选：企业 registry（只读挂载，见下方 volumes）。不设置时行为与单企业相同。
+  # ENTERPRISE_REGISTRY_FILE: /config/enterprise-registry.json
   PROXY_ERROR_DIAGNOSTICS_ENABLED: "false"
   PROXY_ERROR_DIAGNOSTICS_REDACT: "true"
   # 人工启动门禁，不是产品的暂停开关。导入并核对paused=1/target=0后才改成"true"。
@@ -55,11 +64,12 @@ metadata:
 spec:
   replicas: 1
   revisionHistoryLimit: 2
+  # 单企业 → 多企业的首次升级必须 Recreate：旧版与已迁移的库不兼容（写入失败、启动被拒），
+  # 不能与新版混跑。同时停掉SSO/Login/Console旧版，四个组件一起换镜像
+  # （docs/multi-enterprise-upgrade-guide.md）。首次升级验证完成后，同一多企业版本线内
+  # 的Proxy更新可改回 RollingUpdate（maxSurge: 1，maxUnavailable: 0）。
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: ghcp-pool-proxy
@@ -144,6 +154,7 @@ spec:
             timeoutSeconds: 3
             periodSeconds: 10
             failureThreshold: 6
+          # Proxy完成迁移后才监听端口；本探测共约300秒。大库首次升级预计更久时调高failureThreshold。
           startupProbe:
             httpGet:
               path: /healthz
@@ -159,6 +170,14 @@ spec:
             - name: mysql-ca
               mountPath: /run/mysql-ca
               readOnly: true
+            # 多企业 registry：Proxy、SSO、Login 挂载同一文件（只读）。
+            # - name: enterprise-registry
+            #   mountPath: /config
+            #   readOnly: true
+            # registry 中 Proxy 用到的 {"file": ...} secret（如 Models 管理员 token）同样只读挂载。
+            # - name: contoso-ghe-secrets
+            #   mountPath: /run/secrets/contoso-ghe
+            #   readOnly: true
       volumes:
         - name: mysql-ca
           configMap:
@@ -166,6 +185,15 @@ spec:
             items:
               - key: ca.pem
                 path: ca.pem
+        # - name: enterprise-registry
+        #   configMap:
+        #     name: REPLACE_ENTERPRISE_REGISTRY_CONFIGMAP
+        #     items:
+        #       - key: enterprise-registry.json
+        #         path: enterprise-registry.json
+        # - name: contoso-ghe-secrets
+        #   secret:
+        #     secretName: REPLACE_CONTOSO_GHE_SECRET
 ---
 # 此对象是切换时的字段参考。将selector/targetPort合并到原Service，保留其名称/IP/端口。
 # 先启动并验证新Proxy，再切换；不要把整个模板一次性apply到正在运行的环境。

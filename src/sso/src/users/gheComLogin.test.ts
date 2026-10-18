@@ -52,24 +52,28 @@ test('GHE.com mode ignores ENTERPRISE_SHORTCODE and uses unsuffixed GH logins fo
   };
 
   try {
-    const { config } = await import('../config.js');
     const { createUser, getUser } = await import('../db/usersRepo.js');
     const { updateSsoRuntimeSettings } = await import('../db/runtimeSettingsRepo.js');
     const { createEmuImportPlan, listEmuImportPlanRows, runSsoUserBatch } = await import('./service.js');
-    assert.equal(config.gheCom, true);
-    assert.equal(config.enterpriseShortcode, '');
-    updateSsoRuntimeSettings({ expectedVersion: 1, changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 } });
-    createUser({ ssoUser: 'alice', passwordHash: 'hash', salt: 'salt', email: 'alice@example.com' });
+    const enterprise = (await import('../enterprises.js')).defaultSsoEnterprise();
+    assert.equal(enterprise.endpoints.isGheCom, true);
+    assert.equal(enterprise.endpoints.shortcode, '');
+    updateSsoRuntimeSettings(enterprise.id, {
+      expectedVersion: 1,
+      changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 },
+    });
+    createUser(enterprise.id, { ssoUser: 'alice', passwordHash: 'hash', salt: 'salt', email: 'alice@example.com' });
 
-    const synced = await runSsoUserBatch({ operation: 'sync_emu', ssoUsers: ['alice'], assignCopilotSeat: true });
+    const batch = { operation: 'sync_emu', ssoUsers: ['alice'], assignCopilotSeat: true } as const;
+    const synced = await runSsoUserBatch(enterprise, { ...batch, ssoUsers: [...batch.ssoUsers] });
 
     assert.equal(synced.rows[0]?.detail, 'Synced to EMU and assigned Copilot seat.');
-    assert.equal(getUser('alice')?.ghLogin, 'alice');
-    assert.equal(getUser('alice')?.copilotSeatStatus, 'assigned');
+    assert.equal(getUser(enterprise.id, 'alice')?.ghLogin, 'alice');
+    assert.equal(getUser(enterprise.id, 'alice')?.copilotSeatStatus, 'assigned');
     assert.deepEqual(seatAssignments, ['alice']);
 
-    const plan = await createEmuImportPlan();
-    const bob = listEmuImportPlanRows(plan.planId).items.find((row) => row.ssoUser === 'bob');
+    const plan = await createEmuImportPlan(enterprise);
+    const bob = listEmuImportPlanRows(enterprise, plan.planId).items.find((row) => row.ssoUser === 'bob');
     assert.equal(bob?.ghLogin, 'bob');
     assert.equal(bob?.copilotSeatStatus, 'assigned');
   } finally {

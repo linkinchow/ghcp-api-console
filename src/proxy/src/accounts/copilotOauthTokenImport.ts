@@ -2,7 +2,8 @@ import type { BatchResult, ImportCopilotOauthTokenRow } from '@ghcp/shared';
 import { HttpApiError, newBatchId, nowIso } from '@ghcp/shared';
 import { getSsoUser } from '../clients/ssoClient.js';
 import { clearModelsCache, CopilotApiError, validateCopilotOauthToken } from '../copilot/copilotClient.js';
-import { importCopilotOauthToken, toAccountDto } from '../db/accountsRepo.js';
+import { getAccount, importCopilotOauthToken, toAccountDto } from '../db/accountsRepo.js';
+import type { ProxyEnterprise } from '../enterprises.js';
 
 interface ImportRow {
   line: number;
@@ -16,12 +17,16 @@ interface ParseError {
   error: string;
 }
 
-export async function importCopilotOauthTokens(csvText: string): Promise<BatchResult<ImportCopilotOauthTokenRow>> {
+/** Direct-mode token import into one enterprise; caller-lease mode refuses imports before this runs. */
+export async function importCopilotOauthTokens(
+  enterprise: ProxyEnterprise,
+  csvText: string,
+): Promise<BatchResult<ImportCopilotOauthTokenRow>> {
   const startedAt = nowIso();
   const parsed = parseCopilotOauthTokenCsv(csvText);
   const rows: ImportCopilotOauthTokenRow[] = [];
   for (const row of parsed.rows) {
-    rows.push(await importCopilotOauthTokenRow(row));
+    rows.push(await importCopilotOauthTokenRow(enterprise, row));
   }
   for (const error of parsed.errors) {
     rows.push({
@@ -42,11 +47,21 @@ export async function importCopilotOauthTokens(csvText: string): Promise<BatchRe
   };
 }
 
-async function importCopilotOauthTokenRow(row: ImportRow): Promise<ImportCopilotOauthTokenRow> {
+async function importCopilotOauthTokenRow(
+  enterprise: ProxyEnterprise,
+  row: ImportRow,
+): Promise<ImportCopilotOauthTokenRow> {
   try {
-    const ssoUser = await getSsoUser(row.name);
-    await validateCopilotOauthToken(row.name, row.copilotOauthToken);
+    await assertNotOtherEnterprise(enterprise, row.name);
+    const ssoUser = await getSsoUser(enterprise.id, row.name);
+    await validateCopilotOauthToken({
+      identity: row.name,
+      accessToken: row.copilotOauthToken,
+      api: enterprise.endpoints.copilotApiBaseUrl,
+      enterpriseId: enterprise.id,
+    });
     const account = await importCopilotOauthToken({
+      enterpriseId: enterprise.id,
       identity: row.name,
       ssoUser: ssoUser.ssoUser,
       ghLogin: ssoUser.ghLogin ?? row.name,
@@ -70,6 +85,13 @@ async function importCopilotOauthTokenRow(row: ImportRow): Promise<ImportCopilot
       detail: importErrorMessage(err, row.name),
     };
   }
+}
+
+/** Identities are global: a row of another enterprise is never overwritten by this enterprise's import. */
+async function assertNotOtherEnterprise(enterprise: ProxyEnterprise, identity: string): Promise<void> {
+  const existing = await getAccount(identity);
+  if (!existing || existing.enterpriseId === enterprise.id) return;
+  throw new HttpApiError(409, 'account_enterprise_mismatch', `Account "${identity}" belongs to another enterprise.`);
 }
 
 function importErrorMessage(err: unknown, name: string): string {

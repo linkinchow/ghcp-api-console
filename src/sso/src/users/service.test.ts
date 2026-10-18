@@ -25,7 +25,8 @@ test('continues deleting an SSO user when the GitHub user has no Copilot seat', 
     if (url.startsWith('https://scim.test/')) {
       return jsonResponse(200, { Resources: [] });
     }
-    if (url === 'https://proxy.test/internal/accounts/by-sso-user/alice/pool-membership' && method === 'GET') {
+    const membershipUrl = 'https://proxy.test/internal/enterprises/default/accounts/by-sso-user/alice/pool-membership';
+    if (url === membershipUrl && method === 'GET') {
       assert.equal(new Headers(init?.headers).get('X-Internal-Token'), 'test-internal-token');
       return jsonResponse(200, { managed: false });
     }
@@ -44,16 +45,20 @@ test('continues deleting an SSO user when the GitHub user has no Copilot seat', 
     const { createUser, getUser, updateEmu } = await import('../db/usersRepo.js');
     const { updateSsoRuntimeSettings } = await import('../db/runtimeSettingsRepo.js');
     const { runSsoUserBatch } = await import('./service.js');
-    updateSsoRuntimeSettings({ expectedVersion: 1, changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 } });
-    createUser({
+    const enterprise = (await import('../enterprises.js')).defaultSsoEnterprise();
+    updateSsoRuntimeSettings(enterprise.id, {
+      expectedVersion: 1,
+      changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 },
+    });
+    createUser(enterprise.id, {
       ssoUser: 'alice',
       passwordHash: 'hash',
       salt: 'salt',
       email: 'alice@example.com',
     });
-    updateEmu('alice', { ghLogin: 'alice_emu', emuStatus: 'active' });
+    updateEmu(enterprise.id, 'alice', { ghLogin: 'alice_emu', emuStatus: 'active' });
 
-    const result = await runSsoUserBatch({
+    const result = await runSsoUserBatch(enterprise, {
       operation: 'delete_sso',
       ssoUsers: ['alice'],
     });
@@ -63,7 +68,7 @@ test('continues deleting an SSO user when the GitHub user has no Copilot seat', 
     assert.equal(result.summary.warnings, 1);
     assert.equal(result.rows[0]?.status, 'success');
     assert.match(result.rows[0]?.warning ?? '', /has no Copilot seat/);
-    assert.equal(getUser('alice'), undefined);
+    assert.equal(getUser(enterprise.id, 'alice'), undefined);
     assert.deepEqual(requests.map(({ method }) => method), ['GET', 'DELETE', 'GET', 'DELETE']);
   } finally {
     globalThis.fetch = originalFetch;

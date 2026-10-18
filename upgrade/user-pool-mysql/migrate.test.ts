@@ -6,17 +6,24 @@ import { join } from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
+import { defaultEnterpriseSeed } from '../../src/proxy/src/db/enterpriseSeed.js';
 import { runMigrations } from '../../src/proxy/src/db/migrations.js';
 import { UserPoolStore } from '../../src/proxy/src/userPool/store.js';
 import { accountName } from '../../src/proxy/src/userPool/names.js';
 import { migrateSqlitePoolToMysql as migrate, mysqlPoolFromEnv, preflightSqlite, type MigrationOptions } from './migrate.js';
 import { normalizePoolConfig, readPoolConfig, type PoolConfig } from '../../src/proxy/src/userPool/config.js';
 import { MYSQL_CREDENTIAL_FENCE_DDL, SQLITE_CREDENTIAL_FENCE_DDL } from '../../src/proxy/src/db/mysqlSchema.js';
+import { createSchema, referenceSchema, type SourceShape } from './sqlite-schema.js';
 
 const poolConfig: PoolConfig = { enabled: true, accountDomain: 'fixture.invalid', idleTarget: 2, maxAccounts: 20,
   leaseSeconds: 172800, provisionalSeconds: 300, pollMs: 5000, retryAfterSeconds: 30,
   warmupModel: 'unused-offline', requestTimeoutMs: 120000 };
-const migrateSqlitePoolToMysql = (options: MigrationOptions) => migrate({ poolConfig, ...options });
+// The deployment environment: github.com with the baseline shortcode; the importer adds the pool domain.
+const migrateSqlitePoolToMysql = (options: MigrationOptions) => migrate({ poolConfig, env: {}, ...options });
+/** The `default` enterprise the Proxy (and the importer) derive from that environment. */
+const enterpriseSeed = defaultEnterpriseSeed({ ACCOUNT_ROUTING_MODE: 'caller-lease',
+  POOL_ACCOUNT_EMAIL_DOMAIN: poolConfig.accountDomain });
 
 const now = Date.now();
 const timestamp = new Date(now - 10000).toISOString();
@@ -25,36 +32,60 @@ const secondCaller = `sha256:${'b'.repeat(64)}`;
 const lease = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const secondLease = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const syntheticToken = 'SYNTHETIC_ONLY_NeverUseThisToken_AbCdEf';
-function fixture(): { path: string; change: (sql: string) => void; close: () => void } {
+/** Creates the source schema as a Proxy of that shape left it, with its pool settings row. */
+function createSource(db: Database.Database, shape: SourceShape): void {
+  if (shape === 'multi-enterprise') {
+    runMigrations(db, enterpriseSeed);
+    new UserPoolStore(db, poolConfig);
+    // The cap moved to proxy_enterprises; user_pool_settings.max_accounts keeps a stale value.
+    db.exec('UPDATE user_pool_settings SET max_accounts=15');
+    return;
+  }
+  createSchema(db, referenceSchema('single-enterprise'));
+  db.prepare(`
+    INSERT INTO user_pool_settings (id, idle_target, max_accounts, lease_seconds, account_domain)
+    VALUES (1, ?, ?, ?, ?)
+  `).run(poolConfig.idleTarget, poolConfig.maxAccounts, poolConfig.leaseSeconds, poolConfig.accountDomain);
+}
+function fixture(shape: SourceShape = 'multi-enterprise'): {
+  path: string; change: (sql: string) => void; close: () => void;
+} {
   const dir = mkdtempSync(join(tmpdir(), 'pool-migration-synthetic-'));
   const path = join(dir, 'backup.sqlite');
   const db = new Database(path);
   db.pragma('foreign_keys = ON');
-  runMigrations(db);
-  new UserPoolStore(db, poolConfig);
+  createSource(db, shape);
+  // Multi-enterprise tables require enterprise_id on insert (guard triggers); r4 tables have no such column.
+  const enterprise = shape === 'multi-enterprise' ? [DEFAULT_ENTERPRISE_ID] : [];
+  const column = shape === 'multi-enterprise' ? ', enterprise_id' : '';
+  const value = shape === 'multi-enterprise' ? ', ?' : '';
   db.prepare('UPDATE user_pool_settings SET paused=1, next_ordinal=3, version=7, owner=?, owner_until=?')
     .run(randomUUID(), now - 1000);
   for (let ordinal = 0; ordinal < 3; ordinal++) {
     const identity = accountName(ordinal);
     db.prepare(`INSERT INTO proxy_accounts(identity, sso_user, gh_login, copilot_oauth_token, copilot_oauth_status,
-      copilot_oauth_updated_at, created_at, updated_at) VALUES (?, ?, ?, ?, 'valid', ?, ?, ?)`)
-      .run(identity, identity, `synthetic-${ordinal}`, syntheticToken + ordinal, timestamp, timestamp, timestamp);
+      copilot_oauth_updated_at, created_at, updated_at${column}) VALUES (?, ?, ?, ?, 'valid', ?, ?, ?${value})`)
+      .run(identity, identity, `synthetic-${ordinal}`, syntheticToken + ordinal, timestamp, timestamp, timestamp,
+        ...enterprise);
     db.prepare(`INSERT INTO user_pool_accounts(identity, ordinal, state, stage, attempt_id, oauth_attempt_id, task_id,
-      sso_created_at, updated_at, cooldown_until, verified_at, generation, reauth_count, reauth_window_at)
-      VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, 9, 2, ?)`)
+      sso_created_at, updated_at, cooldown_until, verified_at, generation, reauth_count, reauth_window_at${column})
+      VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, 9, 2, ?${value})`)
       .run(identity, ordinal, ordinal === 1 ? 'cooling' : 'ready', randomUUID(), randomUUID(), randomUUID(),
-        timestamp, now - 5000, ordinal === 1 ? now + 60000 : 0, now - 5000, now - 90000);
+        timestamp, now - 5000, ordinal === 1 ? now + 60000 : 0, now - 5000, now - 90000, ...enterprise);
   }
+  // The runtime counts each reservation; these members were inserted directly.
+  if (shape === 'multi-enterprise') db.exec('UPDATE proxy_enterprises SET inventory_count=3');
   db.prepare(`INSERT INTO user_pool_leases VALUES (?, ?, ?, 'active', ?, ?, ?)`)
     .run(caller, accountName(0), lease, now - 4000, now - 3000, now + 172800000);
   db.prepare(`INSERT INTO user_pool_leases VALUES (?, ?, ?, 'provisional', ?, NULL, ?)`)
     .run(secondCaller, accountName(1), secondLease, now - 4000, now + 300000);
   db.prepare('INSERT INTO user_pool_catalog_cooldowns VALUES (?, ?, ?)').run(`sha256:${'c'.repeat(64)}`, accountName(2), now + 60000);
-  db.prepare(`INSERT INTO proxy_request_stats(id, identity, requested_at, path, success, input_tokens, cache_input_tokens, caller_id, lease_id)
-    VALUES (?, ?, ?, '/chat/completions', 1, 123, 45, ?, ?)`)
-    .run('synthetic-stat', accountName(0), timestamp, caller, lease);
-  db.prepare('INSERT INTO user_pool_events(id, at, action, identity, caller_id, lease_id, detail) VALUES (17, ?, ?, ?, ?, ?, ?)')
-    .run(now - 1000, 'synthetic_event', accountName(0), caller, lease, 'synthetic-detail');
+  db.prepare(`INSERT INTO proxy_request_stats(id, identity, requested_at, path, success, input_tokens,
+    cache_input_tokens, caller_id, lease_id${column}) VALUES (?, ?, ?, '/chat/completions', 1, 123, 45, ?, ?${value})`)
+    .run('synthetic-stat', accountName(0), timestamp, caller, lease, ...enterprise);
+  db.prepare(`INSERT INTO user_pool_events(id, at, action, identity, caller_id, lease_id, detail${column})
+    VALUES (17, ?, ?, ?, ?, ?, ?${value})`)
+    .run(now - 1000, 'synthetic_event', accountName(0), caller, lease, 'synthetic-detail', ...enterprise);
   db.close();
   return { path, change(sql) { const writable = new Database(path); try { writable.pragma('foreign_keys = OFF'); writable.exec(sql); } finally { writable.close(); } }, close() { rmSync(dir, { recursive: true, force: true }); } };
 }
@@ -69,6 +100,7 @@ test('SQLite preflight preserves backup bytes and reports only safe counts; dry-
     assert.equal(report.counts.proxy_request_stats, 1);
     assert.equal(report.counts.user_pool_leases, 2);
     assert.equal(report.counts.user_pool_events, 1);
+    assert.equal(report.counts.proxy_enterprises, 1);
     const forbidden = new Proxy({}, { get() { throw new Error('Target must not be used during dry-run'); } }) as Pool;
     assert.deepEqual(await migrateSqlitePoolToMysql({ sqlitePath: f.path, dryRun: true, pool: forbidden }), report);
     assert.equal(sourceHash(f.path), before);
@@ -82,7 +114,8 @@ const unsafeCases: [string, string, RegExp][] = [
   ['live owner', `UPDATE user_pool_settings SET owner_until=${now + 3600000}`, /live scheduler owner/],
   ['expired inference hold', `INSERT INTO user_pool_holds VALUES ('expired', '${lease}', 1, 1, 9)`, /undrained holds/],
   ['expired catalog hold', `INSERT INTO user_pool_catalog_holds VALUES ('expired', 'catalog-lease', '${caller}', '${accountName(0)}', 1, 2, 2, 9)`, /undrained holds/],
-  ['expired initialization', `INSERT INTO proxy_identity_initializations VALUES ('synthetic', 'claim', '${timestamp}', '${timestamp}', '${timestamp}')`, /initialization claims/],
+  ['expired initialization', `INSERT INTO proxy_identity_initializations
+    VALUES ('synthetic', 'claim', '${timestamp}', '${timestamp}', '${timestamp}', 'default')`, /initialization claims/],
   ['provisioning', "UPDATE user_pool_accounts SET state='provisioning'", /provisioning/],
   ['refreshing OAuth', "UPDATE proxy_accounts SET copilot_oauth_status='refreshing'", /refreshing/],
   ['unresolved callback', "UPDATE proxy_accounts SET copilot_oauth_attempt_id='nonce'", /unresolved OAuth/],
@@ -115,6 +148,17 @@ const unsafeCases: [string, string, RegExp][] = [
   ['MySQL INT overflow', 'UPDATE user_pool_accounts SET attempts=2147483648', /field validation/],
   ['oversized task identifier', "UPDATE user_pool_accounts SET task_id='" + 'x'.repeat(256) + "'", /field validation/],
   ['WAL-mode backup', 'PRAGMA journal_mode=WAL', /rollback-journal SQLite backup/],
+  ['second enterprise', `INSERT INTO proxy_enterprises
+    VALUES ('second', 'active', 5, 0, 1, '${'b'.repeat(64)}', 1, 1)`, /enterprises other than default/],
+  ['enterprise inventory drift', 'UPDATE proxy_enterprises SET inventory_count=2', /inventory counter/],
+  ['invalid enterprise fingerprint', "UPDATE proxy_enterprises SET profile_fingerprint='x'", /enterprise is invalid/],
+  ['stat outside default', "UPDATE proxy_request_stats SET enterprise_id='second'", /outside the default/],
+  ['missing enterprise guard', 'DROP TRIGGER proxy_accounts_enterprise_required', /enterprise guard/],
+  ['weakened enterprise guard', `DROP TRIGGER user_pool_accounts_enterprise_matches;
+    CREATE TRIGGER user_pool_accounts_enterprise_matches BEFORE INSERT ON user_pool_accounts BEGIN SELECT 1; END`,
+  /enterprise guard/],
+  ['partial enterprise columns', `DROP INDEX idx_user_pool_events_enterprise;
+    ALTER TABLE user_pool_events DROP COLUMN enterprise_id`, /Unsupported source schema in user_pool_events/],
 ];
 for (const [name, sql, expected] of unsafeCases) test(`SQLite rejects ${name} without modifying source`, () => {
   const f = fixture();
@@ -123,6 +167,49 @@ for (const [name, sql, expected] of unsafeCases) test(`SQLite rejects ${name} wi
     const before = sourceHash(f.path);
     assert.throws(() => preflightSqlite(f.path), expected);
     assert.equal(sourceHash(f.path), before);
+  } finally { f.close(); }
+});
+
+const singleEnterpriseCases: [string, string, RegExp][] = [
+  ['enterprise column', 'ALTER TABLE proxy_accounts ADD COLUMN enterprise_id TEXT',
+    /Unsupported source schema in proxy_accounts/],
+  ['enterprise guard', `CREATE TRIGGER proxy_accounts_enterprise_required BEFORE INSERT ON proxy_accounts
+    BEGIN SELECT 1; END`, /Unsupported source schema objects/],
+];
+for (const [name, sql, expected] of singleEnterpriseCases) test(`single-enterprise source rejects ${name}`, () => {
+  const f = fixture('single-enterprise');
+  try {
+    f.change(sql);
+    const before = sourceHash(f.path);
+    assert.throws(() => preflightSqlite(f.path), expected);
+    assert.equal(sourceHash(f.path), before);
+  } finally { f.close(); }
+});
+
+test('single-enterprise (r4) sources pass preflight with the same counts and no enterprise rows', () => {
+  const f = fixture('single-enterprise');
+  try {
+    const report = preflightSqlite(f.path);
+    assert.deepEqual([report.counts.proxy_accounts, report.counts.user_pool_accounts, report.counts.proxy_enterprises],
+      [3, 3, 0]);
+  } finally { f.close(); }
+});
+
+test('a source whose enterprise identity differs from the deployment is rejected before target access', async () => {
+  const f = fixture();
+  try {
+    let opened = 0;
+    const getConnection = async () => {
+      opened++;
+      throw new Error('unexpected synthetic target access');
+    };
+    const pool = { getConnection } as unknown as Pool;
+    const options = { sqlitePath: f.path, confirmOfflineSource: true, confirmEmptyTarget: true, pool };
+    await assert.rejects(migrateSqlitePoolToMysql({ ...options, env: { ENTERPRISE_SHORTCODE: 'other' } }),
+      /enterprise identity/);
+    await assert.rejects(migrateSqlitePoolToMysql({ ...options, env: { GITHUB_BASE_URL: 'not a url' } }),
+      /enterprise configuration is invalid/);
+    assert.equal(opened, 0);
   } finally { f.close(); }
 });
 
@@ -314,9 +401,17 @@ test('isolated MySQL 8 copy, content verification, rollback and concurrent-impor
     assert.equal(Number(settings[0].owner_until), 0);
     assert.equal(Number(settings[0].version), 7);
     assert.equal(Number(settings[0].next_ordinal), 3);
-    const { idleTarget: _idle, maxAccounts: _max, leaseSeconds: _lease, enabled: _enabled, callerDomain: _legacy, ...invariants } = normalizePoolConfig(poolConfig);
+    // Multi-enterprise fingerprint: the account domain is covered by the enterprise identity instead.
+    const { idleTarget: _idle, maxAccounts: _max, leaseSeconds: _lease, enabled: _enabled, callerDomain: _legacy,
+      accountDomain: _domain, ...invariants } = normalizePoolConfig(poolConfig);
     assert.equal(settings[0].config_fingerprint, createHash('sha256')
       .update(JSON.stringify(Object.entries(invariants).sort(([a], [b]) => a.localeCompare(b)))).digest('hex'));
+    assert.equal(Number(settings[0].max_accounts), 15, 'the retired settings cap is copied as stored');
+    const [enterprises] = await pool.query<RowDataPacket[]>('SELECT * FROM proxy_enterprises');
+    assert.deepEqual(enterprises.map((row) => [row.id, row.state, row.profile_fingerprint,
+      Number(row.max_accounts), Number(row.inventory_count)]),
+    [[DEFAULT_ENTERPRISE_ID, 'active', enterpriseSeed.fingerprint, poolConfig.maxAccounts, 3]]);
+    await assertDefaultEnterprise(pool);
     const { MysqlPoolStore: RuntimeStore } = await import('../../src/proxy/src/userPool/mysqlStore.js');
     const runtimeConfig = readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease', STORAGE_DRIVER: 'mysql',
       POOL_ACCOUNT_EMAIL_DOMAIN: poolConfig.accountDomain, POOL_WARMUP_MODEL: poolConfig.warmupModel });
@@ -342,7 +437,7 @@ test('isolated MySQL 8 copy, content verification, rollback and concurrent-impor
     await admin.query(`CREATE DATABASE ${database} CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`);
     pool = createPool({ uri: url.toString(), connectionLimit: 6, dateStrings: true, timezone: 'Z' });
     const { runMysqlMigrations } = await import('../../src/proxy/src/db/mysqlMigrations.js');
-    await runMysqlMigrations(pool);
+    await runMysqlMigrations(pool, enterpriseSeed);
     const { MysqlPoolStore } = await import('../../src/proxy/src/userPool/mysqlStore.js');
     await new MysqlPoolStore(pool, poolConfig).initialize();
     const schemaCases = [
@@ -400,9 +495,9 @@ test('isolated MySQL 8 copy, content verification, rollback and concurrent-impor
     await t.test('known historical token CI migration remains supported, but not altered types', async () => {
       await pool!.query("DELETE FROM schema_migrations WHERE id='2026-08-27-proxy-token-binary-collation'");
       await pool!.query('ALTER TABLE proxy_accounts MODIFY copilot_oauth_token VARCHAR(255) COLLATE utf8mb4_general_ci');
-      await assert.rejects(runMysqlMigrations(pool!), /schema/);
+      await assert.rejects(runMysqlMigrations(pool!, enterpriseSeed), /schema/);
       await pool!.query('ALTER TABLE proxy_accounts MODIFY copilot_oauth_token TEXT COLLATE utf8mb4_general_ci');
-      await runMysqlMigrations(pool!);
+      await runMysqlMigrations(pool!, enterpriseSeed);
       await new MysqlPoolStore(pool!, poolConfig).initialize();
     });
     // Intercept only synthetic INSERT parameters to exercise read-back mismatch and rollback.
@@ -462,3 +557,58 @@ test('isolated MySQL 8 copy, content verification, rollback and concurrent-impor
     f.close();
   }
 });
+
+test('isolated MySQL 8 import of a single-enterprise (r4) source assigns every row to default', {
+  skip: !integration,
+}, async () => {
+  await withIsolatedDatabase(async (pool) => {
+    const f = fixture('single-enterprise');
+    try {
+      f.change('UPDATE user_pool_settings SET max_accounts=25');
+      await migrateSqlitePoolToMysql({ sqlitePath: f.path, confirmOfflineSource: true, confirmEmptyTarget: true,
+        pool });
+      const [enterprises] = await pool.query<RowDataPacket[]>('SELECT * FROM proxy_enterprises');
+      assert.deepEqual(enterprises.map((row) => [row.id, row.profile_fingerprint, Number(row.max_accounts),
+        Number(row.inventory_count)]), [[DEFAULT_ENTERPRISE_ID, enterpriseSeed.fingerprint, 25, 3]]);
+      await assertDefaultEnterprise(pool);
+      // The Proxy starts on the imported target: same identity, same pool configuration.
+      const { MysqlStorage } = await import('../../src/proxy/src/db/mysqlStorage.js');
+      const storage = new MysqlStorage(pool, 2, true, [enterpriseSeed]);
+      await storage.initialize();
+      await (await storage.userPool(poolConfig)).settings();
+    } finally { f.close(); }
+  });
+});
+
+/** Every imported row belongs to `default`; only global events may have no enterprise. */
+async function assertDefaultEnterprise(pool: Pool): Promise<void> {
+  for (const table of ['proxy_accounts', 'proxy_request_stats', 'user_pool_accounts', 'user_pool_events']) {
+    const [rows] = await pool.query<RowDataPacket[]>(`
+      SELECT DISTINCT enterprise_id
+      FROM ${table}
+    `);
+    assert.deepEqual(rows.map((row) => row.enterprise_id), [DEFAULT_ENTERPRISE_ID], table);
+  }
+}
+
+async function withIsolatedDatabase(run: (pool: Pool) => Promise<void>): Promise<void> {
+  const uri = process.env.USER_POOL_MIGRATION_TEST_MYSQL_URL;
+  assert.ok(uri, 'Set USER_POOL_MIGRATION_TEST_MYSQL_URL for an isolated local test server.');
+  const url = new URL(uri);
+  assert.ok(url.protocol === 'mysql:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
+    && url.pathname === '/user_pool_migration_test' && !url.search && !url.hash,
+  'Integration URL must be loopback with database user_pool_migration_test; remote tests are forbidden.');
+  const admin = createPool({ uri, dateStrings: true, timezone: 'Z' });
+  const database = `user_pool_migration_test_${randomUUID().replaceAll('-', '')}`;
+  await admin.query(`CREATE DATABASE ${database} CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`);
+  url.pathname = '/' + database;
+  const pool = createPool({ uri: url.toString(), connectionLimit: 6, dateStrings: true, timezone: 'Z',
+    supportBigNumbers: true, bigNumberStrings: true });
+  try {
+    await run(pool);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP DATABASE IF EXISTS ${database}`);
+    await admin.end();
+  }
+}

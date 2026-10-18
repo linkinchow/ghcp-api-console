@@ -5,26 +5,49 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import express, { type Request, type Response } from 'express';
 import { chromium, type Page, type Request as BrowserRequest } from 'playwright';
+import type { EnterpriseListItem } from '../api/enterprises.js';
 import type {
   AiCreditsUsageDto, LoginAttemptDto, LoginQueueDto, LoginRuntimeSettingsDto, LoginTaskDto,
   ManagementOperation, ManagementSelection, ProxyAccountDto, ProxyErrorDiagnosticSummaryDto,
   ProxyRequestStatDto, SsoRuntimeSettingsDto, SsoUserDto,
 } from '@ghcp/shared';
 
+/** The enterprise every fixture page uses; the Console defaults to it when the hash names none. */
+export const ENTERPRISE = 'default';
+export const scoped = {
+  proxy: `/api/console/proxy/enterprises/${ENTERPRISE}`,
+  sso: `/api/console/sso/enterprises/${ENTERPRISE}`,
+  login: `/api/console/login-service/enterprises/${ENTERPRISE}`,
+} as const;
+
 export const paths = {
-  tasks: '/api/console/login-service/tasks',
-  queue: '/api/console/login-service/queue',
-  summary: '/api/console/login-service/tasks/summary',
-  operations: '/api/console/login-service/tasks/operations',
-  users: '/api/console/sso/users',
-  capacity: '/api/console/sso/users/capacity',
-  accounts: '/api/console/proxy/accounts',
-  stats: '/api/console/proxy/request-stats',
+  tasks: `${scoped.login}/tasks`,
+  queue: `${scoped.login}/queue`,
+  summary: `${scoped.login}/tasks/summary`,
+  operations: `${scoped.login}/tasks/operations`,
+  users: `${scoped.sso}/users`,
+  capacity: `${scoped.sso}/users/capacity`,
+  accounts: `${scoped.proxy}/accounts`,
+  stats: `${scoped.proxy}/request-stats`,
   diagnostics: '/api/console/proxy/error-diagnostics',
-  ssoSettings: '/api/console/sso/settings/runtime',
+  ssoSettings: `${scoped.sso}/settings/runtime`,
   loginSettings: '/api/console/login-service/settings/runtime',
   password: '/api/console/password',
+  enterprises: '/api/console/proxy/enterprises',
 } as const;
+
+/** One `GET /api/enterprises` row; pool policy omitted (direct mode) unless given. */
+export function enterpriseRow(id: string, overrides: Partial<EnterpriseListItem> = {}): EnterpriseListItem {
+  return {
+    id, displayName: `Fixture ${id}`, githubBaseUrl: 'https://fixture.ghe.com', slug: `${id}-slug`, shortcode: '',
+    pool: null, readiness: null, poolSummary: null, shareScore: null, ...overrides,
+  };
+}
+
+/** Serves the enterprise list the Console header and Dashboard read. */
+export function mountEnterpriseList(app: express.Express, items = [enterpriseRow(ENTERPRISE)]): void {
+  app.get(paths.enterprises, (_req, res) => res.json({ items, nameCapacity: 10000 }));
+}
 
 const timestamp = '2026-09-01T12:00:00.000Z';
 const pendingRequests = new WeakMap<Page, Set<BrowserRequest>>();
@@ -145,8 +168,9 @@ export async function createConsoleFixture(t: TestContext) {
   app.get(paths.summary, (_req, res) => res.json(summary(data.tasks, 'status')));
   app.get(paths.queue, (_req, res) => res.json(data.queue));
   app.get(paths.capacity, (_req, res) => res.json({ current: data.users.length, limit: 100, remaining: 100 - data.users.length, reached: false }));
-  app.get('/api/console/sso/ai-credits/usage', (_req, res) => res.json(data.usage));
-  app.post('/api/console/sso/ai-credits/usage/refresh', (_req, res) => res.json(data.usage));
+  app.get(`${scoped.sso}/ai-credits/usage`, (_req, res) => res.json(data.usage));
+  app.post(`${scoped.sso}/ai-credits/usage/refresh`, (_req, res) => res.json(data.usage));
+  mountEnterpriseList(app);
   app.get(paths.ssoSettings, (_req, res) => res.json(data.ssoSettings));
   app.get(paths.loginSettings, (_req, res) => res.json(data.loginSettings));
   for (const key of ['ssoSettings', 'loginSettings'] as const) {

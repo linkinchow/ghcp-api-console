@@ -7,6 +7,7 @@ import { ConfirmDialog, Dialog } from './ui/dialog.js';
 import { Input } from './ui/input.js';
 import { Select } from './ui/select.js';
 import { Badge } from './ui/badge.js';
+import { scopeText, useOptionalEnterpriseScope } from '../lib/scope.js';
 
 type OperationChange = 'submitted' | 'refreshed' | 'recovered' | 'followed';
 const FOLLOW_DURATION = 120_000;
@@ -296,6 +297,8 @@ export function useOperations(basePath: string | undefined, onChanged: (operatio
 
 export function OperationConfirmation({ controller }: { controller: ReturnType<typeof useOperations> }) {
   const { operation, error, busy } = controller;
+  const scope = useOptionalEnterpriseScope();
+  const where = scope ? `${scopeText(scope)} ` : '';
   const passwordHelpId = useId();
   const [page, setPage] = useState(1);
   const [overrides, setOverrides] = useState<Record<string, string>>({});
@@ -304,6 +307,8 @@ export function OperationConfirmation({ controller }: { controller: ReturnType<t
   const rows = operation?.items ?? [];
   const counts = rows.reduce<Record<string, number>>((result, row) => ({ ...result, [row.status]: (result[row.status] ?? 0) + 1 }), {});
   const pending = counts.pending ?? 0;
+  const eligible = `${where}${pending} eligible target(s) out of ${rows.length} frozen target(s).`;
+  const frozen = `${where}${rows.length} frozen target(s). New matching records are not added to this batch.`;
   const preview = operation?.status === 'preview';
   const credentials = needsCredentials(operation?.action ?? '');
   const dangerous = isDangerous(operation?.action ?? '');
@@ -341,11 +346,11 @@ export function OperationConfirmation({ controller }: { controller: ReturnType<t
   return <>
     <ConfirmDialog open={Boolean(controller.visible && confirming && dangerous)} onClose={controller.close} returnFocusTo={controller.returnFocus}
       title={`Confirm: ${operation?.action ?? ''}`}
-      description={`${pending} eligible target(s) out of ${rows.length} frozen target(s). ${destructiveWarning(operation)}`}
+      description={`${eligible} ${destructiveWarning(operation)}`}
       confirmLabel={`Confirm ${pending} item(s)`} busy={busy || controller.refreshing} error={error} danger
       onConfirm={async () => { await controller.execute({}, ''); }} />
     <Dialog open={Boolean(controller.visible && confirming && credentials)} onClose={controller.close} closeDisabled={busy} returnFocusTo={controller.returnFocus} title={`Confirm: ${operation?.action ?? ''}`}
-      description={`${rows.length} frozen target(s). New matching records are not added to this batch.`}>
+      description={frozen}>
       <div className="space-y-3">
         <p className="text-sm">{Object.entries(counts).map(([status, count]) => `${status}: ${count}`).join(' / ')}</p>
         <div className="rounded bg-blue-50 p-3 text-sm text-blue-900">

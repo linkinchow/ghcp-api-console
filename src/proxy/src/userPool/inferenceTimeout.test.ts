@@ -8,6 +8,7 @@ import { runMigrations } from '../db/migrations.js';
 import { readPoolConfig, UserPoolError } from './config.js';
 import { inferenceHoldTimeoutMs, readInferenceTimeoutMs } from './inferenceTimeout.js';
 import { UserPoolStore } from './store.js';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 
 const env = {
   ACCOUNT_ROUTING_MODE: 'caller-lease', POOL_ACCOUNT_EMAIL_DOMAIN: 'accounts.example.test',
@@ -29,7 +30,7 @@ function fixture(t: TestContext) {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
     db.pragma('busy_timeout = 5000');
-    runMigrations(db);
+    runMigrations(db, defaultEnterpriseSeed({}));
     const store = new UserPoolStore(db, { ...options });
     store.now = () => clock.now;
     return { db, store };
@@ -40,7 +41,7 @@ function fixture(t: TestContext) {
     rmSync(dir, { recursive: true, force: true });
   });
   function ready() {
-    const row = first.store.reserve();
+    const row = first.store.reserve(['default']);
     assert.ok(row);
     first.db.prepare(`UPDATE proxy_accounts SET copilot_oauth_token=?, copilot_oauth_status='valid', gh_login=? WHERE identity=?`)
       .run(`SyntheticToken-${row.identity}`, row.identity, row.identity);
@@ -139,7 +140,7 @@ test('SQLite legacy observer honors 600s persisted hold through provisional expi
   code(() => observer.acquire(caller(2)), 'pool_exhausted');
   f.clock.now = start + 350000;
   observer.finish(held, true);
-  const active = observer.leases()[0];
+  const active = observer.leases('default')[0];
   assert.equal(active.lease_id, held.lease_id);
   assert.equal(active.member_identity, member);
   assert.equal(active.phase, 'active');
@@ -148,7 +149,7 @@ test('SQLite legacy observer honors 600s persisted hold through provisional expi
   assert.equal(hold(f.db, held.request_id), undefined);
   f.clock.now += 1000;
   observer.finish(held, true);
-  assert.deepEqual(observer.leases()[0], active, 'duplicate finish cannot renew again');
+  assert.deepEqual(observer.leases('default')[0], active, 'duplicate finish cannot renew again');
 });
 
 test('SQLite canceled admission and failed long inference remove only their own holds without renewal', t => {
@@ -166,10 +167,10 @@ test('SQLite canceled admission and failed long inference remove only their own 
   f.store.finish(first, false); // Runtime cancellation/failure uses unsuccessful completion.
   assert.equal(hold(f.db, first.request_id), undefined);
   assert.ok(hold(f.db, second.request_id));
-  assert.equal(f.store.leases()[0].phase, 'provisional');
-  assert.equal(f.store.leases()[0].last_success_at, null);
+  assert.equal(f.store.leases('default')[0].phase, 'provisional');
+  assert.equal(f.store.leases('default')[0].last_success_at, null);
   f.store.finish(second, false);
-  assert.equal(f.store.leases().length, 0);
+  assert.equal(f.store.leases('default').length, 0);
   assert.equal(f.store.hasHolds(first.member_identity), false);
   assert.equal(f.store.acquire(caller(2)).member_identity, first.member_identity);
 });
@@ -193,11 +194,11 @@ test('SQLite 600s absolute expiry rejects heartbeat, retains exactly 10s drain, 
   f.clock.now = start + 610000;
   observer.reclaim();
   assert.equal(observer.hasHolds(member), false);
-  assert.equal(observer.leases().length, 0);
+  assert.equal(observer.leases('default').length, 0);
   const replacement = observer.acquire(caller(2));
   observer.finish(held, true);
-  assert.equal(observer.leases()[0].lease_id, replacement.lease_id);
-  assert.equal(observer.leases()[0].phase, 'provisional');
+  assert.equal(observer.leases('default')[0].lease_id, replacement.lease_id);
+  assert.equal(observer.leases('default')[0].phase, 'provisional');
 });
 
 test('SQLite generation fence defeats a still-unexpired 600s hold', t => {
@@ -211,7 +212,7 @@ test('SQLite generation fence defeats a still-unexpired 600s hold', t => {
   assert.equal(f.store.quarantine(member, 'synthetic_stale', held), false);
   f.store.finish(held, true);
   assert.equal(hold(f.db, held.request_id), undefined);
-  assert.equal(f.store.leases().length, 0, 'stale generation cannot promote an expired provisional lease');
+  assert.equal(f.store.leases('default').length, 0, 'stale generation cannot promote an expired provisional lease');
 });
 
 test('SQLite invalid inference override fails before admission or even reclamation mutates SQL', t => {

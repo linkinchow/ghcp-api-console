@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import test from 'node:test';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 
 test('requests Copilot seat assignment when syncing a new Proxy identity', async () => {
   let requestBody: unknown;
+  let requestPath: string | undefined;
   const server = createServer((req, res) => {
+    requestPath = req.url;
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
     req.on('end', () => {
@@ -43,9 +46,10 @@ test('requests Copilot seat assignment when syncing a new Proxy identity', async
 
   try {
     const { syncEmuUser } = await import('./ssoClient.js');
-    const user = await syncEmuUser('alice', { assignCopilotSeat: true });
+    const user = await syncEmuUser(DEFAULT_ENTERPRISE_ID, 'alice', { assignCopilotSeat: true });
 
     assert.equal(user.copilotSeatStatus, 'assigned');
+    assert.equal(requestPath, '/api/enterprises/default/users/batch');
     assert.deepEqual(requestBody, {
       operation: 'sync_emu',
       ssoUsers: ['alice'],

@@ -23,7 +23,9 @@ npm run upgrade:user-pool-mysql -- --sqlite /safe/offline/backup.sqlite --dry-ru
 
 通过安全的环境注入机制提供`MYSQL_URL`。工具不会加载`.env`文件，并明确拒绝`--mysql-url`参数及所有URL查询参数。不要把凭据放入命令参数或日志。
 
-执行写入时，还需提供目标部署的`POOL_WARMUP_MODEL`及账号池不变量环境配置（`PROVISIONAL_LEASE_TTL_SECONDS`、`PREWARM_POLL_SECONDS`、`PREWARM_CONCURRENCY`、`POOL_EXHAUSTED_RETRY_AFTER_SECONDS`、`POOL_REQUEST_TIMEOUT_SECONDS`及新增的运行时池配置）。默认值遵循正常的`readPoolConfig`。备份提供域名及可变的空闲目标／容量／租约配置；显式指定不同域名会被拒绝。`MysqlPoolStore.initialize()`根据实际部署选项初始化配置指纹，不使用占位模型，也不会发起预热请求。后续所有Proxy必须使用相同的不变量配置。编程接口接受明确的`poolConfig: PoolConfig`，以及可选、由调用者持有的`pool: mysql2.Pool`；注入的连接池访问远程目标时必须验证TLS，并且至少有三条连接。`MYSQL_CONNECTION_LIMIT`配置工具内置连接池，范围3～100，默认3。
+执行写入时，还需提供目标部署的`POOL_WARMUP_MODEL`及账号池不变量环境配置（`PROVISIONAL_LEASE_TTL_SECONDS`、`PREWARM_POLL_SECONDS`、`PREWARM_CONCURRENCY`、`POOL_EXHAUSTED_RETRY_AFTER_SECONDS`、`POOL_REQUEST_TIMEOUT_SECONDS`及新增的运行时池配置）。默认值遵循正常的`readPoolConfig`。备份提供域名及可变的空闲目标／容量／租约配置；显式指定不同域名会被拒绝。`MysqlPoolStore.initialize()`根据实际部署选项初始化配置指纹（多企业规则：不含账号域名，域名由企业身份指纹覆盖），不使用占位模型，也不会发起预热请求。后续所有Proxy必须使用相同的不变量配置。编程接口接受明确的`poolConfig: PoolConfig`，以及可选、由调用者持有的`pool: mysql2.Pool`；注入的连接池访问远程目标时必须验证TLS，并且至少有三条连接。`MYSQL_CONNECTION_LIMIT`配置工具内置连接池，范围3～100，默认3。
+
+`default`企业的身份按Proxy启动时的同一规则，从同一环境计算（`ENTERPRISE_REGISTRY_FILE`、`GITHUB_BASE_URL`、`ENTERPRISE_SHORTCODE`等；账号域名取自备份），并用于创建目标表结构。必须与切换后Proxy的配置完全一致，否则Proxy会以`enterprise_identity_changed`拒绝启动。
 
 TLS环境变量沿用现有名称和模式：
 
@@ -42,7 +44,7 @@ npm run upgrade:user-pool-mysql -- --sqlite /safe/offline/backup.sqlite \
 
 ## 校验与数据保留
 
-支持的输入是当前账号池表结构，包括OAuth恢复字段及caller／lease统计列。未知表、视图、触发器名称、关键列缺失或多余、生成列，以及不兼容的SQLite列类型都会被拒绝。**允许保留凭据隔离触发器的前提是其SQLite定义符合标准，不能只检查名称。** 旧版或自定义结构需要单独审查升级；导入器绝不升级或修改源库。任意SQLite索引和表结构迁移历史不会直接复制，MySQL会创建自己的索引与迁移历史。
+支持的输入是r4（单企业）账号池表结构，或已完成多企业迁移的表结构，包括OAuth恢复字段及caller／lease统计列。部分完成多企业迁移的源会被拒绝。未知表、视图、触发器名称、关键列缺失或多余、生成列，以及不兼容的SQLite列类型都会被拒绝。**允许保留凭据隔离触发器及多企业`enterprise_id`守卫触发器的前提是其SQLite定义符合标准，不能只检查名称。** 旧版或自定义结构需要单独审查升级；导入器绝不升级或修改源库。任意SQLite索引和表结构迁移历史不会直接复制，MySQL会创建自己的索引与迁移历史。
 
 预检使用只读连接并设置`query_only`，在同一个读事务中读取表结构、执行`integrity_check`和`foreign_key_check`、读取所有数据表，并显式校验关联关系和字段值。以下情况会被拒绝：
 
@@ -50,8 +52,9 @@ npm run upgrade:user-pool-mysql -- --sqlite /safe/offline/backup.sqlite \
 - 存在开通中的成员、刷新中的账号、未结束的账号OAuth回调、未知状态／阶段、操作意图阶段，或结果不明／未确认的外部操作。
 - failed／disabled成员仍有未结束的Login任务证据。只有在成员已完成验证、状态为`ready`／`cooling`、阶段为`ready`、账号凭据有效且无待处理回调，并且历史task和OAuth ID同时存在时，才接受并保留这些ID。这依据的是worker持久化的开通完成检查点，不是向外部Login服务查询所得的状态。
 - caller哈希非法、关联记录缺失、分配键重复、时间戳不安全／带小数／为负、租约期限不一致、姓名序号／域名／设置无效，或ISO时间格式错误／不规范。
+- 多企业源：存在`default`以外的企业或归属其他企业的行、`proxy_enterprises.inventory_count`与成员数不符，或`default`的身份指纹与部署环境不一致（指纹在写入前检查，dry-run不加载环境，因此不检查）。
 
-复制内容包括：全部Proxy账号和OAuth凭据；含caller／lease归属的请求统计；设置版本、域名、容量、租约时长和下一个序号；成员库存的generation、恢复计数／窗口、错误、重试／验证／冷却时间及已结束的关联字段；租约；目录冷却；事件ID及内容。统计／事件中引用已不存在租约的历史字段仍视为历史引用，不要求当前租约表中存在对应记录。
+所有行保留`enterprise_id`；r4源的账号、统计、成员和事件全部归入`default`。`default`企业的容量取源`proxy_enterprises.max_accounts`（r4源取`user_pool_settings.max_accounts`），`inventory_count`等于复制的成员数，多企业源的状态和策略版本原样保留。复制内容还包括：全部Proxy账号和OAuth凭据；含caller／lease归属的请求统计；设置版本、域名、容量、租约时长和下一个序号；成员库存的generation、恢复计数／窗口、错误、重试／验证／冷却时间及已结束的关联字段；租约；目录冷却；事件ID及内容。统计／事件中引用已不存在租约的历史字段仍视为历史引用，不要求当前租约表中存在对应记录。
 
 有效租约保留原到期时间。已过期的租约与冷却记录也原样复制，后续由正常运行逻辑回收；迁移不会续租或执行回收。只有账号时间字段及统计的`requested_at`会从规范UTC ISO字符串转换为MySQL `DATETIME(3)`。所有账号池毫秒时间戳及SSO创建标记保持不变。目标owner被清除，owner期限置零，并强制暂停预热。
 
@@ -59,7 +62,7 @@ npm run upgrade:user-pool-mysql -- --sqlite /safe/offline/backup.sqlite \
 
 从首次检查目标为空开始，直到初始化、复制、校验及提交／回滚结束，导入器一直持有目标命名锁。只接受空应用表，以及已知MySQL迁移历史和由`MysqlPoolStore.initialize()`生成、尚未使用、未暂停且配置匹配的单例设置种子。非空的部分表结构会在**执行迁移前**被拒绝；不含caller／lease列的空基础统计表可以初始化。未知表、视图、触发器元数据、迁移历史、生成列和非InnoDB表均被拒绝。启动与导入器共用的结构校验会检查受支持的列类型、可空性、默认值、必须的二进制排序规则、完整主键／唯一键、外键行为、查询索引、CHECK条件及标准凭据隔离触发器定义。存在迁移标记后发现隔离机制被修改或缺失，会直接拒绝，不自动修复。已知历史TEXT token排序规则升级仅允许在对应迁移标记出现前执行；其他自定义结构需要单独审查迁移。
 
-表结构初始化调用基础MySQL迁移和`MysqlPoolStore(pool, config).initialize()`。MySQL DDL和初始settings种子**不与数据导入处于同一个事务**，因此失败后可能保留。全部导入DML使用一个可串行化事务：先锁settings，再对所有表做加锁空库检查、复制及读回校验。提交前在内部比对所有字段值（包括token）、记录数及关键关联。不会输出凭据、caller值、源路径、URL或驱动错误。绝不把导入数据合并进已有目标数据。
+表结构初始化调用以部署`default`企业为种子的基础MySQL迁移和`MysqlPoolStore(pool, config).initialize()`。目标中由迁移生成、尚无成员的`default`企业行不视为数据，导入时按上述规则更新。MySQL DDL和初始settings种子**不与数据导入处于同一个事务**，因此失败后可能保留。全部导入DML使用一个可串行化事务：先锁settings，再对所有表做加锁空库检查、复制及读回校验。提交前在内部比对所有字段值（包括token）、记录数及关键关联。不会输出凭据、caller值、源路径、URL或驱动错误。绝不把导入数据合并进已有目标数据。
 
 事务失败会回滚导入的数据，但表结构／种子可能保留。COMMIT异常返回`commit_outcome_unknown`并销毁连接，**不会尝试回滚或重试**。回滚异常返回`rollback_unconfirmed`。出现任一情况，**不要盲目重试，也不要恢复任意一侧部署**；先在维护状态下私下检查目标。工具不会自动重试写入。非空目标会阻止重跑，即使上次成功迁移的是空源库也一样，因为settings已持久化为暂停状态。释放命名锁失败时销毁连接，不将其放回池中。
 

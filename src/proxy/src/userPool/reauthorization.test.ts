@@ -4,16 +4,17 @@ import Database from 'better-sqlite3';
 import { runMigrations } from '../db/migrations.js';
 import { readPoolConfig } from './config.js';
 import { UserPoolStore } from './store.js';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 
 function fixture(t: TestContext) {
   const db = new Database(':memory:');
   db.pragma('foreign_keys=ON');
-  runMigrations(db);
+  runMigrations(db, defaultEnterpriseSeed({}));
   const store = new UserPoolStore(db, readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease',
     POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test', POOL_WARMUP_MODEL: 'test-model', READY_IDLE_TARGET: '1', POOL_MAX_ACCOUNTS: '1' }));
   let now = 1800000000000;
   store.now = () => now;
-  const row = store.reserve()!;
+  const row = store.reserve(['default'])!;
   const token = (value: string) => db.prepare("UPDATE proxy_accounts SET copilot_oauth_status='valid',copilot_oauth_token=?,copilot_oauth_attempt_id=NULL WHERE identity=?").run(value, row.identity);
   const ready = (value = 'test-token') => { token(value); store.update(row.identity, { state: 'ready', stage: 'ready', verified_at: now, attempts: 0 }); };
   ready();
@@ -38,10 +39,10 @@ test('concurrent 401s invalidate and schedule one repair, after every old hold d
   f.store.finish(first, true);
   assert.equal(f.store.pending(), undefined);
   f.store.finish(second, true);
-  assert.equal(f.store.leases().length, 0);
+  assert.equal(f.store.leases('default').length, 0);
   assert.equal(f.store.pending()!.identity, f.identity);
   assert.equal(f.store.inventory(f.identity)!.reauth_count, 1);
-  assert.equal(f.store.events().filter((e: any) => e.action === 'oauth_reauth_scheduled').length, 1);
+  assert.equal(f.store.events('default').filter((e: any) => e.action === 'oauth_reauth_scheduled').length, 1);
 });
 
 test('stale token, generation ABA, disabled account and expired hold cannot start recovery', t => {

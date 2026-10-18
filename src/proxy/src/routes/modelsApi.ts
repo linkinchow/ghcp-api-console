@@ -6,26 +6,32 @@ import { toAdminModels } from '../copilot/adminModels.js';
 import { CopilotApiError, listModelsWithMetadata } from '../copilot/copilotClient.js';
 import { ModelIdCollisionError } from '../copilot/modelIds.js';
 import { ModelsAdminError, resolveModelsAdmin, type ModelsAdminCredential } from '../copilot/modelsAdmin.js';
+import type { ProxyEnterprise } from '../enterprises.js';
+import { requestEnterprise } from './requestEnterprise.js';
 
 const LOOKUP_DEADLINE_MS = 35_000;
 const VERIFY_TIMEOUT_MS = 15_000;
 
 export interface ModelsApiDependencies {
-  admin: () => ModelsAdminCredential;
-  verifySubject: (token: string, signal: AbortSignal) => ReturnType<typeof verifyGithubSubject>;
+  admin: (enterprise: ProxyEnterprise) => ModelsAdminCredential;
+  verifySubject: (
+    enterprise: ProxyEnterprise,
+    token: string,
+    signal: AbortSignal,
+  ) => ReturnType<typeof verifyGithubSubject>;
   catalog: typeof listModelsWithMetadata;
 }
 
 const defaultDependencies: ModelsApiDependencies = {
-  admin: () => resolveModelsAdmin(),
-  verifySubject: (token, signal) => verifyGithubSubject(config.githubApiBaseUrl, token, signal),
+  admin: resolveModelsAdmin,
+  verifySubject: (enterprise, token, signal) => verifyGithubSubject(enterprise.endpoints.apiBaseUrl, token, signal),
   catalog: listModelsWithMetadata,
 };
 
 /**
- * GET /models?refresh=true|false — the Copilot model catalog as seen by the configured GitHub
- * enterprise admin. It never reads, uses or falls back to pool or direct-mode accounts, and it
- * never changes any account state, even when Copilot rejects the admin token.
+ * GET /models?refresh=true|false — the Copilot model catalog of the request's enterprise as seen by that
+ * enterprise's configured admin. Mounted behind `requireEnterprise`. It never reads, uses or falls back to
+ * pool or direct-mode accounts, and it never changes any account state, even when Copilot rejects the token.
  */
 export function createModelsApiRouter(overrides: Partial<ModelsApiDependencies> = {}): Router {
   const deps: ModelsApiDependencies = { ...defaultDependencies, ...overrides };
@@ -47,9 +53,11 @@ export function createModelsApiRouter(overrides: Partial<ModelsApiDependencies> 
     const deadline = setTimeout(abort, LOOKUP_DEADLINE_MS);
     deadline.unref();
 
+    const enterprise = requestEnterprise(res);
     try {
-      const admin = deps.admin();
+      const admin = deps.admin(enterprise);
       const subject = await deps.verifySubject(
+        enterprise,
         admin.accessToken,
         AbortSignal.any([controller.signal, AbortSignal.timeout(VERIFY_TIMEOUT_MS)]),
       );
@@ -60,13 +68,12 @@ export function createModelsApiRouter(overrides: Partial<ModelsApiDependencies> 
         return;
       }
 
-      // A dedicated cache identity: admin catalogs never share cache entries with member accounts.
-      const catalog = await deps.catalog(
-        { identity: `models-admin:${subject.id}`, accessToken: admin.accessToken, api: config.copilotApiBaseUrl },
-        { useCache: !refresh, signal: controller.signal },
-      );
+      const catalog = await deps.catalog(adminCatalogAuth(enterprise, subject.id, admin), {
+        useCache: !refresh,
+        signal: controller.signal,
+      });
       controller.signal.throwIfAborted();
-      if (adminChanged(admin, deps.admin())) {
+      if (adminChanged(admin, deps.admin(enterprise))) {
         res.status(409).json(apiError('models_admin_changed', 'The admin configuration changed during the lookup. Refresh the model catalog.'));
         return;
       }
@@ -89,6 +96,19 @@ export function createModelsApiRouter(overrides: Partial<ModelsApiDependencies> 
   });
 
   return router;
+}
+
+/**
+ * A dedicated cache identity: admin catalogs never share cache entries with member accounts, and numeric
+ * GitHub user IDs of different GitHub instances never share one either (design §6).
+ */
+function adminCatalogAuth(enterprise: ProxyEnterprise, githubUserId: string, admin: ModelsAdminCredential) {
+  return {
+    identity: `models-admin:${enterprise.id}:${githubUserId}`,
+    accessToken: admin.accessToken,
+    api: enterprise.endpoints.copilotApiBaseUrl,
+    enterpriseId: enterprise.id,
+  };
 }
 
 /** `true`/`false`/absent; any other query parameter or shape is rejected. */
@@ -116,7 +136,7 @@ function adminChanged(before: ModelsAdminCredential, after: ModelsAdminCredentia
 const ADMIN_ERROR_RESPONSES: Record<ModelsAdminError['code'], { status: number; message: string }> = {
   models_admin_not_configured: {
     status: 409,
-    message: 'No model-catalog admin is configured. Ask the operator to set MODELS_ADMIN_GITHUB_LOGIN and its Copilot token.',
+    message: 'No model-catalog admin is configured for this enterprise. Ask the operator to set its modelsAdmin.',
   },
   models_admin_credential_missing: {
     status: 409,
@@ -124,7 +144,7 @@ const ADMIN_ERROR_RESPONSES: Record<ModelsAdminError['code'], { status: number; 
   },
   models_admin_configuration_invalid: {
     status: 503,
-    message: 'The model-catalog admin configuration is invalid. Ask the operator to check the MODELS_ADMIN_* settings.',
+    message: 'The model-catalog admin configuration of this enterprise is invalid. Ask the operator to check it.',
   },
 };
 

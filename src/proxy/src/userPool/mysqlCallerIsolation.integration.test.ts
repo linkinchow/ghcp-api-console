@@ -5,6 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { createConnection, createPool, type Connection, type Pool, type PoolConnection, type RowDataPacket } from 'mysql2/promise';
 import { runMysqlMigrations } from '../db/mysqlMigrations.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import type { PoolConfig } from './config.js';
 import { MysqlDeadlineError } from './mysqlDeadline.js';
 import { MysqlPoolStore } from './mysqlStore.js';
@@ -15,6 +16,7 @@ const options: PoolConfig = {
   leaseSeconds: 172800, provisionalSeconds: 300, pollMs: 5000, prewarmConcurrency: 2,
   retryAfterSeconds: 30, warmupModel: 'synthetic-no-http', requestTimeoutMs: 120000,
 };
+const seed = { id: DEFAULT_ENTERPRISE_ID, fingerprint: 'f'.repeat(64), maxAccounts: options.maxAccounts };
 const caller = (n: number) => `sha256:${n.toString(16).padStart(64, '0')}`;
 const lockName = (database: string, id: string) => createHash('sha256').update(JSON.stringify([database, id])).digest('hex');
 const mysqlUrl = process.env.MYSQL_TEST_URL;
@@ -101,7 +103,7 @@ test('MySQL caller isolation: local FIFO protects unrelated callers and shares t
     first = new MysqlPoolStore(firstPool, options);
     const store = first;
     const second = new MysqlPoolStore(secondPool, options);
-    await runMysqlMigrations(pool);
+    await runMysqlMigrations(pool, seed);
     await store.initialize();
     await second.initialize();
 
@@ -115,8 +117,10 @@ test('MySQL caller isolation: local FIFO protects unrelated callers and shares t
       for (const table of ['user_pool_holds', 'user_pool_catalog_holds', 'user_pool_catalog_cooldowns',
         'user_pool_leases', 'user_pool_accounts', 'user_pool_events', 'proxy_accounts']) await pool.query(`DELETE FROM ${table}`);
       await pool.query('UPDATE user_pool_settings SET next_ordinal=0, owner=NULL, owner_until=0 WHERE id=1');
+      // The rows were deleted behind the store's back: reset N_e with them.
+      await pool.query('UPDATE proxy_enterprises SET inventory_count=0');
       for (let i = 0; i < 2; i++) {
-        const member = await store.reserve();
+        const member = await store.reserve(['default']);
         assert.ok(member);
         await pool.execute("UPDATE proxy_accounts SET copilot_oauth_status='valid', copilot_oauth_token='SyntheticToken' WHERE identity=?", [member.identity]);
         await store.update(member.identity, { state: 'ready', stage: 'ready', verified_at: await store.now() });
@@ -214,7 +218,7 @@ test('MySQL caller isolation: local FIFO protects unrelated callers and shares t
       assert.deepEqual(rows.map(row => row.request_id).sort(), survivors.map(h => h.request_id).sort(), 'Only surviving requests have persisted holds');
       assert.equal(rows.filter(row => row.kind === 'catalog').length, 4);
       assert.ok(rows.every(row => row.caller_id === a && row.member_identity === survivors[0].member_identity));
-      const leases = await store.leases();
+      const leases = await store.leases('default');
       assert.equal(leases.length, 2);
       const aLease = leases.find(lease => lease.caller_id === a)!;
       assert.equal(aLease.phase, 'provisional');

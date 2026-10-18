@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { PoolConnection } from 'mysql2/promise';
-import { canonicalSql, MYSQL_CREDENTIAL_FENCE_BODY, MYSQL_SCHEMA, MysqlSchemaError,
+import { canonicalSql, MYSQL_CREDENTIAL_FENCE_BODY, MYSQL_SCHEMA, MysqlSchemaError, parseMysqlKey,
   validateMysqlCredentialFence, validateMysqlSchema } from './mysqlSchema.js';
 
 type Row = Record<string, unknown>;
@@ -19,15 +19,16 @@ function fixture() {
           ? table.pool ? 'utf8mb4_bin' : 'utf8mb4_0900_ai_ci' : null),
         COLUMN_DEFAULT: defaults ? defaults[1] ?? defaults[2] : null, EXTRA: definition.includes('AUTO_INCREMENT') ? 'auto_increment' : '' };
     });
-    indexes[name] = [table.primary, ...table.unique ?? []].map((column, i) => ({ INDEX_NAME: i ? column : 'PRIMARY',
-      NON_UNIQUE: 0, SEQ_IN_INDEX: 1, COLUMN_NAME: column, SUB_PART: null }));
-    for (const index of table.indexes ?? []) {
-      const [indexName, ...parts] = index.replace(/[(),]/g, ' ').trim().split(/\s+/);
-      parts.filter(part => part !== 'DESC').forEach((column, i) => indexes[name].push({ INDEX_NAME: indexName,
-        NON_UNIQUE: 1, SEQ_IN_INDEX: i + 1, COLUMN_NAME: column, SUB_PART: null }));
-    }
-    foreign[name] = (table.foreign ?? []).map(([column, target, referenced, onDelete]) => ({ CONSTRAINT_NAME: 'canonical', COLUMN_NAME: column,
-      REFERENCED_TABLE_NAME: target, REFERENCED_COLUMN_NAME: referenced, DELETE_RULE: onDelete, UPDATE_RULE: 'NO ACTION', local_reference: 1 }));
+    indexes[name] = [{ INDEX_NAME: 'PRIMARY', NON_UNIQUE: 0, SEQ_IN_INDEX: 1, COLUMN_NAME: table.primary,
+      SUB_PART: null }];
+    for (const key of table.unique ?? []) indexes[name].push(...indexRows(key, 0));
+    for (const index of table.indexes ?? []) indexes[name].push(...indexRows(index, 1));
+    foreign[name] = (table.foreign ?? []).flatMap(([column, target, referenced, onDelete, constraint]) => {
+      const targets = referenced.split(', ');
+      return column.split(', ').map((part, i) => ({ CONSTRAINT_NAME: constraint ?? 'canonical', COLUMN_NAME: part,
+        REFERENCED_TABLE_NAME: target, REFERENCED_COLUMN_NAME: targets[i], DELETE_RULE: onDelete,
+        UPDATE_RULE: 'NO ACTION', local_reference: 1 }));
+    });
     checks[name] = (table.checks ?? []).map(check => ({ CHECK_CLAUSE: `(${check})`, ENFORCED: 'YES' }));
   }
   let triggers: Row[] = [{ TRIGGER_NAME: 'user_pool_credential_fence', EVENT_OBJECT_TABLE: 'proxy_accounts', ACTION_TIMING: 'AFTER',
@@ -42,6 +43,29 @@ function fixture() {
     assert.fail(`Unexpected fixture query: ${sql}`);
   } } as unknown as PoolConnection;
   return { columns, indexes, foreign, checks, connection, setTriggers: (rows: Row[]) => { triggers = rows; }, triggers };
+}
+
+function indexRows(spec: string, nonUnique: number): Row[] {
+  const { name, columns } = parseMysqlKey(spec);
+  return columns.map((column, i) => ({ INDEX_NAME: name, NON_UNIQUE: nonUnique, SEQ_IN_INDEX: i + 1,
+    COLUMN_NAME: column, SUB_PART: null }));
+}
+
+/** The r4 shape of a table: what the multi-enterprise upgrade has not added yet. */
+function withoutEnterprise(f: ReturnType<typeof fixture>, table: string): void {
+  f.columns[table] = f.columns[table].filter(row => row.COLUMN_NAME !== 'enterprise_id');
+  f.indexes[table] = f.indexes[table].filter(row => !enterpriseIndex(f, table, String(row.INDEX_NAME)));
+  const enterpriseConstraints = new Set(f.foreign[table].filter(row => row.COLUMN_NAME === 'enterprise_id')
+    .map(row => row.CONSTRAINT_NAME));
+  f.foreign[table] = f.foreign[table].filter(row => !enterpriseConstraints.has(row.CONSTRAINT_NAME));
+}
+
+function enterpriseColumn(f: ReturnType<typeof fixture>): Row {
+  return f.columns.proxy_accounts.find(row => row.COLUMN_NAME === 'enterprise_id')!;
+}
+
+function enterpriseIndex(f: ReturnType<typeof fixture>, table: string, name: string): boolean {
+  return f.indexes[table].some(row => row.INDEX_NAME === name && row.COLUMN_NAME === 'enterprise_id');
 }
 
 test('all canonical schema definitions pass metadata validation', async () => {
@@ -121,4 +145,96 @@ test('credential fence comparison accepts formatting but not semantics, comments
   f.setTriggers([]);
   await assert.rejects(validateMysqlCredentialFence(f.connection), /credential fence is missing/);
   assert.equal(await validateMysqlCredentialFence(f.connection, true), false);
+});
+
+test('extra secondary indexes, unique or not, are tolerated and reported once', async t => {
+  const f = fixture();
+  const warnings: unknown[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => { warnings.push(args); });
+  t.mock.method(console, 'warn', (...args: unknown[]) => { warnings.push(args); });
+  t.mock.method(console, 'error', (...args: unknown[]) => { warnings.push(args); });
+  f.indexes.proxy_request_stats.push({ INDEX_NAME: 'dba_stats_model', NON_UNIQUE: 1, SEQ_IN_INDEX: 1,
+    COLUMN_NAME: 'model', SUB_PART: 20 });
+  f.indexes.user_pool_leases.push({ INDEX_NAME: 'dba_lease_phase', NON_UNIQUE: 0, SEQ_IN_INDEX: 1,
+    COLUMN_NAME: 'phase', SUB_PART: null });
+  // MySQL's own index for a foreign key no declared index covers is expected, not extra.
+  f.indexes.user_pool_catalog_cooldowns.push({ INDEX_NAME: 'fk_user_pool_cooldown_member', NON_UNIQUE: 1,
+    SEQ_IN_INDEX: 1, COLUMN_NAME: 'member_identity', SUB_PART: null });
+  await validateMysqlSchema(f.connection, Object.keys(MYSQL_SCHEMA));
+  await validateMysqlSchema(f.connection, Object.keys(MYSQL_SCHEMA));
+  const reported = JSON.stringify(warnings);
+  assert.doesNotMatch(reported, /fk_user_pool_cooldown_member/);
+  assert.match(reported, /dba_stats_model/);
+  assert.match(reported, /dba_lease_phase/);
+  assert.equal(reported.match(/dba_stats_model/g)?.length, 1);
+});
+
+test('a required index redefined under its own name is still rejected', async () => {
+  const f = fixture();
+  f.indexes.proxy_request_stats.find(row => row.INDEX_NAME === 'idx_proxy_request_stats_enterprise_time')!
+    .COLUMN_NAME = 'identity';
+  await assert.rejects(validateMysqlSchema(f.connection, ['proxy_request_stats']), MysqlSchemaError);
+});
+
+test('extra foreign keys and columns stay strict', async () => {
+  const f = fixture();
+  f.foreign.proxy_request_stats.push({ CONSTRAINT_NAME: 'dba_fk', COLUMN_NAME: 'identity',
+    REFERENCED_TABLE_NAME: 'proxy_accounts', REFERENCED_COLUMN_NAME: 'identity', DELETE_RULE: 'RESTRICT',
+    UPDATE_RULE: 'RESTRICT', local_reference: 1 });
+  await assert.rejects(validateMysqlSchema(f.connection, ['proxy_request_stats']), MysqlSchemaError);
+  const g = fixture();
+  g.columns.proxy_accounts.push({ ...g.columns.proxy_accounts[1], COLUMN_NAME: 'dba_note' });
+  await assert.rejects(validateMysqlSchema(g.connection, ['proxy_accounts']), MysqlSchemaError);
+});
+
+test('composite foreign key columns must match in order', async () => {
+  const f = fixture();
+  const parts = f.foreign.user_pool_accounts.filter(row => row.CONSTRAINT_NAME === 'fk_user_pool_account_enterprise');
+  assert.equal(parts.length, 2);
+  parts[1].REFERENCED_COLUMN_NAME = 'sso_user';
+  await assert.rejects(validateMysqlSchema(f.connection, ['user_pool_accounts']), MysqlSchemaError);
+});
+
+test('enterprise range checks match MySQL CHECK_CLAUSE serialization only', async () => {
+  const f = fixture();
+  f.checks.proxy_enterprises[1].CHECK_CLAUSE = '(`max_accounts` between 1 and 10000)';
+  f.checks.proxy_enterprises[2].CHECK_CLAUSE = '(`inventory_count` >= 0)';
+  await validateMysqlSchema(f.connection, ['proxy_enterprises']);
+  for (const clause of ['(`max_accounts` between 0 and 10000)', '(`max_accounts` between 1 and 10000) or 1',
+    '(`inventory_count` > 0)']) {
+    f.checks.proxy_enterprises[1].CHECK_CLAUSE = clause;
+    await assert.rejects(validateMysqlSchema(f.connection, ['proxy_enterprises']), MysqlSchemaError);
+  }
+});
+
+const ENTERPRISE_TABLES = ['proxy_accounts', 'proxy_request_stats', 'proxy_identity_initializations',
+  'user_pool_accounts', 'user_pool_events'];
+
+test('a pending upgrade accepts the r4 shape, partial steps and the temporary default', async () => {
+  const f = fixture();
+  for (const table of ENTERPRISE_TABLES) withoutEnterprise(f, table);
+  await assert.rejects(validateMysqlSchema(f.connection, ENTERPRISE_TABLES), MysqlSchemaError);
+  await validateMysqlSchema(f.connection, ENTERPRISE_TABLES, { allowPendingEnterprise: true });
+  const g = fixture();
+  g.columns.proxy_accounts.find(row => row.COLUMN_NAME === 'enterprise_id')!.COLUMN_DEFAULT = 'default';
+  g.foreign.proxy_accounts = [];
+  await assert.rejects(validateMysqlSchema(g.connection, ['proxy_accounts']), MysqlSchemaError);
+  await validateMysqlSchema(g.connection, ['proxy_accounts'], { allowPendingEnterprise: true });
+});
+
+test('a pending upgrade still rejects altered enterprise definitions and unrelated drift', async () => {
+  const cases: Array<(f: ReturnType<typeof fixture>) => void> = [
+    f => { enterpriseColumn(f).COLLATION_NAME = 'ascii_general_ci'; },
+    f => { enterpriseColumn(f).COLUMN_DEFAULT = 'other'; },
+    f => { f.indexes.proxy_accounts.find(row => row.INDEX_NAME === 'idx_proxy_accounts_enterprise_updated')!
+      .COLUMN_NAME = 'sso_user'; },
+    f => { f.foreign.proxy_accounts[0].DELETE_RULE = 'CASCADE'; },
+    f => { f.columns.proxy_accounts.find(row => row.COLUMN_NAME === 'gh_login')!.COLUMN_TYPE = 'varchar(64)'; },
+  ];
+  for (const alter of cases) {
+    const f = fixture();
+    alter(f);
+    await assert.rejects(validateMysqlSchema(f.connection, ['proxy_accounts'], { allowPendingEnterprise: true }),
+      MysqlSchemaError);
+  }
 });

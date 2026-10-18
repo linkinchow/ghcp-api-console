@@ -32,20 +32,21 @@ test('marks excess GH imports as failed without rolling back available slots', a
     const { getUser } = await import('../db/usersRepo.js');
     const { updateSsoRuntimeSettings } = await import('../db/runtimeSettingsRepo.js');
     const { applyEmuImportPlan, createEmuImportPlan, listEmuImportPlanRows } = await import('./service.js');
-    updateSsoRuntimeSettings({
+    const enterprise = (await import('../enterprises.js')).defaultSsoEnterprise();
+    updateSsoRuntimeSettings(enterprise.id, {
       expectedVersion: 1,
       changes: { maxSsoUsers: 1, scimRequestDelayMs: 0, scimMaxRetries: 0 },
     });
-    const plan = await createEmuImportPlan();
+    const plan = await createEmuImportPlan(enterprise);
 
-    await applyEmuImportPlan(plan.planId);
+    await applyEmuImportPlan(enterprise, plan.planId);
 
-    const rows = listEmuImportPlanRows(plan.planId).items;
+    const rows = listEmuImportPlanRows(enterprise, plan.planId).items;
     assert.equal(rows.find((row) => row.ssoUser === 'alice')?.status, 'created');
     assert.equal(rows.find((row) => row.ssoUser === 'bob')?.status, 'failed');
     assert.match(rows.find((row) => row.ssoUser === 'bob')?.detail ?? '', /limit of 1 has been reached/);
-    assert.equal(getUser('alice')?.ghLogin, 'alice_emu');
-    assert.equal(getUser('bob'), undefined);
+    assert.equal(getUser(enterprise.id, 'alice')?.ghLogin, 'alice_emu');
+    assert.equal(getUser(enterprise.id, 'bob'), undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }

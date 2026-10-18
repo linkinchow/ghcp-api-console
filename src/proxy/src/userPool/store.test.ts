@@ -9,12 +9,15 @@ import { runMigrations } from '../db/migrations.js';
 import { readPoolConfig, UserPoolError, type PoolConfig } from './config.js';
 import { accountName, NAME_CAPACITY } from './names.js';
 import { UserPoolStore, type HeldLease } from './store.js';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
+import { storeContract, type ContractBackend } from './storeContract.js';
 
 const options = readPoolConfig({
   ACCOUNT_ROUTING_MODE: 'caller-lease', POOL_ACCOUNT_EMAIL_DOMAIN: 'accounts.example.test',
   POOL_WARMUP_MODEL: 'test-model', READY_IDLE_TARGET: '10', POOL_MAX_ACCOUNTS: '100',
 });
 const caller = (number: number): string => `sha256:${number.toString(16).padStart(64, '0')}`;
+const ENTERPRISES = ['default'];
 
 function fixture(t: TestContext, patch: Partial<PoolConfig> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'user-pool-core-'));
@@ -28,7 +31,7 @@ function fixture(t: TestContext, patch: Partial<PoolConfig> = {}) {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
     db.pragma('busy_timeout = 5000');
-    runMigrations(db);
+    runMigrations(db, defaultEnterpriseSeed({}));
     const store = new UserPoolStore(db, config);
     store.now = () => clock.now;
     return { db, store };
@@ -41,7 +44,7 @@ function fixture(t: TestContext, patch: Partial<PoolConfig> = {}) {
   function ready(count = 1): string[] {
     const members: string[] = [];
     for (let index = 0; index < count; index++) {
-      const row = first.store.reserve();
+      const row = first.store.reserve(ENTERPRISES);
       assert.ok(row);
       first.db.prepare(`
         UPDATE proxy_accounts SET copilot_oauth_token = ?, copilot_oauth_status = 'valid', gh_login = ?
@@ -55,6 +58,62 @@ function fixture(t: TestContext, patch: Partial<PoolConfig> = {}) {
     return members;
   }
   return { ...first, path, connect, ready, clock, config };
+}
+
+/** The shared store contract on two SQLite connections to one database file, with the real clock. */
+function sqliteContractBackend(t: TestContext): ContractBackend {
+  const dir = mkdtempSync(join(tmpdir(), 'user-pool-contract-'));
+  const path = join(dir, 'pool.sqlite');
+  const primary = openContractDb(path);
+  runMigrations(primary, defaultEnterpriseSeed({}));
+  const replica = openContractDb(path);
+  t.after(() => {
+    primary.close();
+    replica.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  return {
+    store: new UserPoolStore(primary, options),
+    replica: new UserPoolStore(replica, options),
+    sql: async (statement, values = []) => sqliteStatement(primary, statement, values),
+    recordStatements: (run) => recordSqliteStatements(primary, run),
+  };
+}
+
+function openContractDb(path: string): BetterSqlite3.Database {
+  const db = new BetterSqlite3(path);
+  db.pragma('journal_mode = WAL');
+  db.pragma('foreign_keys = ON');
+  db.pragma('busy_timeout = 5000');
+  return db;
+}
+
+function sqliteStatement(db: BetterSqlite3.Database, sql: string, values: unknown[]): Record<string, unknown>[] {
+  const statement = db.prepare(sql);
+  if (statement.reader) return statement.all(...values) as Record<string, unknown>[];
+  statement.run(...values);
+  return [];
+}
+
+/** The store prepares every statement it runs, so `prepare` and `exec` see each one. */
+async function recordSqliteStatements<T>(db: BetterSqlite3.Database, run: () => Promise<T>) {
+  const statements: string[] = [];
+  const prepare = db.prepare.bind(db);
+  const exec = db.exec.bind(db);
+  db.prepare = ((sql: string) => {
+    statements.push(sql);
+    return prepare(sql);
+  }) as typeof db.prepare;
+  db.exec = ((sql: string) => {
+    statements.push(sql);
+    return exec(sql);
+  }) as typeof db.exec;
+  try {
+    return { result: await run(), statements };
+  } finally {
+    Reflect.deleteProperty(db, 'prepare');
+    Reflect.deleteProperty(db, 'exec');
+  }
 }
 
 function errorCode(action: () => unknown, code: string, status?: number): void {
@@ -75,7 +134,7 @@ if (!isMainThread) {
   const barrier = new Int32Array(data.barrier);
   Atomics.wait(barrier, 0, 0);
   try {
-    const result = data.operation === 'reserve' ? store.reserve()
+    const result = data.operation === 'reserve' ? store.reserve(ENTERPRISES)
       : data.operation === 'catalog' ? store.acquireCatalog(data.caller) : store.acquire(data.caller);
     parentPort!.postMessage({ result });
   } catch (error) {
@@ -92,7 +151,7 @@ if (!isMainThread) {
     controller.abort(reason);
     assert.throws(() => f.store.acquire(caller(1), controller.signal), error => error === reason);
     assert.throws(() => f.store.acquireCatalog(caller(1), controller.signal), error => error === reason);
-    assert.equal(f.store.leases().length, 0);
+    assert.equal(f.store.leases('default').length, 0);
     assert.equal((f.db.prepare('SELECT COUNT(*) n FROM user_pool_holds').get() as { n: number }).n, 0);
     assert.equal((f.db.prepare('SELECT COUNT(*) n FROM user_pool_catalog_holds').get() as { n: number }).n, 0);
   });
@@ -105,7 +164,7 @@ if (!isMainThread) {
       rmSync(dir, { recursive: true, force: true });
     });
     db.pragma('foreign_keys = ON');
-    runMigrations(db);
+    runMigrations(db, defaultEnterpriseSeed({}));
     db.exec(`
       CREATE TABLE user_pool_settings (
         id INTEGER PRIMARY KEY, version INTEGER NOT NULL DEFAULT 1, idle_target INTEGER NOT NULL,
@@ -135,8 +194,8 @@ if (!isMainThread) {
       (id, idle_target, max_accounts, lease_seconds, account_domain, next_ordinal) VALUES (1, 10, 100, 172800, ?, 1)`)
       .run(options.accountDomain);
     db.prepare(`INSERT INTO proxy_accounts
-      (identity, sso_user, copilot_oauth_status, copilot_oauth_token, created_at, updated_at)
-      VALUES (?, ?, 'valid', 'old-token', 'old', 'old')`).run(member, member);
+      (identity, enterprise_id, sso_user, copilot_oauth_status, copilot_oauth_token, created_at, updated_at)
+      VALUES (?, 'default', ?, 'valid', 'old-token', 'old', 'old')`).run(member, member);
     db.prepare(`INSERT INTO user_pool_accounts(identity, ordinal, state, stage, attempt_id, updated_at, verified_at)
       VALUES (?, 0, 'ready', 'ready', 'old-attempt', ?, ?)`).run(member, now, now);
     db.prepare('INSERT INTO user_pool_leases VALUES (?, ?, ?, ?, ?, NULL, ?)')
@@ -144,7 +203,7 @@ if (!isMainThread) {
     db.prepare('INSERT INTO user_pool_holds VALUES (?, ?, ?)').run('legacy-request', 'legacy-lease', now + 5000);
     const store = new UserPoolStore(db, options);
     store.now = () => now;
-    const held: HeldLease = { ...store.leases()[0], request_id: 'legacy-request' };
+    const held: HeldLease = { ...store.leases('default')[0], request_id: 'legacy-request' };
     assert.equal(store.inventory(member)!.generation, 0);
     assert.equal(store.inventory(member)!.oauth_attempt_id, null);
     assert.equal(store.heartbeat(held), false);
@@ -157,8 +216,8 @@ if (!isMainThread) {
     assert.equal(store.hasHolds(member), false);
     const replacement = store.acquire(caller(2));
     store.finish(held, true);
-    assert.equal(store.leases()[0].lease_id, replacement.lease_id);
-    assert.equal(store.leases()[0].phase, 'provisional');
+    assert.equal(store.leases('default')[0].lease_id, replacement.lease_id);
+    assert.equal(store.leases('default')[0].phase, 'provisional');
   });
 
   test('valid replacement credentials require fresh warmup before new admissions', (t) => {
@@ -189,11 +248,11 @@ if (!isMainThread) {
     assert.equal(parallel.expires_at, held.expires_at);
     const other = f.store.acquire(caller(2));
     assert.equal(other.member_identity, second);
-    assert.equal(f.store.leases().length, 2);
+    assert.equal(f.store.leases('default').length, 2);
     errorCode(() => f.store.acquire(caller(3)), 'pool_exhausted', 429);
     f.store.finish(held, false);
     f.store.finish(parallel, false);
-    assert.equal(f.store.leases().find((lease) => lease.caller_id === caller(1))!.expires_at, held.expires_at);
+    assert.equal(f.store.leases('default').find((lease) => lease.caller_id === caller(1))!.expires_at, held.expires_at);
     errorCode(() => f.store.acquire('alice@example.test'), 'invalid_caller_identity', 403);
   });
 
@@ -203,19 +262,19 @@ if (!isMainThread) {
     const held = f.store.acquire(caller(1));
     f.clock.now += 500;
     f.store.finish(held, true);
-    const active = f.store.leases()[0];
+    const active = f.store.leases('default')[0];
     assert.equal(active.phase, 'active');
     assert.equal(active.last_success_at, f.clock.now);
     assert.equal(active.expires_at, f.clock.now + 172800000);
     f.clock.now += 10000;
     f.store.finish(held, true);
-    assert.deepEqual(f.store.leases()[0], active, 'duplicate success cannot extend TTL');
+    assert.deepEqual(f.store.leases('default')[0], active, 'duplicate success cannot extend TTL');
     const next = f.store.acquire(caller(1));
     const settings = f.store.settings();
     f.store.updateSettings(settings.version, { lease_seconds: 3600 });
     f.clock.now += 10;
     f.store.finish(next, true);
-    assert.equal(f.store.leases()[0].expires_at, f.clock.now + 3600000);
+    assert.equal(f.store.leases('default')[0].expires_at, f.clock.now + 3600000);
   });
 
   test('provisional and active expiry cannot reassign a member with a live request', (t) => {
@@ -224,11 +283,12 @@ if (!isMainThread) {
     const held = f.store.acquire(caller(1));
     f.clock.now += 11000;
     f.store.reclaim();
-    assert.equal(f.store.leases().length, 1);
+    assert.equal(f.store.leases('default').length, 1);
     errorCode(() => f.store.acquire(caller(1)), 'lease_draining', 503);
     errorCode(() => f.store.acquire(caller(2)), 'pool_exhausted', 429);
     f.store.finish(held, true);
-    assert.equal(f.store.leases()[0].phase, 'active', 'a pinned live request may finish after provisional expiry');
+    assert.equal(f.store.leases('default')[0].phase, 'active',
+      'a pinned live request may finish after provisional expiry');
     f.db.prepare('UPDATE user_pool_leases SET expires_at = ?').run(f.clock.now + 1000);
     const activeHold = f.store.acquire(caller(1));
     f.clock.now += 2000;
@@ -236,7 +296,7 @@ if (!isMainThread) {
     assert.equal(f.store.hasHolds(member), true);
     errorCode(() => f.store.acquire(caller(2)), 'pool_exhausted');
     f.store.finish(activeHold, false);
-    assert.equal(f.store.leases().length, 0);
+    assert.equal(f.store.leases('default').length, 0);
     assert.equal(f.store.acquire(caller(2)).member_identity, member);
   });
 
@@ -261,8 +321,8 @@ if (!isMainThread) {
     const reassigned = f.store.acquire(caller(2));
     f.store.finish(held, true);
     assert.equal(f.store.heartbeat(held), false);
-    assert.equal(f.store.leases()[0].lease_id, reassigned.lease_id);
-    assert.equal(f.store.leases()[0].phase, 'provisional');
+    assert.equal(f.store.leases('default')[0].lease_id, reassigned.lease_id);
+    assert.equal(f.store.leases('default')[0].phase, 'provisional');
   });
 
   test('late completion within drain grace removes hold without success renewal', (t) => {
@@ -271,7 +331,7 @@ if (!isMainThread) {
     const held = f.store.acquire(caller(1));
     f.clock.now += 5001;
     f.store.finish(held, true);
-    assert.equal(f.store.leases()[0].phase, 'provisional');
+    assert.equal(f.store.leases('default')[0].phase, 'provisional');
     assert.equal(f.store.hasHolds(held.member_identity), false);
   });
 
@@ -288,12 +348,12 @@ if (!isMainThread) {
     assert.equal(f.store.cool(member, 30, held), false);
     assert.equal(f.store.quarantine(member, 'old_401', held), false);
     f.store.finish(held, true);
-    assert.equal(f.store.leases().length, 0);
+    assert.equal(f.store.leases('default').length, 0);
     assert.equal(f.store.inventory(member)!.last_error, 'credential_not_verified');
     f.store.update(member, { state: 'ready', stage: 'ready', verified_at: f.clock.now });
     const current = f.store.acquire(caller(1));
     f.store.finish(current, true);
-    assert.equal(f.store.leases()[0].phase, 'active');
+    assert.equal(f.store.leases('default')[0].phase, 'active');
   });
 
   test('status/authorization/login changes fence holds but unrelated metadata changes do not', (t) => {
@@ -313,7 +373,7 @@ if (!isMainThread) {
     assert.equal(f.store.heartbeat(first), false);
     f.store.finish(first, true);
     assert.equal(f.store.inventory(member)!.state, 'failed');
-    assert.equal(f.store.leases().length, 0);
+    assert.equal(f.store.leases('default').length, 0);
   });
 
   test('completion must match request, lease, member, and caller together', (t) => {
@@ -330,7 +390,7 @@ if (!isMainThread) {
     }
     assert.equal(f.store.hasHolds(first.member_identity), true);
     assert.equal(f.store.hasHolds(second.member_identity), true);
-    assert.ok(f.store.leases().every((lease) => lease.phase === 'provisional'));
+    assert.ok(f.store.leases('default').every((lease) => lease.phase === 'provisional'));
   });
 
   test('catalog discovery has only request-scoped holds and never promotes/renews caller leases', (t) => {
@@ -339,7 +399,7 @@ if (!isMainThread) {
     const catalog = f.store.acquireCatalog(caller(1));
     assert.equal(catalog.kind, 'catalog');
     assert.equal(catalog.member_identity, member);
-    assert.equal(f.store.leases().length, 0);
+    assert.equal(f.store.leases('default').length, 0);
     assert.equal(f.store.counts().catalog_requests, 1);
     assert.equal(f.store.counts().ready_idle, 0);
     errorCode(() => f.store.acquireCatalog(caller(2)), 'pool_exhausted');
@@ -348,17 +408,17 @@ if (!isMainThread) {
     assert.equal(second.member_identity, member);
     const inference = f.store.acquire(caller(1));
     assert.equal(inference.member_identity, member);
-    const lease = f.store.leases()[0];
+    const lease = f.store.leases('default')[0];
     f.store.finish(catalog, true);
-    assert.deepEqual(f.store.leases()[0], { ...lease, active_requests: 2 });
+    assert.deepEqual(f.store.leases('default')[0], { ...lease, active_requests: 2 });
     f.store.finish(inference, true);
-    const active = f.store.leases()[0];
+    const active = f.store.leases('default')[0];
     f.clock.now += 1000;
     f.store.finish(second, true);
-    assert.deepEqual(f.store.leases()[0], { ...active, active_requests: 0 });
+    assert.deepEqual(f.store.leases('default')[0], { ...active, active_requests: 0 });
     const onActive = f.store.acquireCatalog(caller(1));
     f.store.finish(onActive, true);
-    assert.deepEqual(f.store.leases()[0], { ...active, active_requests: 0 });
+    assert.deepEqual(f.store.leases('default')[0], { ...active, active_requests: 0 });
   });
 
   test('catalog-only finish/expiry promptly frees capacity, while disable/retry respects discovery holds', (t) => {
@@ -380,7 +440,7 @@ if (!isMainThread) {
     assert.equal(reassigned.member_identity, member);
     f.store.finish(next, true);
     assert.equal(f.store.hasHolds(member), true);
-    assert.equal(f.store.leases().length, 0);
+    assert.equal(f.store.leases('default').length, 0);
   });
 
   test('catalog hold also pins an expired active lease until discovery drains', (t) => {
@@ -395,7 +455,7 @@ if (!isMainThread) {
     errorCode(() => f.store.release(first.lease_id), 'lease_in_use');
     errorCode(() => f.store.acquire(caller(2)), 'pool_exhausted');
     f.store.finish(catalog, true);
-    assert.equal(f.store.leases().length, 0);
+    assert.equal(f.store.leases('default').length, 0);
     assert.equal(f.store.counts().ready_idle, 1);
   });
 
@@ -410,7 +470,7 @@ if (!isMainThread) {
     assert.equal(f.store.inventory(member)!.cooldown_until, until);
     f.store.finish(held, false);
     f.store.finish(held2, true);
-    assert.equal(f.store.leases()[0].phase, 'provisional');
+    assert.equal(f.store.leases('default')[0].phase, 'provisional');
     f.clock.now += 11000;
     f.store.reclaim();
     errorCode(() => f.store.acquire(caller(1)), 'member_cooling', 429);
@@ -434,7 +494,7 @@ if (!isMainThread) {
     assert.equal(f.store.pending(), undefined);
     errorCode(() => f.store.retry(member), 'member_in_use');
     f.store.finish(held, true);
-    assert.equal(f.store.leases().length, 0);
+    assert.equal(f.store.leases('default').length, 0);
     assert.equal(f.store.inventory(member)!.state, 'failed');
     assert.equal(f.store.update(member, { state: 'ready' }, before), false);
     f.store.retry(member);
@@ -473,12 +533,12 @@ if (!isMainThread) {
     const other = f.connect().store;
     errorCode(() => other.release(held.lease_id), 'lease_in_use', 409);
     other.releaseInactive(member);
-    assert.equal(f.store.leases().length, 1);
+    assert.equal(f.store.leases('default').length, 1);
     other.disable(member);
-    assert.equal(f.store.leases().length, 1);
+    assert.equal(f.store.leases('default').length, 1);
     assert.equal(other.pending(), undefined);
     f.store.finish(held, true);
-    assert.equal(f.store.leases().length, 0);
+    assert.equal(f.store.leases('default').length, 0);
     assert.equal(f.store.inventory(member)!.state, 'disabled');
     errorCode(() => other.release(held.lease_id), 'lease_not_found', 404);
     errorCode(() => other.disable('missing'), 'member_not_found', 404);
@@ -491,46 +551,50 @@ if (!isMainThread) {
     const held = f.store.acquire(caller(1));
     const other = f.connect();
     const initial = f.store.settings();
-    const updated = other.store.updateSettings(initial.version, { idle_target: 0, max_accounts: 1, paused: 1 });
+    const updated = other.store.updateSettings(initial.version, { idle_target: 0, paused: 1 });
     assert.equal(updated.version, initial.version + 1);
     errorCode(() => f.store.updateSettings(initial.version, { paused: 0 }), 'settings_version_conflict', 409);
-    assert.equal(f.store.reserve(), undefined);
+    assert.equal(f.store.reserve(ENTERPRISES), undefined);
     assert.equal(f.store.pending(), undefined);
-    assert.equal(f.store.leases()[0].lease_id, held.lease_id);
+    assert.equal(f.store.leases('default')[0].lease_id, held.lease_id);
     assert.equal(f.store.acquire(caller(2)).phase, 'provisional', 'pause only stops provisioning');
     for (const patch of [
-      { version: 10 }, { other: 1 }, { idle_target: -1 }, { idle_target: 2 }, { max_accounts: 0 },
-      { max_accounts: 10001 }, { lease_seconds: 59 }, { lease_seconds: 2592001 }, { lease_seconds: 1.5 },
+      { version: 10 }, { other: 1 }, { idle_target: -1 }, { idle_target: 10001 },
+      { lease_seconds: 59 }, { lease_seconds: 2592001 }, { lease_seconds: 1.5 },
       { paused: true }, { paused: 2 }, { idle_target: undefined }, null, [],
     ]) {
       errorCode(() => f.store.updateSettings(updated.version, patch as never), 'invalid_pool_settings', 400);
     }
+    // The cap belongs to each enterprise now (PATCH /api/enterprises/:id/pool-policy).
+    errorCode(() => f.store.updateSettings(updated.version, { max_accounts: 1 } as never), 'use_enterprise_cap', 409);
     assert.deepEqual(new UserPoolStore(other.db, { ...f.config, idleTarget: 99, leaseSeconds: 60 }).settings(), updated);
-    assert.throws(() => new UserPoolStore(other.db, { ...f.config, accountDomain: 'other.test' }), /domain differs/);
+    // The account domain is part of the enterprise identity now, which the Proxy migrations verify.
+    assert.deepEqual(new UserPoolStore(other.db, { ...f.config, accountDomain: 'other.test' }).settings(), updated);
   });
 
   test('reservation counts provisioning and leased capacity and safely skips existing aliases', (t) => {
     const f = fixture(t, { idleTarget: 2, maxAccounts: 3 });
     const timestamp = new Date(f.clock.now).toISOString();
     f.db.prepare(`
-      INSERT INTO proxy_accounts(identity, sso_user, created_at, updated_at) VALUES (?, ?, ?, ?), (?, ?, ?, ?)
+      INSERT INTO proxy_accounts(identity, enterprise_id, sso_user, created_at, updated_at)
+      VALUES (?, 'default', ?, ?, ?), (?, 'default', ?, ?, ?)
     `).run(accountName(0).toUpperCase(), 'direct', timestamp, timestamp,
       'another-direct-account', accountName(1).toUpperCase(), timestamp, timestamp);
-    const first = f.store.reserve()!;
-    const second = f.connect().store.reserve()!;
+    const first = f.store.reserve(ENTERPRISES)!;
+    const second = f.connect().store.reserve(ENTERPRISES)!;
     assert.equal(first.ordinal, 2);
     assert.equal(second.ordinal, 3);
-    assert.equal(f.store.reserve(), undefined);
+    assert.equal(f.store.reserve(ENTERPRISES), undefined);
     assert.equal(f.store.counts().provisioning, 2);
     f.db.prepare("UPDATE proxy_accounts SET copilot_oauth_token = 'valid', copilot_oauth_status = 'valid' WHERE identity = ?")
       .run(first.identity);
     f.store.update(first.identity, { state: 'ready', stage: 'ready', verified_at: f.clock.now });
     f.store.acquire(caller(1));
-    const third = f.store.reserve()!;
+    const third = f.store.reserve(ENTERPRISES)!;
     assert.equal(third.ordinal, 4);
-    assert.equal(f.store.reserve(), undefined, 'all inventory states count toward the cap');
+    assert.equal(f.store.reserve(ENTERPRISES), undefined, 'all inventory states count toward the cap');
     f.store.disable(second.identity);
-    assert.equal(f.store.reserve(), undefined);
+    assert.equal(f.store.reserve(ENTERPRISES), undefined);
     assert.equal(f.store.counts().total, 3);
     assert.equal((f.db.prepare('SELECT COUNT(*) n FROM proxy_accounts').get() as { n: number }).n, 5);
   });
@@ -538,16 +602,16 @@ if (!isMainThread) {
   test('name capacity exhausts without wraparound and survives store reconstruction', (t) => {
     const f = fixture(t);
     f.db.prepare('UPDATE user_pool_settings SET next_ordinal = ?').run(NAME_CAPACITY - 1);
-    const last = f.store.reserve()!;
+    const last = f.store.reserve(ENTERPRISES)!;
     assert.equal(last.identity, accountName(9999));
-    errorCode(() => f.store.reserve(), 'name_catalog_exhausted', 503);
-    errorCode(() => f.connect().store.reserve(), 'name_catalog_exhausted', 503);
+    errorCode(() => f.store.reserve(ENTERPRISES), 'name_catalog_exhausted', 503);
+    errorCode(() => f.connect().store.reserve(ENTERPRISES), 'name_catalog_exhausted', 503);
     assert.equal((f.db.prepare('SELECT next_ordinal n FROM user_pool_settings').get() as { n: number }).n, NAME_CAPACITY);
   });
 
   test('failed provisioning obeys backoff, maximum attempts, pause and ambiguous-stage reconciliation', (t) => {
     const f = fixture(t);
-    const row = f.store.reserve()!;
+    const row = f.store.reserve(ENTERPRISES)!;
     f.store.fail(row.identity, 'temporary');
     assert.equal(f.store.pending(), undefined);
     f.clock.now += 30000;
@@ -592,7 +656,7 @@ if (!isMainThread) {
 
   test('worker writes are atomically fenced by retry attempt and owner lease expiry', (t) => {
     const f = fixture(t);
-    const row = f.store.reserve()!;
+    const row = f.store.reserve(ENTERPRISES)!;
     const second = f.connect().store;
     assert.equal(f.store.claimOwner('first'), true);
     assert.equal(f.store.update(row.identity, { stage: 'sso-created' }, row.attempt_id, 'first'), true);
@@ -613,7 +677,7 @@ if (!isMainThread) {
 
   test('OAuth callback correlation persists independently of the provisioning retry fence', (t) => {
     const f = fixture(t);
-    const row = f.store.reserve()!;
+    const row = f.store.reserve(ENTERPRISES)!;
     assert.equal(f.store.update(row.identity, {
       stage: 'oauth-wait', oauth_attempt_id: 'oauth-attempt', task_id: 'login-task',
       sso_created_at: '2026-01-01T00:00:00.000Z',
@@ -632,12 +696,12 @@ if (!isMainThread) {
 
   test('audit output is bounded and never includes credentials', (t) => {
     const f = fixture(t);
-    f.ready();
-    for (let index = 0; index < 10020; index++) f.store.event('test_event', undefined, undefined, undefined, 'safe');
+    const [member] = f.ready();
+    for (let index = 0; index < 10020; index++) f.store.event('test_event', member, undefined, undefined, 'safe');
     assert.equal((f.db.prepare('SELECT COUNT(*) n FROM user_pool_events').get() as { n: number }).n, 10000);
-    assert.equal(f.store.events().length, 200);
-    assert.equal(JSON.stringify(f.store.accounts()).includes('token-'), false);
-    assert.equal(JSON.stringify(f.store.events()).includes('token-'), false);
+    assert.equal(f.store.events('default').length, 200);
+    assert.equal(JSON.stringify(f.store.accounts('default')).includes('token-'), false);
+    assert.equal(JSON.stringify(f.store.events('default')).includes('token-'), false);
   });
 
   async function parallel(f: ReturnType<typeof fixture>, operation: string, callers: string[]) {
@@ -688,7 +752,7 @@ if (!isMainThread) {
     const holds = results.map((item) => item.result as HeldLease);
     assert.equal(new Set(holds.map((held) => held.lease_id)).size, 1);
     assert.equal(new Set(holds.map((held) => held.request_id)).size, 4);
-    assert.equal(f.store.leases().length, 1);
+    assert.equal(f.store.leases('default').length, 1);
   });
 
   test('parallel discovery never borrows another caller member or creates durable leases', async (t) => {
@@ -699,7 +763,7 @@ if (!isMainThread) {
     assert.equal(holds.length, 2);
     assert.equal(new Set(holds.map((held) => held.member_identity)).size, 2);
     assert.equal(results.filter((item) => item.error === 'pool_exhausted').length, 2);
-    assert.equal(f.store.leases().length, 0);
+    assert.equal(f.store.leases('default').length, 0);
     for (const held of holds) f.store.finish(held, true);
     assert.equal(f.store.counts().ready_idle, 2);
   });
@@ -710,5 +774,9 @@ if (!isMainThread) {
     assert.equal(results.filter((item) => item.result).length, 2);
     assert.ok(results.every((item) => !item.error));
     assert.equal(f.store.counts().provisioning, 2);
+  });
+
+  test('SQLite store contract (design §9.3)', async (t) => {
+    await storeContract(t, sqliteContractBackend(t));
   });
 }

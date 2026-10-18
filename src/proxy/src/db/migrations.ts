@@ -1,14 +1,20 @@
 import type Database from 'better-sqlite3';
+import { runEnterpriseMigrations } from './enterpriseMigrations.js';
+import { CREATE_PROXY_ENTERPRISES_SQL } from './enterpriseRepo.js';
+import type { EnterpriseSeed } from './enterpriseSeed.js';
 
 const COPILOT_OAUTH_MIGRATION = '2026-07-23-copilot-oauth-direct';
 
-export function runMigrations(db: Database.Database): void {
+/** Fresh tables are created with `enterprise_id`; the enterprise steps upgrade older databases in place. */
+export function runMigrations(db: Database.Database, seed: EnterpriseSeed): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       id TEXT PRIMARY KEY,
       applied_at TEXT NOT NULL
     );
   `);
+  // proxy_accounts references it, and SQLite cannot prepare writes to a table whose parent table is missing.
+  db.exec(CREATE_PROXY_ENTERPRISES_SQL);
   migrateCopilotOauthCredentials(db);
   createProxyAccountsTable(db);
   addColumnIfMissing(db, 'proxy_accounts', 'copilot_oauth_attempt_id', 'TEXT');
@@ -27,7 +33,8 @@ export function runMigrations(db: Database.Database): void {
       output_tokens INTEGER,
       cache_tokens INTEGER,
       cache_input_tokens INTEGER,
-      cache_write_tokens INTEGER
+      cache_write_tokens INTEGER,
+      enterprise_id TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_proxy_request_stats_identity_time
@@ -46,12 +53,14 @@ export function runMigrations(db: Database.Database): void {
       claim_id TEXT NOT NULL,
       lease_expires_at TEXT NOT NULL,
       created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      enterprise_id TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_proxy_identity_initializations_lease
       ON proxy_identity_initializations(lease_expires_at);
   `);
+  runEnterpriseMigrations(db, seed);
 }
 
 function migrateCopilotOauthCredentials(db: Database.Database): void {
@@ -108,7 +117,8 @@ function createProxyAccountsTable(db: Database.Database, table = 'proxy_accounts
       copilot_oauth_updated_at TEXT,
       copilot_oauth_attempt_id TEXT,
       created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      enterprise_id TEXT REFERENCES proxy_enterprises(id)
     )
   `);
 }

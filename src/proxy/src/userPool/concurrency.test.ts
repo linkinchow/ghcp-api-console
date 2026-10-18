@@ -6,11 +6,12 @@ import { readPoolConfig } from './config.js';
 import { UserPoolStore } from './store.js';
 import { PrewarmWorker } from './worker.js';
 import type { ProvisionAdapter, ProvisionContext, ProvisionPatch } from './provisioner.js';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 
 function setup(t: TestContext, target = 20, cap = target) {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  runMigrations(db, defaultEnterpriseSeed({}));
   const config = readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease', POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test',
     POOL_WARMUP_MODEL: 'test-model', READY_IDLE_TARGET: String(target), POOL_MAX_ACCOUNTS: String(cap) });
   const store = new UserPoolStore(db, config);
@@ -43,7 +44,10 @@ async function waitFor(predicate: () => boolean) {
 
 test('N=50 and idle=30 registers all 20 missing accounts but runs at most five stages', async (t) => {
   const f = setup(t, 50);
-  for (let i = 0; i < 30; i++) { const row = f.store.reserve()!; f.store.update(row.identity, f.ready(row.identity)); }
+  for (let i = 0; i < 30; i++) {
+    const row = f.store.reserve(['default'])!;
+    f.store.update(row.identity, f.ready(row.identity));
+  }
   let active = 0, peak = 0;
   const steps = new Map<string, ReturnType<typeof deferred<ProvisionPatch>>>();
   const worker = f.worker({ step(row) {
@@ -110,15 +114,15 @@ test('OAuth wait yields its lane and cannot be hot-polled by request wake storms
 test('backoff counts as projected supply; terminal failures permit bounded replacement', (t) => {
   const f = setup(t, 5, 7);
   assert.equal(f.store.claimOwner('owner'), true);
-  assert.equal(f.store.reserveDeficit('owner'), 5);
+  assert.equal(f.store.reserveDeficit('owner', ['default']), 5);
   const rows = f.rows();
   for (const row of rows.slice(0, 2)) f.store.update(row!.identity, f.ready(row!.identity));
   for (const row of rows.slice(3)) f.store.fail(row!.identity, 'service_unavailable');
-  assert.equal(f.store.reserveDeficit('owner'), 0);
-  assert.equal(f.store.reserveDeficit('other-owner'), 0);
+  assert.equal(f.store.reserveDeficit('owner', ['default']), 0);
+  assert.equal(f.store.reserveDeficit('other-owner', ['default']), 0);
   f.store.update(rows[4]!.identity, { attempts: 3 });
-  assert.equal(f.store.reserveDeficit('owner'), 1);
-  assert.equal(f.store.reserveDeficit('owner'), 0);
+  assert.equal(f.store.reserveDeficit('owner', ['default']), 1);
+  assert.equal(f.store.reserveDeficit('owner', ['default']), 0);
   assert.equal(f.store.counts().total, 6);
 });
 
@@ -135,12 +139,12 @@ test('catalog exhaustion keeps existing and partially reserved tasks dispatchabl
 test('due retry and OAuth polls are scheduled ahead of newly reserved accounts', (t) => {
   const f = setup(t, 3, 4);
   let now = f.store.now(); f.store.now = () => now;
-  const first = f.store.reserve()!, second = f.store.reserve()!;
+  const first = f.store.reserve(['default'])!, second = f.store.reserve(['default'])!;
   f.store.update(first.identity, { stage: 'oauth-wait', retry_at: now + 100 });
   f.store.fail(second.identity, 'temporary');
   now += 31000;
   assert.equal(f.store.claimOwner('owner'), true);
-  assert.equal(f.store.reserveDeficit('owner'), 1);
+  assert.equal(f.store.reserveDeficit('owner', ['default']), 1);
   assert.equal(f.store.pending()!.identity, first.identity);
   assert.equal(f.store.pending([first.identity])!.identity, second.identity);
 });
@@ -151,7 +155,8 @@ test('pause stops new dispatch while active stages finish; shrink does not delet
   const worker = f.worker({ step(row) { const step = deferred<ProvisionPatch>(); running.set(row.identity, step); return step.promise; } }, 2);
   await worker.start();
   await waitFor(() => running.size === 2);
-  f.store.updateSettings(f.store.settings().version, { paused: 1, idle_target: 0, max_accounts: 1 });
+  f.store.updateSettings(f.store.settings().version, { paused: 1, idle_target: 0 });
+  f.store.updateEnterprisePolicy('default', f.store.enterprisePolicies()[0].policyVersion, { maxAccounts: 1 });
   for (const [identity, step] of running) step.resolve(f.ready(identity));
   await waitFor(() => f.store.counts().ready_idle === 2);
   await worker.tick();

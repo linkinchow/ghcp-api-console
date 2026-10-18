@@ -1,7 +1,7 @@
 // Independent process: only IPC fixture barriers; no production server/debug endpoints.
 import assert from 'node:assert/strict';
 import { createPool } from 'mysql2/promise';
-import { optedIn, options, validateMockOrigin, type WorkerMessage } from './worker-common.js';
+import { enterpriseSeed, optedIn, options, validateMockOrigin, type WorkerMessage } from './worker-common.js';
 
 const send = (message: Omit<WorkerMessage, 'pid'>) => process.send?.({ ...message, pid: process.pid });
 let closing = false;
@@ -27,7 +27,7 @@ try {
   ]);
   const pool = createPool({ uri: url.toString(), connectionLimit: 4, connectTimeout: 5000,
     timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true });
-  const storage = new MysqlStorage(pool, 2);
+  const storage = new MysqlStorage(pool, 2, true, [await enterpriseSeed()]);
   const store = await storage.userPool(options);
   const claimOwner = store.claimOwner.bind(store);
   store.claimOwner = async owner => {

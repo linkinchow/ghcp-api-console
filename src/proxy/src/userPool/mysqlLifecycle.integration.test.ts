@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import { runMysqlMigrations } from '../db/mysqlMigrations.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import { UserPoolError, type PoolConfig } from './config.js';
 import { MysqlPoolStore } from './mysqlStore.js';
 import type { Inventory } from './store.js';
@@ -17,6 +18,8 @@ const mysqlUrl = process.env.MYSQL_TEST_URL;
 const enabled = Boolean(mysqlUrl) && process.env.MYSQL_POOL_TEST_DISPOSABLE === '1';
 const skip = enabled ? false : 'Requires loopback MYSQL_TEST_URL and MYSQL_POOL_TEST_DISPOSABLE=1; creates a fresh synthetic database.';
 const caller = (n: number) => `sha256:${n.toString(16).padStart(64, '0')}`;
+const deficits = (f: Fixture, owner: string) =>
+  Promise.all([f.first.reserveDeficit(owner, ['default']), f.second.reserveDeficit(owner, ['default'])]);
 
 interface Fixture {
   database: string;
@@ -49,7 +52,8 @@ async function withDatabase(config: PoolConfig, run: (fixture: Fixture) => Promi
     for (let i = 0; i < 2; i++) pools.push(createPool({ uri: url.toString(), connectionLimit: 4,
       connectTimeout: 5000, timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true }));
     const [db, otherDb] = pools;
-    await runMysqlMigrations(db);
+    const seed = { id: DEFAULT_ENTERPRISE_ID, fingerprint: 'f'.repeat(64), maxAccounts: config.maxAccounts };
+    await runMysqlMigrations(db, seed);
     const first = new MysqlPoolStore(db, config), second = new MysqlPoolStore(otherDb, config);
     await Promise.all([first.initialize(), second.initialize()]);
     await run({ database, db, otherDb, first, second });
@@ -62,7 +66,7 @@ async function withDatabase(config: PoolConfig, run: (fixture: Fixture) => Promi
 }
 
 async function ready(f: Fixture): Promise<Inventory> {
-  const row = await f.first.reserve();
+  const row = await f.first.reserve(['default']);
   assert.ok(row);
   await f.db.execute(`UPDATE proxy_accounts SET copilot_oauth_status='valid', copilot_oauth_token=?, gh_login=? WHERE identity=?`,
     [`SyntheticToken-${row.identity}`, row.identity, row.identity]);
@@ -134,18 +138,18 @@ test('MySQL lifecycle: racing settings CAS and deficit batches honor shrink, pau
     const held = await f.second.acquire(caller(1));
     assert.equal(held.member_identity, member.identity);
     await ready(f);
-    assert.ok(await f.first.reserve()); // One queued account and one ready-idle account supply the target.
+    assert.ok(await f.first.reserve(['default'])); // One queued account and one ready-idle account supply the target.
     const original = await inventory(f);
     const owner = randomUUID();
     assert.equal(await f.first.claimOwner(owner), true);
     const initial = await f.first.settings();
     const patches = [
-      { paused: 1, idle_target: 1, max_accounts: 2 },
-      { paused: 1, idle_target: 0, max_accounts: 1 },
+      { paused: 1, idle_target: 1 },
+      { paused: 1, idle_target: 0 },
     ];
     const [writes, batches] = await atSettingsGate(f, 4, () => Promise.all([
       Promise.allSettled([f.first.updateSettings(initial.version, patches[0]), f.second.updateSettings(initial.version, patches[1])]),
-      Promise.allSettled([f.first.reserveDeficit(owner), f.second.reserveDeficit(owner)]),
+      Promise.allSettled([f.first.reserveDeficit(owner, ['default']), f.second.reserveDeficit(owner, ['default'])]),
     ]));
     const reservations = batches.map(result => {
       assert.equal(result.status, 'fulfilled', 'reservation transaction must complete without a SQL error');
@@ -168,15 +172,18 @@ test('MySQL lifecycle: racing settings CAS and deficit batches honor shrink, pau
     assert.ok(added === 0 || added === 2);
     const total = original.length + added;
     await assertBudget(f, total);
-    assert.ok(total > shrunk.max_accounts, 'lowering cap below existing inventory is explicitly allowed');
+    const policy = (await f.first.enterprisePolicies())[0];
+    await f.first.updateEnterprisePolicy('default', policy.policyVersion, { maxAccounts: 1 });
+    assert.ok(total > 1, 'lowering cap below existing inventory is explicitly allowed');
     assert.deepEqual((await inventory(f)).slice(0, original.length), original, 'shrink neither deletes nor rewrites existing jobs');
     const [[events]] = await f.db.query<RowDataPacket[]>("SELECT COUNT(*) n FROM user_pool_events WHERE action='settings_updated'");
     assert.equal(Number(events.n), 1, 'losing CAS cannot leave an audit event');
-    await rejectCode(f.second.updateSettings(initial.version, { paused: 0, idle_target: 6, max_accounts: 6 }), 'settings_version_conflict');
-    await rejectCode(f.first.updateSettings(shrunk.version, { idle_target: shrunk.max_accounts + 1 }), 'invalid_pool_settings');
+    const stale = f.second.updateSettings(initial.version, { paused: 0, idle_target: 6 });
+    await rejectCode(stale, 'settings_version_conflict');
+    await rejectCode(f.first.updateSettings(shrunk.version, { idle_target: 10001 }), 'invalid_pool_settings');
     assert.deepEqual(await f.second.settings(), shrunk);
-    assert.deepEqual(await Promise.all([f.first.reserveDeficit(owner), f.second.reserveDeficit(owner)]), [0, 0]);
-    assert.equal(await f.first.reserve(), undefined);
+    assert.deepEqual(await deficits(f, owner), [0, 0]);
+    assert.equal(await f.first.reserve(['default']), undefined);
     assert.deepEqual(await Promise.all([f.first.pending(), f.second.pending()]), [undefined, undefined]);
     assert.equal(await f.first.heartbeat(held), true, 'pause/shrink cannot evict a live caller');
     const discovery = await f.second.acquireCatalog(caller(2));
@@ -184,21 +191,21 @@ test('MySQL lifecycle: racing settings CAS and deficit batches honor shrink, pau
     await f.first.finish(discovery, false);
 
     const resumed = await f.second.updateSettings(shrunk.version, { paused: 0 });
-    assert.deepEqual(await Promise.all([f.first.reserveDeficit(owner), f.second.reserveDeficit(owner)]), [0, 0]);
+    assert.deepEqual(await deficits(f, owner), [0, 0]);
     const queued = original.find(row => row.state === 'provisioning')!;
     assert.equal((await f.first.pending())!.identity, queued.identity);
     assert.equal((await f.second.pending())!.identity, queued.identity, 'queued work survives a cap below total');
     await assertBudget(f, total);
     // Headroom alone does not create demand. Raising the idle target later adds
     // exactly two jobs: the existing caller's member is not ready-idle supply.
-    const expanded = await f.first.updateSettings(resumed.version, { max_accounts: total + 3 });
-    assert.deepEqual(await Promise.all([f.first.reserveDeficit(owner), f.second.reserveDeficit(owner)]), [0, 0]);
-    await f.second.updateSettings(expanded.version, { idle_target: total + 1 });
-    const replenished = await Promise.all([f.first.reserveDeficit(owner), f.second.reserveDeficit(owner)]);
+    await f.first.updateEnterprisePolicy('default', policy.policyVersion + 1, { maxAccounts: total + 3 });
+    assert.deepEqual(await deficits(f, owner), [0, 0]);
+    await f.second.updateSettings(resumed.version, { idle_target: total + 1 });
+    const replenished = await deficits(f, owner);
     assert.equal(replenished.reduce((sum, n) => sum + n, 0), 2);
-    assert.deepEqual(await Promise.all([f.first.reserveDeficit(owner), f.second.reserveDeficit(owner)]), [0, 0]);
+    assert.deepEqual(await deficits(f, owner), [0, 0]);
     await assertBudget(f, total + 2);
-    assert.equal((await f.second.leases())[0].lease_id, held.lease_id);
+    assert.equal((await f.second.leases('default'))[0].lease_id, held.lease_id);
     await f.first.finish(held, false);
     await f.second.releaseOwner(owner);
   }));
@@ -270,7 +277,7 @@ test('MySQL lifecycle: full-pool credential invalidation repairs unheld members 
       await tick();
       assert.equal(calls.length, 2);
       assert.deepEqual(await Promise.all(heldIdentities.map(identity => f.second.inventory(identity))), pinned);
-      const [lease] = await f.first.leases();
+      const [lease] = await f.first.leases('default');
       assert.equal(lease.lease_id, inference.lease_id);
       assert.equal(lease.phase, 'provisional');
       assert.equal(lease.last_success_at, null);
@@ -283,7 +290,7 @@ test('MySQL lifecycle: full-pool credential invalidation repairs unheld members 
       assert.equal(calls.length, 3);
       assert.equal(calls[2].identity, inference.member_identity, 'only the fully drained member becomes repairable');
       assert.deepEqual(await f.first.inventory(catalog.member_identity), pinned[1]);
-      assert.equal((await f.second.leases()).length, 0);
+      assert.equal((await f.second.leases('default')).length, 0);
       assert.equal((await f.first.counts()).ready_idle, 3);
 
       await f.first.finish(parallelCatalog, true);
@@ -306,7 +313,7 @@ test('MySQL lifecycle: full-pool credential invalidation repairs unheld members 
       assert.equal(counts.failed, 0);
       assert.equal(counts.provisioning, 0);
       assert.equal(counts.catalog_requests, 0);
-      assert.equal((await f.first.leases()).length, 0);
+      assert.equal((await f.first.leases('default')).length, 0);
       await assertBudget(f, 4);
       const [[events]] = await f.db.query<RowDataPacket[]>("SELECT COUNT(*) n FROM user_pool_events WHERE action='account_ready'");
       assert.equal(Number(events.n), 4, 'each repair checkpoint commits once');

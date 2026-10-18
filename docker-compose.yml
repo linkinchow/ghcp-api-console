@@ -4,6 +4,8 @@ x-healthcheck-defaults: &healthcheck-defaults
   retries: 12
   start_period: 20s
 
+# Multi-enterprise release line: to add enterprises, also pass docker-compose.enterprise-registry.yml, which
+# mounts ENTERPRISE_REGISTRY_FILE read-only into Proxy, SSO and Login (docs/multi-enterprise-registry.md).
 services:
   sso:
     build:
@@ -27,9 +29,11 @@ services:
       SSO_DEFAULT_USER_PASSWORD: "${SSO_DEFAULT_USER_PASSWORD:-}"
       SSO_USER_EVENTS_LOG: /data/sso-user-events.log
       ENTERPRISE_SLUG: ${ENTERPRISE_SLUG:?set ENTERPRISE_SLUG}
-      ENTERPRISE_SHORTCODE: ${ENTERPRISE_SHORTCODE:-octo}
-      GITHUB_BASE_URL: ${GITHUB_BASE_URL:-https://github.com}
-      GITHUB_API_BASE_URL: ${GITHUB_API_BASE_URL:-https://api.github.com}
+      # Empty means the built-in default (shortcode octo, https://github.com, API URL derived from
+      # GITHUB_BASE_URL). Keep these empty when the enterprise registry file defines `default` (design §3.5).
+      ENTERPRISE_SHORTCODE: "${ENTERPRISE_SHORTCODE:-}"
+      GITHUB_BASE_URL: "${GITHUB_BASE_URL:-}"
+      GITHUB_API_BASE_URL: "${GITHUB_API_BASE_URL:-}"
       GITHUB_COPILOT_SEAT_PAT: ${GITHUB_COPILOT_SEAT_PAT:-}
       SCIM_BASE_URL: ${SCIM_BASE_URL:?set SCIM_BASE_URL}
       SCIM_TOKEN: ${SCIM_TOKEN:?set SCIM_TOKEN}
@@ -65,9 +69,10 @@ services:
       SSO_URL: ${LOGIN_SSO_URL:-http://sso:7001/login}
       AUTH_HEADLESS: ${AUTH_HEADLESS:-true}
       AUTH_DEBUG_ARTIFACT_DIR: /logs/auth-debug
-      GITHUB_BASE_URL: ${GITHUB_BASE_URL:-https://github.com}
+      # Empty means the built-in default (https://github.com and the OpenCode OAuth client ID).
+      GITHUB_BASE_URL: "${GITHUB_BASE_URL:-}"
       ENTERPRISE_SLUG: ${ENTERPRISE_SLUG:-}
-      GITHUB_OAUTH_CLIENT_ID: ${GITHUB_OAUTH_CLIENT_ID:-Ov23li8tweQw6odWQebz}
+      GITHUB_OAUTH_CLIENT_ID: "${GITHUB_OAUTH_CLIENT_ID:-}"
       GITHUB_OAUTH_SCOPE: ${GITHUB_OAUTH_SCOPE:-read:user}
       OPENCODE_VERSION: ${OPENCODE_VERSION:-1.0.0}
       OPENCODE_USER_AGENT: "${OPENCODE_USER_AGENT:-}"
@@ -101,6 +106,10 @@ services:
       MYSQL_CONNECTION_LIMIT: "${MYSQL_CONNECTION_LIMIT:-10}"
       MYSQL_SSL_MODE: ${MYSQL_SSL_MODE:-disabled}
       MYSQL_SSL_CA_PATH: "${MYSQL_SSL_CA_PATH:-}"
+      # Seconds a Proxy replica waits for another replica's schema migration (1-3600).
+      MYSQL_MIGRATION_LOCK_WAIT_SECONDS: "${MYSQL_MIGRATION_LOCK_WAIT_SECONDS:-30}"
+      # Direct mode: enterprise of new direct identities; empty means `default`.
+      DIRECT_MODE_ENTERPRISE_ID: "${DIRECT_MODE_ENTERPRISE_ID:-}"
       IDENTITY_INIT_LEASE_SECONDS: "${IDENTITY_INIT_LEASE_SECONDS:-900}"
       API_KEY: ${API_KEY:?set API_KEY}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?set INTERNAL_API_TOKEN}
@@ -122,8 +131,10 @@ services:
       CLAUDE_CODE_OPTIMIZED: "${CLAUDE_CODE_OPTIMIZED:-true}"
       SSO_BASE_URL: http://sso:7001
       LOGIN_BASE_URL: http://login:7003
-      ENTERPRISE_SHORTCODE: ${ENTERPRISE_SHORTCODE:-octo}
-      GITHUB_BASE_URL: ${GITHUB_BASE_URL:-https://github.com}
+      # Empty means the built-in default (shortcode octo, https://github.com; API and Copilot URLs derived
+      # from GITHUB_BASE_URL). Keep these empty when the enterprise registry file defines `default`.
+      ENTERPRISE_SHORTCODE: "${ENTERPRISE_SHORTCODE:-}"
+      GITHUB_BASE_URL: "${GITHUB_BASE_URL:-}"
       REQUEST_STATS_PER_ACCOUNT_LIMIT: "${REQUEST_STATS_PER_ACCOUNT_LIMIT:-2}"
       PROXY_ERROR_DIAGNOSTICS_ENABLED: "${PROXY_ERROR_DIAGNOSTICS_ENABLED:-true}"
       PROXY_ERROR_DIAGNOSTICS_DIR: ${PROXY_ERROR_DIAGNOSTICS_DIR:-/data/error-diagnostics}
@@ -132,11 +143,11 @@ services:
       PROXY_ERROR_DIAGNOSTICS_MAX_FILES: "${PROXY_ERROR_DIAGNOSTICS_MAX_FILES:-5}"
       PROXY_ERROR_DIAGNOSTICS_SHARED: "${PROXY_ERROR_DIAGNOSTICS_SHARED:-false}"
       PROXY_INSTANCE_ID: "${PROXY_INSTANCE_ID:-}"
-      COPILOT_API_BASE_URL: ${COPILOT_API_BASE_URL:-https://api.githubcopilot.com}
+      COPILOT_API_BASE_URL: "${COPILOT_API_BASE_URL:-}"
       OPENCODE_VERSION: ${OPENCODE_VERSION:-1.0.0}
       OPENCODE_USER_AGENT: "${OPENCODE_USER_AGENT:-}"
       GITHUB_API_VERSION: ${GITHUB_API_VERSION:-2026-06-01}
-      GITHUB_API_BASE_URL: ${GITHUB_API_BASE_URL:-https://api.github.com}
+      GITHUB_API_BASE_URL: "${GITHUB_API_BASE_URL:-}"
       # Console Models page: catalog of one configured GitHub enterprise admin (docs/models-admin-guide.md).
       MODELS_ADMIN_GITHUB_LOGIN: "${MODELS_ADMIN_GITHUB_LOGIN:-}"
       MODELS_ADMIN_GITHUB_USER_ID: "${MODELS_ADMIN_GITHUB_USER_ID:-}"
@@ -173,6 +184,8 @@ services:
       PROXY_BASE_URL: http://proxy:3000
       SSO_BASE_URL: http://sso:7001
       LOGIN_BASE_URL: http://login:7003
+      # Public Console URL when a reverse proxy rewrites Host; used by the same-origin check on writes.
+      CONSOLE_PUBLIC_BASE_URL: ${CONSOLE_PUBLIC_BASE_URL:-}
     ports:
       - "${CONSOLE_PORT:-7004}:7004"
     volumes:

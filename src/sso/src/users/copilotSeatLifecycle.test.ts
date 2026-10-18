@@ -13,6 +13,7 @@ test('direct seat cancellation, readback errors, restoration and API exports sha
   process.env.SCIM_BASE_URL = 'https://scim.test/enterprise';
   process.env.SCIM_TOKEN = 'test-scim-token';
   process.env.LOG_LEVEL = 'error';
+  process.env.INTERNAL_API_TOKEN = 'lifecycle-internal-token';
   const originalFetch = globalThis.fetch;
   t.after(() => { globalThis.fetch = originalFetch; });
   const requests: Array<{ url: string; method: string }> = [];
@@ -49,24 +50,35 @@ test('direct seat cancellation, readback errors, restoration and API exports sha
   const { readAiCreditsUsage } = await import('../budget/budgetService.js');
   const { updateSsoRuntimeSettings } = await import('../db/runtimeSettingsRepo.js');
   const { assignCopilotSeatForSsoUser, deleteEmuUser, removeCopilotSeatForSsoUser, runSsoUserBatch } = await import('./service.js');
-  const { usersApiRouter } = await import('../routes/usersApi.js');
-  updateSsoRuntimeSettings({ expectedVersion: 1, changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 } });
-  createUser({ ssoUser: 'alice', email: 'alice@example.test', passwordHash: 'hash', salt: 'salt' });
-  updateEmu('alice', { ghLogin: 'alice_emu', ghScimId: 'scim-alice', emuStatus: 'active' });
-  updateCopilotSeat('alice', { status: 'assigned', lastOperation: 'assign' });
-  for (const month of [9, 10]) saveAiCreditsUsagePeriod({ year: 2026, month, quantity: 10, rawJson: {}, fetchedAt: '2026-10-20T00:00:00Z' });
-  const usage = () => readAiCreditsUsage(new Date('2026-10-20T00:00:00Z'));
+  const enterprise = (await import('../enterprises.js')).defaultSsoEnterprise();
+  const { createEnterpriseApiRouter } = await import('../routes/enterpriseRoutes.js');
+  updateSsoRuntimeSettings(enterprise.id, {
+    expectedVersion: 1,
+    changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 },
+  });
+  createUser(enterprise.id, { ssoUser: 'alice', email: 'alice@example.test', passwordHash: 'hash', salt: 'salt' });
+  updateEmu(enterprise.id, 'alice', { ghLogin: 'alice_emu', ghScimId: 'scim-alice', emuStatus: 'active' });
+  updateCopilotSeat(enterprise.id, 'alice', { status: 'assigned', lastOperation: 'assign' });
+  for (const month of [9, 10]) {
+    const period = { year: 2026, month, quantity: 10, rawJson: {}, fetchedAt: '2026-10-20T00:00:00Z' };
+    saveAiCreditsUsagePeriod(enterprise.id, period);
+  }
+  const usage = () => readAiCreditsUsage(enterprise, new Date('2026-10-20T00:00:00Z'));
 
   const app = express();
   app.use(express.json());
-  app.use('/api', usersApiRouter);
+  app.use('/api/enterprises/:enterpriseId', createEnterpriseApiRouter());
   const server = app.listen(0, '127.0.0.1');
   await new Promise<void>((resolve) => server.once('listening', resolve));
   t.after(() => { server.closeAllConnections(); return new Promise<void>((resolve) => server.close(() => resolve())); });
-  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/enterprises/default`;
+  const api = (path: string, init: RequestInit = {}) => originalFetch(`${base}${path}`, {
+    ...init,
+    headers: { 'X-Internal-Token': 'lifecycle-internal-token' },
+  });
 
   await t.test('single DELETE retains access metadata and counts the pending seat', async () => {
-    const response = await originalFetch(`${base}/users/alice/copilot-seat`, { method: 'DELETE' });
+    const response = await api('/users/alice/copilot-seat', { method: 'DELETE' });
     assert.equal(response.status, 200);
     const user = await response.json() as SsoUserDto;
     assert.equal(user.copilotSeatStatus, 'pending_cancellation');
@@ -74,7 +86,7 @@ test('direct seat cancellation, readback errors, restoration and API exports sha
     assert.equal(user.emuStatus, 'active');
     assert.equal(user.ghLogin, 'alice_emu');
     assert.deepEqual(requests.map((request) => request.method), ['DELETE', 'GET']);
-    assert.equal(countAssignedCopilotSeats(), 1);
+    assert.equal(countAssignedCopilotSeats(enterprise.id), 1);
     assert.equal(usage()?.assignedSeatMonthlyCost, 19);
     assert.deepEqual(getDb().prepare('SELECT copilot_seat_status, copilot_seat_pending_cancellation_date FROM sso_users').get(), {
       copilot_seat_status: 'pending_cancellation', copilot_seat_pending_cancellation_date: '2026-10-17',
@@ -83,16 +95,16 @@ test('direct seat cancellation, readback errors, restoration and API exports sha
 
   await t.test('past dates remain pending across list, filter, CSV and cost reads without GH calls', async () => {
     lookupBody = seats('2000-01-01');
-    const batch = await runSsoUserBatch({ operation: 'remove_copilot', ssoUsers: ['alice'] });
+    const batch = await runSsoUserBatch(enterprise, { operation: 'remove_copilot', ssoUsers: ['alice'] });
     assert.equal(batch.summary.success, 1);
     assert.match(batch.rows[0]!.detail, /cancell at 2000-01-01/);
     const before = requests.length;
-    assert.equal(listUsers({ seatStatus: 'pending_cancellation', pageSize: 1 }).total, 1);
-    assert.equal(listUsers({ seatStatus: 'unassigned' }).total, 0);
-    const list = await originalFetch(`${base}/users?seatStatus=pending_cancellation`);
+    assert.equal(listUsers(enterprise.id, { seatStatus: 'pending_cancellation', pageSize: 1 }).total, 1);
+    assert.equal(listUsers(enterprise.id, { seatStatus: 'unassigned' }).total, 0);
+    const list = await api('/users?seatStatus=pending_cancellation');
     const body = await list.json() as { items: SsoUserDto[]; total: number };
     assert.equal(body.items[0]?.copilotSeatPendingCancellationDate, '2000-01-01');
-    const csv = await originalFetch(`${base}/users/export?seatStatus=pending_cancellation`);
+    const csv = await api('/users/export?seatStatus=pending_cancellation');
     assert.equal(csv.status, 200);
     const text = await csv.text();
     assert.match(text, /copilotSeatPendingCancellationDate/);
@@ -102,68 +114,71 @@ test('direct seat cancellation, readback errors, restoration and API exports sha
   });
 
   await t.test('successful mutation with failed readback preserves snapshot and exposes a partial-success error', async () => {
-    const previous = getUser('alice')!;
+    const previous = getUser(enterprise.id, 'alice')!;
     lookupStatus = 503;
-    const response = await originalFetch(`${base}/users/alice/copilot-seat`, { method: 'DELETE' });
+    const response = await api('/users/alice/copilot-seat', { method: 'DELETE' });
     assert.equal(response.status, 400);
     const body = await response.json() as { error: { message: string } };
     assert.match(body.error.message, /accepted.*synchronization failed.*503/);
-    assert.equal(getUser('alice')?.copilotSeatStatus, previous.copilotSeatStatus);
-    assert.equal(getUser('alice')?.copilotSeatPendingCancellationDate, previous.copilotSeatPendingCancellationDate);
-    assert.equal(getUser('alice')?.copilotSeatUpdatedAt, previous.copilotSeatUpdatedAt);
-    assert.match(getUser('alice')?.copilotSeatLastError ?? '', /Previous confirmed state was kept/);
-    const batch = await runSsoUserBatch({ operation: 'remove_copilot', ssoUsers: ['alice'] });
+    assert.equal(getUser(enterprise.id, 'alice')?.copilotSeatStatus, previous.copilotSeatStatus);
+    const pendingDate = getUser(enterprise.id, 'alice')?.copilotSeatPendingCancellationDate;
+    assert.equal(pendingDate, previous.copilotSeatPendingCancellationDate);
+    assert.equal(getUser(enterprise.id, 'alice')?.copilotSeatUpdatedAt, previous.copilotSeatUpdatedAt);
+    assert.match(getUser(enterprise.id, 'alice')?.copilotSeatLastError ?? '', /Previous confirmed state was kept/);
+    const batch = await runSsoUserBatch(enterprise, { operation: 'remove_copilot', ssoUsers: ['alice'] });
     assert.equal(batch.summary.failed, 1);
     assert.match(batch.rows[0]!.detail, /accepted.*synchronization failed/);
-    await assert.rejects(assignCopilotSeatForSsoUser('alice'), /accepted.*assign.*synchronization failed/);
-    assert.equal(getUser('alice')?.copilotSeatPendingCancellationDate, '2000-01-01');
-    assert.equal(countAssignedCopilotSeats(), 1);
+    await assert.rejects(assignCopilotSeatForSsoUser(enterprise, 'alice'), /accepted.*assign.*synchronization failed/);
+    assert.equal(getUser(enterprise.id, 'alice')?.copilotSeatPendingCancellationDate, '2000-01-01');
+    assert.equal(countAssignedCopilotSeats(enterprise.id), 1);
     lookupStatus = 200;
     lookupBody = { seats: [{ assignee: { login: 'alice_emu' } }] };
-    await assert.rejects(removeCopilotSeatForSsoUser('alice'), /missing or invalid pending_cancellation_date/);
-    assert.equal(getUser('alice')?.copilotSeatUpdatedAt, previous.copilotSeatUpdatedAt);
+    const invalidDate = /missing or invalid pending_cancellation_date/;
+    await assert.rejects(removeCopilotSeatForSsoUser(enterprise, 'alice'), invalidDate);
+    assert.equal(getUser(enterprise.id, 'alice')?.copilotSeatUpdatedAt, previous.copilotSeatUpdatedAt);
   });
 
   await t.test('Assign confirms recovery and clears the previous date and errors', async () => {
     lookupBody = seats(null);
-    const user = await assignCopilotSeatForSsoUser('alice');
+    const user = await assignCopilotSeatForSsoUser(enterprise, 'alice');
     assert.equal(user.copilotSeatStatus, 'assigned');
     assert.equal(user.copilotSeatPendingCancellationDate, undefined);
     assert.equal(Boolean(user.copilotSeatLastError), false);
     assert.equal(usage()?.assignedSeatMonthlyCost, 19);
-    await assert.rejects(removeCopilotSeatForSsoUser('alice'), /still assigned.*not yet confirmed/);
-    assert.equal(getUser('alice')?.copilotSeatStatus, 'assigned');
-    assert.match(getUser('alice')?.copilotSeatLastError ?? '', /not yet confirmed/);
+    await assert.rejects(removeCopilotSeatForSsoUser(enterprise, 'alice'), /still assigned.*not yet confirmed/);
+    assert.equal(getUser(enterprise.id, 'alice')?.copilotSeatStatus, 'assigned');
+    assert.match(getUser(enterprise.id, 'alice')?.copilotSeatLastError ?? '', /not yet confirmed/);
     lookupBody = seats('2026-10-17');
-    await assert.rejects(assignCopilotSeatForSsoUser('alice'), /still pending_cancellation.*not yet confirmed/);
-    assert.equal(getUser('alice')?.copilotSeatPendingCancellationDate, '2026-10-17');
+    const unconfirmed = /still pending_cancellation.*not yet confirmed/;
+    await assert.rejects(assignCopilotSeatForSsoUser(enterprise, 'alice'), unconfirmed);
+    assert.equal(getUser(enterprise.id, 'alice')?.copilotSeatPendingCancellationDate, '2026-10-17');
   });
 
   await t.test('mutation failures cannot erase a previously confirmed cancellation', async () => {
     mutationStatus = 422;
     mutationMessage = 'The seat cannot be cancelled because it was assigned through a team.';
-    await assert.rejects(removeCopilotSeatForSsoUser('alice'), /assigned through a team/);
-    assert.equal(getUser('alice')?.copilotSeatStatus, 'pending_cancellation');
-    assert.equal(getUser('alice')?.copilotSeatPendingCancellationDate, '2026-10-17');
+    await assert.rejects(removeCopilotSeatForSsoUser(enterprise, 'alice'), /assigned through a team/);
+    assert.equal(getUser(enterprise.id, 'alice')?.copilotSeatStatus, 'pending_cancellation');
+    assert.equal(getUser(enterprise.id, 'alice')?.copilotSeatPendingCancellationDate, '2026-10-17');
     mutationStatus = 200;
   });
 
   await t.test('another Remove confirms expiration, while a forbidden fallback cannot mark unassigned', async () => {
     lookupStatus = 404;
     listStatus = 403;
-    await assert.rejects(removeCopilotSeatForSsoUser('alice'), /synchronization failed.*403/);
-    assert.equal(getUser('alice')?.copilotSeatStatus, 'pending_cancellation');
+    await assert.rejects(removeCopilotSeatForSsoUser(enterprise, 'alice'), /synchronization failed.*403/);
+    assert.equal(getUser(enterprise.id, 'alice')?.copilotSeatStatus, 'pending_cancellation');
     listStatus = 200;
-    const result = await runSsoUserBatch({ operation: 'remove_copilot', ssoUsers: ['alice'] });
+    const result = await runSsoUserBatch(enterprise, { operation: 'remove_copilot', ssoUsers: ['alice'] });
     assert.equal(result.summary.success, 1);
     assert.match(result.rows[0]!.detail, /No enterprise direct Copilot seat/);
-    assert.equal(getUser('alice')?.copilotSeatStatus, 'unassigned');
-    assert.equal(getUser('alice')?.copilotSeatPendingCancellationDate, undefined);
+    assert.equal(getUser(enterprise.id, 'alice')?.copilotSeatStatus, 'unassigned');
+    assert.equal(getUser(enterprise.id, 'alice')?.copilotSeatPendingCancellationDate, undefined);
     assert.equal(usage()?.assignedSeatCount, 0);
     assert.equal(usage()?.assignedSeatMonthlyCost, 0);
     mutationStatus = 422;
     mutationMessage = 'Cannot cancel a user without a Copilot seat.';
-    const missing = await removeCopilotSeatForSsoUser('alice');
+    const missing = await removeCopilotSeatForSsoUser(enterprise, 'alice');
     assert.match(missing.warning ?? '', /has no Copilot seat/);
     assert.equal(missing.user?.copilotSeatStatus, 'unassigned');
     mutationStatus = 200;
@@ -172,7 +187,7 @@ test('direct seat cancellation, readback errors, restoration and API exports sha
 
   await t.test('deleting the EMU does not wait for the scheduled seat date', async () => {
     lookupBody = seats('2026-10-17');
-    const result = await deleteEmuUser('alice');
+    const result = await deleteEmuUser(enterprise, 'alice');
     assert.equal(result.user?.emuStatus, 'not_synced');
     assert.equal(result.user?.copilotSeatStatus, 'unassigned');
     assert.equal(result.user?.copilotSeatPendingCancellationDate, undefined);

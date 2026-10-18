@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import type { HeldLease } from './store.js';
 
 const savedStartupEnv = { ...process.env };
@@ -46,6 +47,7 @@ test('runtime captures inference-only override without changing store config, ca
     const acquired: Array<{ kind: string; override?: number }> = [];
     const finished: boolean[] = [];
     const held: HeldLease = { caller_id: caller, member_identity: 'synthetic-member', lease_id: 'synthetic-lease',
+      enterprise_id: DEFAULT_ENTERPRISE_ID,
       phase: 'active', assigned_at: 1, expires_at: 1000000, last_success_at: 1,
       request_id: 'synthetic-request', kind: 'lease', deadline_at: 600000 };
     store.acquire = (_caller, _signal, override) => { acquired.push({ kind: 'lease', override }); return held; };

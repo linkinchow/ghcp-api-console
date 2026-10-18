@@ -7,6 +7,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { COMPOSE, loadState, PROJECT, ROOT, sha } from './qualification-prepare.mjs';
+import { MULTI_MODES } from './qualification-multi-lib.mjs';
 
 const APPS = ['proxy', 'proxy2', 'console', 'sso', 'login'];
 const ALL = ['mysql', 'mock', ...APPS, 'bridge'];
@@ -732,58 +733,83 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
   });
 }
 
-try {
-  await main();
-} catch (error) {
-  if (state) {
-    await writeFile(join(state.directory, 'failure-detail.json'), JSON.stringify({
-      name: error?.name,
-      code: error?.code,
-      message: error?.message,
-      stack: error?.stack,
-      sqlState: error?.sqlState,
-    }), { flag: 'wx', mode: 0o600 });
-  }
-  // Only snake_case check names reach the report; anything else may carry environment detail.
-  report.failure = (error?.fixtureFailure || error?.fixtureCheck) && /^[a-z0-9_]+$/.test(error.message)
-    ? error.message
-    : 'fixture_prerequisite_or_assertion_failure';
-  event('qualification_failure', { pass: false, reason: report.failure });
-  process.exitCode = 1;
-} finally {
+// Multi-enterprise modes (design §9.4) live in qualification-multi-run.mjs; `--plan` prints their step plan
+// without touching Docker.
+const MULTI_MODE = MULTI_MODES.includes(process.env.RELEASE_QUALIFICATION_MODE)
+  ? process.env.RELEASE_QUALIFICATION_MODE
+  : undefined;
+if (MULTI_MODE || process.argv[2] === '--plan') {
   clearTimeout(activeTimer);
-  child?.kill('SIGKILL');
-  if (db) await db.end().catch(() => {});
-  if (owned) {
-    // Logs are best effort: a slow or failed log read must never skip stopping the services.
-    await compose(['logs', '--no-color', '--tail', '100', ...ALL], { timeout: 20000, cleanup: true, optional: true })
-      .catch(() => event('cleanup_logs_unavailable', { pass: true }));
-    try {
-      // Failure cleanup never tears down volumes or anything outside this project.
-      await compose(['stop', '-t', '8', ...ALL], { timeout: 120000, cleanup: true });
-      report.cleanup = 'all_owned_services_stopped_volumes_retained';
-    } catch {
-      report.cleanup = 'owned_stop_incomplete_manual_review_required';
-      report.pass = false;
-      process.exitCode = 1;
-    }
-  }
   globalThis.fetch = fetchOriginal;
-  report.elapsedMs = Date.now() - started;
-  report.finishedAt = new Date().toISOString();
-  if (state) {
-    await writeFile(
-      join(state.directory, 'qualification-report.json'),
-      JSON.stringify(report, null, 2),
-      { flag: 'wx', mode: 0o600 },
-    );
+  const multi = await import('./qualification-multi-run.mjs');
+  if (process.argv[2] === '--plan') {
+    if (MULTI_MODE) {
+      console.log(multi.planText(MULTI_MODE));
+    } else {
+      console.error(`--plan needs RELEASE_QUALIFICATION_MODE=${MULTI_MODES.join('|')}`);
+      process.exitCode = 2;
+    }
+  } else {
+    process.exitCode = await multi.runMultiQualification(MULTI_MODE, process.argv.slice(2));
   }
-  console.log(JSON.stringify({
-    result: 'release_qualification',
-    pass: report.pass,
-    elapsedMs: report.elapsedMs,
-    report: state ? join(state.directory, 'qualification-report.json') : null,
-    dropInCompatibilityGatePassed: report.pass,
-    cleanup: report.cleanup ?? 'no_owned_resources_started',
-  }));
+} else {
+  await runSingleQualification();
+}
+
+async function runSingleQualification() {
+  try {
+    await main();
+  } catch (error) {
+    if (state) {
+      await writeFile(join(state.directory, 'failure-detail.json'), JSON.stringify({
+        name: error?.name,
+        code: error?.code,
+        message: error?.message,
+        stack: error?.stack,
+        sqlState: error?.sqlState,
+      }), { flag: 'wx', mode: 0o600 });
+    }
+    // Only snake_case check names reach the report; anything else may carry environment detail.
+    report.failure = (error?.fixtureFailure || error?.fixtureCheck) && /^[a-z0-9_]+$/.test(error.message)
+      ? error.message
+      : 'fixture_prerequisite_or_assertion_failure';
+    event('qualification_failure', { pass: false, reason: report.failure });
+    process.exitCode = 1;
+  } finally {
+    clearTimeout(activeTimer);
+    child?.kill('SIGKILL');
+    if (db) await db.end().catch(() => {});
+    if (owned) {
+      // Logs are best effort: a slow or failed log read must never skip stopping the services.
+      await compose(['logs', '--no-color', '--tail', '100', ...ALL], { timeout: 20000, cleanup: true, optional: true })
+        .catch(() => event('cleanup_logs_unavailable', { pass: true }));
+      try {
+        // Failure cleanup never tears down volumes or anything outside this project.
+        await compose(['stop', '-t', '8', ...ALL], { timeout: 120000, cleanup: true });
+        report.cleanup = 'all_owned_services_stopped_volumes_retained';
+      } catch {
+        report.cleanup = 'owned_stop_incomplete_manual_review_required';
+        report.pass = false;
+        process.exitCode = 1;
+      }
+    }
+    globalThis.fetch = fetchOriginal;
+    report.elapsedMs = Date.now() - started;
+    report.finishedAt = new Date().toISOString();
+    if (state) {
+      await writeFile(
+        join(state.directory, 'qualification-report.json'),
+        JSON.stringify(report, null, 2),
+        { flag: 'wx', mode: 0o600 },
+      );
+    }
+    console.log(JSON.stringify({
+      result: 'release_qualification',
+      pass: report.pass,
+      elapsedMs: report.elapsedMs,
+      report: state ? join(state.directory, 'qualification-report.json') : null,
+      dropInCompatibilityGatePassed: report.pass,
+      cleanup: report.cleanup ?? 'no_owned_resources_started',
+    }));
+  }
 }

@@ -4,6 +4,8 @@ import type { LoginTaskDto } from '@ghcp/shared';
 import type { PoolConfig } from './config.js';
 import { isExhaustedLoginReservation, realProvisioner, type LoginReservationContext, type ProvisionAdapter, type ProvisionInventory } from './provisioner.js';
 import { PrewarmWorker, type PrewarmStore } from './worker.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
+import { unscopedUrl } from '../testing/scopedPaths.js';
 
 const options: PoolConfig = {
   enabled: true, accountDomain: 'pool.example.test', idleTarget: 5, maxAccounts: 100,
@@ -24,7 +26,8 @@ function fixture(count = 5) {
   let now = Date.parse(createdAt), monotonic = 0, owner: string | undefined;
   let paused = 0, held = false;
   const rows: ProvisionInventory[] = Array.from({ length: count }, (_, i) => ({
-    identity: `pool${i}`, ordinal: i, state: 'failed', stage: 'oauth-wait', attempt_id: `worker${i}`,
+    identity: `pool${i}`, enterprise_id: 'default', ordinal: i, state: 'failed', stage: 'oauth-wait',
+    attempt_id: `worker${i}`,
     oauth_attempt_id: `nonce${i}`, sso_created_at: createdAt, task_id: `task${i}`,
     attempts: 3, retry_at: now + 30000, last_error: 'sso_http_503', updated_at: now,
     cooldown_until: 0, verified_at: null, generation: 9,
@@ -48,7 +51,7 @@ function fixture(count = 5) {
     async renewOwner(expected) { return live(expected); },
     async releaseOwner(expected) { if (live(expected)) owner = undefined; },
     async reclaim() {},
-    async settings() { return { version: 1, idle_target: 5, max_accounts: 100, lease_seconds: 600, paused }; },
+    async settings() { return { version: 1, idle_target: 5, lease_seconds: 600, paused }; },
     async reserveDeficit() { return 0; },
     async pending(excluded = []) {
       const row = rows.find(row => row.state === 'provisioning' && row.retry_at <= now && !excluded.includes(row.identity));
@@ -78,10 +81,19 @@ function fixture(count = 5) {
   };
   const adapter: ProvisionAdapter = {
     ...realProvisioner(store, options, {
-      getAccount: async identity => ({ identity, ssoUser: identity, ghLogin: `${identity}_emu`, copilotOauthStatus: 'missing', createdAt, updatedAt: createdAt }),
+      isReady: async () => true,
+      getAccount: async identity => ({
+        identity,
+        enterpriseId: DEFAULT_ENTERPRISE_ID,
+        ssoUser: identity,
+        ghLogin: `${identity}_emu`,
+        copilotOauthStatus: 'missing',
+        createdAt,
+        updatedAt: createdAt,
+      }),
       fetch: async (input, init) => {
         assert.equal(init?.method, 'GET', 'only read-only Login requests are allowed');
-        const url = new URL(String(input));
+        const url = unscopedUrl(input);
         assert.ok(url.pathname.startsWith('/api/tasks'));
         requests.push(url.pathname + url.search);
         signals.push(init!.signal!);

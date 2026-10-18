@@ -10,12 +10,21 @@ import {
   pageResponse,
   type CopilotOauthStatus,
   type DeleteProxyAccountResult,
+  type EnterpriseId,
+  type EnterpriseLifecycleState,
   type PageResponse,
   type ProxyRequestStatDto,
   type ManagementQuery,
   type ManagementSummary,
 } from '@ghcp/shared';
-import { runMysqlMigrations, validateMysqlTables } from './mysqlMigrations.js';
+import {
+  prepareMysqlEnterprises,
+  runMysqlMigrations,
+  syncMysqlEnterprises,
+  validateMysqlTables,
+} from './mysqlMigrations.js';
+import { MYSQL_MIGRATION_LOCK_WAIT } from './mysqlMigrationLock.js';
+import { requireDefaultSeed, type EnterpriseSeed } from './enterpriseSeed.js';
 import { managementSql } from './managementQueries.js';
 import { MysqlPoolStore } from '../userPool/mysqlStore.js';
 import type { PoolConfig } from '../userPool/config.js';
@@ -26,12 +35,15 @@ import type {
   DeleteAccountsBySsoUserResult,
   ImportCopilotOauthTokenInput,
   ProxyAccountRecord,
+  ProxyEnterpriseRecord,
   ProxyStorage,
   RecordRequestStatInput,
+  SnapshotReader,
 } from './storageTypes.js';
 
 interface AccountRow extends RowDataPacket {
   identity: string;
+  enterprise_id: string;
   sso_user: string;
   gh_login: string | null;
   copilot_oauth_token: string | null;
@@ -60,14 +72,31 @@ interface StatRow extends RowDataPacket {
   cache_write_tokens: number | null;
 }
 
+interface EnterpriseRow extends RowDataPacket {
+  id: string;
+  state: EnterpriseLifecycleState;
+  max_accounts: number;
+  inventory_count: number;
+  policy_version: number;
+  profile_fingerprint: string;
+  created_at: number | string;
+  updated_at: number | string;
+}
+
 const SNAPSHOT_READ_DEADLINE_MS = 30_000;
+
+/**
+ * Upserts must not move an identity to another enterprise. Assigning NULL to the NOT NULL column fails the whole
+ * statement (strict mode), so a mismatch leaves the row untouched, like the SQLite immutability trigger.
+ */
+const KEEP_ENTERPRISE_SQL = 'enterprise_id = IF(enterprise_id = VALUES(enterprise_id), enterprise_id, NULL)';
 
 export class MysqlStorage implements ProxyStorage {
   private poolStore?: Promise<MysqlPoolStore>;
 
   userPool(options: PoolConfig): Promise<MysqlPoolStore> {
     return this.poolStore ??= (async () => {
-      const store = new MysqlPoolStore(this.pool, options, this.autoMigrate);
+      const store = new MysqlPoolStore(this.pool, options, this.autoMigrate, this.migrationLockWaitSeconds);
       await store.initialize();
       return store;
     })().catch((error: unknown) => {
@@ -76,7 +105,7 @@ export class MysqlStorage implements ProxyStorage {
     });
   }
 
-  async withReadSnapshot<T>(read: (reader: Pick<ProxyStorage, 'listAccounts' | 'listRequestStatsPage'>) => Promise<T>): Promise<T> {
+  async withReadSnapshot<T>(read: (reader: SnapshotReader) => Promise<T>): Promise<T> {
     // Snapshot reads page through whole tables for exports, so they get a longer budget than single statements.
     const lease = await leaseMysqlConnection(this.pool, new MysqlDeadline(SNAPSHOT_READ_DEADLINE_MS, SNAPSHOT_READ_DEADLINE_MS));
     const { connection } = lease;
@@ -84,8 +113,8 @@ export class MysqlStorage implements ProxyStorage {
       await connection.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
       await connection.beginTransaction();
       return await read({
-        listAccounts: (query) => this.listAccounts(query, connection),
-        listRequestStatsPage: (query) => this.listRequestStatsPage(query, connection),
+        listAccounts: (enterpriseId, query) => this.listAccounts(enterpriseId, query, connection),
+        listRequestStatsPage: (enterpriseId, query) => this.listRequestStatsPage(enterpriseId, query, connection),
       });
     } finally {
       try {
@@ -98,18 +127,27 @@ export class MysqlStorage implements ProxyStorage {
     }
   }
 
+  /**
+   * `seeds`: every registry enterprise, `default` first.
+   * `migrationLockWaitSeconds`: MYSQL_MIGRATION_LOCK_WAIT_SECONDS.
+   */
   constructor(
     private readonly pool: Pool,
     private readonly requestStatsPerAccountLimit: number,
-    private readonly autoMigrate = true,
+    private readonly autoMigrate: boolean,
+    private readonly seeds: readonly EnterpriseSeed[],
+    private readonly migrationLockWaitSeconds: number = MYSQL_MIGRATION_LOCK_WAIT.defaultSeconds,
   ) { }
 
   async initialize(): Promise<void> {
+    const seed = requireDefaultSeed(this.seeds);
     if (this.autoMigrate) {
-      await runMysqlMigrations(this.pool);
+      await runMysqlMigrations(this.pool, seed, this.migrationLockWaitSeconds);
     } else {
       await validateMysqlTables(this.pool);
+      await prepareMysqlEnterprises(this.pool, seed, this.migrationLockWaitSeconds);
     }
+    await syncMysqlEnterprises(this.pool, this.seeds, this.migrationLockWaitSeconds);
     await this.ping();
   }
 
@@ -121,10 +159,14 @@ export class MysqlStorage implements ProxyStorage {
     await this.pool.end();
   }
 
-  async listAccounts(query: AccountListQuery = {}, connection: Pick<Pool, 'execute'> = { execute: this.execute }): Promise<PageResponse<ProxyAccountRecord>> {
+  async listAccounts(
+    enterpriseId: EnterpriseId,
+    query: AccountListQuery = {},
+    connection: Pick<Pool, 'execute'> = { execute: this.execute },
+  ): Promise<PageResponse<ProxyAccountRecord>> {
     let page = Math.max(1, Math.trunc(query.page ?? 1));
     const pageSize = Math.max(1, Math.min(Math.trunc(query.pageSize ?? 25), 100));
-    const { where, args, order } = managementSql('accounts', query, mysqlTimestamp);
+    const { where, args, order } = managementSql('accounts', enterpriseId, query, mysqlTimestamp);
     const [countRows] = await connection.execute<Array<RowDataPacket & { count: number }>>(
       `SELECT COUNT(*) AS count FROM proxy_accounts ${where}`,
       args,
@@ -138,10 +180,13 @@ export class MysqlStorage implements ProxyStorage {
     return pageResponse(rows.map(mapAccountRow), total, page, pageSize);
   }
 
-  async summarizeAccounts(): Promise<ManagementSummary> {
-    const [rows] = await this.execute<Array<RowDataPacket & { status: string; count: number }>>(
-      'SELECT copilot_oauth_status AS status, COUNT(*) AS count FROM proxy_accounts GROUP BY copilot_oauth_status',
-    );
+  async summarizeAccounts(enterpriseId: EnterpriseId): Promise<ManagementSummary> {
+    const [rows] = await this.execute<Array<RowDataPacket & { status: string; count: number }>>(`
+      SELECT copilot_oauth_status AS status, COUNT(*) AS count
+      FROM proxy_accounts
+      WHERE enterprise_id = ?
+      GROUP BY copilot_oauth_status
+    `, [enterpriseId]);
     return { total: rows.reduce((total, row) => total + Number(row.count), 0), counts: Object.fromEntries(rows.map((row) => [row.status, Number(row.count)])), updatedAt: nowIso() };
   }
 
@@ -175,14 +220,18 @@ export class MysqlStorage implements ProxyStorage {
     });
   }
 
-  async deleteAccountsBySsoUser(ssoUser: string): Promise<DeleteAccountsBySsoUserResult> {
+  /** `sso_user` is unique only within an enterprise (design §5.3). */
+  async deleteAccountsBySsoUser(enterpriseId: EnterpriseId, ssoUser: string): Promise<DeleteAccountsBySsoUserResult> {
     const target = ssoUser.trim();
     if (!target) return { ssoUser: target, matchedAccounts: 0, deletedAccounts: 0, deletedRequestStats: 0 };
     return this.transaction(async (connection) => {
-      const [accounts] = await connection.execute<Array<RowDataPacket & { identity: string }>>(
-        'SELECT identity FROM proxy_accounts WHERE LOWER(sso_user) = LOWER(?) FOR UPDATE',
-        [target],
-      );
+      const [accounts] = await connection.execute<Array<RowDataPacket & { identity: string }>>(`
+        SELECT identity
+        FROM proxy_accounts
+        WHERE enterprise_id = ?
+          AND LOWER(sso_user) = LOWER(?)
+        FOR UPDATE
+      `, [enterpriseId, target]);
       const identities = accounts.map((account) => account.identity);
       let deletedRequestStats = 0;
       if (identities.length > 0) {
@@ -193,10 +242,11 @@ export class MysqlStorage implements ProxyStorage {
         );
         deletedRequestStats = statsResult.affectedRows;
       }
-      const [accountResult] = await connection.execute<ResultSetHeader>(
-        'DELETE FROM proxy_accounts WHERE LOWER(sso_user) = LOWER(?)',
-        [target],
-      );
+      const [accountResult] = await connection.execute<ResultSetHeader>(`
+        DELETE FROM proxy_accounts
+        WHERE enterprise_id = ?
+          AND LOWER(sso_user) = LOWER(?)
+      `, [enterpriseId, target]);
       return {
         ssoUser: target,
         matchedAccounts: accounts.length,
@@ -206,13 +256,16 @@ export class MysqlStorage implements ProxyStorage {
     });
   }
 
+  /** An existing identity never moves to another enterprise; trying fails with `enterprise_id_immutable`. */
   async createAccount(input: CreateAccountInput): Promise<ProxyAccountRecord> {
     const now = mysqlTimestamp(nowIso());
-    await this.execute(`
+    await this.upsertAccount(`
       INSERT INTO proxy_accounts (
-        identity, sso_user, gh_login, copilot_oauth_status, copilot_oauth_attempt_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        identity, sso_user, gh_login, copilot_oauth_status, copilot_oauth_attempt_id, created_at, updated_at,
+        enterprise_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
+        ${KEEP_ENTERPRISE_SQL},
         sso_user = VALUES(sso_user),
         gh_login = COALESCE(VALUES(gh_login), gh_login),
         updated_at = VALUES(updated_at)
@@ -224,18 +277,20 @@ export class MysqlStorage implements ProxyStorage {
       input.copilotOauthAttemptId ?? null,
       now,
       now,
+      input.enterpriseId,
     ]);
     return (await this.getAccount(input.identity))!;
   }
 
   async importCopilotOauthToken(input: ImportCopilotOauthTokenInput): Promise<ProxyAccountRecord> {
     const now = mysqlTimestamp(nowIso());
-    await this.execute(`
+    await this.upsertAccount(`
       INSERT INTO proxy_accounts (
         identity, sso_user, gh_login, copilot_oauth_token, copilot_oauth_status,
-        copilot_oauth_updated_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'valid', ?, ?, ?)
+        copilot_oauth_updated_at, created_at, updated_at, enterprise_id
+      ) VALUES (?, ?, ?, ?, 'valid', ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
+        ${KEEP_ENTERPRISE_SQL},
         sso_user = VALUES(sso_user),
         gh_login = COALESCE(VALUES(gh_login), gh_login),
         copilot_oauth_token = VALUES(copilot_oauth_token),
@@ -251,8 +306,18 @@ export class MysqlStorage implements ProxyStorage {
       now,
       now,
       now,
+      input.enterpriseId,
     ]);
     return (await this.getAccount(input.identity))!;
+  }
+
+  private async upsertAccount(sql: string, values: Parameters<Pool['execute']>[1]): Promise<void> {
+    try {
+      await this.execute(sql, values);
+    } catch (error) {
+      if (isBadNullError(error)) throw new Error('enterprise_id_immutable', { cause: error });
+      throw error;
+    }
   }
 
   async saveCopilotOauthToken(
@@ -317,22 +382,27 @@ export class MysqlStorage implements ProxyStorage {
     return result.affectedRows > 0;
   }
 
-  async claimIdentityInitialization(identity: string, claimId: string, leaseSeconds: number): Promise<boolean> {
+  async claimIdentityInitialization(
+    enterpriseId: EnterpriseId,
+    identity: string,
+    claimId: string,
+    leaseSeconds: number,
+  ): Promise<boolean> {
     const now = mysqlTimestamp(nowIso());
     const leaseExpiresAt = mysqlTimestamp(new Date(Date.now() + leaseSeconds * 1000).toISOString());
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
         const [inserted] = await this.execute<ResultSetHeader>(`
           INSERT IGNORE INTO proxy_identity_initializations (
-            identity, claim_id, lease_expires_at, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?)
-        `, [identity, claimId, leaseExpiresAt, now, now]);
+            identity, claim_id, lease_expires_at, created_at, updated_at, enterprise_id
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `, [identity, claimId, leaseExpiresAt, now, now, enterpriseId]);
         if (inserted.affectedRows === 1) return true;
         const [updated] = await this.execute<ResultSetHeader>(`
           UPDATE proxy_identity_initializations
-          SET claim_id = ?, lease_expires_at = ?, updated_at = ?
+          SET claim_id = ?, lease_expires_at = ?, updated_at = ?, enterprise_id = ?
           WHERE identity = ? AND lease_expires_at <= ?
-        `, [claimId, leaseExpiresAt, now, identity, now]);
+        `, [claimId, leaseExpiresAt, now, enterpriseId, identity, now]);
         return updated.affectedRows === 1;
       } catch (err) {
         if (!isRetryableMysqlLockError(err) || attempt === 2) throw err;
@@ -354,8 +424,9 @@ export class MysqlStorage implements ProxyStorage {
     await this.execute(`
       INSERT INTO proxy_request_stats (
         id, identity, gh_login, requested_at, path, model, success, failure_reason,
-        input_tokens, output_tokens, cache_tokens, cache_input_tokens, cache_write_tokens, caller_id, lease_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        input_tokens, output_tokens, cache_tokens, cache_input_tokens, cache_write_tokens, caller_id, lease_id,
+        enterprise_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
       newRequestId(),
       input.identity,
@@ -372,26 +443,31 @@ export class MysqlStorage implements ProxyStorage {
       input.cacheWriteTokens ?? null,
       input.callerId ?? null,
       input.leaseId ?? null,
+      input.enterpriseId,
     ]);
     await this.pruneStats(input.identity);
   }
 
-  async listRequestStats(identity?: string, limit = 100): Promise<ProxyRequestStatDto[]> {
+  async listRequestStats(enterpriseId: EnterpriseId, identity?: string, limit = 100): Promise<ProxyRequestStatDto[]> {
     const boundedLimit = Math.max(1, Math.min(limit, 1000));
-    const [rows] = identity
-      ? await this.execute<StatRow[]>(
-          'SELECT * FROM proxy_request_stats WHERE identity = ? ORDER BY requested_at DESC, id DESC LIMIT ?',
-          [identity, boundedLimit],
-        )
-      : await this.execute<StatRow[]>(
-          'SELECT * FROM proxy_request_stats ORDER BY requested_at DESC, id DESC LIMIT ?',
-          [boundedLimit],
-        );
+    const identityFilter = identity ? 'AND identity = ?' : '';
+    const [rows] = await this.execute<StatRow[]>(`
+      SELECT *
+      FROM proxy_request_stats
+      WHERE enterprise_id = ?
+        ${identityFilter}
+      ORDER BY requested_at DESC, id DESC
+      LIMIT ?
+    `, [enterpriseId, ...(identity ? [identity] : []), boundedLimit]);
     return rows.map(mapStatRow);
   }
 
-  async listRequestStatsPage(query: ManagementQuery = {}, connection: Pick<Pool, 'execute'> = { execute: this.execute }): Promise<PageResponse<ProxyRequestStatDto>> {
-    const { where, args, order } = managementSql('requests', query, mysqlTimestamp);
+  async listRequestStatsPage(
+    enterpriseId: EnterpriseId,
+    query: ManagementQuery = {},
+    connection: Pick<Pool, 'execute'> = { execute: this.execute },
+  ): Promise<PageResponse<ProxyRequestStatDto>> {
+    const { where, args, order } = managementSql('requests', enterpriseId, query, mysqlTimestamp);
     const [counts] = await connection.execute<Array<RowDataPacket & { count: number }>>(`SELECT COUNT(*) AS count FROM proxy_request_stats ${where}`, args);
     const total = Number(counts[0]?.count ?? 0);
     const pageSize = Math.max(1, Math.min(query.pageSize ?? 25, 100));
@@ -399,6 +475,15 @@ export class MysqlStorage implements ProxyStorage {
     const [rows] = await connection.execute<StatRow[]>(`SELECT * FROM proxy_request_stats ${where} ORDER BY ${order} LIMIT ? OFFSET ?`,
       [...args, pageSize, (page - 1) * pageSize]);
     return pageResponse(rows.map(mapStatRow), total, page, pageSize);
+  }
+
+  async listEnterprises(): Promise<ProxyEnterpriseRecord[]> {
+    const [rows] = await this.execute<EnterpriseRow[]>(`
+      SELECT *
+      FROM proxy_enterprises
+      ORDER BY id
+    `);
+    return rows.map(mapEnterpriseRow);
   }
 
   async pruneAllRequestStats(): Promise<void> {
@@ -481,6 +566,7 @@ export class MysqlStorage implements ProxyStorage {
 function mapAccountRow(row: AccountRow): ProxyAccountRecord {
   return {
     identity: row.identity,
+    enterpriseId: row.enterprise_id as EnterpriseId,
     ssoUser: row.sso_user,
     ghLogin: row.gh_login ?? undefined,
     copilotOauthToken: row.copilot_oauth_token ?? undefined,
@@ -489,6 +575,19 @@ function mapAccountRow(row: AccountRow): ProxyAccountRecord {
     copilotOauthAttemptId: row.copilot_oauth_attempt_id ?? undefined,
     createdAt: mysqlTimestampToIso(row.created_at)!,
     updatedAt: mysqlTimestampToIso(row.updated_at)!,
+  };
+}
+
+function mapEnterpriseRow(row: EnterpriseRow): ProxyEnterpriseRecord {
+  return {
+    id: row.id as EnterpriseId,
+    state: row.state,
+    maxAccounts: Number(row.max_accounts),
+    inventoryCount: Number(row.inventory_count),
+    policyVersion: Number(row.policy_version),
+    profileFingerprint: row.profile_fingerprint,
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
   };
 }
 
@@ -524,6 +623,10 @@ function mysqlTimestampToIso(value: string | null): string | undefined {
 function isRetryableMysqlLockError(err: unknown): boolean {
   if (!(err instanceof Error) || !('code' in err)) return false;
   return err.code === 'ER_LOCK_DEADLOCK' || err.code === 'ER_LOCK_WAIT_TIMEOUT';
+}
+
+function isBadNullError(error: unknown): boolean {
+  return error instanceof Error && 'code' in error && error.code === 'ER_BAD_NULL_ERROR';
 }
 
 function sleep(milliseconds: number): Promise<void> {

@@ -11,8 +11,9 @@ const taskPosts = (children: Process[]) => children.flatMap(child => child.messa
   .filter(message => message.kind === 'http' && message.method === 'POST' && message.path === '/api/tasks').length;
 
 async function seed(f: Fixture): Promise<Inventory> {
-  const row = await f.store.reserve(); assert.ok(row);
-  await f.storage.createAccount({ identity: row.identity, ssoUser: row.identity, ghLogin: `${row.identity}_synthetic` });
+  const row = await f.store.reserve(['default']); assert.ok(row);
+  await f.storage.createAccount({ enterpriseId: f.enterprise.id, identity: row.identity, ssoUser: row.identity,
+    ghLogin: `${row.identity}_synthetic` });
   assert.equal(await f.store.update(row.identity, { stage: 'synced', sso_created_at: CREATED_AT }), true);
   return (await f.store.inventory(row.identity))!;
 }
@@ -90,7 +91,9 @@ test('real MySQL Worker/Provisioner Login network fault acceptance', {
         await f.init();
         if (restart) {
           const settings = await f.store.settings();
-          await f.store.updateSettings(settings.version, { idle_target: 1, max_accounts: 1 });
+          await f.store.updateSettings(settings.version, { idle_target: 1 });
+          const [policy] = await f.store.enterprisePolicies();
+          await f.store.updateEnterprisePolicy('default', policy.policyVersion, { maxAccounts: 1 });
         }
         const first = await seed(f);
         let second: Inventory | undefined;

@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import type { Connection, RowDataPacket } from 'mysql2/promise';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import type { PoolRequest } from '../userPool/runtime.js';
 
 const mysqlUrl = process.env.MYSQL_TEST_URL;
@@ -202,12 +203,13 @@ async function fixture(t: TestContext) {
   assert.ok(m.getStorage() instanceof m.MysqlStorage, 'HTTP credentials/statistics also use the real MySQL driver');
   const store = pool;
   for (let i = 0; i < 2; i++) {
-    const member = await store.reserve();
+    const member = await store.reserve([DEFAULT_ENTERPRISE_ID]);
     assert.ok(member);
     members.push(member.identity);
     tokens.set(`Bearer catalog-pressure-mysql-token-${i}`, member.identity);
     m.clearModelsCache(member.identity);
-    await m.importCopilotOauthToken({ identity: member.identity, ssoUser: member.identity,
+    await m.importCopilotOauthToken({ enterpriseId: DEFAULT_ENTERPRISE_ID, identity: member.identity,
+      ssoUser: member.identity,
       ghLogin: 'catalog-pressure-mysql-synthetic', copilotOauthToken: `catalog-pressure-mysql-token-${i}` });
     await store.update(member.identity, { state: 'ready', stage: 'ready', verified_at: await store.now() });
   }
@@ -279,7 +281,7 @@ async function fixture(t: TestContext) {
     assert.deepEqual(await persistedHolds(), []);
     assert.ok((await Promise.all(members.map(member => store.hasHolds(member)))).every(value => !value));
     assert.equal((await store.counts()).catalog_requests, 0);
-    assert.ok((await store.leases()).every(lease => lease.active_requests === 0));
+    assert.ok((await store.leases(DEFAULT_ENTERPRISE_ID)).every(lease => lease.active_requests === 0));
   }
   return { store, tokens, models, calls, contexts, joined, finished, request, until, persistedHolds, drain,
     releaseModels: () => models.forEach(call => call.release()),
@@ -301,7 +303,7 @@ test('MySQL catalog HTTP pressure: shared refresh cancellation isolation, exclus
     f.request(caller, (['GET', 'HEAD', 'count'] as const)[i % 3])));
   await f.until(() => f.joined.size === 12, 'twelve SQL-backed catalog requests join cache');
   assert.equal(f.models.length, 2);
-  assert.equal((await f.store.leases()).length, 0);
+  assert.equal((await f.store.leases(DEFAULT_ENTERPRISE_ID)).length, 0);
   assert.equal((await f.persistedHolds()).length, 12);
   const exhausted = await f.request(callers[2]).response;
   assert.equal(exhausted.status, 429);
@@ -311,7 +313,7 @@ test('MySQL catalog HTTP pressure: shared refresh cancellation isolation, exclus
   await f.until(() => f.joined.size === 20, 'eight inference requests join existing catalog refreshes');
   assert.equal(f.models.length, 2);
   assert.equal((await f.persistedHolds()).length, 20);
-  const leases = await f.store.leases();
+  const leases = await f.store.leases(DEFAULT_ENTERPRISE_ID);
   assert.equal(leases.length, 2);
   assert.notEqual(leases[0].member_identity, leases[1].member_identity);
   for (const caller of callers.slice(0, 2)) {
@@ -328,12 +330,12 @@ test('MySQL catalog HTTP pressure: shared refresh cancellation isolation, exclus
   await f.until(() => f.calls.filter(call => call.path === '/v1/messages').length === 8, 'all mixed inference reaches upstream');
   for (const result of await Promise.all(catalog.slice(1).map(request => request.response))) success(result);
   await f.until(() => catalog.every(request => f.finished.has(request.id)), 'catalog finishes commit before inspecting inference leases');
-  assert.ok((await f.store.leases()).every(lease => lease.phase === 'provisional'));
+  assert.ok((await f.store.leases(DEFAULT_ENTERPRISE_ID)).every(lease => lease.phase === 'provisional'));
   assert.equal((await f.persistedHolds()).length, 8);
   f.releaseInference();
   for (const result of await Promise.all(inference.map(request => request.response))) success(result);
   await f.drain();
-  const before = await f.store.leases();
+  const before = await f.store.leases(DEFAULT_ENTERPRISE_ID);
   assert.ok(before.every(lease => lease.phase === 'active'));
   f.clearCache();
   const later = callers.slice(0, 2).flatMap(caller => (['GET', 'HEAD', 'count'] as const).map(kind => f.request(caller, kind)));
@@ -342,7 +344,8 @@ test('MySQL catalog HTTP pressure: shared refresh cancellation isolation, exclus
   f.releaseModels();
   for (const result of await Promise.all(later.map(request => request.response))) success(result);
   await f.drain();
-  assert.deepEqual(await f.store.leases(), before, 'GET/HEAD/count do not renew expiry or last-success SQL timestamps');
+  assert.deepEqual(await f.store.leases(DEFAULT_ENTERPRISE_ID), before,
+    'GET/HEAD/count do not renew expiry or last-success SQL timestamps');
   for (const call of f.calls.filter(call => call.path === '/v1/messages')) {
     const id = JSON.stringify(call.body?.messages).match(/catalog-pressure-mysql-request-(\d+)/)?.[1];
     assert.ok(id);
@@ -357,13 +360,13 @@ test('MySQL catalog HTTP pressure: all partial-body waiters cancel, SQL holds dr
   await f.until(() => f.joined.size === 9 && f.models[0]?.bytes > 0, 'nine real SQL admissions join partial body');
   assert.equal(f.models.length, 1);
   assert.equal((await f.persistedHolds()).length, 9);
-  assert.equal((await f.store.leases()).length, 0);
+  assert.equal((await f.store.leases(DEFAULT_ENTERPRISE_ID)).length, 0);
   requests.forEach(request => request.controller.abort());
   for (const outcome of await Promise.all(requests.map(request => request.outcome))) assert.ok('error' in outcome);
   await f.until(() => f.models[0].cancelled, 'last cache consumer cancels partial upstream reader');
   assert.equal(f.models[0].signal.aborted, true);
   await f.drain();
-  assert.equal((await f.store.leases()).length, 0);
+  assert.equal((await f.store.leases(DEFAULT_ENTERPRISE_ID)).length, 0);
   assert.equal((await f.store.counts()).ready_idle, 2);
   const retry = f.request(callers[1]);
   await f.until(() => f.joined.has(retry.id) && f.models.length === 2, 'new caller starts fresh, uncancelled refresh');
@@ -371,6 +374,6 @@ test('MySQL catalog HTTP pressure: all partial-body waiters cancel, SQL holds dr
   f.releaseModels();
   success(await retry.response);
   await f.drain();
-  assert.equal((await f.store.leases()).length, 0);
+  assert.equal((await f.store.leases(DEFAULT_ENTERPRISE_ID)).length, 0);
   assert.equal((await f.store.counts()).ready_idle, 2);
 });

@@ -15,7 +15,7 @@ const HELP = `Build customer-owned images from one exact, locally available Git 
 node deploy/user-pool-mysql-customer/build-images.mjs \\
   --commit <40-lowercase-hex-SHA> --output <new-absolute-directory-outside-checkout> \\
   --image-prefix <local-name-prefix> --platform <linux/amd64|linux/arm64> \
-  [--npm-registry <https-url-without-credentials>] [--execute-build]
+  [--npm-registry <https-url-without-credentials>] [--release-line <single|multi>] [--execute-build]
 
 Without --execute-build: validate source and print a build plan; no Docker or writes.
 With --execute-build: archive only the exact commit, build the four targets of
@@ -23,6 +23,7 @@ ${RELEASE_DOCKERFILE} (the same definition as the published images),
 record local image IDs and build inputs. No fetch, checkout, push, container startup,
 application environment loading, database access, migration or host installation.
 Docker builds use the existing npm ci / Login browser install inside their images.
+--release-line multi labels the images as the multi-enterprise line (default: single).
 `;
 
 export function parseArgs(args) {
@@ -30,6 +31,7 @@ export function parseArgs(args) {
   const keys = new Map([
     ['--commit', 'commit'], ['--output', 'output'],
     ['--image-prefix', 'prefix'], ['--platform', 'platform'], ['--npm-registry', 'npmRegistry'],
+    ['--release-line', 'releaseLine'],
   ]);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -49,6 +51,9 @@ export function parseArgs(args) {
   if (!/^[a-z0-9]+(?:[._-][a-z0-9]+)*$/.test(result.prefix ?? '')) throw new Error('--image-prefix must be a local name, without registry, tag or shell syntax');
   if (!['linux/amd64', 'linux/arm64'].includes(result.platform)) throw new Error('Explicit linux/amd64 or linux/arm64 platform required; platform support must be verified by the customer');
   if (result.npmRegistry !== undefined) assertRegistryUrl(result.npmRegistry);
+  if (![undefined, 'single', 'multi'].includes(result.releaseLine)) {
+    throw new Error('--release-line must be single or multi');
+  }
   return result;
 }
 
@@ -72,6 +77,8 @@ export function buildSpec(options, service) {
       'build', '--platform', options.platform,
       '--file', RELEASE_DOCKERFILE, '--target', service, '--tag', tag,
       ...(options.npmRegistry ? ['--build-arg', `NPM_REGISTRY=${options.npmRegistry}`] : []),
+      // Dockerfile.release defaults to the single line; only the multi line needs the build arg.
+      ...(options.releaseLine === 'multi' ? ['--build-arg', 'RELEASE_LINE=multi'] : []),
       '--label', `org.opencontainers.image.revision=${options.commit}`,
       '--iidfile', path.join(options.output, `${service}.iid`), '-',
     ],
@@ -117,8 +124,13 @@ export function main(args = process.argv.slice(2)) {
     return { path: file, sha256: sha256(result.stdout), baseImageReferences };
   });
   const specs = SERVICES.map((service) => buildSpec(options, service));
+  const releaseLine = options.releaseLine ?? 'single';
   if (!options.execute) {
-    console.log(JSON.stringify({ status: 'plan-only', commit: options.commit, platform: options.platform, output: options.output, inputs: inputDetails, images: specs.map(({ service, dockerfile, tag }) => ({ service, dockerfile, tag })), deploymentApproved: false }, null, 2));
+    console.log(JSON.stringify({
+      status: 'plan-only', commit: options.commit, platform: options.platform, releaseLine, output: options.output,
+      inputs: inputDetails, images: specs.map(({ service, dockerfile, tag }) => ({ service, dockerfile, tag })),
+      deploymentApproved: false,
+    }, null, 2));
     return;
   }
   // This is the only build branch. No Docker calls occur during a default plan.
@@ -137,6 +149,7 @@ export function main(args = process.argv.slice(2)) {
     sourceArchiveSha256: sha256(readFileSync(archivePath)),
     buildScriptSha256: sha256(readFileSync(scriptPath)),
     platform: options.platform,
+    releaseLine,
     dockerVersion,
     nodeVersion: process.version,
     inputs: inputDetails,

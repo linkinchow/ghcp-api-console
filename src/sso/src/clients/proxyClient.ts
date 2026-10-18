@@ -1,4 +1,4 @@
-import { JsonHttpClient } from '@ghcp/shared';
+import { JsonHttpClient, type EnterpriseId } from '@ghcp/shared';
 import { config } from '../config.js';
 
 export interface DeleteProxyAccountsBySsoUserResult {
@@ -22,11 +22,11 @@ export class PoolMembershipUnavailableError extends Error {
   }
 }
 
-export async function isProxyPoolManagedSsoUser(ssoUser: string): Promise<boolean> {
+/** `sso_user` is unique only within an enterprise, so every lookup is scoped (design §5.3). */
+export async function isProxyPoolManagedSsoUser(enterpriseId: EnterpriseId, ssoUser: string): Promise<boolean> {
   try {
-    const result = await client.request<{ managed?: unknown }>(`/internal/accounts/by-sso-user/${encodeURIComponent(ssoUser)}/pool-membership`, {
-      method: 'GET',
-    });
+    const path = `${bySsoUserPath(enterpriseId, ssoUser)}/pool-membership`;
+    const result = await client.request<{ managed?: unknown }>(path, { method: 'GET' });
     // Missing endpoints, malformed responses and transport failures must not allow deletion.
     if (!result || typeof result.managed !== 'boolean') throw new PoolMembershipUnavailableError();
     return result.managed;
@@ -36,8 +36,16 @@ export async function isProxyPoolManagedSsoUser(ssoUser: string): Promise<boolea
   }
 }
 
-export async function deleteProxyAccountsBySsoUser(ssoUser: string): Promise<DeleteProxyAccountsBySsoUserResult> {
-  return client.request<DeleteProxyAccountsBySsoUserResult>(`/internal/accounts/by-sso-user/${encodeURIComponent(ssoUser)}`, {
+export async function deleteProxyAccountsBySsoUser(
+  enterpriseId: EnterpriseId,
+  ssoUser: string,
+): Promise<DeleteProxyAccountsBySsoUserResult> {
+  return client.request<DeleteProxyAccountsBySsoUserResult>(bySsoUserPath(enterpriseId, ssoUser), {
     method: 'DELETE',
   });
+}
+
+function bySsoUserPath(enterpriseId: EnterpriseId, ssoUser: string): string {
+  const enterprise = encodeURIComponent(enterpriseId);
+  return `/internal/enterprises/${enterprise}/accounts/by-sso-user/${encodeURIComponent(ssoUser)}`;
 }

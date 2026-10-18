@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { createPool, type PoolOptions } from 'mysql2/promise';
 import { config } from '../config.js';
+import { enterpriseSeeds } from './enterpriseSeed.js';
 import { MysqlStorage } from './mysqlStorage.js';
 import { SqliteStorage } from './sqliteStorage.js';
 import type { ProxyStorage } from './storageTypes.js';
@@ -12,7 +13,7 @@ export function getStorage(): ProxyStorage {
   if (!storage) {
     storage = config.storageDriver === 'mysql'
       ? createMysqlStorage()
-      : new SqliteStorage(config.dbPath, config.requestStatsPerAccountLimit);
+      : new SqliteStorage(config.dbPath, config.requestStatsPerAccountLimit, enterpriseSeeds());
   }
   return storage;
 }
@@ -59,5 +60,11 @@ function createMysqlStorage(): MysqlStorage {
       rejectUnauthorized: true,
     };
   }
-  return new MysqlStorage(createPool(poolOptions), config.requestStatsPerAccountLimit, config.mysqlAutoMigrate);
+  return new MysqlStorage(
+    createPool(poolOptions),
+    config.requestStatsPerAccountLimit,
+    config.mysqlAutoMigrate,
+    enterpriseSeeds(),
+    config.mysqlMigrationLockWaitSeconds,
+  );
 }

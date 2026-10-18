@@ -30,6 +30,8 @@ export const errorDiagnosticsStore = new ErrorDiagnosticsStore({
 
 export interface ErrorDiagnosticContext {
   identity: string;
+  /** Set once the request's account (pool lease or direct row) is resolved (design §5.4). */
+  enterpriseId?: string;
   path: ProxyRequestStatDto['path'];
   model?: string;
   inboundRequest: {
@@ -123,6 +125,7 @@ export async function recordFetchFailure(
   logger.error('upstream-fetch-failed', 'Copilot upstream request failed before receiving a response', {
     diagnosticId,
     identity: context.identity,
+    enterpriseId: context.enterpriseId,
     path: context.path,
     model: context.model,
     upstreamUrl: request.url,
@@ -161,6 +164,7 @@ async function persistRecord(
     timestamp: new Date().toISOString(),
     failureKind,
     identity: context.identity,
+    ...(context.enterpriseId === undefined ? {} : { enterpriseId: context.enterpriseId }),
     path: context.path,
     model: context.model,
     redacted: config.errorDiagnosticsRedact,
@@ -333,6 +337,7 @@ function failureLogFields(
   return {
     diagnosticId,
     identity: context.identity,
+    enterpriseId: context.enterpriseId,
     path: context.path,
     model: context.model,
     status,

@@ -20,7 +20,8 @@ function fixture(stage = 'new') {
   let held = false;
   let token: string | undefined = 'synthetic-token';
   const row: ProvisionInventory = {
-    identity: 'synthetic001', ordinal: 0, state: 'provisioning', stage, attempt_id: 'attempt-1', generation: 0,
+    identity: 'synthetic001', enterprise_id: 'default', ordinal: 0, state: 'provisioning', stage,
+    attempt_id: 'attempt-1', generation: 0,
     task_id: null, attempts: 0, retry_at: 0, last_error: null, updated_at: now, cooldown_until: 0,
     verified_at: null, sso_created_at: null, oauth_attempt_id: null,
   };

@@ -1,7 +1,7 @@
 // Test-only barriers retain the ORIGINAL real worker checkpoint in its own process.
 import assert from 'node:assert/strict';
 import { isDeepStrictEqual } from 'node:util';
-import { options, OAUTH_TOKEN, validateMockOrigin } from './worker-common.js';
+import { enterpriseSeed, options, OAUTH_TOKEN, validateMockOrigin } from './worker-common.js';
 import { bounded, suspendGate, type SuspendMessage } from './suspend-common.js';
 import type { ProvisionContext, ProvisionInventory } from '../../src/proxy/src/userPool/provisioner.js';
 
@@ -29,7 +29,7 @@ try {
   ]);
   const pool = createPool({ uri: url.toString(), connectionLimit: 4, connectTimeout: 5000,
     timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true });
-  const storage = new MysqlStorage(pool, 2);
+  const storage = new MysqlStorage(pool, 2, true, [await enterpriseSeed()]);
   const store = await bounded('child store init', storage.userPool(options), 20000);
   let steps = 0, httpCalls = 0, updates = 0;
   let retained: ProvisionContext | undefined;

@@ -1,9 +1,16 @@
-import { HttpApiError, LIKE_ESCAPE_CLAUSE, likeContains, type ManagementQuery } from '@ghcp/shared';
+import { HttpApiError, LIKE_ESCAPE_CLAUSE, likeContains, type EnterpriseId, type ManagementQuery } from '@ghcp/shared';
 
-export function managementSql(kind: 'accounts' | 'requests', query: ManagementQuery, timestamp: (value: string) => string = (value) => value) {
+/** Every management query is scoped to one enterprise; the enterprise filter is always the first clause. */
+export function managementSql(
+  kind: 'accounts' | 'requests',
+  enterpriseId: EnterpriseId,
+  query: ManagementQuery,
+  timestamp: (value: string) => string = (value) => value,
+) {
   const clauses: string[] = [];
   const args: (string | number)[] = [];
   const add = (sql: string, ...values: (string | number)[]) => { clauses.push(sql); args.push(...values); };
+  add('enterprise_id = ?', enterpriseId);
   if (query.ids?.length) add(`${kind === 'accounts' ? 'identity' : 'id'} IN (${query.ids.map(() => '?').join(',')})`, ...query.ids);
   const fields = kind === 'accounts' ? ['identity', 'sso_user', 'gh_login'] : ['identity', 'gh_login', 'model', 'failure_reason'];
   // Wildcards in the search term are escaped: a raw `_` otherwise matches any character, so

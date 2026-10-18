@@ -9,6 +9,7 @@ import { chromium, type Page, type Route } from 'playwright';
 import type { AdminModelsResponse } from '@ghcp/shared';
 
 const ORIGIN = 'http://models-console.test';
+const MODELS_PATH = /^\/api\/console\/proxy\/enterprises\/(default|ghe-tenant)\/models$/;
 const FETCHED_AT = '2026-10-17T08:00:00.000Z';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 
@@ -47,12 +48,20 @@ function testAssets() {
       import React, { useState } from 'react';
       import { createRoot } from 'react-dom/client';
       import { ModelsPage } from '/src/web/pages/ModelsPage.tsx';
+      import { EnterpriseScopeContext } from '/src/web/lib/scope.ts';
       import '/src/web/styles.css';
       function Harness() {
         const [notice, setNotice] = useState('');
+        const [enterprise, setEnterprise] = useState('default');
+        const scope = { id: enterprise, slug: enterprise + '-slug', displayName: 'Enterprise ' + enterprise };
         return <main className="min-w-0 p-4">
           <output aria-label="Notification">{notice}</output>
-          <ModelsPage notify={(message) => setNotice(message)} />
+          <select aria-label="Enterprise" value={enterprise} onChange={(event) => setEnterprise(event.target.value)}>
+            <option value="default">default</option><option value="ghe-tenant">ghe-tenant</option>
+          </select>
+          <EnterpriseScopeContext.Provider key={enterprise} value={scope}>
+            <ModelsPage notify={(message) => setNotice(message)} />
+          </EnterpriseScopeContext.Provider>
         </main>;
       }
       createRoot(document.getElementById('root')).render(<Harness />);`;
@@ -93,7 +102,9 @@ async function offlineModels() {
     errors: [] as string[],
     unexpected: [] as string[],
     requests: [] as URL[],
-    response: () => catalog(),
+    response: (_enterprise: string) => catalog(),
+    /** Per-enterprise failures; `failure`/`errorCode` apply to every enterprise without one. */
+    failures: {} as Record<string, { status: number; code: string }>,
     failure: 0,
     errorCode: 'synthetic_failure',
     holds: [] as Array<{ started: ReturnType<typeof deferred>; release: ReturnType<typeof deferred>; finished: ReturnType<typeof deferred> }>,
@@ -128,14 +139,17 @@ async function offlineModels() {
 
   async function answerApi(route: Route, url: URL) {
     fixture.requests.push(url);
-    if (url.pathname !== '/api/console/proxy/models' || route.request().method() !== 'GET') {
+    const enterprise = MODELS_PATH.exec(url.pathname)?.[1];
+    if (!enterprise || route.request().method() !== 'GET') {
       fixture.unexpected.push(url.href);
       return route.abort();
     }
-    const status = fixture.failure || 200;
-    const body = fixture.failure
-      ? { error: { code: fixture.errorCode, message: 'Synthetic failure' } }
-      : fixture.response();
+    const fallback = fixture.failure ? { status: fixture.failure, code: fixture.errorCode } : undefined;
+    const failure = fixture.failures[enterprise] ?? fallback;
+    const status = failure?.status ?? 200;
+    const body = failure
+      ? { error: { code: failure.code, message: 'Synthetic failure' } }
+      : fixture.response(enterprise);
     const hold = fixture.holds.shift();
     if (hold) {
       hold.started.resolve();
@@ -252,7 +266,8 @@ test('empty catalog, filtered catalog, and admin configuration or authorization 
       await page.getByRole('button', { name: 'Refresh models', exact: true }).click();
       const alert = page.getByRole('alert').filter({ hasText: message });
       await alert.waitFor();
-      assert.match(await alert.innerText(), /No pool account is used instead/);
+      const scoped = /Enterprise default: .*No pool account or other enterprise is used instead/;
+      assert.match(await alert.innerText(), scoped);
       assert.equal(await page.getByRole('region', { name: 'Models' }).count(), 0);
     }
 
@@ -261,7 +276,49 @@ test('empty catalog, filtered catalog, and admin configuration or authorization 
     await page.getByRole('button', { name: 'Refresh models', exact: true }).click();
     await page.getByLabel('Search models').fill('nonexistent');
     await page.getByText('No models match this search and view.', { exact: false }).waitFor();
-    assert.ok(f.requests.every((url) => url.pathname === '/api/console/proxy/models'), 'only the Models API is called');
+    const onlyDefault = f.requests.every((url) => url.pathname === '/api/console/proxy/enterprises/default/models');
+    assert.ok(onlyDefault, 'only the Models API of the selected enterprise is called');
+    assert.deepEqual(f.errors, []);
+    assert.deepEqual(f.unexpected, []);
+  } finally {
+    await f.close();
+  }
+});
+
+const PER_ENTERPRISE = 'each enterprise reads its own catalog; a switch drops the late lookup and never falls back';
+test(PER_ENTERPRISE, { timeout: 120000 }, async () => {
+  const f = await offlineModels();
+  const { page } = f;
+  try {
+    f.response = (enterprise) => catalog(enterprise === 'default' ? 'default_admin' : 'ghe_admin');
+    await page.goto(`${ORIGIN}/`);
+    await page.getByText('default_admin', { exact: true }).waitFor();
+    assert.equal(f.requests.at(-1)!.pathname, '/api/console/proxy/enterprises/default/models');
+
+    const late = f.holdNext();
+    await page.getByRole('button', { name: 'Refresh models', exact: true }).click();
+    await late.started.promise;
+    f.failures['ghe-tenant'] = { status: 409, code: 'models_admin_not_configured' };
+    await page.getByLabel('Enterprise', { exact: true }).selectOption('ghe-tenant');
+    const alert = page.getByRole('alert').filter({ hasText: 'Enterprise ghe-tenant:' });
+    await alert.waitFor();
+    assert.match(await alert.innerText(), /No GitHub enterprise admin is configured/);
+    late.release.resolve();
+    await late.finished.promise;
+    await paint(page);
+    const lateRows = await page.getByText('default_admin', { exact: true }).count();
+    assert.equal(lateRows, 0, 'the late default catalog is dropped');
+    assert.equal(await alert.count(), 1);
+    const scoped = f.requests.slice(-1).map((url) => url.pathname);
+    const tenant = ['/api/console/proxy/enterprises/ghe-tenant/models'];
+    assert.deepEqual(scoped, tenant, 'no fallback lookup follows the error');
+
+    delete f.failures['ghe-tenant'];
+    await page.getByRole('button', { name: 'Refresh models', exact: true }).click();
+    await page.getByText('ghe_admin', { exact: true }).waitFor();
+    await page.getByLabel('Enterprise', { exact: true }).selectOption('default');
+    await page.getByText('default_admin', { exact: true }).waitFor();
+    assert.equal(await page.getByText('ghe_admin', { exact: true }).count(), 0);
     assert.deepEqual(f.errors, []);
     assert.deepEqual(f.unexpected, []);
   } finally {

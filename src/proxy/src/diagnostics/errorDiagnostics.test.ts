@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { gzipSync } from 'node:zlib';
 import express, { type Request, type Response as ExpressResponse } from 'express';
-import { INTERNAL_AUTH_HEADER } from '@ghcp/shared';
+import { DEFAULT_ENTERPRISE_ID, INTERNAL_AUTH_HEADER } from '@ghcp/shared';
 import { config } from '../config.js';
 import { listModels, prepareCopilotRequest } from '../copilot/copilotClient.js';
 import { listRequestStats } from '../db/requestStatsRepo.js';
@@ -268,7 +268,7 @@ test('records an upstream response-stream read failure as a failed request stat'
       pipeAndRecord(upstream, prepared, fakeResponse(), { identity, path: '/responses', model: 'gpt-5' }, context),
       /stream read failed/,
     );
-    const stats = await listRequestStats(identity, 10);
+    const stats = await listRequestStats(DEFAULT_ENTERPRISE_ID, identity, 10);
     assert.equal(stats.length, 1);
     assert.equal(stats[0]?.success, false);
     assert.match(stats[0]?.failureReason ?? '', /Upstream stream failed/);
@@ -297,7 +297,7 @@ test('persists JSON, SSE, plain-text, and bodyless upstream HTTP failures', asyn
     const listed = await errorDiagnosticsStore.list(1, 10);
     assert.equal(listed.total, 4);
     assert.deepEqual(new Set(listed.items.map((item) => item.status)), new Set([400, 429, 502, 503]));
-    const stats = (await listRequestStats(identity, 10)).filter((stat) => !stat.success);
+    const stats = (await listRequestStats(DEFAULT_ENTERPRISE_ID, identity, 10)).filter((stat) => !stat.success);
     assert.equal(stats.length, config.requestStatsPerAccountLimit);
     assert.deepEqual(stats.map((stat) => stat.failureReason?.split(' [ref: ')[0]), ['HTTP 503', 'HTTP 502']);
     assert.ok(stats.every(stat => /\[ref: [a-f0-9-]{36}\]$/.test(stat.failureReason ?? '')));

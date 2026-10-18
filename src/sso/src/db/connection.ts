@@ -1,24 +1,30 @@
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
-import Database from 'better-sqlite3';
+import type Database from 'better-sqlite3';
+import { openServiceDb } from '@ghcp/shared';
 import { config } from '../config.js';
+import { ssoEnterprises } from '../enterprises.js';
+import { ssoEnterpriseSeed } from './enterpriseRepo.js';
 import { runMigrations } from './migrations.js';
 
 let db: Database.Database | undefined;
 
+/** Opens the database once; migrations and the enterprise identity checks (design §3.6) fail closed. */
 export function getDb(): Database.Database {
-  if (!db) {
-    mkdirSync(dirname(config.dbPath), { recursive: true });
-    db = new Database(config.dbPath);
-    db.pragma('journal_mode = WAL');
-    db.pragma('secure_delete = ON');
-    db.pragma('foreign_keys = ON');
-    runMigrations(db);
-  }
+  if (!db) db = openMigratedDb();
   return db;
 }
 
 export function closeDb(): void {
   db?.close();
   db = undefined;
+}
+
+function openMigratedDb(): Database.Database {
+  const opened = openServiceDb(config.dbPath, { secureDelete: true });
+  try {
+    runMigrations(opened, ssoEnterprises().map((enterprise) => ssoEnterpriseSeed(enterprise.profile)));
+  } catch (error) {
+    opened.close();
+    throw error;
+  }
+  return opened;
 }

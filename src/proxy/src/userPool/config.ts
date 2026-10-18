@@ -4,6 +4,7 @@ export interface PoolConfig {
   enabled: boolean;
   /** Legacy configuration only. Caller identities are authenticated key hashes, not emails. */
   callerDomain?: string;
+  /** POOL_ACCOUNT_EMAIL_DOMAIN, or '' when unset; members use their enterprise's `pool.accountDomain`. */
   accountDomain: string;
   idleTarget: number;
   maxAccounts: number;
@@ -48,13 +49,7 @@ export function readPoolConfig(env: NodeJS.ProcessEnv): PoolConfig {
     if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error(`Invalid ${key}`);
     return value;
   };
-  const accountDomain = (env.POOL_ACCOUNT_EMAIL_DOMAIN ?? '').trim().toLowerCase();
-  const labels = accountDomain.split('.');
-  if (accountDomain.length > 253 || labels.length < 2
-    || labels.some((label) => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
-    || !/^[a-z]{2,63}$/.test(labels.at(-1)!)) {
-    throw new Error('POOL_ACCOUNT_EMAIL_DOMAIN must be an email domain');
-  }
+  const accountDomain = readAccountDomain(env.POOL_ACCOUNT_EMAIL_DOMAIN);
   const idleTarget = integer('READY_IDLE_TARGET', defaults.idleTarget, 0, NAME_CAPACITY);
   const maxAccounts = integer('POOL_MAX_ACCOUNTS', defaults.maxAccounts, 1, NAME_CAPACITY);
   if (idleTarget > maxAccounts) throw new Error('Idle target exceeds pool account cap');
@@ -75,6 +70,22 @@ export function readPoolConfig(env: NodeJS.ProcessEnv): PoolConfig {
     retryAfterSeconds: integer('POOL_EXHAUSTED_RETRY_AFTER_SECONDS', defaults.retryAfterSeconds, 1, 3600),
     requestTimeoutMs: integer('POOL_REQUEST_TIMEOUT_SECONDS', defaults.requestTimeoutMs / 1000, 5, 600) * 1000,
   };
+}
+
+/**
+ * POOL_ACCOUNT_EMAIL_DOMAIN is optional (design §3.5): it only feeds the `default` enterprise's
+ * `pool.accountDomain`, and an enterprise without a domain is not ready. A value that is set must be valid.
+ */
+function readAccountDomain(raw: string | undefined): string {
+  const accountDomain = (raw ?? '').trim().toLowerCase();
+  if (!accountDomain) return '';
+  const labels = accountDomain.split('.');
+  if (accountDomain.length > 253 || labels.length < 2
+    || labels.some((label) => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
+    || !/^[a-z]{2,63}$/.test(labels.at(-1)!)) {
+    throw new Error('POOL_ACCOUNT_EMAIL_DOMAIN must be an email domain');
+  }
+  return accountDomain;
 }
 
 export function normalizePoolConfig(options: PoolConfig): PoolConfig {

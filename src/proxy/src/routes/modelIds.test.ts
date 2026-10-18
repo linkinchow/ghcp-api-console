@@ -8,6 +8,7 @@ import { importCopilotOauthToken } from '../db/accountsRepo.js';
 import { closeStorage } from '../db/connection.js';
 import { listRequestStats, recordRequestStat } from '../db/requestStatsRepo.js';
 import { buildApp } from '../server.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 
 const identity = `model-route-${Date.now()}`;
 const apiKey = 'route-test-api-key';
@@ -26,6 +27,7 @@ before(async () => {
   config.requestStatsPerAccountLimit = 100;
   config.claudeCodeOptimized = true;
   await importCopilotOauthToken({
+    enterpriseId: DEFAULT_ENTERPRISE_ID,
     identity,
     ssoUser: identity,
     ghLogin: `${identity}_test`,
@@ -108,7 +110,7 @@ test('all POST routes accept canonical and dotted aliases and send the live raw 
     { path: '/responses', model: 'claude-opus-5.2' },
   ]);
 
-  const stats = await listRequestStats(identity, 20);
+  const stats = await listRequestStats(DEFAULT_ENTERPRISE_ID, identity, 20);
   const routed = stats.filter((stat) => stat.path !== '/v1/models');
   assert.equal(routed.length, 4);
   assert.ok(routed.every((stat) => stat.model === 'claude-opus-5-2'));
@@ -143,12 +145,13 @@ test('canonicalizes model metadata in streaming responses', async () => {
 test('canonicalizes new and historical request-stat model values at the repository boundary', async () => {
   const statsIdentity = `${identity}-stats`;
   await recordRequestStat({
+    enterpriseId: DEFAULT_ENTERPRISE_ID,
     identity: statsIdentity,
     path: '/v1/messages',
     model: 'claude-opus-5-2-20260101',
     success: true,
   });
-  const stats = await listRequestStats(statsIdentity, 10);
+  const stats = await listRequestStats(DEFAULT_ENTERPRISE_ID, statsIdentity, 10);
   assert.equal(stats[0]?.model, 'claude-opus-5-2');
 });
 

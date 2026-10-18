@@ -2,7 +2,7 @@ import { config } from '../config.js';
 import type { AccountLogger } from '../tasks/accountLogger.js';
 import type { AuthStrategy } from './types.js';
 import { setTimeout as delay } from 'node:timers/promises';
-import { HttpApiError } from '@ghcp/shared';
+import { HttpApiError, parseTrustedUrl, sameTrustedUrl, type DeviceFlowEndpoints } from '@ghcp/shared';
 
 type DeviceFlowLogger = Pick<AccountLogger, 'info' | 'warn'>;
 
@@ -10,6 +10,14 @@ interface DeviceFlowRuntime {
   fetch: typeof globalThis.fetch;
   sleep(ms: number, signal?: AbortSignal): Promise<void>;
   now(): number;
+}
+
+/** The GitHub instance and OAuth app of one enterprise. */
+export interface DeviceFlowClient {
+  clientId: string;
+  endpoints: Readonly<DeviceFlowEndpoints>;
+  /** `<baseUrl>/login/device`; the browser is always sent to this page, whatever GitHub answers. */
+  verificationUrl: string;
 }
 
 const defaultRuntime: DeviceFlowRuntime = {
@@ -38,11 +46,13 @@ interface AccessTokenResponse {
 export async function loginWithDeviceFlow(
   strategy: AuthStrategy,
   logger: DeviceFlowLogger,
+  client: DeviceFlowClient,
   runtime: DeviceFlowRuntime = defaultRuntime,
   signal?: AbortSignal,
 ): Promise<string> {
   signal?.throwIfAborted();
-  const device = await requestDeviceCode(logger, runtime, signal);
+  const answer = await requestDeviceCode(client, logger, runtime, signal);
+  const device = withEnterpriseVerificationUrl(answer, client, logger);
   logger.info('device-flow', 'Received GitHub device code', {
     verificationUri: device.verification_uri,
     expiresIn: device.expires_in,
@@ -50,19 +60,56 @@ export async function loginWithDeviceFlow(
   });
   await strategy.authorize(device, signal);
   signal?.throwIfAborted();
-  return pollAccessToken(device, logger, runtime, signal);
+  return pollAccessToken(client, device, logger, runtime, signal);
 }
 
-async function requestDeviceCode(logger: DeviceFlowLogger, runtime: DeviceFlowRuntime, signal?: AbortSignal): Promise<DeviceCodeResponse> {
+/** The browser goes to the enterprise's own verification page; a different answer from GitHub is only logged. */
+function withEnterpriseVerificationUrl(
+  device: DeviceCodeResponse,
+  client: DeviceFlowClient,
+  logger: DeviceFlowLogger,
+): DeviceCodeResponse {
+  if (isSameUrl(device.verification_uri, client.verificationUrl)) return device;
+  logger.warn('device-flow', 'GitHub returned another device verification page; using the enterprise page', {
+    received: pageOf(device.verification_uri),
+    used: client.verificationUrl,
+  });
+  return { ...device, verification_uri: client.verificationUrl };
+}
+
+/** Origin and path only, so nothing beyond the page itself reaches the log. */
+function pageOf(raw: unknown): string {
+  try {
+    const url = new URL(String(raw));
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return 'invalid URL';
+  }
+}
+
+function isSameUrl(raw: unknown, expected: string): boolean {
+  try {
+    return typeof raw === 'string' && sameTrustedUrl(parseTrustedUrl(raw), parseTrustedUrl(expected));
+  } catch {
+    return false;
+  }
+}
+
+async function requestDeviceCode(
+  client: DeviceFlowClient,
+  logger: DeviceFlowLogger,
+  runtime: DeviceFlowRuntime,
+  signal?: AbortSignal,
+): Promise<DeviceCodeResponse> {
   const maxAttempts = 3;
   let lastError = '';
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     signal?.throwIfAborted();
-    const res = await runtime.fetch(config.endpoints.deviceCode, {
+    const res = await runtime.fetch(client.endpoints.deviceCode, {
       signal,
       method: 'POST',
       headers: deviceFlowHeaders(),
-      body: JSON.stringify({ client_id: config.githubOauthClientId, scope: config.githubOauthScope }),
+      body: JSON.stringify({ client_id: client.clientId, scope: config.githubOauthScope }),
     });
 
     if (res.ok) {
@@ -80,7 +127,13 @@ async function requestDeviceCode(logger: DeviceFlowLogger, runtime: DeviceFlowRu
   throw new HttpApiError(502, 'device_code_request_failed', `Device code request failed after ${maxAttempts} attempts: ${lastError}`);
 }
 
-async function pollAccessToken(device: DeviceCodeResponse, logger: DeviceFlowLogger, runtime: DeviceFlowRuntime, signal?: AbortSignal): Promise<string> {
+async function pollAccessToken(
+  client: DeviceFlowClient,
+  device: DeviceCodeResponse,
+  logger: DeviceFlowLogger,
+  runtime: DeviceFlowRuntime,
+  signal?: AbortSignal,
+): Promise<string> {
   const started = runtime.now();
   let interval = (Math.max(1, device.interval) + 3) * 1000;
   let attempt = 0;
@@ -93,12 +146,12 @@ async function pollAccessToken(device: DeviceCodeResponse, logger: DeviceFlowLog
     signal?.throwIfAborted();
     await runtime.sleep(interval, signal);
     attempt++;
-    const res = await runtime.fetch(config.endpoints.accessToken, {
+    const res = await runtime.fetch(client.endpoints.accessToken, {
       signal,
       method: 'POST',
       headers: deviceFlowHeaders(),
       body: JSON.stringify({
-        client_id: config.githubOauthClientId,
+        client_id: client.clientId,
         device_code: device.device_code,
         grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
       }),

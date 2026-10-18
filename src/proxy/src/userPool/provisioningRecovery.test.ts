@@ -4,19 +4,24 @@ import { setImmediate as yieldTurn } from 'node:timers/promises';
 import type { LoginTaskDto, SsoUserDto } from '@ghcp/shared';
 import { SqliteStorage } from '../db/sqliteStorage.js';
 import { readPoolConfig } from './config.js';
+import { installDefaultPoolDomain } from '../testing/enterpriseFixture.js';
 import { realProvisioner } from './provisioner.js';
 import { PrewarmWorker, type PrewarmStore } from './worker.js';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
+import { unscopedUrl } from '../testing/scopedPaths.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 
 for (const fault of ['before-write', 'after-write-before-ack'] as const) {
   test(`terminal Login callback failure (${fault}) recovers with one new OAuth attempt, not new identities`,
     { timeout: 15000 }, async t => {
-      const storage = new SqliteStorage(':memory:', 100);
+      const storage = new SqliteStorage(':memory:', 100, [defaultEnterpriseSeed({})]);
       let worker: PrewarmWorker | undefined;
       t.after(async () => { await worker?.stop(); await storage.close(); });
       await storage.initialize();
       const options = readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease',
         POOL_ACCOUNT_EMAIL_DOMAIN: 'recovery.test', POOL_WARMUP_MODEL: 'synthetic',
         READY_IDLE_TARGET: '1', POOL_MAX_ACCOUNTS: '1', POOL_LOGIN_MAX_PENDING: '1' });
+      installDefaultPoolDomain(options.accountDomain);
       const store = storage.userPool(options);
       let now = store.now(), monotonicNow = 0;
       store.now = () => now;
@@ -33,7 +38,8 @@ for (const fault of ['before-write', 'after-write-before-ack'] as const) {
         releaseOwner: owner => later(() => store.releaseOwner(owner)),
         reclaim: () => later(() => store.reclaim()),
         settings: () => later(() => store.settings()),
-        reserveDeficit: owner => later(() => store.reserveDeficit(owner)),
+        reserveDeficit: (owner, eligible) => later(() => store.reserveDeficit(owner, eligible)),
+        enterprisePolicies: () => later(() => store.enterprisePolicies()),
         pending: excluded => later(() => store.pending(excluded)),
         hasHolds: id => later(() => store.hasHolds(id)),
         inventory: id => later(() => store.inventory(id)),
@@ -54,13 +60,14 @@ for (const fault of ['before-write', 'after-write-before-ack'] as const) {
       let user: SsoUserDto | undefined;
       const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
       const adapter = realProvisioner(asyncStore, options, {
+        isReady: async () => true,
         async getAccount(id) {
           await yieldTurn();
           return storage.getAccount(id);
         },
         async fetch(input, init) {
           await yieldTurn();
-          const url = new URL(String(input)), method = init?.method ?? 'GET';
+          const url = unscopedUrl(input), method = init?.method ?? 'GET';
           const body = () => JSON.parse(String(init?.body));
           if (url.pathname === '/api/users' && method === 'POST') {
             const request = body() as { ssoUser: string };
@@ -108,7 +115,7 @@ for (const fault of ['before-write', 'after-write-before-ack'] as const) {
             assert.equal(row.stage, 'oauth-dispatch', 'Login POST requires the real persisted dispatch claim');
             assert.ok(row.oauth_attempt_id);
             assert.deepEqual(request, { identity: user.ssoUser, ssoUser: user.ssoUser, ghLogin: user.ghLogin,
-              oauthAttemptId: row.oauth_attempt_id, ssoType: 'custom', ssoPassword: 'synthetic-password' });
+              oauthAttemptId: row.oauth_attempt_id, ssoPassword: 'synthetic-password' });
             const count = (postsPerAttempt.get(request.oauthAttemptId) ?? 0) + 1;
             postsPerAttempt.set(request.oauthAttemptId, count);
             assert.equal(count, 1, 'Login does not deduplicate: never POST the same oauthAttemptId twice');
@@ -285,10 +292,10 @@ for (const fault of ['before-write', 'after-write-before-ack'] as const) {
       assert.deepEqual(user, originalUser, 'SSO creation marker, SCIM identity and assigned seat all survive repair');
       assert.equal(store.counts().total, 1);
       assert.equal(store.counts().ready_idle, 1);
-      assert.equal((await storage.listAccounts()).total, 1);
+      assert.equal((await storage.listAccounts(DEFAULT_ENTERPRISE_ID)).total, 1);
       assert.equal(posted.length, 2);
       assert.deepEqual([...postsPerAttempt.values()], [1, 1]);
-      const events = store.events() as { action: string; identity: string; detail: string | null }[];
+      const events = store.events('default') as { action: string; identity: string; detail: string | null }[];
       assert.equal(events.filter(event => event.action === 'name_reserved').length, 1);
       assert.equal(events.filter(event => event.action === 'account_ready' && event.identity === identity).length, 1);
       assert.deepEqual(events.filter(event => event.action === 'provision_failed').map(event => event.detail), ['oauth_login_failed']);

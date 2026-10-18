@@ -14,6 +14,8 @@ import type { PoolConfig } from '../userPool/config.js';
 import { MysqlPoolStore } from '../userPool/mysqlStore.js';
 import { getUserPool, stopUserPool } from '../userPool/runtime.js';
 import { UserPoolStore } from '../userPool/store.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 
 const originalFetch = globalThis.fetch;
 const caller = `sha256:${'a'.repeat(64)}`;
@@ -84,12 +86,18 @@ async function fixture(t: TestContext, stage: FailureStage, code: ConnectivityCo
     // Keep admission and its first heartbeat real and healthy, then fail the
     // selected member's credential SELECT through MysqlStorage (not a generic Error stub).
     assert.ok(store instanceof UserPoolStore);
-    const reserved = store.reserve()!;
+    const reserved = store.reserve([DEFAULT_ENTERPRISE_ID])!;
     member = reserved.identity;
     clearModelsCache(member);
-    await importCopilotOauthToken({ identity: member, ssoUser: member, ghLogin: 'synthetic', copilotOauthToken: 'synthetic-token' });
+    await importCopilotOauthToken({
+      enterpriseId: DEFAULT_ENTERPRISE_ID,
+      identity: member,
+      ssoUser: member,
+      ghLogin: 'synthetic',
+      copilotOauthToken: 'synthetic-token',
+    });
     store.update(member, { state: 'ready', stage: 'ready', verified_at: store.now() });
-    const mysqlStorage = new MysqlStorage(driver.pool, 100);
+    const mysqlStorage = new MysqlStorage(driver.pool, 100, true, [defaultEnterpriseSeed({})]);
     t.mock.method(storage, 'getAccount', async (identity: string) => {
       accountLookups++;
       assert.equal(identity, member, 'Credential lookup must target the admitted member, not the caller hash');
@@ -168,8 +176,9 @@ for (const stage of ['admission', 'credential lookup'] as const) {
           await new Promise(resolve => setTimeout(resolve, 10));
         }
         assert.equal(f.store.hasHolds(f.member!), false, 'Credential failure must drain the admitted hold');
-        assert.equal(f.store.leases().length, 1);
-        assert.equal(f.store.leases()[0].phase, 'provisional', 'Failed credential lookup must not promote the lease');
+        assert.equal(f.store.leases(DEFAULT_ENTERPRISE_ID).length, 1);
+        assert.equal(f.store.leases(DEFAULT_ENTERPRISE_ID)[0].phase, 'provisional',
+          'Failed credential lookup must not promote the lease');
       }
       await assertSafeStorageFailure(response, f.driver.error);
     });

@@ -1,4 +1,4 @@
-import { Router, type Request, type Response } from 'express';
+import { Router, type Request, type RequestHandler, type Response } from 'express';
 import { requireInternalToken } from '../auth/internalAuth.js';
 import { getLocalUserPoolSchedulerSnapshot, getUserPool, wakePool } from '../userPool/runtime.js';
 import { readPoolConfig, UserPoolError } from '../userPool/config.js';
@@ -7,6 +7,7 @@ import { NAME_CAPACITY } from '../userPool/names.js';
 import type { PoolSettings } from '../userPool/store.js';
 import { poolPageSql, type PoolList, type PoolPageQuery } from '../userPool/paging.js';
 import type { PoolStore } from '../userPool/storage.js';
+import { requestEnterprise } from './requestEnterprise.js';
 
 type AdminStore = Pick<PoolStore, 'settings' | 'counts' | 'accounts' | 'leases' | 'events'
   | 'updateSettings' | 'inventory' | 'disable' | 'retry' | 'release' | 'hasHolds'> & Partial<Pick<PoolStore, 'page'>>;
@@ -27,7 +28,7 @@ const EVENT_ACTIONS = new Set([
   'settings_updated', 'lease_expired', 'lease_acquired', 'lease_renewed', 'lease_released',
   'member_quarantined', 'member_cooling', 'member_disabled', 'member_retry', 'member_resumed',
   'name_reserved', 'provision_failed', 'account_ready', 'request_finished',
-  'oauth_reauth_scheduled', 'oauth_reauth_blocked',
+  'oauth_reauth_scheduled', 'oauth_reauth_blocked', 'enterprise_inventory_drift', 'enterprise_policy_updated',
 ]);
 const SAFE_DETAILS = new Set([
   'success', 'not_renewed', 'credential_not_valid', 'credential_not_verified', 'sso_creation_ambiguous', 'sso_name_conflict',
@@ -39,6 +40,7 @@ const SAFE_DETAILS = new Set([
   'oauth_attempt_missing', 'oauth_dispatch_unconfirmed', 'oauth_callback_unconfirmed', 'oauth_task_invalid',
   'warmup_invalid_response', 'warmup_credential_changed', 'warmup_model_unavailable', 'service_invalid_response', 'service_response_too_large',
   'service_invalid_json', 'upstream_unauthorized', 'entitlement_denied', 'oauth_reauth_limit_reached',
+  'enterprise_not_found', 'enterprise_not_ready',
 ]);
 const ERROR_MESSAGES: Record<string, string> = {
   pool_mode_disabled: 'User pool is disabled. Configure ACCOUNT_ROUTING_MODE=caller-lease on the Proxy to use it.',
@@ -55,52 +57,58 @@ const ERROR_MESSAGES: Record<string, string> = {
   invalid_member_state: 'Resume is only available for disabled accounts; retry is only available for failed accounts.',
   manual_reconciliation_required: 'This account has an ambiguous provisioning result. Resolve it manually before retrying.',
   action_not_found: 'Pool action was not found.',
+  enterprise_scope_required: 'Use /api/enterprises/:enterpriseId/user-pool/... for members, leases and events.',
+  use_enterprise_cap: 'The account cap is set per enterprise. Use PATCH /api/enterprises/:enterpriseId/pool-policy.',
   pool_operation_failed: 'Pool operation failed. Check Proxy health and retry.',
 };
 
-/** The router also authenticates itself so an alternate mount cannot expose pool administration. */
-export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}): Router {
-  const { getStore, wake, isPoolEnabled, localScheduler } = {
+/** The routers also authenticate themselves so an alternate mount cannot expose pool administration. */
+function resolveDependencies(dependencies: Partial<Dependencies>): Dependencies {
+  return {
     getStore: getUserPool, wake: wakePool,
     isPoolEnabled: () => readPoolConfig(process.env).enabled,
     localScheduler: getLocalUserPoolSchedulerSnapshot,
     ...dependencies,
   };
-  const router = Router();
+}
+
+function poolRouter(): Router {
+  const router = Router({ mergeParams: true });
   router.use('/user-pool', requireInternalToken, (_req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
     next();
   });
+  return router;
+}
 
-  const handle = (operation: (req: Request, res: Response, store: AdminStore) => void | Promise<void>) =>
-    async (req: Request, res: Response): Promise<void> => {
-      try {
-        if (Object.keys(req.query).length) throw new UserPoolError(400, 'invalid_request');
-        const store = await getStore();
-        if (!store) throw new UserPoolError(409, 'pool_mode_disabled');
-        await operation(req, res, store);
-      } catch (error) {
-        sendError(res, error);
-      }
-    };
+type Operation = (req: Request, res: Response, store: AdminStore) => void | Promise<void>;
 
-  router.get('/user-pool', handle(async (_req, res, store) => {
-    const counts = countsDto(await store.counts());
-    const accounts = (await store.accounts()).slice(0, LIST_LIMITS.accounts).map(accountDto);
-    const leases = (await store.leases()).slice(0, LIST_LIMITS.leases)
-      .map((lease) => leaseDto(lease, number(lease.active_requests) > 0));
-    res.json({
-      enabled: true,
-      poolId: 'default',
-      observedAt: Date.now(),
-      settings: settingsDto(await store.settings()),
-      counts,
-      accounts,
-      leases,
-      events: (await store.events()).slice(0, LIST_LIMITS.events).map(eventDto),
-      limits: SETTINGS_LIMITS,
-      listLimits: LIST_LIMITS,
-    });
+function handler(getStore: Dependencies['getStore']): (operation: Operation) => RequestHandler {
+  return (operation) => async (req, res) => {
+    try {
+      if (Object.keys(req.query).length) throw new UserPoolError(400, 'invalid_request');
+      const store = await getStore();
+      if (!store) throw new UserPoolError(409, 'pool_mode_disabled');
+      await operation(req, res, store);
+    } catch (error) {
+      sendError(res, error);
+    }
+  };
+}
+
+/**
+ * Process-wide pool administration (design §5.1): settings, the global overview, local scheduler diagnostics
+ * and a reconcile wake. Every other `/user-pool/*` path needs an enterprise: 400 `enterprise_scope_required`.
+ */
+export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}): Router {
+  const { getStore, wake, isPoolEnabled, localScheduler } = resolveDependencies(dependencies);
+  const router = poolRouter();
+  const handle = handler(getStore);
+
+  router.get('/user-pool/overview', handle(async (_req, res, store) => {
+    res.json({ enabled: true, poolId: 'default', observedAt: Date.now(),
+      settings: settingsDto(await store.settings()), counts: countsDto(await store.counts()),
+      limits: SETTINGS_LIMITS, listLimits: LIST_LIMITS });
   }));
 
   // Local diagnostics must remain readable without initializing or querying storage.
@@ -113,52 +121,9 @@ export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}
     } catch (error) { sendError(res, error); }
   });
 
-  router.get('/user-pool/summary', handle(async (_req, res, store) => {
-    res.json({ enabled: true, poolId: 'default', observedAt: Date.now(),
-      settings: settingsDto(await store.settings()), counts: countsDto(await store.counts()),
-      limits: SETTINGS_LIMITS, listLimits: LIST_LIMITS, accounts: [], leases: [], events: [] });
+  router.get('/user-pool/settings', handle(async (_req, res, store) => {
+    res.json(settingsDto(await store.settings()));
   }));
-  router.get('/user-pool/page/:kind', async (req, res) => {
-    try {
-      const kind = req.params.kind as PoolList;
-      if (!['accounts', 'leases', 'events'].includes(kind)
-        || Object.keys(req.query).some(key => !['page', 'pageSize', 'q', 'state'].includes(key))) {
-        throw new UserPoolError(400, 'invalid_request');
-      }
-      const integerQuery = (key: string, fallback: number) => {
-        const value = req.query[key];
-        if (value === undefined) return fallback;
-        if (typeof value !== 'string' || !/^\d+$/.test(value)) throw new UserPoolError(400, 'invalid_request');
-        return Number(value);
-      };
-      if (req.query.q !== undefined && typeof req.query.q !== 'string'
-        || req.query.state !== undefined && typeof req.query.state !== 'string') throw new UserPoolError(400, 'invalid_request');
-      const query: PoolPageQuery = { page: integerQuery('page', 1), pageSize: integerQuery('pageSize', 25),
-        q: req.query.q as string | undefined, state: req.query.state as string | undefined };
-      try { poolPageSql(kind, query, 0); } catch { throw new UserPoolError(400, 'invalid_request'); }
-      const store = await getStore();
-      if (!store) throw new UserPoolError(409, 'pool_mode_disabled');
-      if (!store.page) throw new UserPoolError(503, 'pool_operation_failed');
-      const result = await store.page(kind, query);
-      res.json({ ...result, items: result.items.map(row => kind === 'accounts' ? accountDto(row)
-        : kind === 'events' ? eventDto(row) : leaseDto(row, isRecord(row) && number(row.active_requests) > 0)) });
-    } catch (error) { sendError(res, error); }
-  });
-
-  router.get('/user-pool/accounts', handle(async (_req, res, store) => {
-    const counts = countsDto(await store.counts());
-    res.json({ items: (await store.accounts()).slice(0, LIST_LIMITS.accounts).map(accountDto), total: counts.total, limit: LIST_LIMITS.accounts });
-  }));
-  router.get('/user-pool/leases', handle(async (_req, res, store) => {
-    const counts = countsDto(await store.counts());
-    const items = (await store.leases()).slice(0, LIST_LIMITS.leases)
-      .map((lease) => leaseDto(lease, number(lease.active_requests) > 0));
-    res.json({ items, total: counts.leased + counts.provisional, limit: LIST_LIMITS.leases });
-  }));
-  router.get('/user-pool/events', handle(async (_req, res, store) => {
-    res.json({ items: (await store.events()).slice(0, LIST_LIMITS.events).map(eventDto), limit: LIST_LIMITS.events });
-  }));
-
   router.patch('/user-pool/settings', handle(async (req, res, store) => {
     const { expectedVersion, changes } = readSettingsPatch(req.body);
     const settings = await store.updateSettings(expectedVersion, changes);
@@ -170,30 +135,49 @@ export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}
     await wake();
     res.status(202).json({ scheduled: true });
   }));
+  router.use('/user-pool', (_req, res) => {
+    const code = 'enterprise_scope_required';
+    res.status(400).json({ error: { code, message: ERROR_MESSAGES[code] } });
+  });
+  return router;
+}
+
+/** Pool members, leases and events of one enterprise; mount behind `requireEnterprise` (design §5.2). */
+export function createEnterpriseUserPoolRouter(dependencies: Partial<Dependencies> = {}): Router {
+  const { getStore, wake } = resolveDependencies(dependencies);
+  const router = poolRouter();
+  const handle = handler(getStore);
+
+  router.get('/user-pool/summary', handle(async (_req, res, store) => {
+    const enterpriseId = requestEnterprise(res).id;
+    res.json({ enabled: true, enterpriseId, observedAt: Date.now(),
+      counts: countsDto(await store.counts(enterpriseId)), listLimits: LIST_LIMITS });
+  }));
+  router.get('/user-pool/page/:kind', (req, res) => sendPage(getStore, req, res));
+  router.get('/user-pool/accounts', handle(async (_req, res, store) => {
+    const enterpriseId = requestEnterprise(res).id;
+    const counts = countsDto(await store.counts(enterpriseId));
+    const items = (await store.accounts(enterpriseId)).slice(0, LIST_LIMITS.accounts).map(accountDto);
+    res.json({ items, total: counts.total, limit: LIST_LIMITS.accounts });
+  }));
+  router.get('/user-pool/leases', handle(async (_req, res, store) => {
+    const enterpriseId = requestEnterprise(res).id;
+    const counts = countsDto(await store.counts(enterpriseId));
+    const items = (await store.leases(enterpriseId)).slice(0, LIST_LIMITS.leases)
+      .map((lease) => leaseDto(lease, number(lease.active_requests) > 0));
+    res.json({ items, total: counts.leased + counts.provisional, limit: LIST_LIMITS.leases });
+  }));
+  router.get('/user-pool/events', handle(async (_req, res, store) => {
+    const items = (await store.events(requestEnterprise(res).id)).slice(0, LIST_LIMITS.events).map(eventDto);
+    res.json({ items, limit: LIST_LIMITS.events });
+  }));
   router.post('/user-pool/accounts/:identity/:action', handle(async (req, res, store) => {
-    requireEmptyBody(req.body);
-    const identity = String(req.params.identity);
-    const action = String(req.params.action);
-    if (identity !== identity.trim() || !/^[a-zA-Z0-9][a-zA-Z0-9._@+-]{0,253}$/.test(identity)) throw new UserPoolError(400, 'invalid_member_identity');
-    if (!['disable', 'resume', 'retry'].includes(action)) throw new UserPoolError(404, 'action_not_found');
-    const account = await store.inventory(identity);
-    if (!account) throw new UserPoolError(404, 'member_not_found');
-    if (action === 'disable') {
-      await store.disable(identity);
-    } else {
-      if (account.state !== (action === 'resume' ? 'disabled' : 'failed')) throw new UserPoolError(409, 'invalid_member_state');
-      // Retry revalidates entitlement and credentials; a resumed account is not immediately ready.
-      await store.retry(identity);
-    }
+    await memberAction(req, res, store);
     await wake();
     res.json({ accepted: true });
   }));
   router.post('/user-pool/leases/:id/release', handle(async (req, res, store) => {
-    if (!isRecord(req.body) || req.body.confirm !== true) throw new UserPoolError(400, 'confirmation_required');
-    if (Object.keys(req.body).some((key) => key !== 'confirm')) throw new UserPoolError(400, 'invalid_request');
-    const id = String(req.params.id);
-    if (id.length !== 36 || !UUID.test(id)) throw new UserPoolError(400, 'invalid_lease_id');
-    await store.release(id);
+    await releaseLease(req, res, store);
     await wake();
     res.json({ released: true });
   }));
@@ -204,6 +188,75 @@ export function createUserPoolApiRouter(dependencies: Partial<Dependencies> = {}
 }
 
 export const userPoolApiRouter = createUserPoolApiRouter();
+
+async function sendPage(getStore: Dependencies['getStore'], req: Request, res: Response): Promise<void> {
+  try {
+    const kind = req.params.kind as PoolList;
+    const query = readPageQuery(kind, req.query, requestEnterprise(res).id);
+    const store = await getStore();
+    if (!store) throw new UserPoolError(409, 'pool_mode_disabled');
+    if (!store.page) throw new UserPoolError(503, 'pool_operation_failed');
+    const result = await store.page(kind, query);
+    res.json({ ...result, items: result.items.map(row => kind === 'accounts' ? accountDto(row)
+      : kind === 'events' ? eventDto(row) : leaseDto(row, isRecord(row) && number(row.active_requests) > 0)) });
+  } catch (error) { sendError(res, error); }
+}
+
+function readPageQuery(kind: PoolList, raw: Request['query'], enterpriseId: string): PoolPageQuery {
+  if (!['accounts', 'leases', 'events'].includes(kind)
+    || Object.keys(raw).some(key => !['page', 'pageSize', 'q', 'state'].includes(key))) {
+    throw new UserPoolError(400, 'invalid_request');
+  }
+  const integerQuery = (key: string, fallback: number) => {
+    const value = raw[key];
+    if (value === undefined) return fallback;
+    if (typeof value !== 'string' || !/^\d+$/.test(value)) throw new UserPoolError(400, 'invalid_request');
+    return Number(value);
+  };
+  if (raw.q !== undefined && typeof raw.q !== 'string'
+    || raw.state !== undefined && typeof raw.state !== 'string') throw new UserPoolError(400, 'invalid_request');
+  const query: PoolPageQuery = { enterpriseId, page: integerQuery('page', 1), pageSize: integerQuery('pageSize', 25),
+    q: raw.q as string | undefined, state: raw.state as string | undefined };
+  try { poolPageSql(kind, query, 0); } catch { throw new UserPoolError(400, 'invalid_request'); }
+  return query;
+}
+
+/** A member of another enterprise is reported as missing, never acted on (design §5.3). */
+async function memberAction(req: Request, res: Response, store: AdminStore): Promise<void> {
+  requireEmptyBody(req.body);
+  const identity = String(req.params.identity);
+  const action = String(req.params.action);
+  if (identity !== identity.trim() || !/^[a-zA-Z0-9][a-zA-Z0-9._@+-]{0,253}$/.test(identity)) {
+    throw new UserPoolError(400, 'invalid_member_identity');
+  }
+  if (!['disable', 'resume', 'retry'].includes(action)) throw new UserPoolError(404, 'action_not_found');
+  const account = await store.inventory(identity);
+  if (account?.enterprise_id !== requestEnterprise(res).id) throw new UserPoolError(404, 'member_not_found');
+  if (action === 'disable') {
+    await store.disable(identity);
+    return;
+  }
+  const expectedState = action === 'resume' ? 'disabled' : 'failed';
+  if (account.state !== expectedState) throw new UserPoolError(409, 'invalid_member_state');
+  // Retry revalidates entitlement and credentials; a resumed account is not immediately ready.
+  await store.retry(identity);
+}
+
+async function releaseLease(req: Request, res: Response, store: AdminStore): Promise<void> {
+  if (!isRecord(req.body) || req.body.confirm !== true) throw new UserPoolError(400, 'confirmation_required');
+  if (Object.keys(req.body).some((key) => key !== 'confirm')) throw new UserPoolError(400, 'invalid_request');
+  const id = String(req.params.id);
+  if (id.length !== 36 || !UUID.test(id)) throw new UserPoolError(400, 'invalid_lease_id');
+  if (!await enterpriseHasLease(store, requestEnterprise(res).id, id)) throw new UserPoolError(404, 'lease_not_found');
+  await store.release(id);
+}
+
+/** Lease IDs are searchable in the enterprise's lease page; a lease of another enterprise is not found. */
+async function enterpriseHasLease(store: AdminStore, enterpriseId: string, leaseId: string): Promise<boolean> {
+  if (!store.page) throw new UserPoolError(503, 'pool_operation_failed');
+  const page = await store.page('leases', { enterpriseId, page: 1, pageSize: 100, q: leaseId });
+  return page.items.some((row) => isRecord(row) && row.lease_id === leaseId);
+}
 
 function schedulerDto(snapshot: PrewarmWorkerSnapshot | undefined) {
   if (!snapshot) return null;
@@ -229,9 +282,11 @@ function readSettingsPatch(body: unknown): { expectedVersion: number; changes: P
   if (!isRecord(body) || Object.keys(body).some((key) => !['expectedVersion', 'changes'].includes(key))
     || !integerInRange(body.expectedVersion, 1, Number.MAX_SAFE_INTEGER) || !isRecord(body.changes)) throw invalid();
   const changes = body.changes;
-  if (!Object.keys(changes).length || Object.keys(changes).some((key) => !['idle_target', 'max_accounts', 'lease_seconds', 'paused'].includes(key))) throw invalid();
+  // The cap moved to each enterprise's pool policy (design §5.8).
+  if ('max_accounts' in changes) throw new UserPoolError(409, 'use_enterprise_cap');
+  const keys = Object.keys(changes);
+  if (!keys.length || keys.some((key) => !['idle_target', 'lease_seconds', 'paused'].includes(key))) throw invalid();
   if (('idle_target' in changes && !integerInRange(changes.idle_target, 0, NAME_CAPACITY))
-    || ('max_accounts' in changes && !integerInRange(changes.max_accounts, 1, NAME_CAPACITY))
     || ('lease_seconds' in changes && !integerInRange(changes.lease_seconds, SETTINGS_LIMITS.minLeaseSeconds, SETTINGS_LIMITS.maxLeaseSeconds))
     || ('paused' in changes && changes.paused !== 0 && changes.paused !== 1)) throw invalid();
   return { expectedVersion: body.expectedVersion as number, changes: changes as Partial<PoolSettings> };
@@ -260,7 +315,6 @@ function settingsDto(settings: PoolSettings) {
   return {
     version: settings.version,
     idle_target: settings.idle_target,
-    max_accounts: settings.max_accounts,
     lease_seconds: settings.lease_seconds,
     paused: settings.paused,
   };

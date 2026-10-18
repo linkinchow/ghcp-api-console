@@ -144,7 +144,9 @@ async function startFixture(t: TestContext) {
         {
           ...config.auth,
           github,
-          ssoUrl: `http://localhost:${ssoPort}/login`,
+          ssoLoginUrl: `http://localhost:${ssoPort}/login`,
+          allowedLoginUrls: [`http://localhost:${ssoPort}/login`],
+          selectors: {},
           ssoProvider: 'custom',
           headless: true,
           timeoutMs: 30_000,

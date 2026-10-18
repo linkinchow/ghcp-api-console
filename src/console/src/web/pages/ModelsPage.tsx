@@ -7,24 +7,27 @@ import { Card, CardDescription, CardTitle } from '../components/ui/card.js';
 import { Dialog } from '../components/ui/dialog.js';
 import { Input } from '../components/ui/input.js';
 import { Select } from '../components/ui/select.js';
+import { useEnterpriseScope } from '../lib/scope.js';
 
 type Notify = (message: string, tone?: 'success' | 'warning' | 'error') => void;
 type ModelView = 'all' | 'messages';
 
 const ADMIN_SOURCE_ERRORS: Record<string, string> = {
-  models_admin_not_configured: 'No GitHub enterprise admin is configured for the model catalog.',
+  models_admin_not_configured: 'No GitHub enterprise admin is configured for the model catalog of this enterprise.',
   models_admin_credential_missing: 'The configured GitHub enterprise admin credential is unavailable.',
   models_admin_identity_mismatch: 'The credential does not belong to the configured GitHub enterprise admin.',
   models_upstream_authorization_rejected: 'Copilot rejected the configured GitHub enterprise admin.',
   models_admin_configuration_invalid: 'The GitHub enterprise admin configuration is invalid.',
 };
 
-function errorMessage(error: unknown): string {
+function errorMessage(error: unknown, enterpriseId: string): string {
   if (error instanceof ConsoleApiError && error.status === 401) {
     return 'Your console session may have expired. Reload the console and sign in again.';
   }
   if (error instanceof ConsoleApiError && ADMIN_SOURCE_ERRORS[error.code]) {
-    return `${ADMIN_SOURCE_ERRORS[error.code]} Ask your operator to correct it, then refresh. No pool account is used instead.`;
+    const advice = 'Ask your operator to correct it, then refresh. '
+      + 'No pool account or other enterprise is used instead.';
+    return `Enterprise ${enterpriseId}: ${ADMIN_SOURCE_ERRORS[error.code]} ${advice}`;
   }
   return error instanceof Error ? error.message : 'Unable to load models. Try again.';
 }
@@ -39,7 +42,9 @@ function matches(model: ProxyModelDto, view: ModelView, search: string): boolean
   return [model.id, model.upstreamId, model.name ?? ''].some((value) => value.toLowerCase().includes(needle));
 }
 
+/** The catalog of the selected enterprise's admin; the page remounts when the enterprise changes. */
 export function ModelsPage({ notify }: { notify: Notify }) {
+  const scope = useEnterpriseScope();
   const [catalog, setCatalog] = useState<AdminModelsResponse>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
@@ -60,10 +65,10 @@ export function ModelsPage({ notify }: { notify: Notify }) {
     setManualCopy(undefined);
     setLoading(true);
     try {
-      const result = await getAdminModels(refresh, controller.signal);
+      const result = await getAdminModels(scope.id, refresh, controller.signal);
       if (!controller.signal.aborted) setCatalog(result);
     } catch (err) {
-      if (!controller.signal.aborted) setError(errorMessage(err));
+      if (!controller.signal.aborted) setError(errorMessage(err, scope.id));
     } finally {
       if (!controller.signal.aborted) setLoading(false);
     }
@@ -97,8 +102,11 @@ export function ModelsPage({ notify }: { notify: Notify }) {
       <Card>
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
-            <CardTitle>Model catalog</CardTitle>
-            <CardDescription>The actual Copilot /models catalog of the configured GitHub enterprise admin, not Proxy configuration.</CardDescription>
+            <CardTitle>Model catalog of {scope.displayName}</CardTitle>
+            <CardDescription>
+              The actual Copilot /models catalog of the GitHub enterprise admin configured for enterprise
+              {' '}<code>{scope.id}</code>, not Proxy configuration.
+            </CardDescription>
           </div>
           <Button variant="secondary" disabled={loading} onClick={() => void load(true)}>
             {loading ? 'Loading models…' : 'Refresh models'}

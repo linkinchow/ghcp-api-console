@@ -10,6 +10,8 @@ import test from 'node:test';
 import { createPool, type Pool } from 'mysql2/promise';
 import type { PoolStore } from '../userPool/storage.js';
 import type { PrewarmWorker as Worker } from '../userPool/worker.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
+import { defaultProxyEnterprise } from '../enterprises.js';
 
 // Capture explicit opt-in before loading any production module or dotenv.
 const mysqlTestUrl = process.env.MYSQL_TEST_URL;
@@ -153,21 +155,27 @@ async function race(engine: 'sqlite' | 'mysql', scenario: Scenario): Promise<voi
     }
     store = await getUserPool();
     assert.ok(store);
-    identity = (await store.reserve())!.identity;
+    identity = (await store.reserve([DEFAULT_ENTERPRISE_ID]))!.identity;
     const memberIdentity = identity;
-    await importCopilotOauthToken({ identity, ssoUser: identity, ghLogin: 'synthetic-gh-race', copilotOauthToken: tokenA });
+    await importCopilotOauthToken({
+      enterpriseId: DEFAULT_ENTERPRISE_ID,
+      identity,
+      ssoUser: identity,
+      ghLogin: 'synthetic-gh-race',
+      copilotOauthToken: tokenA,
+    });
     assert.equal(await store.update(identity, { state: 'provisioning', stage: 'warmup', sso_created_at: createdAt }), true);
 
     // This is the existing client-boundary fetch pattern, not storage/runtime mocks.
     // Unexpected traffic (including Login or any real provider) fails closed.
     globalThis.fetch = async (input, init) => {
       const url = new URL(String(input));
-      if (url.origin === config.ssoBaseUrl && url.pathname === `/api/users/${memberIdentity}`) {
+      if (url.origin === config.ssoBaseUrl && url.pathname === `/api/enterprises/default/users/${memberIdentity}`) {
         assert.equal(init?.method, 'GET');
         return json({ ssoUser: memberIdentity, email: `${memberIdentity}@credential-race.test`, role: 'user',
           createdAt, emuStatus: 'active', ghLogin: 'synthetic-gh-race', ghScimId: 'synthetic-scim', copilotSeatStatus: 'assigned' });
       }
-      assert.equal(url.origin, config.copilotApiBaseUrl, 'No real services may be called');
+      assert.equal(url.origin, defaultProxyEnterprise().endpoints.copilotApiBaseUrl, 'No real services may be called');
       const token = new Headers(init?.headers).get('authorization') ?? '';
       if (url.pathname === '/models') {
         calls.push({ kind: 'catalog', token });
@@ -194,7 +202,8 @@ async function race(engine: 'sqlite' | 'mysql', scenario: Scenario): Promise<voi
       return success();
     };
     const options = readPoolConfig(process.env);
-    worker = new PrewarmWorker(store, realProvisioner(store, options), 60000, 1, undefined, { multiReplica: engine === 'mysql' });
+    const adapter = realProvisioner(store, options, { isReady: async () => true });
+    worker = new PrewarmWorker(store, adapter, 60000, 1, undefined, { multiReplica: engine === 'mysql' });
     await bounded(worker.tick(), 'initial production warmup');
     assert.equal((await store.inventory(identity))?.state, 'ready');
     assert.notEqual((await store.inventory(identity))?.verified_at, null);
@@ -225,16 +234,19 @@ async function race(engine: 'sqlite' | 'mysql', scenario: Scenario): Promise<voi
     await bounded(started.success.promise, 'first request upstream');
     const oldUnauthorized = request(1, 'old-unauthorized');
     await bounded(started.unauthorized.promise, 'second request upstream');
-    const [oldLease] = await store.leases();
-    assert.equal((await store.leases()).length, 1);
+    const [oldLease] = await store.leases(DEFAULT_ENTERPRISE_ID);
+    assert.equal((await store.leases(DEFAULT_ENTERPRISE_ID)).length, 1);
     assert.equal(oldLease.member_identity, identity);
     assert.equal(oldLease.caller_id, caller);
     assert.equal(oldLease.active_requests, 2);
     assert.equal(oldLease.phase, 'provisional');
     assert.equal(oldLease.last_success_at, null);
     const originalGeneration = (await store.inventory(identity))!.generation;
-    const reauthEvents = async () => (await store!.events() as Array<{ action: string }>).filter(event => event.action === 'oauth_reauth_scheduled').length;
-    const leaseRenewals = async () => (await store!.events() as Array<{ action: string; lease_id: string }>).filter(event => event.action === 'lease_renewed' && event.lease_id === oldLease.lease_id).length;
+    type PoolEvent = { action: string; lease_id: string };
+    const events = async () => await store!.events(DEFAULT_ENTERPRISE_ID) as PoolEvent[];
+    const reauthEvents = async () => (await events()).filter(event => event.action === 'oauth_reauth_scheduled').length;
+    const leaseRenewals = async () => (await events())
+      .filter(event => event.action === 'lease_renewed' && event.lease_id === oldLease.lease_id).length;
     const releaseUnauthorized = async () => {
       responses.unauthorized.resolve(json({ error: { message: 'synthetic unauthorized' } }, 401));
       assert.equal((await bounded(oldUnauthorized, 'old 401 response')).status, 401);
@@ -243,7 +255,13 @@ async function race(engine: 'sqlite' | 'mysql', scenario: Scenario): Promise<voi
       responses.success.resolve(success());
       assert.equal((await bounded(oldSuccess, 'old 200 response')).status, 200);
     };
-    const importToken = async (token: string) => importCopilotOauthToken({ identity: memberIdentity, ssoUser: memberIdentity, ghLogin: 'synthetic-gh-race', copilotOauthToken: token });
+    const importToken = async (token: string) => importCopilotOauthToken({
+      enterpriseId: DEFAULT_ENTERPRISE_ID,
+      identity: memberIdentity,
+      ssoUser: memberIdentity,
+      ghLogin: 'synthetic-gh-race',
+      copilotOauthToken: token,
+    });
     const beforeRotation = (await store.inventory(identity))!.generation;
     await importToken(tokenB);
     const intermediate = (await store.inventory(identity))!;
@@ -267,12 +285,13 @@ async function race(engine: 'sqlite' | 'mysql', scenario: Scenario): Promise<voi
     await assertReplacement();
     // Do not run admission/reclaim before the first completion: failed-state
     // fencing would mask a broken credential-generation (especially ABA) fence.
-    const leaseBeforeCompletion = (await store.leases())[0];
+    const leaseBeforeCompletion = (await store.leases(DEFAULT_ENTERPRISE_ID))[0];
     assert.equal(leaseBeforeCompletion.lease_id, oldLease.lease_id);
     assert.equal(leaseBeforeCompletion.phase, 'provisional');
     const assertOldNotRenewed = async () => {
       assert.equal(await leaseRenewals(), 0, 'Old 200 cannot promote or renew its prior-generation lease');
-      const remaining = (await store!.leases()).find(lease => lease.lease_id === oldLease.lease_id);
+      const leases = await store!.leases(DEFAULT_ENTERPRISE_ID);
+      const remaining = leases.find(lease => lease.lease_id === oldLease.lease_id);
       if (remaining) {
         assert.equal(remaining.phase, 'provisional');
         assert.equal(remaining.last_success_at, null);
@@ -282,7 +301,8 @@ async function race(engine: 'sqlite' | 'mysql', scenario: Scenario): Promise<voi
     const first = scenario.order === 'success-first' ? releaseSuccess : releaseUnauthorized;
     const second = scenario.order === 'success-first' ? releaseUnauthorized : releaseSuccess;
     await first();
-    await waitFor(async () => (await store!.leases())[0]?.active_requests === 1, 'first race hold drains');
+    const activeRequests = async () => (await store!.leases(DEFAULT_ENTERPRISE_ID))[0]?.active_requests;
+    await waitFor(async () => await activeRequests() === 1, 'first race hold drains');
     await assertReplacement();
     await assertOldNotRenewed();
     assert.equal((await bounded(request(0, 'must-not-admit'), 'unverified admission')).status, 503);
@@ -321,8 +341,8 @@ async function race(engine: 'sqlite' | 'mysql', scenario: Scenario): Promise<voi
     const replacement = await bounded(request(1, 'replacement'), 'verified replacement admission');
     assert.equal(replacement.status, 200);
     await waitFor(async () => !await store!.hasHolds(memberIdentity), 'replacement hold drains');
-    const [newLease] = await store.leases();
-    assert.equal((await store.leases()).length, 1);
+    const [newLease] = await store.leases(DEFAULT_ENTERPRISE_ID);
+    assert.equal((await store.leases(DEFAULT_ENTERPRISE_ID)).length, 1);
     assert.notEqual(newLease.lease_id, oldLease.lease_id, 'Expired lease epoch is not resurrected');
     assert.equal(newLease.member_identity, memberIdentity);
     assert.equal(newLease.caller_id, caller);

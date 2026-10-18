@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 
 test('only invalidates the credential and authorization attempt that are still current', async () => {
   process.env.DB_PATH = ':memory:';
@@ -12,7 +13,12 @@ test('only invalidates the credential and authorization attempt that are still c
     saveCopilotOauthToken,
   } = await import('./accountsRepo.js');
 
-  await createAccount({ identity: 'alice', ssoUser: 'alice', ghLogin: 'alice_octo' });
+  await createAccount({
+    enterpriseId: DEFAULT_ENTERPRISE_ID,
+    identity: 'alice',
+    ssoUser: 'alice',
+    ghLogin: 'alice_octo',
+  });
   assert.equal(await beginCopilotOauthAuthorization('alice', 'attempt-1'), true);
   await saveCopilotOauthToken('alice', 'attempt-1', 'new-token', 'alice_octo');
 

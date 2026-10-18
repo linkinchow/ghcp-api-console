@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
 import type { PoolConnection } from 'mysql2/promise';
-import { MYSQL_SCHEMA, MYSQL_CREDENTIAL_FENCE_BODY } from '../../src/proxy/src/db/mysqlSchema.js';
+import { MYSQL_SCHEMA, MYSQL_CREDENTIAL_FENCE_BODY, parseMysqlKey } from '../../src/proxy/src/db/mysqlSchema.js';
 import { readPoolConfig } from '../../src/proxy/src/userPool/config.js';
 import { concurrencyConfigFingerprint, reconfigureConcurrency, type ExpectedPoolSettings,
   type ReconfigureConcurrencyOptions } from './reconfigure-concurrency.js';
@@ -15,16 +15,27 @@ const newEnv = { ...oldEnv, PREWARM_CONCURRENCY: '5', POOL_LOGIN_MAX_PENDING: '2
 const expected: ExpectedPoolSettings = { id: 1, version: 7, idle_target: 2, max_accounts: 10, lease_seconds: 172800,
   paused: 1, next_ordinal: 2, account_domain: 'synthetic.invalid', owner: 'expired-synthetic-owner', owner_until: 500 };
 type Row = Record<string, any>;
+/** One KEY_COLUMN_USAGE row per column, grouped by constraint name as MySQL reports composite keys. */
+function foreignKeyRows(foreign: readonly [string, string, string, string, string?], index: number): Row[] {
+  const [columns, REFERENCED_TABLE_NAME, referenced, DELETE_RULE] = foreign;
+  const targets = referenced.split(', ');
+  return columns.split(', ').map((COLUMN_NAME, i) => ({ CONSTRAINT_NAME: `fk_${index}`, COLUMN_NAME,
+    REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME: targets[i], DELETE_RULE, UPDATE_RULE: 'RESTRICT',
+    local_reference: 1 }));
+}
 function fixture() {
   const data: Record<string, Row[]> = Object.fromEntries(Object.keys(MYSQL_SCHEMA).map(table => [table, []]));
   data.user_pool_settings = [{ ...expected, config_fingerprint: concurrencyConfigFingerprint(readPoolConfig(oldEnv)) }];
   for (const identity of ['synthetic-one', 'synthetic-two']) {
     data.proxy_accounts.push({ identity, sso_user: identity, gh_login: identity, copilot_oauth_status: 'valid',
-      copilot_oauth_token: 'SYNTHETIC_ONLY_TOKEN', copilot_oauth_attempt_id: null, copilot_oauth_updated_at: '2026-01-01' });
+      copilot_oauth_token: 'SYNTHETIC_ONLY_TOKEN', copilot_oauth_attempt_id: null,
+      copilot_oauth_updated_at: '2026-01-01', enterprise_id: 'default' });
     data.user_pool_accounts.push({ identity, state: 'ready', stage: 'ready', verified_at: 100, sso_created_at: '2026-01-01',
       task_id: 'historical-task', oauth_attempt_id: 'historical-attempt', generation: 12, ordinal: data.user_pool_accounts.length,
-      last_error: null });
+      last_error: null, enterprise_id: 'default' });
   }
+  data.proxy_enterprises = [{ id: 'default', state: 'active', max_accounts: '10', inventory_count: 2, policy_version: 3,
+    profile_fingerprint: 'e'.repeat(64), created_at: '1', updated_at: '2' }];
   data.schema_migrations = [{ id: 'synthetic-history', applied_at: '2026-01-01' }];
   data.user_pool_leases = [{ caller_id: 'synthetic-caller', member_identity: 'synthetic-one', expires_at: 999999 }];
   data.user_pool_events = [{ id: '1', detail: 'synthetic-history' }];
@@ -49,8 +60,10 @@ function fixture() {
         EXTRA: definition.includes('AUTO_INCREMENT') ? 'auto_increment' : '',
       })), []];
       if (sql.includes('information_schema.STATISTICS')) {
-        const result: Row[] = [schema.primary, ...schema.unique ?? []].map((COLUMN_NAME, i) => ({
-          COLUMN_NAME, INDEX_NAME: i === 0 ? 'PRIMARY' : `unique_${i}`, NON_UNIQUE: 0, SEQ_IN_INDEX: 1, SUB_PART: null }));
+        const keys = [schema.primary, ...schema.unique ?? []].map(spec => parseMysqlKey(spec).columns);
+        const result: Row[] = keys.flatMap((columns, i) => columns.map((COLUMN_NAME, seq) => ({
+          COLUMN_NAME, INDEX_NAME: i === 0 ? 'PRIMARY' : `unique_${i}`, NON_UNIQUE: 0, SEQ_IN_INDEX: seq + 1,
+          SUB_PART: null })));
         for (const definition of schema.indexes ?? []) {
           const [INDEX_NAME, ...parts] = definition.replace(/[(),]/g, ' ').trim().split(/\s+/);
           parts.filter(part => part !== 'DESC').forEach((COLUMN_NAME, i) => result.push({ COLUMN_NAME, INDEX_NAME, NON_UNIQUE: 1, SEQ_IN_INDEX: i + 1, SUB_PART: null }));
@@ -58,8 +71,9 @@ function fixture() {
         return [result, []];
       }
       if (sql.includes('information_schema.CHECK_CONSTRAINTS')) return [(schema.checks ?? []).map(CHECK_CLAUSE => ({ CHECK_CLAUSE, ENFORCED: 'YES' })), []];
-      if (sql.includes('information_schema.KEY_COLUMN_USAGE')) return [(schema.foreign ?? []).map(([COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, DELETE_RULE]) => ({
-        COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, DELETE_RULE, UPDATE_RULE: 'RESTRICT', local_reference: 1 })), []];
+      if (sql.includes('information_schema.KEY_COLUMN_USAGE')) {
+        return [(schema.foreign ?? []).flatMap(foreignKeyRows), []];
+      }
       if (sql.includes('information_schema.TRIGGERS')) return [f.missingTrigger ? [] : [{ TRIGGER_NAME: 'user_pool_credential_fence',
         EVENT_OBJECT_TABLE: 'proxy_accounts', ACTION_TIMING: 'AFTER', EVENT_MANIPULATION: 'UPDATE', ACTION_STATEMENT: MYSQL_CREDENTIAL_FENCE_BODY }], []];
       const table = sql.match(/SELECT \* FROM `?(\w+)`?/i)?.[1];
@@ -88,13 +102,15 @@ function fixture() {
 
 test('fingerprint equals independent current runtime formula, defaults normalize, mutable seeds excluded', () => {
   const config = readPoolConfig(oldEnv);
-  const { enabled, idleTarget, maxAccounts, leaseSeconds, callerDomain, ...invariants } = config;
+  // Multi-enterprise rule: the account domain is part of the enterprise identity, not the pool fingerprint.
+  const { enabled, idleTarget, maxAccounts, leaseSeconds, callerDomain, accountDomain, ...invariants } = config;
   const legacy = createHash('sha256').update(JSON.stringify(Object.entries(invariants).sort(([a], [b]) => a.localeCompare(b)))).digest('hex');
   assert.equal(concurrencyConfigFingerprint(config), legacy);
   assert.equal(concurrencyConfigFingerprint({ ...config, idleTarget: 0, maxAccounts: 3, enabled: false }), legacy);
   assert.equal(concurrencyConfigFingerprint({ ...config, prewarmConcurrency: undefined, loginMaxPending: undefined }),
     concurrencyConfigFingerprint({ ...config, prewarmConcurrency: 5, loginMaxPending: 5 }));
   assert.notEqual(concurrencyConfigFingerprint(readPoolConfig(newEnv)), legacy);
+  assert.equal(concurrencyConfigFingerprint({ ...config, accountDomain: 'other.invalid' }), legacy);
 });
 test('changes only fingerprint; preserves every other table and completed task correlation', async () => {
   const { f, options } = fixture();
@@ -132,6 +148,12 @@ for (const [label, change, error] of [
   ['credential callback', (f: any) => { f.data.proxy_accounts[0].copilot_oauth_attempt_id = 'pending'; }, 'unresolved_credentials'],
   ['refreshing', (f: any) => { f.data.proxy_accounts[0].copilot_oauth_status = 'refreshing'; }, 'unresolved_credentials'],
   ['unpaired task history', (f: any) => { f.data.user_pool_accounts[0].oauth_attempt_id = null; }, 'inventory_not'],
+  ['inventory counter drift', (f: any) => { f.data.proxy_enterprises[0].inventory_count = 1; }, 'enterprise_inventory'],
+  ['member enterprise mismatch', (f: any) => { f.data.user_pool_accounts[0].enterprise_id = 'other'; },
+    'enterprise_inventory'],
+  ['idle target above enterprise cap', (f: any) => { f.data.proxy_enterprises[0].max_accounts = '1'; },
+    'enterprise_inventory'],
+  ['missing default enterprise', (f: any) => { f.data.proxy_enterprises = []; }, 'enterprise_inventory'],
   ['schema trigger mismatch', (f: any) => { f.missingTrigger = true; }, 'maintenance_failed_details_suppressed'],
   ['CAS failure', (f: any) => { f.casRows = 0; }, 'fingerprint_cas_failed'],
   ['unexpected data mutation', (f: any) => { f.mutateAfterUpdate = true; }, 'preservation_verification_failed'],

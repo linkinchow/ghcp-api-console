@@ -34,8 +34,18 @@ data:
   PROXY_ERROR_DIAGNOSTICS_REDACT: "true"
   SSO_BASE_URL: REPLACE_EXISTING_INTERNAL_SSO_ROOT
   LOGIN_BASE_URL: REPLACE_EXISTING_INTERNAL_LOGIN_ROOT
+  # These two (and POOL_* above) define the `default` enterprise. If the registry file also sets the same
+  # `default` field, both values must be equal or startup fails with enterprise_env_conflict.
   ENTERPRISE_SHORTCODE: REPLACE_EXISTING_ENTERPRISE_SHORTCODE
   COPILOT_API_BASE_URL: REPLACE_APPROVED_COPILOT_API_ROOT
+  # Multi-enterprise line: seconds a replica waits for another replica's schema migration (1-3600, default 30).
+  # Raise it for large request-stats tables, or let a DBA run scripts/proxy-mysql-enterprise-upgrade.sql first.
+  MYSQL_MIGRATION_LOCK_WAIT_SECONDS: "30"
+  # Multi-enterprise line, direct mode only: enterprise of new direct identities (default `default`).
+  # DIRECT_MODE_ENTERPRISE_ID: default
+  # Multi-enterprise line, optional: the enterprise registry, mounted read-only (see volumes below).
+  # Unset keeps single-enterprise behaviour. See docs/multi-enterprise-registry.md.
+  # ENTERPRISE_REGISTRY_FILE: /config/enterprise-registry.json
   # This is checked by the init container, not a product env or DB pause setting.
   # Leave BLOCKED until actual persisted paused=1, target=0 and safe external-task
   # state are privately verified. Importer forces paused=1 but preserves source target.
@@ -80,11 +90,12 @@ spec:
   # 3/5 independent-process tests are NOT Rancher cross-node capacity/HA evidence.
   replicas: 3
   revisionHistoryLimit: 2
+  # The first single-enterprise -> multi-enterprise upgrade needs Recreate: previous-release replicas fail
+  # closed on the migrated database and must not run next to new ones. Replace SSO/Login/Console in the same
+  # window (docs/multi-enterprise-upgrade-guide.md). After that upgrade is verified, Proxy updates within the
+  # multi-enterprise line may return to RollingUpdate (maxSurge: 1, maxUnavailable: 0).
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: ghcp-pool-proxy
@@ -176,6 +187,8 @@ spec:
             timeoutSeconds: 3
             periodSeconds: 10
             failureThreshold: 6
+          # Proxy listens only after its schema migration; this allows about 300 s. Raise failureThreshold
+          # when the first upgrade of a large database is expected to take longer.
           startupProbe:
             httpGet:
               path: /healthz
@@ -192,6 +205,14 @@ spec:
             - name: mysql-ca
               mountPath: /run/mysql-ca
               readOnly: true
+            # Multi-enterprise registry: Proxy, SSO and Login mount the same file read-only.
+            # - name: enterprise-registry
+            #   mountPath: /config
+            #   readOnly: true
+            # {"file": ...} secrets the Proxy reads (e.g. a Models admin token), also read-only.
+            # - name: contoso-ghe-secrets
+            #   mountPath: /run/secrets/contoso-ghe
+            #   readOnly: true
       volumes:
         - name: mysql-ca
           configMap:
@@ -199,3 +220,12 @@ spec:
             items:
               - key: ca.pem
                 path: ca.pem
+        # - name: enterprise-registry
+        #   configMap:
+        #     name: REPLACE_ENTERPRISE_REGISTRY_CONFIGMAP
+        #     items:
+        #       - key: enterprise-registry.json
+        #         path: enterprise-registry.json
+        # - name: contoso-ghe-secrets
+        #   secret:
+        #     secretName: REPLACE_CONTOSO_GHE_SECRET

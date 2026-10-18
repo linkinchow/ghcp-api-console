@@ -14,9 +14,11 @@ test('accepts SAML 2.0 AuthnRequests regardless of namespace prefix', async () =
   for (const prefix of ['samlp', 'saml2p', '']) {
     assert.equal(await validateSamlXml(authnRequest(prefix)), 'SUCCESS_VALIDATE_XML', `prefix "${prefix}"`);
   }
+  const declared = `<?xml version="1.0" encoding="UTF-8"?>${authnRequest('samlp')}`;
+  assert.equal(await validateSamlXml(declared), 'SUCCESS_VALIDATE_XML');
 });
 
-test('rejects malformed XML, DTDs and messages other than a protocol AuthnRequest', async () => {
+test('rejects malformed XML, DTDs, processing instructions and non-AuthnRequest messages', async () => {
   const rejected = {
     empty: '',
     text: 'not xml',
@@ -27,6 +29,9 @@ test('rejects malformed XML, DTDs and messages other than a protocol AuthnReques
     undefinedEntity: `<samlp:AuthnRequest xmlns:samlp="${PROTOCOL}" ID="_req">&foo;</samlp:AuthnRequest>`,
     doctype: `<!DOCTYPE r [<!ENTITY x "y">]>${authnRequest('samlp')}`,
     entity: `<!ENTITY x SYSTEM "file:///etc/passwd">${authnRequest('samlp')}`,
+    processingInstruction: `<?xml-stylesheet href="x"?>${authnRequest('samlp')}`,
+    innerProcessingInstruction: authnRequest('samlp').replace('<saml:Issuer>', '<?target data?><saml:Issuer>'),
+    lateDeclaration: `${authnRequest('samlp')}<?xml version="1.0"?>`,
     logoutRequest: `<samlp:LogoutRequest xmlns:samlp="${PROTOCOL}" ID="_lo" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>`,
     response: `<samlp:Response xmlns:samlp="${PROTOCOL}" ID="_r" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>`,
     nonSaml: '<foo ID="_x"/>',

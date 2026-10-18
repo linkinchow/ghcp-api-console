@@ -11,18 +11,23 @@ import {
   type ProvisionInventory,
   type ProvisionPatch,
 } from './provisioner.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
+import { unscopedUrl } from '../testing/scopedPaths.js';
+import { installDefaultPoolDomain } from '../testing/enterpriseFixture.js';
 
 const options: PoolConfig = {
   enabled: true, accountDomain: 'pool.example.test', idleTarget: 2, maxAccounts: 10,
   leaseSeconds: 600, provisionalSeconds: 30, pollMs: 10000, retryAfterSeconds: 30,
   warmupModel: 'test-warmup-model', requestTimeoutMs: 1000,
 };
+installDefaultPoolDomain(options.accountDomain);
 const createdAt = '2026-01-01T00:00:00.000Z';
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 
 function fixture(stage = 'new') {
   let row: ProvisionInventory = {
-    identity: 'alex001', ordinal: 0, state: 'provisioning', stage, attempt_id: 'worker-attempt',
+    identity: 'alex001', enterprise_id: 'default', ordinal: 0, state: 'provisioning', stage,
+    attempt_id: 'worker-attempt',
     task_id: null, attempts: 0, retry_at: 0, last_error: null, updated_at: Date.now(),
     cooldown_until: 0, verified_at: null, generation: 0,
     sso_created_at: stage === 'new' ? null : createdAt,
@@ -34,7 +39,7 @@ function fixture(stage = 'new') {
     createdAt, updatedAt: createdAt,
   };
   let account: ProxyAccountRecord = {
-    identity: row.identity, ssoUser: row.identity, ghLogin: user?.ghLogin,
+    identity: row.identity, enterpriseId: DEFAULT_ENTERPRISE_ID, ssoUser: row.identity, ghLogin: user?.ghLogin,
     copilotOauthStatus: stage === 'warmup' ? 'valid' : 'missing',
     copilotOauthToken: stage === 'warmup' ? 'test-oauth-token' : undefined,
     createdAt, updatedAt: createdAt,
@@ -69,7 +74,7 @@ function fixture(stage = 'new') {
     },
   };
   const fetchMock: typeof fetch = async (input, init) => {
-    const path = new URL(String(input)).pathname;
+    const path = unscopedUrl(input).pathname;
     const method = init?.method ?? 'GET';
     const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
     requests.push({ path, method, body });
@@ -561,7 +566,7 @@ test('task age validation uses awaited database time', async () => {
   f.patch({ task_id: 'task-1' });
   const task = makeTask({ createdAt, status: 'running' });
   const adapter = realProvisioner({ now: async () => Date.parse(createdAt) + 15 * 60 * 1000 }, options, {
-    fetch: async input => String(input).includes('/api/tasks/') ? json(task) : json(f.user()),
+    fetch: async input => unscopedUrl(input).pathname.startsWith('/api/tasks/') ? json(task) : json(f.user()),
   });
   await rejectsCode(adapter.step(f.row(), f.context), 'oauth_task_stalled');
 });

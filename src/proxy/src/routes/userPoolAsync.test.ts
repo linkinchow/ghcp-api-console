@@ -9,6 +9,7 @@ import { buildApp, startServer } from '../server.js';
 import { getUserPool, stopUserPool } from '../userPool/runtime.js';
 import { UserPoolStore } from '../userPool/store.js';
 import { clearModelsCache } from '../copilot/copilotClient.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 
 const originalFetch = globalThis.fetch;
 const caller = `sha256:${'a'.repeat(64)}`;
@@ -30,9 +31,15 @@ async function fixture() {
   const store = await getUserPool();
   assert.ok(store instanceof UserPoolStore);
   let now = store.now(); store.now = () => now;
-  const member = store.reserve()!;
+  const member = store.reserve([DEFAULT_ENTERPRISE_ID])!;
   clearModelsCache(member.identity);
-  await importCopilotOauthToken({ identity: member.identity, ssoUser: member.identity, ghLogin: 'synthetic', copilotOauthToken: 'synthetic-token' });
+  await importCopilotOauthToken({
+    enterpriseId: DEFAULT_ENTERPRISE_ID,
+    identity: member.identity,
+    ssoUser: member.identity,
+    ghLogin: 'synthetic',
+    copilotOauthToken: 'synthetic-token',
+  });
   store.update(member.identity, { state: 'ready', stage: 'ready', verified_at: now });
   let forwarded = 0;
   globalThis.fetch = async input => {
@@ -69,9 +76,9 @@ test('completed inference promotes and drains before unrelated statistics settle
     const response = await f.request(); assert.equal(response.status, 200); await response.text();
     for (let i = 0; i < 100 && f.store.hasHolds(f.member.identity); i++) await sleep(10);
     assert.equal(f.store.hasHolds(f.member.identity), false);
-    assert.equal(f.store.leases()[0].phase, 'active');
+    assert.equal(f.store.leases(DEFAULT_ENTERPRISE_ID)[0].phase, 'active');
     f.advance(); delayed.resolve(); await sleep(30);
-    assert.equal(f.store.leases()[0].phase, 'active');
+    assert.equal(f.store.leases(DEFAULT_ENTERPRISE_ID)[0].phase, 'active');
   } finally { delayed.resolve(); await sleep(30); storage.recordRequestStat = saved; await f.close(); }
 });
 

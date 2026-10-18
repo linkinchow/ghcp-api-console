@@ -3,19 +3,23 @@ import test from 'node:test';
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import express from 'express';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 
 test('Login task mutations preserve pool recovery evidence and fail closed', async (t) => {
   process.env.DB_PATH = ':memory:';
   process.env.INTERNAL_API_TOKEN = 'login-protection-test';
   process.env.PROXY_BASE_URL = 'https://proxy.test';
   process.env.LOG_LEVEL = 'error';
-  const { tasksApiRouter } = await import('../routes/tasksApi.js');
-  const { createTask, getTask, markSuccess } = await import('./tasksRepo.js');
-  const { requireInternalToken } = await import('../auth/internalAuth.js');
+  process.env.SSO_URL = 'http://sso.test:7001/login';
+  const { createEnterpriseApiRouter } = await import('../routes/enterpriseRoutes.js');
+  const repo = await import('./tasksRepo.js');
   const { getDb } = await import('./connection.js');
+  const scope = DEFAULT_ENTERPRISE_ID;
+  const getTask = (id: string) => repo.getTask(scope, id);
+  const markSuccess = (id: string) => repo.markSuccess(scope, id);
   const app = express();
   app.use(express.json());
-  app.use('/api', requireInternalToken, tasksApiRouter);
+  app.use('/api/enterprises/:enterpriseId', createEnterpriseApiRouter());
   const server = app.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -27,6 +31,7 @@ test('Login task mutations preserve pool recovery evidence and fail closed', asy
     const url = new URL(String(input));
     if (url.origin === base) return original(input, init);
     assert.equal(url.origin, 'https://proxy.test');
+    assert.ok(url.pathname.startsWith('/internal/enterprises/default/accounts/'));
     assert.ok(url.pathname.endsWith('/login-task-protection'));
     assert.equal(new Headers(init?.headers).get('X-Internal-Token'), 'login-protection-test');
     assert.match(url.searchParams.get('oauthAttemptId') ?? '', /^attempt-/);
@@ -35,8 +40,13 @@ test('Login task mutations preserve pool recovery evidence and fail closed', asy
     return new Response(JSON.stringify(protection), { headers: { 'Content-Type': 'application/json' } });
   };
   // Attempt IDs are unique per account mapping, so each seeded identity gets its own.
-  const seed = (identity: string) => createTask({ identity, ssoUser: identity, ghLogin: `${identity}_test`, oauthAttemptId: `attempt-${identity}`, ssoType: 'custom' });
-  const request = (id: string, operation: 'delete' | 'retry', authenticated = true) => fetch(`${base}/api/tasks/${id}${operation === 'retry' ? '/retry' : ''}`, {
+  const seed = (identity: string) => repo.createTask(scope, {
+    identity, ssoUser: identity, ghLogin: `${identity}_test`, oauthAttemptId: `attempt-${identity}`, ssoType: 'custom',
+  });
+  const taskUrl = (id: string, operation: 'delete' | 'retry') => (
+    `${base}/api/enterprises/${scope}/tasks/${id}${operation === 'retry' ? '/retry' : ''}`
+  );
+  const request = (id: string, operation: 'delete' | 'retry', authenticated = true) => fetch(taskUrl(id, operation), {
     method: operation === 'delete' ? 'DELETE' : 'POST',
     headers: { 'Content-Type': 'application/json', ...(authenticated ? { 'X-Internal-Token': 'login-protection-test' } : {}) },
     ...(operation === 'retry' ? { body: JSON.stringify({ ssoPassword: 'test-only' }) } : {}),

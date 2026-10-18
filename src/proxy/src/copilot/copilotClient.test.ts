@@ -52,7 +52,11 @@ test('uses OpenCode headers and isolates model caches by identity', async () => 
     assert.equal(headers.get('Copilot-Vision-Request'), 'true');
     assert.equal(headers.get('X-Interaction-Type'), 'agent-session-name-generation');
 
-    await validateCopilotOauthToken('test-import', 'candidate-token');
+    await validateCopilotOauthToken({
+      identity: 'test-import',
+      accessToken: 'candidate-token',
+      api: 'https://api.githubcopilot.com',
+    });
     const validation = requests[4]!;
     assert.equal(new Headers(validation.init?.headers).get('Authorization'), 'Bearer candidate-token');
   } finally {

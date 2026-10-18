@@ -96,7 +96,8 @@ test('expired snapshot never fences work, logs, claims, or records a loss; execu
   let context!: ProvisionContext;
   const external = deferred<{}>();
   const row: ProvisionInventory = {
-    identity: 'sensitive-identity', ordinal: 1, state: 'provisioning', stage: 'new', attempt_id: 'attempt',
+    identity: 'sensitive-identity', enterprise_id: 'default', ordinal: 1, state: 'provisioning', stage: 'new',
+    attempt_id: 'attempt',
     task_id: null, attempts: 0, retry_at: 0, last_error: null, updated_at: 0, cooldown_until: 0,
     verified_at: null, generation: 0, sso_created_at: null, oauth_attempt_id: null,
   };

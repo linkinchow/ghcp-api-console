@@ -1,4 +1,5 @@
 import type { RequestHandler, Response } from 'express';
+import type { EnterpriseId } from '@ghcp/shared';
 import { config } from '../config.js';
 import { getStorage, initializeStorage } from '../db/connection.js';
 import { SqliteStorage } from '../db/sqliteStorage.js';
@@ -89,11 +90,35 @@ export function poolRequest(res: Response): PoolRequest | undefined {
   return res.locals?.userPool as PoolRequest | undefined;
 }
 
-export function statIdentity(res: Response, fallback: string): { identity: string; callerId?: string; leaseId?: string } {
+export interface StatIdentity {
+  identity: string;
+  callerId?: string;
+  leaseId?: string;
+  /** Undefined while a direct request's account is not resolved yet. */
+  enterpriseId?: EnterpriseId;
+}
+
+const ACCOUNT_ENTERPRISE_KEY = 'accountEnterpriseId';
+
+/** Records the enterprise of the direct-mode account that serves this request (design §5.4). */
+export function rememberAccountEnterprise(res: Response, enterpriseId: EnterpriseId): void {
+  res.locals[ACCOUNT_ENTERPRISE_KEY] = enterpriseId;
+}
+
+function accountEnterprise(res: Response): EnterpriseId | undefined {
+  return res.locals?.[ACCOUNT_ENTERPRISE_KEY] as EnterpriseId | undefined;
+}
+
+export function statIdentity(res: Response, fallback: string): StatIdentity {
   const context = poolRequest(res);
-  return context
-    ? { identity: context.held.member_identity, callerId: context.held.caller_id, leaseId: context.held.lease_id }
-    : { identity: fallback };
+  if (!context) return { identity: fallback, enterpriseId: accountEnterprise(res) };
+  const { held } = context;
+  return {
+    identity: held.member_identity,
+    callerId: held.caller_id,
+    leaseId: held.lease_id,
+    enterpriseId: held.enterprise_id as EnterpriseId,
+  };
 }
 
 export async function withPoolOperation(res: Response, operation: () => Promise<void>): Promise<void> {

@@ -30,9 +30,11 @@ async function body(req) {
   }
   return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
 }
-function forward(req, res, hostname, port, path = req.url) {
+// preserveHost keeps the caller's Host so the nested mock can dispatch GHE.com tenants by host name.
+function forward(req, res, hostname, port, path = req.url, preserveHost = false) {
+  const host = preserveHost && req.headers.host ? req.headers.host : `${hostname}:${port}`;
   const upstream = http.request({ hostname, port, path, method: req.method,
-    headers: { ...req.headers, host: `${hostname}:${port}` } }, response => {
+    headers: { ...req.headers, host } }, response => {
     res.writeHead(response.statusCode, response.headers);
     // pipe() does not forward IncomingMessage failures. A truncated upstream
     // must abort the downstream socket, not leave it hanging or turn it into EOF.
@@ -159,7 +161,7 @@ if (mode === 'bridge') {
       return json(res, 404, { error: 'not_found' });
     }
     const match = /^Bearer mysql-fixture-load-token-([0-9]{4})$/.exec(String(req.headers.authorization ?? ''));
-    if (!match) return forward(req, res, '127.0.0.1', 8003);
+    if (!match) return forward(req, res, '127.0.0.1', 8003, req.url, true);
     const memberIndex = Number(match[1]);
     if (!registered || memberIndex >= 2000) return json(res, 401, { error: { code: 'unregistered_fixture_token' } });
     if (path === '/models' && req.method === 'GET') {

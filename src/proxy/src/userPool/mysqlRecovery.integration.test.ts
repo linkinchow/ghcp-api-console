@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createPool, type RowDataPacket } from 'mysql2/promise';
 import { runMysqlMigrations } from '../db/mysqlMigrations.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import { MysqlPoolStore } from './mysqlStore.js';
 import { normalizePoolConfig, readPoolConfig } from './config.js';
 import { PrewarmWorker } from './worker.js';
@@ -10,6 +11,7 @@ import { ProvisionFailure } from './provisioner.js';
 
 const options = readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease', STORAGE_DRIVER: 'mysql',
   POOL_ACCOUNT_EMAIL_DOMAIN: 'synthetic.test', POOL_WARMUP_MODEL: 'unused-mock', READY_IDLE_TARGET: '1', POOL_MAX_ACCOUNTS: '2000' });
+const seed = { id: DEFAULT_ENTERPRISE_ID, fingerprint: 'f'.repeat(64), maxAccounts: options.maxAccounts };
 const enabled = Boolean(process.env.MYSQL_TEST_URL) && process.env.MYSQL_POOL_TEST_DISPOSABLE === '1';
 
 test('MySQL production regressions: bounded backlog, defaults and terminal callback', { skip: !enabled, timeout: 600000 }, async t => {
@@ -25,7 +27,7 @@ test('MySQL production regressions: bounded backlog, defaults and terminal callb
   url.pathname = '/' + database;
   const db = createPool({ uri: url.toString(), connectionLimit: 4, dateStrings: true, timezone: 'Z', supportBigNumbers: true, bigNumberStrings: true });
   try {
-    await runMysqlMigrations(db);
+    await runMysqlMigrations(db, seed);
     const { loginMaxPending: _login, prewarmConcurrency: _prewarm, ...omitted } = options;
     const store = new MysqlPoolStore(db, omitted);
     await store.initialize();
@@ -43,7 +45,7 @@ test('MySQL production regressions: bounded backlog, defaults and terminal callb
       } finally { await c.query("SET time_zone='+00:00'"); c.release(); }
     });
     await t.test('credential callback after atomic terminal fail cannot hide the reservation', async () => {
-      const member = (await store.reserve())!;
+      const member = (await store.reserve(['default']))!;
       await store.update(member.identity, { stage: 'oauth-wait', task_id: 'synthetic-task', oauth_attempt_id: 'synthetic-nonce' });
       const fail = store.fail.bind(store);
       store.fail = async (...args) => {
@@ -69,8 +71,14 @@ test('MySQL production regressions: bounded backlog, defaults and terminal callb
           members.push([identity, n, 'ready', 'ready', randomUUID(), 1, 1]);
           leases.push([`sha256:${n.toString(16).padStart(64, '0')}`, identity, randomUUID(), 'active', 1, 1, 1]);
         }
-        await db.query(`INSERT INTO proxy_accounts(identity,sso_user,copilot_oauth_token,copilot_oauth_status,created_at,updated_at) VALUES ${accounts.map(() => '(?,?,?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))').join(',')}`, accounts.flat());
-        await db.query(`INSERT INTO user_pool_accounts(identity,ordinal,state,stage,attempt_id,updated_at,verified_at) VALUES ${members.map(() => '(?,?,?,?,?,?,?)').join(',')}`, members.flat());
+        const account = "(?,?,?,?,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),'default')";
+        await db.query(`
+          INSERT INTO proxy_accounts(
+            identity,sso_user,copilot_oauth_token,copilot_oauth_status,created_at,updated_at,enterprise_id)
+          VALUES ${accounts.map(() => account).join(',')}`, accounts.flat());
+        await db.query(`
+          INSERT INTO user_pool_accounts(identity,ordinal,state,stage,attempt_id,updated_at,verified_at,enterprise_id)
+          VALUES ${members.map(() => "(?,?,?,?,?,?,?,'default')").join(',')}`, members.flat());
         await db.query(`INSERT INTO user_pool_leases(caller_id,member_identity,lease_id,phase,assigned_at,last_success_at,expires_at) VALUES ${leases.map(() => '(?,?,?,?,?,?,?)').join(',')}`, leases.flat());
       }
       const now = await store.now();
@@ -90,13 +98,16 @@ test('MySQL production regressions: bounded backlog, defaults and terminal callb
       assert.equal(await remaining(), 32);
       await db.execute('UPDATE user_pool_leases SET expires_at=1');
       await db.query('DELETE FROM user_pool_holds');
-      await db.execute('UPDATE user_pool_settings SET max_accounts=2100,idle_target=100 WHERE id=1');
-      assert.equal(await store.reserve(), undefined, 'Expired reusable inventory prevents unnecessary provisioning before all batches drain');
+      await db.execute('UPDATE user_pool_settings SET idle_target=100 WHERE id=1');
+      await db.execute("UPDATE proxy_enterprises SET max_accounts=2100 WHERE id='default'");
+      assert.equal(await store.reserve(['default']), undefined,
+        'Expired reusable inventory prevents unnecessary provisioning before all batches drain');
       for (let pass = 0; pass < 10 && await remaining(); pass++) await store.reclaim();
       assert.equal(await remaining(), 0);
       assert.equal((await store.counts()).ready_idle, 2000);
       await db.query("UPDATE proxy_accounts SET copilot_oauth_token='synthetic-refreshed-token'");
-      assert.equal(await store.reserve(), undefined, 'Unprocessed credential verification backlog counts toward future capacity');
+      assert.equal(await store.reserve(['default']), undefined,
+        'Unprocessed credential verification backlog counts toward future capacity');
       assert.equal(Number((await db.query<RowDataPacket[]>('SELECT COUNT(*) total FROM user_pool_accounts'))[0][0].total), 2000);
     });
   } finally {

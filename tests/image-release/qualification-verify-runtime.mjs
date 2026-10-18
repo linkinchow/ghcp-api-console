@@ -7,9 +7,14 @@ import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const [service, phase] = process.argv.slice(2);
+// Optional third argument `scoped`: multi-enterprise images, whose SSO/Login management APIs are enterprise-scoped
+// (unscoped paths answer 400 enterprise_scope_required); the `default` enterprise is checked instead.
+const [service, phase, apiScope = 'unscoped'] = process.argv.slice(2);
 assert.ok(['proxy', 'proxy2', 'console', 'sso', 'login'].includes(service));
 assert.ok(['baseline', 'candidate', 'rollback'].includes(phase));
+assert.ok(['unscoped', 'scoped'].includes(apiScope));
+const scoped = apiScope === 'scoped';
+const managementPath = (path) => (scoped ? `/api/enterprises/default${path}` : `/api${path}`);
 const component = service === 'proxy2' ? 'proxy' : service;
 const anchor = `/app/src/${component}/package.json`;
 const requireImage = createRequire(anchor);
@@ -19,6 +24,7 @@ const hash = (value) => createHash('sha256')
 const result = {
   service,
   phase,
+  apiScope,
   pass: false,
   node: process.versions.node,
   abi: process.versions.modules,
@@ -182,38 +188,53 @@ try {
     assert.equal(response.status, 200, 'runtime_http');
     return response;
   }
-  await get('/healthz');
-  if (service === 'sso') {
-    const xml = await (await get('/metadata')).text();
-    assert.match(xml, /EntityDescriptor/);
-    result.metadataSha256 = hash(xml);
-    result.certSha256 = hash(readFileSync('/certs/idp-cert.pem'));
-    const users = await (await get('/api/users?page=1&pageSize=100')).json();
-    assert.equal(users.total, 3, 'sso_users_survive');
-    result.userCount = users.total;
-    const ssoDb = new Database('/data/sso.sqlite', { readonly: true, fileMustExist: true });
+  const health = await (await get('/healthz')).json();
+  // Multi-enterprise images may report their release line; r4 does not.
+  result.releaseLine = typeof health.releaseLine === 'string' ? health.releaseLine : null;
+  async function expectScopeRequired(path) {
+    const port = { sso: 7001, login: 7003 }[service];
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      headers: auth,
+      signal: AbortSignal.timeout(15000),
+    });
+    assert.equal(response.status, 400, 'unscoped_management_status');
+    assert.equal((await response.json()).error?.code, 'enterprise_scope_required', 'unscoped_management_code');
+  }
+  function hashTables(dbPath) {
+    // Hash only fixture-generated logical table rows; never emit password hashes or tokens.
+    // Rows are reported per table and column so an upgrade may add tables or columns while the
+    // runner still proves every pre-existing value is unchanged.
+    const db = new Database(dbPath, { readonly: true, fileMustExist: true });
     try {
-      // Hash only fixture-generated logical table rows; never emit password hashes.
-      // Rows are reported per table and column so an upgrade may add tables or columns while the
-      // runner still proves every pre-existing value is unchanged.
-      const tables = ssoDb
+      const tables = db
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .all();
-      result.logicalTables = Object.fromEntries(tables.map(({ name }) => {
+      return Object.fromEntries(tables.map(({ name }) => {
         const quoted = `"${name.replaceAll('"', '""')}"`;
-        const columns = ssoDb
+        const columns = db
           .prepare(`SELECT name FROM pragma_table_info(?) ORDER BY cid`)
           .all(name)
           .map((column) => column.name);
-        const rows = ssoDb.prepare(`SELECT * FROM ${quoted}`).all();
+        const rows = db.prepare(`SELECT * FROM ${quoted}`).all();
         return [name, {
           columns,
           rows: rows.map((row) => Object.fromEntries(columns.map((column) => [column, hash(String(row[column]))]))),
         }];
       }));
     } finally {
-      ssoDb.close();
+      db.close();
     }
+  }
+  if (service === 'sso') {
+    const xml = await (await get('/metadata')).text();
+    assert.match(xml, /EntityDescriptor/);
+    result.metadataSha256 = hash(xml);
+    result.certSha256 = hash(readFileSync('/certs/idp-cert.pem'));
+    const users = await (await get(`${managementPath('/users')}?page=1&pageSize=100`)).json();
+    assert.equal(users.total, 3, 'sso_users_survive');
+    result.userCount = users.total;
+    if (scoped) await expectScopeRequired('/api/users?page=1&pageSize=100');
+    result.logicalTables = hashTables('/data/sso.sqlite');
   }
   if (service === 'console') {
     result.adminFileSha256 = hash(readFileSync('/data/admins.json'));
@@ -227,9 +248,13 @@ try {
     result.asset = { path: asset[1], sha256: hash(await response.text()) };
   }
   if (service === 'login') {
-    const tasks = await (await get('/api/tasks?page=1&pageSize=100')).json();
+    const tasks = await (await get(`${managementPath('/tasks')}?page=1&pageSize=100`)).json();
     assert.equal(tasks.total, 0, 'real_login_must_remain_zero_tasks');
-    const unauthorized = await fetch('http://127.0.0.1:7003/api/tasks', { signal: AbortSignal.timeout(15000) });
+    if (scoped) await expectScopeRequired('/api/tasks?page=1&pageSize=100');
+    result.logicalTables = hashTables('/data/login.sqlite');
+    const unauthorized = await fetch(`http://127.0.0.1:7003${managementPath('/tasks')}`, {
+      signal: AbortSignal.timeout(15000),
+    });
     assert.equal(unauthorized.status, 401);
     await unauthorized.body?.cancel();
     // Chromium must launch, but every network request is aborted: local HTML only.

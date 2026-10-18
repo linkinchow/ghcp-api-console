@@ -2,38 +2,57 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { csvCell, HttpApiError, OperationManager, readLoginCredentials, readManagementQuery, redactSecrets, resolveOperationSelection, type OperationItem } from '@ghcp/shared';
+import {
+  csvCell,
+  DEFAULT_ENTERPRISE_ID,
+  HttpApiError,
+  OperationManager,
+  readLoginCredentials,
+  readManagementQuery,
+  redactSecrets,
+  resolveOperationSelection,
+  type OperationItem,
+} from '@ghcp/shared';
 
 test('attempt history survives retries and old callbacks cannot change the current attempt', async () => {
   process.env.DB_PATH = ':memory:';
   process.env.DOTENV_CONFIG_PATH = '/dev/null';
   const repo = await import('./tasksRepo.js');
+  const scope = DEFAULT_ENTERPRISE_ID;
   const firstId = randomUUID();
-  const task = repo.createTask({ identity: 'history-user', ssoUser: 'history-user', ghLogin: 'history-user-gh', oauthAttemptId: firstId, ssoType: 'custom' });
-  repo.markRunning(task.id, '/not-a-real-log', firstId);
-  repo.markFailed(task.id, 'first failure', firstId);
+  const input = {
+    identity: 'history-user',
+    ssoUser: 'history-user',
+    ghLogin: 'history-user-gh',
+    ssoType: 'custom' as const,
+  };
+  const task = repo.createTask(scope, { ...input, oauthAttemptId: firstId });
+  repo.markRunning(scope, task.id, '/not-a-real-log', firstId);
+  repo.markFailed(scope, task.id, 'first failure', firstId);
   const secondId = randomUUID();
-  const retried = repo.reserveRetry(repo.getTask(task.id)!, secondId);
+  const retried = repo.reserveRetry(scope, repo.getTask(scope, task.id)!, secondId);
   assert.equal(retried.id, task.id);
+  assert.equal(retried.enterpriseId, scope);
   assert.equal(retried.status, 'pending');
   assert.equal(retried.stage, 'preparing');
   assert.equal(retried.failureReason, undefined);
-  assert.equal(repo.listAttempts(task.id).find((attempt) => attempt.id === firstId)?.failureReason, 'first failure');
-  assert.equal(repo.getTaskByAttempt(firstId)?.status, 'failed');
-  assert.equal(repo.getTaskByAttempt(firstId)?.oauthAttemptId, firstId);
-  assert.equal(repo.createTask({ identity: task.identity, ssoUser: task.ssoUser, ghLogin: task.ghLogin!, oauthAttemptId: firstId, ssoType: task.ssoType }).id, task.id);
-  assert.equal(repo.getTask(task.id)?.oauthAttemptId, secondId);
-  assert.throws(() => repo.reserveRetry(retried, randomUUID()), /already has an active/);
-  repo.markSuccess(task.id, firstId);
-  assert.equal(repo.getTask(task.id)?.status, 'pending');
-  repo.markRunning(task.id, '/another-test-log', secondId);
-  assert.equal(repo.getTask(task.id)?.attempts, 2);
-  repo.requestCancellation(task.id);
-  assert.equal(repo.deleteTask(task.id), 'not_allowed');
-  repo.markCancelled(task.id, secondId);
-  repo.markSuccess(task.id, secondId);
-  assert.equal(repo.getTask(task.id)?.status, 'cancelled');
-  assert.equal(repo.listAttempts(task.id).length, 2);
+  const firstAttempt = repo.listAttempts(scope, task.id).find((attempt) => attempt.id === firstId);
+  assert.equal(firstAttempt?.failureReason, 'first failure');
+  assert.equal(repo.getTaskByAttempt(scope, firstId)?.status, 'failed');
+  assert.equal(repo.getTaskByAttempt(scope, firstId)?.oauthAttemptId, firstId);
+  assert.equal(repo.createTask(scope, { ...input, oauthAttemptId: firstId }).id, task.id);
+  assert.equal(repo.getTask(scope, task.id)?.oauthAttemptId, secondId);
+  assert.throws(() => repo.reserveRetry(scope, retried, randomUUID()), /already has an active/);
+  repo.markSuccess(scope, task.id, firstId);
+  assert.equal(repo.getTask(scope, task.id)?.status, 'pending');
+  repo.markRunning(scope, task.id, '/another-test-log', secondId);
+  assert.equal(repo.getTask(scope, task.id)?.attempts, 2);
+  repo.requestCancellation(scope, task.id);
+  assert.equal(repo.deleteTask(scope, task.id), 'not_allowed');
+  repo.markCancelled(scope, task.id, secondId);
+  repo.markSuccess(scope, task.id, secondId);
+  assert.equal(repo.getTask(scope, task.id)?.status, 'cancelled');
+  assert.equal(repo.listAttempts(scope, task.id).length, 2);
 });
 
 test('operations run once per preview, stay readable afterwards and expire when unconfirmed', async () => {

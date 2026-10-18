@@ -9,6 +9,7 @@ import type { Browser } from 'playwright';
 import { chromium } from 'playwright-extra';
 import { AccountLogger } from '../tasks/accountLogger.js';
 import { HeadlessPlaywrightAuthStrategy } from '../auth/HeadlessPlaywrightAuthStrategy.js';
+import { resolveGithubDeployment } from '../auth/githubUrls.js';
 
 test('cancellation closes a real authorization browser, including a transient close failure', { timeout: 60_000 }, async (t) => {
   process.env.DOTENV_CONFIG_PATH = '/dev/null';
@@ -39,7 +40,17 @@ test('cancellation closes a real authorization browser, including a transient cl
   });
   const logger = AccountLogger.create(directory, 'fixture-user', false, 'fixture-attempt', undefined, ['fixture-password']);
   const strategy = new HeadlessPlaywrightAuthStrategy(
-    { ...config.auth, ssoProvider: 'custom', headless: true, timeoutMs: 30_000, debugArtifacts: false, debugLogs: false },
+    {
+      ...config.auth,
+      github: resolveGithubDeployment(undefined, undefined),
+      ssoProvider: 'custom',
+      allowedLoginUrls: [],
+      selectors: {},
+      headless: true,
+      timeoutMs: 30_000,
+      debugArtifacts: false,
+      debugLogs: false,
+    },
     { githubUsername: 'fixture-gh', ssoUsername: 'fixture-user', ssoPassword: 'fixture-password' },
     logger,
   );
