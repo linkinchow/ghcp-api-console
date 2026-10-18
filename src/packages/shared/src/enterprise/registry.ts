@@ -45,7 +45,8 @@ export interface SsoProfile {
 }
 
 export interface LoginProfile {
-  readonly ssoProvider: SsoProvider;
+  /** Absent: each task chooses its provider, as in r4 (the env-synthesized `default`). Present: enforced. */
+  readonly ssoProvider?: SsoProvider;
   readonly ssoLoginUrl?: string;
   readonly allowedLoginUrls: readonly string[];
   readonly selectors: LoginSelectors;

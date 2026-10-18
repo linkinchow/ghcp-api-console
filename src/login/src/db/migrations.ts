@@ -1,6 +1,49 @@
 import type Database from 'better-sqlite3';
+import {
+  addColumnIfMissing,
+  DEFAULT_ENTERPRISE_ID,
+  runSqliteMigrations,
+  type SqliteMigrationStep,
+} from '@ghcp/shared';
+import {
+  CREATE_LOGIN_ENTERPRISES_SQL,
+  insertEnterpriseIfMissing,
+  syncEnterprises,
+  type LoginEnterpriseSeed,
+} from './enterpriseRepo.js';
 
-export function runMigrations(db: Database.Database): void {
+/** `schema_migrations` ids of the multi-enterprise upgrade (design §4.4); never rename an applied id. */
+export const ENTERPRISE_MIGRATION_IDS = {
+  createEnterprises: 'enterprise-v1/01-create-login-enterprises',
+  tasks: 'enterprise-v1/02-tasks-enterprise',
+  taskGuards: 'enterprise-v1/03-tasks-enterprise-guards',
+} as const;
+
+/**
+ * Brings any Login database (fresh, r4 or older) to the multi-enterprise schema, then creates or verifies a row
+ * per registry enterprise. A fresh database takes the same path as an upgraded one, so both end up identical.
+ * Returns the enterprise step ids applied now.
+ */
+export function runMigrations(db: Database.Database, enterprises: readonly LoginEnterpriseSeed[]): string[] {
+  const defaultSeed = enterprises.find((seed) => seed.id === DEFAULT_ENTERPRISE_ID);
+  if (!defaultSeed) throw new Error('Login migrations need the default enterprise.');
+  runBaselineMigrations(db);
+  const applied = runSqliteMigrations(db, enterpriseSteps(defaultSeed));
+  db.transaction(() => syncEnterprises(db, enterprises)).immediate();
+  return applied;
+}
+
+/** The ordered steps of design §4.4; each one commits atomically with its `schema_migrations` record. */
+export function enterpriseSteps(defaultSeed: LoginEnterpriseSeed): SqliteMigrationStep[] {
+  return [
+    { id: ENTERPRISE_MIGRATION_IDS.createEnterprises, up: (db) => createEnterprises(db, defaultSeed) },
+    { id: ENTERPRISE_MIGRATION_IDS.tasks, up: migrateTasks },
+    { id: ENTERPRISE_MIGRATION_IDS.taskGuards, up: createTaskGuards },
+  ];
+}
+
+/** The single-enterprise (r4) schema and its in-place column upgrades; a no-op on a migrated database. */
+export function runBaselineMigrations(db: Database.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS login_tasks (
       id TEXT PRIMARY KEY,
@@ -100,8 +143,44 @@ function addAttemptNumberUniqueIndex(db: Database.Database): void {
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_login_attempts_task_number ON login_task_attempts(task_id, attempt_number)');
 }
 
-function addColumnIfMissing(db: Database.Database, table: string, column: string, definition: string): void {
-  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-  if (columns.some((item) => item.name === column)) return;
-  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+/** Step 01: the enterprise table, with `default` as the owner of every pre-upgrade task. */
+function createEnterprises(db: Database.Database, defaultSeed: LoginEnterpriseSeed): void {
+  db.exec(CREATE_LOGIN_ENTERPRISES_SQL);
+  insertEnterpriseIfMissing(db, defaultSeed);
+}
+
+/** Step 02: before the upgrade there was a single enterprise, so every existing task belongs to `default`. */
+function migrateTasks(db: Database.Database): void {
+  addColumnIfMissing(db, 'login_tasks', 'enterprise_id', 'TEXT REFERENCES login_enterprises(id)');
+  db.prepare(`
+    UPDATE login_tasks
+    SET enterprise_id = ?
+    WHERE enterprise_id IS NULL
+  `).run(DEFAULT_ENTERPRISE_ID);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_login_tasks_enterprise_status_created
+      ON login_tasks (enterprise_id, status, created_at)
+  `);
+}
+
+/** Step 03: the added column cannot be NOT NULL, so triggers require it and keep a task in its enterprise. */
+function createTaskGuards(db: Database.Database): void {
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS login_tasks_enterprise_required
+    BEFORE INSERT ON login_tasks
+    FOR EACH ROW
+    WHEN NEW.enterprise_id IS NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'enterprise_id_required');
+    END
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS login_tasks_enterprise_immutable
+    BEFORE UPDATE OF enterprise_id ON login_tasks
+    FOR EACH ROW
+    WHEN NEW.enterprise_id IS NOT OLD.enterprise_id
+    BEGIN
+      SELECT RAISE(ABORT, 'enterprise_id_immutable');
+    END
+  `);
 }

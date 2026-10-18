@@ -4,8 +4,11 @@ import type { AddressInfo } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import express from 'express';
-import type { CreateLoginTaskRequest, ManagementOperation } from '@ghcp/shared';
+import { DEFAULT_ENTERPRISE_ID, type ManagementOperation } from '@ghcp/shared';
 import type { LoginTaskRecord } from '../db/tasksRepo.js';
+import type { LoginTaskRequest } from '../tasks/runner.js';
+
+const scope = DEFAULT_ENTERPRISE_ID;
 
 test('batch retry uses server defaults and one-account overrides without persisting passwords', async (t) => {
   const received: Array<{ identity: string; mode: string; password?: string; attemptId: string }> = [];
@@ -15,7 +18,7 @@ test('batch retry uses server defaults and one-account overrides without persist
   const preparation = new Promise<void>((resolve) => { release = resolve; });
   const proxy = express();
   proxy.use(express.json());
-  proxy.post('/internal/accounts/:identity/oauth-attempts/:attemptId/prepare', async (req, res) => {
+  proxy.post('/internal/enterprises/default/accounts/:identity/oauth-attempts/:attemptId/prepare', async (req, res) => {
     received.push({ identity: req.params.identity, mode: req.body.credentialMode, password: req.body.ssoPassword, attemptId: req.params.attemptId });
     if (req.params.identity === 'cancel-during-prepare') { prepared!(); await preparation; }
     res.json({
@@ -24,11 +27,11 @@ test('batch retry uses server defaults and one-account overrides without persist
     });
   });
   // Fork pool-protection lookup before retry: these fixture tasks are not pool-managed.
-  proxy.get('/internal/accounts/:identity/login-task-protection', (_req, res) => {
+  proxy.get('/internal/enterprises/default/accounts/:identity/login-task-protection', (_req, res) => {
     res.json({ managed: false, referenced: false });
   });
   const releasedAtProxy: string[] = [];
-  proxy.post('/internal/accounts/:identity/mark-copilot-oauth-failed', (req, res) => {
+  proxy.post('/internal/enterprises/default/accounts/:identity/mark-copilot-oauth-failed', (req, res) => {
     releasedAtProxy.push(`${req.params.identity}:${req.body.oauthAttemptId}`);
     res.json({ identity: req.params.identity, copilotOauthStatus: 'failed' });
   });
@@ -43,20 +46,22 @@ test('batch retry uses server defaults and one-account overrides without persist
   const repo = await import('../db/tasksRepo.js');
   const { loginQueue } = await import('../tasks/queue.js');
   const { buildApp } = await import('../server.js');
-  t.mock.method(loginQueue, 'retry', (task: LoginTaskRecord, payload: CreateLoginTaskRequest) => {
-    repo.markRunning(task.id, '/unavailable-fixture-log', payload.oauthAttemptId);
-    repo.markSuccess(task.id, payload.oauthAttemptId);
-    return repo.getTask(task.id)!;
+  t.mock.method(loginQueue, 'retry', (task: LoginTaskRecord, payload: LoginTaskRequest) => {
+    repo.markRunning(scope, task.id, '/unavailable-fixture-log', payload.oauthAttemptId);
+    repo.markSuccess(scope, task.id, payload.oauthAttemptId);
+    return repo.getTask(scope, task.id)!;
   });
   const tasks = ['default-user', 'override-user'].map((identity) => {
-    const task = repo.createTask({ identity, ssoUser: identity, ghLogin: `${identity}-gh`, ssoType: 'custom', oauthAttemptId: randomUUID() });
-    repo.markFailed(task.id, 'initial failure', task.oauthAttemptId);
+    const task = repo.createTask(scope, {
+      identity, ssoUser: identity, ghLogin: `${identity}-gh`, ssoType: 'custom', oauthAttemptId: randomUUID(),
+    });
+    repo.markFailed(scope, task.id, 'initial failure', task.oauthAttemptId);
     return task;
   });
   const server = buildApp().listen(0, '127.0.0.1');
   await new Promise<void>((resolve) => server.once('listening', resolve));
   t.after(() => { server.closeAllConnections(); return new Promise<void>((resolve) => server.close(() => resolve())); });
-  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/tasks/operations`;
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/enterprises/${scope}/tasks/operations`;
   const headers = { 'Content-Type': 'application/json', 'X-Internal-Token': 'fixture-internal-token' };
   const previewResponse = await fetch(`${base}/preview`, { method: 'POST', headers, body: JSON.stringify({ action: 'retry', selection: { ids: tasks.map((task) => task.id) } }) });
   assert.equal(previewResponse.status, 201);
@@ -75,8 +80,14 @@ test('batch retry uses server defaults and one-account overrides without persist
   assert.deepEqual(finished.items.map((item) => item.status), ['success', 'success']);
   assert.equal(received.length, 2);
   const duplicates = Array.from({ length: 2 }, () => {
-    const task = repo.createTask({ identity: 'duplicate-account', ssoUser: 'duplicate-account', ghLogin: 'duplicate-gh', ssoType: 'azure', oauthAttemptId: randomUUID() });
-    repo.markFailed(task.id, 'Fixture failure', task.oauthAttemptId);
+    const task = repo.createTask(scope, {
+      identity: 'duplicate-account',
+      ssoUser: 'duplicate-account',
+      ghLogin: 'duplicate-gh',
+      ssoType: 'azure',
+      oauthAttemptId: randomUUID(),
+    });
+    repo.markFailed(scope, task.id, 'Fixture failure', task.oauthAttemptId);
     return task.id;
   });
   const deduplicated = await (await fetch(`${base}/preview`, {
@@ -90,13 +101,13 @@ test('batch retry uses server defaults and one-account overrides without persist
     method: 'POST', headers, body: JSON.stringify({ credentialMode: 'default' }),
   });
   assert.equal(busyResponse.status, 409);
-  assert.equal(repo.listAttempts(duplicates[0]!).length, 1);
+  assert.equal(repo.listAttempts(scope, duplicates[0]!).length, 1);
   busy.mock.restore();
   assert.equal(received[0]?.mode, 'default');
   assert.equal(received[0]?.password, undefined);
   assert.equal(received[1]?.password, 'fixture-account-override');
   assert.notEqual(received[0]?.attemptId, tasks[0]?.oauthAttemptId);
-  assert.equal(repo.listAttempts(tasks[0]!.id).length, 2);
+  assert.equal(repo.listAttempts(scope, tasks[0]!.id).length, 2);
   const persisted = JSON.stringify(getDb().prepare('SELECT * FROM login_tasks').all())
     + JSON.stringify(getDb().prepare('SELECT * FROM login_task_attempts').all())
     + JSON.stringify(finished);
@@ -105,18 +116,25 @@ test('batch retry uses server defaults and one-account overrides without persist
   const duplicate = await fetch(`${base}/${preview.id}/execute`, { method: 'POST', headers, body: JSON.stringify(body) });
   assert.equal(duplicate.status, 202);
   assert.equal(received.length, 2);
-  const cancelling = repo.createTask({ identity: 'cancel-during-prepare', ssoUser: 'cancel-user', ghLogin: 'cancel-gh', ssoType: 'custom', oauthAttemptId: randomUUID() });
-  repo.markFailed(cancelling.id, 'Initial failure', cancelling.oauthAttemptId);
+  const cancelling = repo.createTask(scope, {
+    identity: 'cancel-during-prepare',
+    ssoUser: 'cancel-user',
+    ghLogin: 'cancel-gh',
+    ssoType: 'custom',
+    oauthAttemptId: randomUUID(),
+  });
+  repo.markFailed(scope, cancelling.id, 'Initial failure', cancelling.oauthAttemptId);
   const taskBase = base.replace('/operations', '');
   const retry = fetch(`${taskBase}/${cancelling.id}/retry`, { method: 'POST', headers, body: JSON.stringify({ credentialMode: 'default' }) });
   await entered;
   await fetch(`${taskBase}/${cancelling.id}/cancel`, { method: 'POST', headers });
-  for (let index = 0; index < 100 && repo.getTask(cancelling.id)?.status !== 'cancelled'; index++) await delay(10);
+  const isCancelled = () => repo.getTask(scope, cancelling.id)?.status === 'cancelled';
+  for (let index = 0; index < 100 && !isCancelled(); index++) await delay(10);
   release!();
   assert.equal((await (await retry).json() as LoginTaskRecord).status, 'cancelled');
-  assert.deepEqual(loginQueue.snapshot().pending, []);
-  assert.equal(repo.getTask(cancelling.id)?.attempts, 0);
-  const cancelledAttempt = repo.getTask(cancelling.id)?.oauthAttemptId;
+  assert.deepEqual(loginQueue.snapshot(scope).pending, []);
+  assert.equal(repo.getTask(scope, cancelling.id)?.attempts, 0);
+  const cancelledAttempt = repo.getTask(scope, cancelling.id)?.oauthAttemptId;
   for (let index = 0; index < 100 && releasedAtProxy.filter((entry) => entry === `cancel-during-prepare:${cancelledAttempt}`).length < 1; index++) await delay(10);
   assert.ok(releasedAtProxy.includes(`cancel-during-prepare:${cancelledAttempt}`), 'The attempt Proxy prepared for a cancelled retry is released');
 });

@@ -182,7 +182,7 @@ test('URL attacks inside registry fields fail closed with the field path', () =>
   rejects(registryOf({ id: 'acme', github: { baseUrl: 'https://user@github.com' } }), 'acme.github.baseUrl');
   rejects(registryOf({ id: 'acme', github: { baseUrl: 'https://github.com/enterprises' } }), 'acme.github.baseUrl');
   rejects(registryOf(githubCom('acme', { sso: { spAcsUrl: 'https://github.com/a/../b' } })), 'acme.sso.spAcsUrl');
-  rejects(registryOf(githubCom('acme', { login: { ssoLoginUrl: 'http://sso/login#x' } })), 'acme.login.ssoLoginUrl');
+  rejects(registryOf(githubCom('acme', { login: { ssoLoginUrl: 'http://sso/%2e%2e/x?y' } })), 'acme.login.ssoLoginUrl');
   rejects(registryOf(githubCom('acme', { login: { allowedLoginUrls: ['http://sso/ok', 'http://sso/%2e'] } })),
     'acme.login.allowedLoginUrls');
 });

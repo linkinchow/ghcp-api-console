@@ -50,7 +50,7 @@ test('derives github.com and GHE.com defaults (design §3.3)', () => {
       spAcsUrl: 'https://github.com/enterprises/acme/saml/consume',
       scimBaseUrl: 'https://api.github.com/scim/v2/enterprises/acme',
     },
-    login: { ssoProvider: 'custom', allowedLoginUrls: [], selectors: {} },
+    login: { allowedLoginUrls: [], selectors: {} },
     pool: { initialMaxAccounts: 10 },
     blockers: [],
   });
@@ -85,7 +85,10 @@ test('login URLs default from SSO_URL: the URL itself for default, /enterprises/
   assert.deepEqual(second.login.allowedLoginUrls, ['http://sso:7001/enterprises/acme/login']);
   assert.equal(second.github.oauthClientId, 'client');
   assert.deepEqual(second.login.selectors, { ssoSubmit: '#go' });
-  rejects(registryOf(githubCom('acme')), 'SSO_URL', { ssoUrl: 'http://sso:7001/login?next=x' });
+  const withQuery = { ssoUrl: 'http://sso:7001/login?next=x#top' };
+  const [derived] = parseRegistry(registryOf(githubCom('acme')), withQuery).enterprises;
+  assert.equal(derived.login.ssoLoginUrl, 'http://sso:7001/enterprises/acme/login');
+  rejects(registryOf(githubCom('acme')), 'SSO_URL', { ssoUrl: 'http://sso:7001/%2e%2e/login?next=x' });
 });
 
 test('profile values override global login defaults', () => {

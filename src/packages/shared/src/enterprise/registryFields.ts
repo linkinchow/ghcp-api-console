@@ -1,6 +1,6 @@
 import { isAbsolute } from 'node:path';
 import { parseGithubBaseUrl } from '../github.js';
-import { parseTrustedUrl } from './trustedUrl.js';
+import { parseTrustedUrl, type TrustedUrl } from './trustedUrl.js';
 
 export type SsoProvider = 'custom' | 'azure';
 /** A reference to a secret; registries never carry secret values inline (design §3.4). */
@@ -52,8 +52,8 @@ export const ACCOUNT_NAME_CAPACITY = 10_000;
 export const MAX_ALLOWED_LOGIN_URLS = 16;
 
 type FieldKind =
-  | 'text' | 'githubBaseUrl' | 'origin' | 'url' | 'urlList' | 'slug' | 'shortcode' | 'domain' | 'count'
-  | 'provider' | 'secret';
+  | 'text' | 'githubBaseUrl' | 'origin' | 'url' | 'loginUrl' | 'urlList' | 'slug' | 'shortcode' | 'domain'
+  | 'count' | 'provider' | 'secret';
 
 const FIELD_KINDS: ReadonlyMap<string, FieldKind> = new Map<string, FieldKind>([
   ['displayName', 'text'],
@@ -71,7 +71,7 @@ const FIELD_KINDS: ReadonlyMap<string, FieldKind> = new Map<string, FieldKind>([
   ['sso.userPrefix', 'text'],
   ...SSO_SECRET_KEYS.map((key): [string, FieldKind] => [`sso.${key}`, 'secret']),
   ['login.ssoProvider', 'provider'],
-  ['login.ssoLoginUrl', 'url'],
+  ['login.ssoLoginUrl', 'loginUrl'],
   ['login.allowedLoginUrls', 'urlList'],
   ...LOGIN_SELECTOR_KEYS.map((key): [string, FieldKind] => [`login.selectors.${key}`, 'text']),
   ['pool.accountDomain', 'domain'],
@@ -94,6 +94,7 @@ const NORMALIZERS: Record<FieldKind, (value: unknown) => FieldValue> = {
   githubBaseUrl: (value) => parseGithubBaseUrl(readOrigin(value)).baseUrl,
   origin: readOrigin,
   url: (value) => parseTrustedUrl(readString(value)).href,
+  loginUrl: (value) => parseLoginUrl(readString(value)).href,
   urlList: readUrlList,
   slug: readSlug,
   shortcode: readShortcode,
@@ -112,6 +113,11 @@ export function normalizeField(path: string, value: unknown, label: string): Fie
   } catch (error) {
     throw invalidRegistryField(label, error instanceof Error ? error.message : 'is invalid');
   }
+}
+
+/** Login page URL: query and fragment are dropped (r4 ignored them in SSO_URL), then the trusted-URL checks run. */
+export function parseLoginUrl(raw: string): TrustedUrl {
+  return parseTrustedUrl(raw.replace(/[?#].*$/s, ''));
 }
 
 export function readProvider(value: unknown): SsoProvider {
@@ -149,7 +155,7 @@ function readUrlList(value: unknown): string[] {
   }
   return value.map((item, index) => {
     try {
-      return parseTrustedUrl(readString(item)).href;
+      return parseLoginUrl(readString(item)).href;
     } catch (error) {
       throw new Error(`[${index}] ${error instanceof Error ? error.message : 'is invalid'}`);
     }

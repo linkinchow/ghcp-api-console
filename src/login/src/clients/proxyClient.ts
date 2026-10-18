@@ -1,4 +1,10 @@
-import { JsonHttpClient, type CreateLoginTaskRequest, type LoginCredentials, type LoginTaskDto } from '@ghcp/shared';
+import {
+  JsonHttpClient,
+  type CreateLoginTaskRequest,
+  type EnterpriseId,
+  type LoginCredentials,
+  type LoginTaskDto,
+} from '@ghcp/shared';
 import { config } from '../config.js';
 
 const client = new JsonHttpClient({
@@ -6,10 +12,20 @@ const client = new JsonHttpClient({
   internalToken: config.internalApiToken,
 });
 
-export async function getPoolTaskProtection(identity: string, taskId: string, oauthAttemptId?: string): Promise<{ managed: boolean; referenced: boolean }> {
+export interface PoolTaskProtection {
+  managed: boolean;
+  referenced: boolean;
+}
+
+export async function getPoolTaskProtection(
+  enterpriseId: EnterpriseId,
+  identity: string,
+  taskId: string,
+  oauthAttemptId?: string,
+): Promise<PoolTaskProtection> {
   const query = new URLSearchParams({ taskId, ...(oauthAttemptId ? { oauthAttemptId } : {}) });
   const result = await client.request<{ managed?: unknown; referenced?: unknown }>(
-    `/internal/accounts/${encodeURIComponent(identity)}/login-task-protection?${query}`,
+    `${accountPath(enterpriseId, identity)}/login-task-protection?${query}`,
   );
   if (typeof result?.managed !== 'boolean' || typeof result?.referenced !== 'boolean') {
     throw new Error('Invalid pool task protection response.');
@@ -22,27 +38,50 @@ export async function getPoolTaskProtection(identity: string, taskId: string, oa
  * agrees while the account still points at the attempt this task ran before, so a retry of a stale
  * task cannot take over an authorization that was started elsewhere in the meantime.
  */
-export function prepareLoginRetry(task: LoginTaskDto, attemptId: string, credentials: LoginCredentials, previousAttemptId: string | null): Promise<CreateLoginTaskRequest> {
-  return client.request(`/internal/accounts/${encodeURIComponent(task.identity)}/oauth-attempts/${encodeURIComponent(attemptId)}/prepare`, {
-    method: 'POST', body: { ...credentials, ssoUser: task.ssoUser, ghLogin: task.ghLogin, ssoType: task.ssoType, previousAttemptId },
-  });
+export function prepareLoginRetry(
+  enterpriseId: EnterpriseId,
+  task: LoginTaskDto,
+  attemptId: string,
+  credentials: LoginCredentials,
+  previousAttemptId: string | null,
+): Promise<CreateLoginTaskRequest> {
+  const path = `${accountPath(enterpriseId, task.identity)}/oauth-attempts/${encodeURIComponent(attemptId)}/prepare`;
+  const body = {
+    ...credentials,
+    ssoUser: task.ssoUser,
+    ghLogin: task.ghLogin,
+    ssoType: task.ssoType,
+    previousAttemptId,
+  };
+  return client.request(path, { method: 'POST', body });
 }
 
 export async function saveCopilotOauthToken(
+  enterpriseId: EnterpriseId,
   identity: string,
   oauthAttemptId: string,
   copilotOauthToken: string,
   ghLogin?: string,
 ): Promise<void> {
-  await client.request(`/internal/accounts/${encodeURIComponent(identity)}/copilot-oauth-token`, {
+  await client.request(`${accountPath(enterpriseId, identity)}/copilot-oauth-token`, {
     method: 'PUT',
     body: { oauthAttemptId, copilotOauthToken, ghLogin },
   });
 }
 
-export async function markCopilotOauthFailed(identity: string, oauthAttemptId: string, failureReason: string): Promise<void> {
-  await client.request(`/internal/accounts/${encodeURIComponent(identity)}/mark-copilot-oauth-failed`, {
+export async function markCopilotOauthFailed(
+  enterpriseId: EnterpriseId,
+  identity: string,
+  oauthAttemptId: string,
+  failureReason: string,
+): Promise<void> {
+  await client.request(`${accountPath(enterpriseId, identity)}/mark-copilot-oauth-failed`, {
     method: 'POST',
     body: { oauthAttemptId, failureReason },
   });
+}
+
+/** Proxy checks that the account belongs to the path's enterprise (design §5.3). */
+function accountPath(enterpriseId: EnterpriseId, identity: string): string {
+  return `/internal/enterprises/${encodeURIComponent(enterpriseId)}/accounts/${encodeURIComponent(identity)}`;
 }

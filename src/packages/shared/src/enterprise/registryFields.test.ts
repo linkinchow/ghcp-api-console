@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { EnterpriseRegistryError, normalizeField } from './registryFields.js';
+import { EnterpriseRegistryError, normalizeField, parseLoginUrl } from './registryFields.js';
 
 function rejects(path: string, value: unknown, label = `acme.${path}`): EnterpriseRegistryError {
   let caught: unknown;
@@ -57,7 +57,19 @@ test('URLs: github.baseUrl is an origin; API and other URLs keep their path', ()
   rejects('github.apiBaseUrl', 'http://mock:8002/api?x=1');
   rejects('github.copilotApiBaseUrl', 'ftp://mock');
   rejects('sso.spAcsUrl', 'https://github.com/a/../b');
-  rejects('login.ssoLoginUrl', 'http://sso/login#x');
+  rejects('sso.spAcsUrl', 'http://sso/login#x');
+});
+
+test('login URLs drop the query and fragment that r4 ignored, then pass the trusted-URL checks', () => {
+  assert.equal(normalizeField('login.ssoLoginUrl', 'http://sso:7001/login?next=%2e#x', 'x'), 'http://sso:7001/login');
+  assert.equal(normalizeField('login.ssoLoginUrl', 'http://sso:7001/login#a?b', 'x'), 'http://sso:7001/login');
+  const allowed = normalizeField('login.allowedLoginUrls', ['http://sso:7001/a?x=1', 'http://sso:7001/b#f'], 'x');
+  assert.deepEqual(allowed, ['http://sso:7001/a', 'http://sso:7001/b']);
+  rejects('login.ssoLoginUrl', 'http://sso:7001/%2e%2e/login?x=1');
+  rejects('login.ssoLoginUrl', 'http://user@sso:7001/login?x=1');
+  rejects('login.allowedLoginUrls', ['http://sso:7001/a\\b?x=1']);
+  assert.equal(parseLoginUrl('http://SSO:7001/login/?RelayState=%2f').href, 'http://sso:7001/login');
+  assert.throws(() => parseLoginUrl('http://sso:7001/../login?x'), /dot segments/);
 });
 
 test('allowedLoginUrls holds 1 to 16 trusted URLs', () => {

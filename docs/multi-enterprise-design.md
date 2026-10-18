@@ -170,9 +170,9 @@
 | `sso.emailDomain` / `sso.userPrefix` | 否 | 只在首次创建该企业的 `sso_runtime_settings` 行时作为种子 | SSO |
 | `sso.signingCert` / `signingKey` / `sessionSecret` | 是 | — | SSO |
 | `sso.scimToken` / `seatPat` / `defaultUserPassword` | 否 | 缺失时，对应功能对该企业报 `enterprise_secret_unconfigured` | SSO |
-| `login.ssoProvider` | 否 | `custom` | Login |
+| `login.ssoProvider` | 否 | 不设：由每个任务选择（基线行为，未指定时为 `custom`）；设置后任务必须一致 | Login |
 | `login.ssoLoginUrl` | 否 | default 企业取 `SSO_URL`；其他企业取 `<SSO_URL origin>/enterprises/<id>/login` | Login |
-| `login.allowedLoginUrls` | 否 | `[ssoLoginUrl]`。最多 16 项，origin 与 path 精确匹配 | Login |
+| `login.allowedLoginUrls` | 否 | `[ssoLoginUrl]`。最多 16 项；origin 相同且路径整段前缀匹配；query、fragment 被去掉 | Login |
 | `login.selectors` | 否 | 全局 `AUTH_*_SELECTOR` | Login |
 | `pool.accountDomain` | 池模式必填 | — | Proxy |
 | `pool.initialMaxAccounts` | 否 | default 企业取 `POOL_MAX_ACCOUNTS`；其他企业取 `10` | Proxy，只在首次插入 `proxy_enterprises` 行时使用 |
@@ -507,14 +507,15 @@ SAML 会话**不建表**（§5.5）。
 ### 5.7 Login 任务绑定
 
 - 创建任务：Proxy 调用 `POST /api/enterprises/:id/tasks`，body 为 `{ identity, ssoUser, ghLogin, oauthAttemptId, ssoType? }`。
-  - `ssoType` 必须等于 `profile.login.ssoProvider`，或者省略。
+  - profile 设置了 `login.ssoProvider` 时，`ssoType` 必须等于它，或者省略；没有设置时（env 合成的 default 即如此）沿用基线，由任务选择 `custom` 或 `azure`。
   - **body 不能覆盖 `ssoUrl` 或 selector**。需要删除基线 `src/login/src/tasks/runner.ts:31` 的 `payload.ssoUrl ?? config.auth.ssoUrl`。
 - 任务行写入 `enterprise_id`。runner 从 profile 构造 `RuntimeAuthConfig`，内容包括：
   - `resolveGithubDeployment(baseUrl, slug)`；
   - `deviceFlowEndpoints()`；
   - `ssoLoginUrl`、`allowedLoginUrls`、`selectors`、`oauthClientId`。
 - 重试（`tasks/retry.ts`）继承原任务的 `enterprise_id`，不接受 body 中的作用域。删除和重试仍先经过 `tasks/poolProtection.ts`。
-- 允许的登录页：在每次填写 SSO 表单前，检查当前 URL 是否与 `allowedLoginUrls` 中某项的 origin 和 path 精确匹配（移植旧分支 `isAllowedLoginUrl`）。GitHub 页面用该企业的 `isGitHubUrl(url, deployment)` 判断。
+- 允许的登录页：在每次填写 SSO 表单前，检查当前 URL 是否与 `allowedLoginUrls` 中某项匹配：origin 相同，且该项的路径段是当前路径段的**整段前缀**（基线用 `startsWith` 接受子路径，这里保留子路径，但 `/login` 不再匹配 `/loginfoo`）；编码穿越、点段、userinfo 一律拒绝；当前页面的 query 和 fragment 不参与比较。
+  - 基线 `SSO_URL` 可能带 query 或 fragment（基线不使用它们），registry 解析 `login.ssoLoginUrl` 和 `allowedLoginUrls` 时去掉这两部分，而不是拒绝，保证原地升级。GitHub 页面用该企业的 `isGitHubUrl(url, deployment)` 判断。
 - 回调：使用 §5.3 的带作用域路径。成功回调前，Proxy 按以下顺序校验：
   1. 路径企业 = 行企业；
   2. `copilot_oauth_attempt_id` CAS（基线已有）；
@@ -564,7 +565,7 @@ SAML 会话**不建表**（§5.5）。
 | web base | `github.baseUrl` | Login `HeadlessPlaywrightAuthStrategy.ts` 的 `isGitHubUrl`、`isGitHubSsoInterstitial`、`isGheComSignInPage`；SSO 中 `saml/saml.ts` 的 SP 默认值 |
 | GHE.com enterprise SSO 入口 | `<baseUrl>/enterprises/<slug>/sso` | Login `completeEnterpriseSsoLogin` |
 | 设备流 | `<baseUrl>/login/device/code`、`<baseUrl>/login/oauth/access_token` | Login `auth/deviceFlow.ts`，使用 `github.oauthClientId` |
-| 设备验证页 | `<baseUrl>/login/device` | Login。旧分支在 `deviceFlow.ts:34` 和 `HeadlessPlaywrightAuthStrategy.ts:133` 写死了 github.com，不带入 |
+| 设备验证页 | `<baseUrl>/login/device` | Login：浏览器始终打开这个计算值；GitHub 返回的 `verification_uri` 不一致时只记 warning。旧分支在 `deviceFlow.ts:34` 和 `HeadlessPlaywrightAuthStrategy.ts:133` 写死了 github.com，不带入 |
 | GitHub 允许的主机 | baseUrl 主机及其子域；GHE.com 额外允许 `auth.ghe.com` | Login。旧分支 `HeadlessPlaywrightAuthStrategy.ts:785` 写死的 `url.origin === 'https://github.com'` 不带入 |
 | REST API | `github.apiBaseUrl` | SSO `copilot/seats.ts`、`budget/budgetService.ts`；Proxy `accounts/githubSubject.ts`（Models、回调主体校验） |
 | SCIM | `sso.scimBaseUrl` | SSO `scim/scimClient.ts` |
@@ -659,7 +660,7 @@ MySQL 的 schema 定义仍集中在 `src/proxy/src/db/mysqlSchema.ts`，只服�
 | `src/sso/src/users/enterpriseIsolation.test.ts` | 同名用户的 CRUD、搜索、设置、预算、导入隔离 |
 | `src/sso/src/saml/saml.test.ts`、`sessionStore.test.ts` | 按企业的 metadata 和证书；严格 AuthnRequest；cookie 跨企业无效；重建用户后旧 cookie 失效；重启后会话有效（新增） |
 | `src/sso/src/users/poolSafety.test.ts` | pool-membership 查询带作用域；查询失败时 fail closed |
-| `src/login/src/auth/profileIsolation.test.ts` | allowlist 精确匹配（兄弟前缀、子路径、编码穿越）；GHE.com 主机判断 |
+| `src/login/src/auth/profileIsolation.test.ts` | allowlist 整段前缀匹配（兄弟前缀拒绝、子路径接受、编码穿越拒绝）；GHE.com 主机判断 |
 | `src/login/src/db/poolTaskSafety.test.ts`、`runnerIsolation.test.ts` | body 不能改作用域；重试继承企业；跨企业的变更不会调用 Proxy |
 | `src/console/src/server/apiProxy.test.ts` | **所有**写路由都要求同源（含旧 `/accounts/:id`） |
 | `src/console/src/web/pages/EnterprisePoolPage.browser.test.ts` | 迟到的读写停留在已确认的作用域；切换企业后草稿重置 |
@@ -887,7 +888,7 @@ M1 ──┬── M2 ── M5 ──┐
 | `src/sso/src/clients/externalFetch.ts` | 移植 → shared `externalFetch.ts` | — |
 | `src/sso/src/db/connection.ts`、`src/login/src/db/connection.ts` | 重写 → shared `sqliteService.ts` | — |
 | `src/login/src/db/tasksRepo.ts`、`routes/tasksApi.ts`、`tasks/queue.ts`、`tasks/runner.ts` | 在基线上重写 | 只加 `enterprise_id` 绑定；`binding_version`、nonce ledger 和 tombstone 表丢弃 |
-| `src/login/src/auth/deviceFlow.ts`、`HeadlessPlaywrightAuthStrategy.ts` 的改动 | 部分移植 | allowlist 精确匹配逻辑保留；写死的 github.com 删除 |
+| `src/login/src/auth/deviceFlow.ts`、`HeadlessPlaywrightAuthStrategy.ts` 的改动 | 部分移植 | allowlist 改为整段前缀匹配；写死的 github.com 删除 |
 | `src/console/src/web/pages/EnterprisePoolPage.tsx` | 重写 | 全局页加企业表；无 validate 步骤 |
 | `src/console/src/server/apiProxy.ts` 的同源保护 | 移植并扩大 | 覆盖所有写路由 |
 | `src/console/src/web/lib/scope.ts` | 移植 | `useScopeLifetime` |

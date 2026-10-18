@@ -1,41 +1,36 @@
 import 'dotenv/config';
-import { deviceFlowEndpoints, resolveGithubDeployment, type GithubDeployment } from './auth/githubUrls.js';
+import type { GithubDeployment, LoginSelectors, SsoProvider } from '@ghcp/shared';
 
+/** Process-level settings; per-enterprise values (GitHub, SSO login page, selectors) live in the registry. */
 export interface LoginConfig {
   port: number;
   dbPath: string;
   internalApiToken: string;
   proxyBaseUrl: string;
   logDir: string;
-  githubOauthClientId: string;
   githubOauthScope: string;
   opencodeUserAgent: string;
   auth: AuthConfig;
-  endpoints: {
-    deviceCode: string;
-    accessToken: string;
-  };
 }
 
-export type SsoProvider = 'custom' | 'azure';
-
 export interface AuthConfig {
-  github: GithubDeployment;
-  ssoUrl?: string;
   azureStaySignedIn: boolean;
   headless: boolean;
   debugArtifactsDir: string;
-  selectors: Record<string, string | undefined>;
 }
 
+/** Everything one browser authorization needs, built from the task's enterprise (design §5.7). */
 export interface RuntimeAuthConfig extends AuthConfig {
+  github: GithubDeployment;
   ssoProvider: SsoProvider;
+  ssoLoginUrl?: string;
+  /** Pages that may receive SSO credentials; see `auth/loginUrlAllowlist.ts`. */
+  allowedLoginUrls: readonly string[];
+  selectors: LoginSelectors;
   timeoutMs: number;
   debugLogs: boolean;
   debugArtifacts: boolean;
 }
-
-const github = resolveGithubDeployment(process.env.GITHUB_BASE_URL, process.env.ENTERPRISE_SLUG);
 
 export const config: LoginConfig = {
   port: readPort(process.env.PORT, 7003),
@@ -43,34 +38,13 @@ export const config: LoginConfig = {
   internalApiToken: process.env.INTERNAL_API_TOKEN ?? '',
   proxyBaseUrl: process.env.PROXY_BASE_URL ?? 'http://localhost:3000',
   logDir: process.env.LOG_DIR ?? './logs/login',
-  githubOauthClientId: readOptionalString(process.env.GITHUB_OAUTH_CLIENT_ID) ?? 'Ov23li8tweQw6odWQebz',
   githubOauthScope: readOptionalString(process.env.GITHUB_OAUTH_SCOPE) ?? 'read:user',
   opencodeUserAgent: readOptionalString(process.env.OPENCODE_USER_AGENT)
     ?? `opencode/${readOptionalString(process.env.OPENCODE_VERSION) ?? '1.0.0'}`,
-  endpoints: deviceFlowEndpoints(github),
   auth: {
-    github,
-    ssoUrl: process.env.SSO_URL,
     azureStaySignedIn: readBoolean(process.env.AZURE_STAY_SIGNED_IN, false),
     headless: readBoolean(process.env.AUTH_HEADLESS, true),
     debugArtifactsDir: process.env.AUTH_DEBUG_ARTIFACT_DIR ?? '.auth-debug',
-    selectors: {
-      deviceCodeInput: process.env.AUTH_DEVICE_CODE_INPUT_SELECTOR,
-      deviceCodeSubmit: process.env.AUTH_DEVICE_CODE_SUBMIT_SELECTOR,
-      githubLoginInput: process.env.AUTH_GITHUB_LOGIN_INPUT_SELECTOR,
-      githubLoginSubmit: process.env.AUTH_GITHUB_LOGIN_SUBMIT_SELECTOR,
-      githubSsoSubmit: process.env.AUTH_GITHUB_SSO_SUBMIT_SELECTOR,
-      ssoUsernameInput: process.env.AUTH_SSO_USERNAME_INPUT_SELECTOR,
-      ssoPasswordInput: process.env.AUTH_SSO_PASSWORD_INPUT_SELECTOR,
-      ssoSubmit: process.env.AUTH_SSO_SUBMIT_SELECTOR,
-      azureUsernameInput: process.env.AUTH_AZURE_USERNAME_INPUT_SELECTOR,
-      azureNextSubmit: process.env.AUTH_AZURE_NEXT_SUBMIT_SELECTOR,
-      azurePasswordInput: process.env.AUTH_AZURE_PASSWORD_INPUT_SELECTOR,
-      azureSignInSubmit: process.env.AUTH_AZURE_SIGN_IN_SUBMIT_SELECTOR,
-      azureStaySignedInYes: process.env.AUTH_AZURE_STAY_SIGNED_IN_YES_SELECTOR,
-      azureStaySignedInNo: process.env.AUTH_AZURE_STAY_SIGNED_IN_NO_SELECTOR,
-      githubAuthorizeSubmit: process.env.AUTH_GITHUB_AUTHORIZE_SUBMIT_SELECTOR,
-    },
   },
 };
 

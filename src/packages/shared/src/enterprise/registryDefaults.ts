@@ -14,12 +14,14 @@ import type {
 import {
   invalidRegistryField,
   LOGIN_SELECTOR_KEYS,
+  parseLoginUrl,
   readProvider,
   SSO_SECRET_KEYS,
   type LoginSelectorKey,
   type LoginSelectors,
   type ProfileFields,
   type SecretRef,
+  type SsoProvider,
 } from './registryFields.js';
 import { DEFAULT_ENTERPRISE_ID } from './scope.js';
 import { parseTrustedUrl, sameTrustedUrl, type TrustedUrl } from './trustedUrl.js';
@@ -104,7 +106,7 @@ function resolveLogin(entry: ProfileEntry, options: ParseRegistryOptions): Login
     throw invalidRegistryField(`${entry.id}.login.allowedLoginUrls`, 'must include login.ssoLoginUrl');
   }
   return definedOnly({
-    ssoProvider: readProvider(text(entry.fields, 'login.ssoProvider') ?? 'custom'),
+    ssoProvider: optionalProvider(entry.fields),
     ssoLoginUrl,
     allowedLoginUrls,
     selectors: resolveSelectors(entry.fields, options.selectors ?? {}),
@@ -118,9 +120,15 @@ function defaultSsoLoginUrl(id: string, ssoUrl: string | undefined): string | un
   return id === DEFAULT_ENTERPRISE_ID ? url.href : `${url.origin}/enterprises/${id}/login`;
 }
 
+function optionalProvider(fields: ProfileFields): SsoProvider | undefined {
+  const provider = text(fields, 'login.ssoProvider');
+  return provider === undefined ? undefined : readProvider(provider);
+}
+
+/** Like `login.ssoLoginUrl`, SSO_URL's query and fragment are dropped rather than rejected. */
 function parseSsoUrl(raw: string): TrustedUrl {
   try {
-    return parseTrustedUrl(raw.trim());
+    return parseLoginUrl(raw.trim());
   } catch (error) {
     throw invalidRegistryField('SSO_URL', error instanceof Error ? error.message : 'is invalid');
   }

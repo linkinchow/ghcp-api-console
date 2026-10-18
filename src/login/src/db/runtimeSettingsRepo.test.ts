@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import Database from 'better-sqlite3';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import { runMigrations } from './migrations.js';
 import {
   LoginRuntimeSettingsRepository,
@@ -10,7 +11,7 @@ import {
 
 test('reads immutable runtime settings and updates them transactionally', () => {
   const db = new Database(':memory:');
-  runMigrations(db);
+  runMigrations(db, [{ id: DEFAULT_ENTERPRISE_ID, fingerprint: 'fixture' }]);
   const repository = new LoginRuntimeSettingsRepository(db);
 
   const initial = repository.getSnapshot();
@@ -60,7 +61,7 @@ test('reads immutable runtime settings and updates them transactionally', () => 
 
 test('rejects stale versions without replacing the current snapshot', () => {
   const db = new Database(':memory:');
-  runMigrations(db);
+  runMigrations(db, [{ id: DEFAULT_ENTERPRISE_ID, fingerprint: 'fixture' }]);
   const repository = new LoginRuntimeSettingsRepository(db);
   const initial = repository.getSnapshot();
   const updated = repository.update({ expectedVersion: initial.version, changes: { concurrency: 2 } });
@@ -95,7 +96,7 @@ test('validates every runtime setting before writing', () => {
 
   for (const changes of invalidChanges) {
     const db = new Database(':memory:');
-    runMigrations(db);
+    runMigrations(db, [{ id: DEFAULT_ENTERPRISE_ID, fingerprint: 'fixture' }]);
     const repository = new LoginRuntimeSettingsRepository(db);
     const initial = repository.getSnapshot();
     assert.throws(

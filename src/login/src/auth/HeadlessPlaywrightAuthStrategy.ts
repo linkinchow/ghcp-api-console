@@ -8,6 +8,7 @@ import type { AccountLogger } from '../tasks/accountLogger.js';
 import type { AccountCredentials, AuthStrategy } from './types.js';
 import type { DeviceCodeResponse } from './deviceFlow.js';
 import { isGheComSignInPage, isGitHubDeviceAccountSelectionUrl, isGitHubSsoInterstitial, isGitHubUrl } from './githubUrls.js';
+import { isAllowedLoginUrl } from './loginUrlAllowlist.js';
 import { HttpApiError } from '@ghcp/shared';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -72,7 +73,7 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
         githubUsername: this.account.githubUsername,
         ssoUsername: this.account.ssoUsername,
         ssoProvider: this.options.ssoProvider,
-        ssoUrl: this.options.ssoUrl ? safeUrl(this.options.ssoUrl) : undefined,
+        ssoLoginUrl: this.options.ssoLoginUrl ? safeUrl(this.options.ssoLoginUrl) : undefined,
         githubBaseUrl: this.options.github.baseUrl,
         gheCom: this.options.github.isGheCom,
       });
@@ -258,7 +259,7 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
       }
 
       this.logger.info('sso-login', 'Waiting for SSO redirect', {
-        expectedUrl: this.options.ssoUrl ? safeUrl(this.options.ssoUrl) : undefined,
+        expectedUrl: this.options.ssoLoginUrl ? safeUrl(this.options.ssoLoginUrl) : undefined,
         currentUrl: safeUrl(page.url()),
         provider: this.options.ssoProvider,
         attempt,
@@ -307,18 +308,18 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
   }
 
   private async completeCustomSsoLogin(page: Page): Promise<void> {
-    await this.fillFirst(page, 'sso-login', this.ssoUsernameInputCandidates(), this.account.ssoUsername, 'SSO username');
-    await this.fillFirst(page, 'sso-login', this.ssoPasswordInputCandidates(), this.account.ssoPassword, 'SSO password');
+    await this.fillSsoField(page, this.ssoUsernameInputCandidates(), this.account.ssoUsername, 'SSO username');
+    await this.fillSsoField(page, this.ssoPasswordInputCandidates(), this.account.ssoPassword, 'SSO password');
     await this.clickFirst(page, 'sso-login', this.ssoSubmitCandidates(), 'SSO submit');
     await waitForPageSettle(page);
   }
 
   private async completeAzureSsoLogin(page: Page): Promise<void> {
-    await this.fillFirst(page, 'sso-login', this.azureUsernameInputCandidates(), this.account.ssoUsername, 'Azure username');
+    await this.fillSsoField(page, this.azureUsernameInputCandidates(), this.account.ssoUsername, 'Azure username');
     await this.clickFirst(page, 'sso-login', this.azureNextSubmitCandidates(), 'Azure next');
     await waitForPageSettle(page);
 
-    await this.fillFirst(page, 'sso-login', this.azurePasswordInputCandidates(), this.account.ssoPassword, 'Azure password');
+    await this.fillSsoField(page, this.azurePasswordInputCandidates(), this.account.ssoPassword, 'Azure password');
     await this.clickFirst(page, 'sso-login', this.azureSignInSubmitCandidates(), 'Azure sign in');
     await waitForPageSettle(page);
 
@@ -409,15 +410,28 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
     });
   }
 
+  private async fillSsoField(page: Page, candidates: LocatorCandidate[], value: string, label: string): Promise<void> {
+    await this.fillFirst(page, 'sso-login', candidates, value, label, () => this.assertCredentialPage(page));
+  }
+
+  /** Checked right before typing: the page may have navigated while a selector was awaited. */
+  private assertCredentialPage(page: Page): void {
+    const url = page.url();
+    if (this.isSsoUrl(url) || this.hasKnownProviderUrl(url)) return;
+    throw new HttpApiError(502, 'untrusted_sso_credential_url', `Refusing to enter SSO credentials on ${safeUrl(url)}`);
+  }
+
   private async fillFirst(
     page: Page,
     step: string,
     candidates: LocatorCandidate[],
     value: string,
     label: string,
+    beforeFill?: () => void,
   ): Promise<void> {
     const element = await this.firstVisible(page, step, candidates, 2_000);
     if (!element) throw new Error(`Could not find ${label} input on ${safeUrl(page.url())}`);
+    beforeFill?.();
     await element.locator.fill(value);
     this.logger.debug(step, `Filled ${label}`, { candidate: element.description });
   }
@@ -676,14 +690,7 @@ export class HeadlessPlaywrightAuthStrategy implements AuthStrategy {
   }
 
   private isSsoUrl(rawUrl: string): boolean {
-    if (!this.options.ssoUrl) return false;
-    try {
-      const current = new URL(rawUrl);
-      const expected = new URL(this.options.ssoUrl);
-      return current.origin === expected.origin && current.pathname.startsWith(expected.pathname);
-    } catch {
-      return false;
-    }
+    return isAllowedLoginUrl(rawUrl, this.options.allowedLoginUrls);
   }
 
   private hasKnownProviderUrl(rawUrl: string): boolean {

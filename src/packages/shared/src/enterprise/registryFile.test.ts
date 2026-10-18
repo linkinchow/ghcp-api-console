@@ -142,7 +142,6 @@ test('no registry file: Login default equals today\'s Login config', () => {
   assert.equal(profile.github.slug, 'local-test');
   assert.equal(profile.github.oauthClientId, 'Ov23li8tweQw6odWQebz');
   assert.deepEqual(profile.login, {
-    ssoProvider: 'custom',
     ssoLoginUrl: 'http://sso:7001/login',
     allowedLoginUrls: ['http://sso:7001/login'],
     selectors: { ssoSubmit: 'button[type=submit]' },

@@ -106,7 +106,7 @@ function readMigrationLockWait(value: string | undefined): number {
   return assertMysqlMigrationLockWait(seconds);
 }
 
-function readBoolean(value: string | undefined, defaultValue: boolean): boolean {
+export function readBoolean(value: string | undefined, defaultValue: boolean): boolean {
   if (value === undefined) return defaultValue;
   if (/^(1|true|yes|on)$/i.test(value)) return true;
   if (/^(0|false|no|off)$/i.test(value)) return false;
