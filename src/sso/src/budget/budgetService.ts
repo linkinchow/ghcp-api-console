@@ -1,7 +1,13 @@
 import type { AiCreditsPeriodUsageDto, AiCreditsUsageDto } from '@ghcp/shared';
-import { nowIso } from '@ghcp/shared';
-import { config } from '../config.js';
-import { countAssignedCopilotSeats, getAiCreditsUsagePeriod, saveAiCreditsUsagePeriod, type AiCreditsUsageCacheRecord } from '../db/budgetRepo.js';
+import { externalFetch, nowIso } from '@ghcp/shared';
+import {
+  countAssignedCopilotSeats,
+  getAiCreditsUsagePeriod,
+  saveAiCreditsUsagePeriod,
+  type AiCreditsUsageCacheRecord,
+} from '../db/budgetRepo.js';
+import type { SsoEnterprise } from '../enterprises.js';
+import { requireSsoSecret } from '../enterpriseSecrets.js';
 
 const AI_CREDITS_SKU = 'copilot_ai_unit';
 const SEAT_PRICE_PER_MONTH = 19;
@@ -26,34 +32,32 @@ interface Period {
   month: number;
 }
 
-export function readAiCreditsUsage(now = new Date()): AiCreditsUsageDto | undefined {
+export function readAiCreditsUsage(enterprise: SsoEnterprise, now = new Date()): AiCreditsUsageDto | undefined {
   const current = currentPeriod(now);
   const last = previousPeriod(current);
-  const currentUsage = getAiCreditsUsagePeriod(current.year, current.month);
-  const lastUsage = getAiCreditsUsagePeriod(last.year, last.month);
+  const currentUsage = getAiCreditsUsagePeriod(enterprise.id, current.year, current.month);
+  const lastUsage = getAiCreditsUsagePeriod(enterprise.id, last.year, last.month);
   if (!currentUsage || !lastUsage) return undefined;
-  return toUsageDto(lastUsage, currentUsage, now);
+  return toUsageDto(enterprise, lastUsage, currentUsage, now);
 }
 
-export async function refreshAiCreditsUsage(now = new Date()): Promise<AiCreditsUsageDto> {
+export async function refreshAiCreditsUsage(enterprise: SsoEnterprise, now = new Date()): Promise<AiCreditsUsageDto> {
   const current = currentPeriod(now);
   const last = previousPeriod(current);
   const [lastUsage, currentUsage] = await Promise.all([
-    fetchAndSaveAiCreditsUsage(last),
-    fetchAndSaveAiCreditsUsage(current),
+    fetchAndSaveAiCreditsUsage(enterprise, last),
+    fetchAndSaveAiCreditsUsage(enterprise, current),
   ]);
-  return toUsageDto(lastUsage, currentUsage, now);
+  return toUsageDto(enterprise, lastUsage, currentUsage, now);
 }
 
-async function fetchAndSaveAiCreditsUsage(period: Period): Promise<AiCreditsUsageCacheRecord> {
-  if (!config.githubCopilotSeatPat) throw new Error('GITHUB_COPILOT_SEAT_PAT is required to query AI Credits usage.');
-  const url = new URL(`${config.githubApiBaseUrl.replace(/\/+$/, '')}/enterprises/${encodeURIComponent(config.enterpriseSlug)}/settings/billing/usage/summary`);
-  url.searchParams.set('year', String(period.year));
-  url.searchParams.set('month', String(period.month));
-  url.searchParams.set('sku', AI_CREDITS_SKU);
-  const res = await fetch(url, {
+async function fetchAndSaveAiCreditsUsage(
+  enterprise: SsoEnterprise,
+  period: Period,
+): Promise<AiCreditsUsageCacheRecord> {
+  const res = await externalFetch(usageSummaryUrl(enterprise, period), {
     headers: {
-      Authorization: `Bearer ${config.githubCopilotSeatPat}`,
+      Authorization: `Bearer ${requireSsoSecret(enterprise, 'seatPat')}`,
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2026-03-10',
     },
@@ -62,7 +66,7 @@ async function fetchAndSaveAiCreditsUsage(period: Period): Promise<AiCreditsUsag
   const rawJson = (await res.json()) as BillingUsageSummary;
   const items = (rawJson.usageItems ?? []).filter((item) => item.sku === AI_CREDITS_SKU);
   const quantity = items.reduce((sum, item) => sum + numberOrZero(item.grossQuantity), 0);
-  return saveAiCreditsUsagePeriod({
+  return saveAiCreditsUsagePeriod(enterprise.id, {
     year: rawJson.timePeriod?.year ?? period.year,
     month: rawJson.timePeriod?.month ?? period.month,
     quantity,
@@ -72,10 +76,26 @@ async function fetchAndSaveAiCreditsUsage(period: Period): Promise<AiCreditsUsag
   });
 }
 
-function toUsageDto(lastMonth: AiCreditsUsageCacheRecord, currentMonth: AiCreditsUsageCacheRecord, now: Date): AiCreditsUsageDto {
-  const assignedSeatCount = countAssignedCopilotSeats();
+/** `<apiBaseUrl>/enterprises/<slug>/settings/billing/usage/summary` of the enterprise (design §5.6). */
+function usageSummaryUrl(enterprise: SsoEnterprise, period: Period): URL {
+  const { apiBaseUrl, slug } = enterprise.endpoints;
+  if (!slug) throw new Error(`${enterprise.id}.github.slug is not configured.`);
+  const url = new URL(`${apiBaseUrl}/enterprises/${encodeURIComponent(slug)}/settings/billing/usage/summary`);
+  url.searchParams.set('year', String(period.year));
+  url.searchParams.set('month', String(period.month));
+  url.searchParams.set('sku', AI_CREDITS_SKU);
+  return url;
+}
+
+function toUsageDto(
+  enterprise: SsoEnterprise,
+  lastMonth: AiCreditsUsageCacheRecord,
+  currentMonth: AiCreditsUsageCacheRecord,
+  now: Date,
+): AiCreditsUsageDto {
+  const assignedSeatCount = countAssignedCopilotSeats(enterprise.id);
   return {
-    enterprise: config.enterpriseSlug,
+    enterprise: enterprise.endpoints.slug ?? enterprise.id,
     lastMonth: toPeriodDto(lastMonth),
     currentMonth: toPeriodDto(currentMonth),
     projectedCurrentMonthQuantity: projectCurrentMonthQuantity(currentMonth.quantity, now),

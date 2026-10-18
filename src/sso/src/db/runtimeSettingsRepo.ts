@@ -1,4 +1,9 @@
-import type { SsoRuntimeSettingsDto, SsoRuntimeSettingsValues, UpdateSsoRuntimeSettingsRequest } from '@ghcp/shared';
+import type {
+  EnterpriseId,
+  SsoRuntimeSettingsDto,
+  SsoRuntimeSettingsValues,
+  UpdateSsoRuntimeSettingsRequest,
+} from '@ghcp/shared';
 import type Database from 'better-sqlite3';
 import { nowIso } from '@ghcp/shared';
 import { getDb } from './connection.js';
@@ -42,72 +47,87 @@ export class SsoSettingsVersionConflictError extends Error {
   }
 }
 
-let snapshot: Readonly<SsoRuntimeSettingsDto> | undefined;
+const snapshots = new Map<EnterpriseId, Readonly<SsoRuntimeSettingsDto>>();
 
-export function getSsoRuntimeSettings(): Readonly<SsoRuntimeSettingsDto> {
-  if (!snapshot) snapshot = Object.freeze(readSettings(getDb()));
+export function getSsoRuntimeSettings(enterpriseId: EnterpriseId): Readonly<SsoRuntimeSettingsDto> {
+  let snapshot = snapshots.get(enterpriseId);
+  if (!snapshot) {
+    snapshot = Object.freeze(readSettings(getDb(), enterpriseId));
+    snapshots.set(enterpriseId, snapshot);
+  }
   return snapshot;
 }
 
-export function readMaxSsoUsers(db: Database.Database = getDb()): number | null {
-  const row = db.prepare('SELECT max_sso_users FROM sso_runtime_settings WHERE id = 1').get() as { max_sso_users: number | null } | undefined;
-  if (!row) throw new Error('SSO runtime settings row is missing.');
+export function readMaxSsoUsers(enterpriseId: EnterpriseId, db: Database.Database = getDb()): number | null {
+  const row = db.prepare(`
+    SELECT max_sso_users
+    FROM sso_runtime_settings
+    WHERE enterprise_id = ?
+  `).get(enterpriseId) as { max_sso_users: number | null } | undefined;
+  if (!row) throw missingRow(enterpriseId);
   return row.max_sso_users;
 }
 
-export function updateSsoRuntimeSettings(request: UpdateSsoRuntimeSettingsRequest): SsoRuntimeSettingsDto {
+export function updateSsoRuntimeSettings(
+  enterpriseId: EnterpriseId,
+  request: UpdateSsoRuntimeSettingsRequest,
+): SsoRuntimeSettingsDto {
   const db = getDb();
   const next = db.transaction(() => {
-    const current = readSettings(db);
+    const current = readSettings(db, enterpriseId);
     if (!Number.isInteger(request.expectedVersion) || request.expectedVersion !== current.version) {
       throw new SsoSettingsVersionConflictError(request.expectedVersion, current.version);
     }
     const changes = request.changes as Record<string, unknown>;
-    const values = validateSettings({
-      maxSsoUsers: current.maxSsoUsers,
-      userPrefix: current.userPrefix,
-      emailDomain: current.emailDomain,
-      bulkSyncConcurrency: current.bulkSyncConcurrency,
-      scimRequestDelayMs: current.scimRequestDelayMs,
-      scimMaxRetries: current.scimMaxRetries,
-      scimRetryBaseDelayMs: current.scimRetryBaseDelayMs,
-      ...changes,
-    }, changes);
-    const updatedAt = nowIso();
-    const result = db.prepare(`
-      UPDATE sso_runtime_settings
-      SET max_sso_users = ?, user_prefix = ?, email_domain = ?, bulk_sync_concurrency = ?,
-          scim_request_delay_ms = ?, scim_max_retries = ?, scim_retry_base_delay_ms = ?,
-          version = version + 1, updated_at = ?
-      WHERE id = 1 AND version = ?
-    `).run(
-      values.maxSsoUsers,
-      values.userPrefix,
-      values.emailDomain,
-      values.bulkSyncConcurrency,
-      values.scimRequestDelayMs,
-      values.scimMaxRetries,
-      values.scimRetryBaseDelayMs,
-      updatedAt,
-      current.version,
-    );
-    if (result.changes !== 1) {
-      const latest = readSettings(db);
-      throw new SsoSettingsVersionConflictError(current.version, latest.version);
-    }
-    return readSettings(db);
+    const values = validateSettings({ ...settingsValues(current), ...changes }, changes);
+    writeSettings(db, enterpriseId, values, current.version);
+    return readSettings(db, enterpriseId);
   }).immediate();
-  snapshot = Object.freeze(next);
+  snapshots.set(enterpriseId, Object.freeze(next));
   return next;
 }
 
 export function resetSsoRuntimeSettingsCacheForTests(): void {
-  snapshot = undefined;
+  snapshots.clear();
 }
 
-function readSettings(db: Database.Database): SsoRuntimeSettingsDto {
-  const row = db.prepare('SELECT * FROM sso_runtime_settings WHERE id = 1').get() as SsoRuntimeSettingsRow | undefined;
-  if (!row) throw new Error('SSO runtime settings row is missing.');
+function writeSettings(
+  db: Database.Database,
+  enterpriseId: EnterpriseId,
+  values: SsoRuntimeSettingsValues,
+  version: number,
+): void {
+  const result = db.prepare(`
+    UPDATE sso_runtime_settings
+    SET max_sso_users = ?, user_prefix = ?, email_domain = ?, bulk_sync_concurrency = ?,
+        scim_request_delay_ms = ?, scim_max_retries = ?, scim_retry_base_delay_ms = ?,
+        version = version + 1, updated_at = ?
+    WHERE enterprise_id = ?
+      AND version = ?
+  `).run(
+    values.maxSsoUsers,
+    values.userPrefix,
+    values.emailDomain,
+    values.bulkSyncConcurrency,
+    values.scimRequestDelayMs,
+    values.scimMaxRetries,
+    values.scimRetryBaseDelayMs,
+    nowIso(),
+    enterpriseId,
+    version,
+  );
+  if (result.changes !== 1) {
+    throw new SsoSettingsVersionConflictError(version, readSettings(db, enterpriseId).version);
+  }
+}
+
+function readSettings(db: Database.Database, enterpriseId: EnterpriseId): SsoRuntimeSettingsDto {
+  const row = db.prepare(`
+    SELECT *
+    FROM sso_runtime_settings
+    WHERE enterprise_id = ?
+  `).get(enterpriseId) as SsoRuntimeSettingsRow | undefined;
+  if (!row) throw missingRow(enterpriseId);
   return {
     maxSsoUsers: row.max_sso_users,
     userPrefix: row.user_prefix,
@@ -121,27 +141,37 @@ function readSettings(db: Database.Database): SsoRuntimeSettingsDto {
   };
 }
 
+function settingsValues(current: SsoRuntimeSettingsDto): SsoRuntimeSettingsValues {
+  return {
+    maxSsoUsers: current.maxSsoUsers,
+    userPrefix: current.userPrefix,
+    emailDomain: current.emailDomain,
+    bulkSyncConcurrency: current.bulkSyncConcurrency,
+    scimRequestDelayMs: current.scimRequestDelayMs,
+    scimMaxRetries: current.scimMaxRetries,
+    scimRetryBaseDelayMs: current.scimRetryBaseDelayMs,
+  };
+}
+
+function missingRow(enterpriseId: EnterpriseId): Error {
+  return new Error(`SSO runtime settings row of enterprise "${enterpriseId}" is missing.`);
+}
+
 function validateSettings(values: Record<string, unknown>, changes: Record<string, unknown>): SsoRuntimeSettingsValues {
   const errors: Record<string, string> = {};
   for (const key of Object.keys(changes)) {
     if (!ALLOWED_KEYS.has(key as keyof SsoRuntimeSettingsValues)) errors[key] = 'Unknown setting.';
   }
-
-  if (values.maxSsoUsers !== null && (typeof values.maxSsoUsers !== 'number' || !Number.isInteger(values.maxSsoUsers) || values.maxSsoUsers <= 0 || values.maxSsoUsers > 1_000_000)) {
-    errors.maxSsoUsers = 'Must be null or an integer from 1 to 1000000.';
-  }
+  if (!isValidMaxSsoUsers(values.maxSsoUsers)) errors.maxSsoUsers = 'Must be null or an integer from 1 to 1000000.';
   const userPrefix = normalizeUserPrefix(values.userPrefix);
   if (!/[a-z0-9]/.test(userPrefix)) errors.userPrefix = 'Must contain at least one letter or digit.';
   const emailDomain = typeof values.emailDomain === 'string' ? values.emailDomain.trim().toLowerCase() : '';
-  if (!isValidHostname(emailDomain)) {
-    errors.emailDomain = 'Must be a valid domain name.';
-  }
+  if (!isValidHostname(emailDomain)) errors.emailDomain = 'Must be a valid domain name.';
   validateInteger(errors, 'bulkSyncConcurrency', values.bulkSyncConcurrency, 1, 20);
   validateInteger(errors, 'scimRequestDelayMs', values.scimRequestDelayMs, 0, 60_000);
   validateInteger(errors, 'scimMaxRetries', values.scimMaxRetries, 0, 10);
   validateInteger(errors, 'scimRetryBaseDelayMs', values.scimRetryBaseDelayMs, 0, 60_000);
   if (Object.keys(errors).length > 0) throw new InvalidSsoRuntimeSettingsError(errors);
-
   return {
     maxSsoUsers: values.maxSsoUsers as number | null,
     userPrefix,
@@ -153,6 +183,11 @@ function validateSettings(values: Record<string, unknown>, changes: Record<strin
   };
 }
 
+function isValidMaxSsoUsers(value: unknown): boolean {
+  if (value === null) return true;
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 1_000_000;
+}
+
 function normalizeUserPrefix(value: unknown): string {
   return typeof value === 'string'
     ? value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32)
@@ -160,7 +195,9 @@ function normalizeUserPrefix(value: unknown): string {
 }
 
 function validateInteger(errors: Record<string, string>, key: string, value: unknown, min: number, max: number): void {
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) errors[key] = `Must be an integer from ${min} to ${max}.`;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
+    errors[key] = `Must be an integer from ${min} to ${max}.`;
+  }
 }
 
 function isValidHostname(value: string): boolean {

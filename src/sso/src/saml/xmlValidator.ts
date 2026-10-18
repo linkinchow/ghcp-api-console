@@ -1,6 +1,7 @@
 import { DOMParser } from '@xmldom/xmldom';
 
 const SAML_PROTOCOL_NS = 'urn:oasis:names:tc:SAML:2.0:protocol';
+const XML_DECLARATION = /^\uFEFF?<\?xml\s[^?]*\?>/;
 
 /**
  * samlify schema validator for the only inbound message this IdP parses: an SP-initiated AuthnRequest.
@@ -12,6 +13,10 @@ const SAML_PROTOCOL_NS = 'urn:oasis:names:tc:SAML:2.0:protocol';
 export async function validateSamlXml(xml: string): Promise<string> {
   // SAML messages must not carry a DTD; rejecting it up front also rules out entity expansion.
   if (/<!(?:DOCTYPE|ENTITY)/i.test(xml)) throw new Error('SAML message must not contain a DTD.');
+  // Processing instructions have no meaning in SAML; only a leading XML declaration is allowed.
+  if (xml.replace(XML_DECLARATION, '').includes('<?')) {
+    throw new Error('SAML message must not contain processing instructions.');
+  }
   // xmldom only reports some well-formedness problems (e.g. unclosed or mismatched tags) as warnings.
   const root = new DOMParser({ errorHandler: { warning: rejectXml, error: rejectXml, fatalError: rejectXml } })
     .parseFromString(xml, 'text/xml')

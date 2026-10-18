@@ -1,19 +1,27 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { config } from '../config.js';
-import { assignCopilotSeat, CopilotSeatNotAssignedError, getCopilotSeatAssignment, isCancellationDate, listCopilotSeatAssignments, removeCopilotSeat } from './seats.js';
+import { defaultSsoEnterprise } from '../enterprises.js';
+import {
+  assignCopilotSeat,
+  CopilotSeatNotAssignedError,
+  getCopilotSeatAssignment,
+  isCancellationDate,
+  listCopilotSeatAssignments,
+  removeCopilotSeat,
+} from './seats.js';
+
+process.env.GITHUB_COPILOT_SEAT_PAT = 'test-token';
+const enterprise = () => defaultSsoEnterprise();
 
 test('identifies a missing Copilot seat without hiding other cancellation errors', async () => {
   const originalFetch = globalThis.fetch;
-  const originalPat = config.githubCopilotSeatPat;
-  config.githubCopilotSeatPat = 'test-token';
 
   try {
     globalThis.fetch = async () => jsonResponse(422, {
       message: 'Cannot cancel a user without a Copilot seat.',
     });
     await assert.rejects(
-      removeCopilotSeat('alice_emu'),
+      removeCopilotSeat(enterprise(), 'alice_emu'),
       (err: unknown) => err instanceof CopilotSeatNotAssignedError && err.status === 422,
     );
 
@@ -21,7 +29,7 @@ test('identifies a missing Copilot seat without hiding other cancellation errors
       message: 'Seat assignment for user alice_emu could not be cancelled: User is not assigned to a seat',
     });
     await assert.rejects(
-      removeCopilotSeat('alice_emu'),
+      removeCopilotSeat(enterprise(), 'alice_emu'),
       (err: unknown) => err instanceof CopilotSeatNotAssignedError && err.status === 422,
     );
 
@@ -31,7 +39,7 @@ test('identifies a missing Copilot seat without hiding other cancellation errors
       status: '422',
     });
     await assert.rejects(
-      removeCopilotSeat('wangwu_selfsso'),
+      removeCopilotSeat(enterprise(), 'wangwu_selfsso'),
       (err: unknown) => err instanceof CopilotSeatNotAssignedError && err.status === 422,
     );
 
@@ -39,19 +47,16 @@ test('identifies a missing Copilot seat without hiding other cancellation errors
       message: 'The seat cannot be cancelled because it was assigned through a team.',
     });
     await assert.rejects(
-      removeCopilotSeat('alice_emu'),
+      removeCopilotSeat(enterprise(), 'alice_emu'),
       (err: unknown) => err instanceof Error && !(err instanceof CopilotSeatNotAssignedError),
     );
   } finally {
     globalThis.fetch = originalFetch;
-    config.githubCopilotSeatPat = originalPat;
   }
 });
 
 test('lists all enterprise Copilot seat assignments with pagination', async () => {
   const originalFetch = globalThis.fetch;
-  const originalPat = config.githubCopilotSeatPat;
-  config.githubCopilotSeatPat = 'test-token';
   const urls: string[] = [];
 
   try {
@@ -70,7 +75,7 @@ test('lists all enterprise Copilot seat assignments with pagination', async () =
       });
     };
 
-    const assignments = await listCopilotSeatAssignments();
+    const assignments = await listCopilotSeatAssignments(enterprise());
 
     assert.equal(assignments.size, 101);
     assert.equal(assignments.has('last-user'), true);
@@ -79,15 +84,12 @@ test('lists all enterprise Copilot seat assignments with pagination', async () =
     assert.match(urls[1] ?? '', /page=2$/);
   } finally {
     globalThis.fetch = originalFetch;
-    config.githubCopilotSeatPat = originalPat;
   }
 });
 
 test('reads only direct seats without ending pagination at the unique user count', async (t) => {
   const originalFetch = globalThis.fetch;
-  const originalPat = config.githubCopilotSeatPat;
-  config.githubCopilotSeatPat = 'test-token';
-  t.after(() => { globalThis.fetch = originalFetch; config.githubCopilotSeatPat = originalPat; });
+  t.after(() => { globalThis.fetch = originalFetch });
   const urls: string[] = [];
   globalThis.fetch = async (input) => {
     const url = String(input);
@@ -105,7 +107,7 @@ test('reads only direct seats without ending pagination at the unique user count
         ],
     });
   };
-  const seats = await listCopilotSeatAssignments();
+  const seats = await listCopilotSeatAssignments(enterprise());
   assert.equal(urls.length, 2);
   assert.deepEqual([...seats], [
     ['alice', { status: 'pending_cancellation', pendingCancellationDate: '2026-10-01' }],
@@ -115,9 +117,7 @@ test('reads only direct seats without ending pagination at the unique user count
 
 test('honors safe pagination links and rejects incomplete or conflicting direct snapshots', async (t) => {
   const originalFetch = globalThis.fetch;
-  const originalPat = config.githubCopilotSeatPat;
-  config.githubCopilotSeatPat = 'test-token';
-  t.after(() => { globalThis.fetch = originalFetch; config.githubCopilotSeatPat = originalPat; });
+  t.after(() => { globalThis.fetch = originalFetch });
   let requests = 0;
   globalThis.fetch = async (input) => {
     requests++;
@@ -127,20 +127,20 @@ test('honors safe pagination links and rejects incomplete or conflicting direct 
       headers: requests === 1 ? { Link: `<${next.href}>; rel="next"` } : {},
     });
   };
-  assert.equal((await listCopilotSeatAssignments()).size, 2);
+  assert.equal((await listCopilotSeatAssignments(enterprise())).size, 2);
   assert.equal(requests, 2);
   globalThis.fetch = async () => new Response(JSON.stringify({ seats: [] }), {
     headers: { Link: '<https://other.test/seats>; rel="next"' },
   });
-  await assert.rejects(listCopilotSeatAssignments(), /unexpected pagination URL/);
+  await assert.rejects(listCopilotSeatAssignments(enterprise()), /unexpected pagination URL/);
   globalThis.fetch = async (input) => new Response(JSON.stringify({ seats: [] }), {
     headers: { Link: `<${String(input)}>; rel="next"` },
   });
-  await assert.rejects(listCopilotSeatAssignments(), /repeated pagination link/);
+  await assert.rejects(listCopilotSeatAssignments(enterprise()), /repeated pagination link/);
 
   for (const date of [undefined, '', '2026-02-30', '2026-10-01T00:00:00Z', 123]) {
     globalThis.fetch = async () => jsonResponse(200, { seats: [{ assignee: { login: 'alice' }, pending_cancellation_date: date }] });
-    await assert.rejects(listCopilotSeatAssignments(), /pending_cancellation_date/);
+    await assert.rejects(listCopilotSeatAssignments(enterprise()), /pending_cancellation_date/);
   }
   for (const seats of [
     [{ assignee: {}, pending_cancellation_date: null }],
@@ -151,19 +151,17 @@ test('honors safe pagination links and rejects incomplete or conflicting direct 
     ],
   ]) {
     globalThis.fetch = async () => jsonResponse(200, { seats });
-    await assert.rejects(listCopilotSeatAssignments(), /invalid|conflicting/);
+    await assert.rejects(listCopilotSeatAssignments(enterprise()), /invalid|conflicting/);
   }
   globalThis.fetch = async () => jsonResponse(200, {});
-  await assert.rejects(listCopilotSeatAssignments(), /seats array/);
+  await assert.rejects(listCopilotSeatAssignments(enterprise()), /seats array/);
   assert.equal(isCancellationDate('2028-02-29'), true);
   assert.equal(isCancellationDate('2026-02-29'), false);
 });
 
 test('enterprise member lookup uses a seats array and confirms 404 through the enterprise list', async (t) => {
   const originalFetch = globalThis.fetch;
-  const originalPat = config.githubCopilotSeatPat;
-  config.githubCopilotSeatPat = 'test-token';
-  t.after(() => { globalThis.fetch = originalFetch; config.githubCopilotSeatPat = originalPat; });
+  t.after(() => { globalThis.fetch = originalFetch });
   globalThis.fetch = async (input) => {
     assert.match(String(input), /\/enterprises\/[^/]+\/members\/ALICE\/copilot$/);
     return jsonResponse(200, { total_seats: 1, seats: [
@@ -171,7 +169,10 @@ test('enterprise member lookup uses a seats array and confirms 404 through the e
       { assignee: { login: 'alice' }, organization: { id: 1 }, pending_cancellation_date: null },
     ] });
   };
-  assert.deepEqual(await getCopilotSeatAssignment(' ALICE '), { status: 'pending_cancellation', pendingCancellationDate: '2026-10-01' });
+  assert.deepEqual(await getCopilotSeatAssignment(enterprise(), ' ALICE '), {
+    status: 'pending_cancellation',
+    pendingCancellationDate: '2026-10-01',
+  });
   const urls: string[] = [];
   globalThis.fetch = async (input) => {
     urls.push(String(input));
@@ -179,29 +180,27 @@ test('enterprise member lookup uses a seats array and confirms 404 through the e
       ? jsonResponse(404, { message: 'Not Found' })
       : jsonResponse(200, { total_seats: 0, seats: [] });
   };
-  assert.deepEqual(await getCopilotSeatAssignment('alice'), { status: 'unassigned' });
+  assert.deepEqual(await getCopilotSeatAssignment(enterprise(), 'alice'), { status: 'unassigned' });
   assert.equal(urls.length, 2);
   for (const status of [401, 403, 422, 429, 500]) {
     globalThis.fetch = async () => jsonResponse(status, { message: 'Unavailable' });
-    await assert.rejects(getCopilotSeatAssignment('alice'), new RegExp(String(status)));
+    await assert.rejects(getCopilotSeatAssignment(enterprise(), 'alice'), new RegExp(String(status)));
   }
   globalThis.fetch = async () => jsonResponse(404, { message: 'Not Found' });
-  await assert.rejects(getCopilotSeatAssignment('alice'), /404/);
+  await assert.rejects(getCopilotSeatAssignment(enterprise(), 'alice'), /404/);
   globalThis.fetch = async () => jsonResponse(200, { assignee: { login: 'alice' }, pending_cancellation_date: null });
-  await assert.rejects(getCopilotSeatAssignment('alice'), /seats array/);
+  await assert.rejects(getCopilotSeatAssignment(enterprise(), 'alice'), /seats array/);
 });
 
 test('mutation responses require a count but never infer a cancellation date', async (t) => {
   const originalFetch = globalThis.fetch;
-  const originalPat = config.githubCopilotSeatPat;
-  config.githubCopilotSeatPat = 'test-token';
-  t.after(() => { globalThis.fetch = originalFetch; config.githubCopilotSeatPat = originalPat; });
+  t.after(() => { globalThis.fetch = originalFetch });
   globalThis.fetch = async () => jsonResponse(200, { seats_cancelled: 0 });
-  assert.deepEqual((await removeCopilotSeat('alice')).response, { seats_cancelled: 0 });
+  assert.deepEqual((await removeCopilotSeat(enterprise(), 'alice')).response, { seats_cancelled: 0 });
   globalThis.fetch = async () => jsonResponse(201, { seats_created: 1 });
-  assert.equal((await assignCopilotSeat('alice')).status, 201);
+  assert.equal((await assignCopilotSeat(enterprise(), 'alice')).status, 201);
   globalThis.fetch = async () => jsonResponse(200, {});
-  await assert.rejects(removeCopilotSeat('alice'), /accepted.*invalid seats_cancelled/);
+  await assert.rejects(removeCopilotSeat(enterprise(), 'alice'), /accepted.*invalid seats_cancelled/);
 });
 
 function jsonResponse(status: number, value: unknown): Response {

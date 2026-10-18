@@ -25,7 +25,8 @@ test('parses MYSQL_AUTO_MIGRATE without changing the default migration behavior'
         '--eval', `const { config } = await import(${JSON.stringify(configUrl)}); console.log(config.mysqlAutoMigrate);`,
       ], {
         encoding: 'utf8',
-        timeout: 15_000,
+        // Each child cold-starts tsx; under a parallel full-suite run that can exceed 15 s.
+        timeout: 60_000,
         env: {
           PATH: process.env.PATH,
           DOTENV_CONFIG_PATH: join(directory, 'missing.env'),

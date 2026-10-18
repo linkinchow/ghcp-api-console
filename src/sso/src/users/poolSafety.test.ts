@@ -16,20 +16,24 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
   process.env.GITHUB_COPILOT_SEAT_PAT = 'test-seat-token';
   process.env.LOG_LEVEL = 'error';
 
-  const { requireInternalToken } = await import('../auth/internalAuth.js');
   const { hashPassword, verifyPassword } = await import('../auth/password.js');
-  const { config } = await import('../config.js');
   const { getDb } = await import('../db/connection.js');
   const { createUser, deleteUser, getUser, isPoolManagedSsoUser, toDto, updateEmu } = await import('../db/usersRepo.js');
   const { runMigrations } = await import('../db/migrations.js');
+  const { ssoEnterpriseSeed } = await import('../db/enterpriseRepo.js');
+  const { ssoEnterprises } = await import('../enterprises.js');
   const { updateSsoRuntimeSettings } = await import('../db/runtimeSettingsRepo.js');
-  const { usersApiRouter } = await import('../routes/usersApi.js');
+  const { createEnterpriseApiRouter } = await import('../routes/enterpriseRoutes.js');
   const { runSsoUserBatch } = await import('./service.js');
-  updateSsoRuntimeSettings({ expectedVersion: 1, changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 } });
+  const enterprise = (await import('../enterprises.js')).defaultSsoEnterprise();
+  updateSsoRuntimeSettings(enterprise.id, {
+    expectedVersion: 1,
+    changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 },
+  });
 
   const app = express();
   app.use(express.json());
-  app.use('/api', requireInternalToken, usersApiRouter);
+  app.use('/api/enterprises/:enterpriseId', createEnterpriseApiRouter());
   const server = app.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -83,9 +87,9 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
   };
 
   const seed = async (ssoUser: string, password = process.env.SSO_DEFAULT_USER_PASSWORD!, role: 'user' | 'admin' = 'user') =>
-    createUser({ ssoUser, ...await hashPassword(password), email: `${ssoUser}@pool.test`, role });
+    createUser(enterprise.id, { ssoUser, ...await hashPassword(password), email: `${ssoUser}@pool.test`, role });
   const request = (path: string, body?: unknown, token: string | undefined = process.env.INTERNAL_API_TOKEN, method = 'POST') =>
-    fetch(`${baseUrl}/api${path}`, {
+    fetch(`${baseUrl}/api/enterprises/default${path}`, {
       method,
       headers: { 'Content-Type': 'application/json', ...(token ? { 'X-Internal-Token': token } : {}) },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -110,11 +114,11 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
         assert.equal((await response.json()).error.code, 'invalid_ownership');
       }
       assert.deepEqual(changes(), before);
-      assert.deepEqual(getUser('owned'), user);
+      assert.deepEqual(getUser(enterprise.id, 'owned'), user);
     });
 
     await t.test('credentials read an existing user without mutations or secret-bearing ordinary DTOs', async () => {
-      const user = getUser('owned')!;
+      const user = getUser(enterprise.id, 'owned')!;
       const before = changes();
       const response = await request('/users/owned/login-credentials', ownership(user));
       assert.equal(response.status, 200);
@@ -129,16 +133,16 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
         }
       }
       assert.deepEqual(changes(), before);
-      assert.deepEqual(getUser('owned'), user);
+      assert.deepEqual(getUser(enterprise.id, 'owned'), user);
     });
 
     await t.test('credentials reject mismatched identity, ownership, role, and disabled EMU state', async () => {
-      const user = getUser('owned')!;
+      const user = getUser(enterprise.id, 'owned')!;
       const admin = await seed('admin', undefined, 'admin');
       await seed('suspended');
-      const suspended = updateEmu('suspended', { emuStatus: 'suspended', ghScimId: 'suspended-id' });
+      const suspended = updateEmu(enterprise.id, 'suspended', { emuStatus: 'suspended', ghScimId: 'suspended-id' });
       await seed('deleted-emu');
-      const deleted = updateEmu('deleted-emu', { emuStatus: 'deleted' });
+      const deleted = updateEmu(enterprise.id, 'deleted-emu', { emuStatus: 'deleted' });
       const before = changes();
       for (const [ssoUser, body] of [
         ['owned', { ...ownership(user), expectedEmail: 'different@pool.test' }],
@@ -157,13 +161,13 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
 
     await t.test('missing/deleted credentials return 404 and never recreate users; recreated identity fails ownership', async () => {
       const deleted = await seed('removed');
-      deleteUser('removed');
+      deleteUser(enterprise.id, 'removed');
       let before = changes();
       for (const ssoUser of ['missing', 'removed']) {
         const response = await request(`/users/${ssoUser}/login-credentials`, ownership(deleted));
         assert.equal(response.status, 404);
         assert.equal((await response.json()).error.code, 'user_not_found');
-        assert.equal(getUser(ssoUser), undefined);
+        assert.equal(getUser(enterprise.id, ssoUser), undefined);
       }
       assert.deepEqual(changes(), before);
       await seed('removed');
@@ -182,7 +186,7 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
       const unavailable = await request('/users/custom-password/login-credentials', ownership(custom));
       assert.equal(unavailable.status, 409);
       assert.equal((await unavailable.json()).error.code, 'login_credentials_unavailable');
-      assert.deepEqual(getUser('custom-password'), custom);
+      assert.deepEqual(getUser(enterprise.id, 'custom-password'), custom);
       const response = await request('/users/username-password/login-credentials', ownership(usernamePassword));
       assert.equal(response.status, 200);
       assert.equal((await response.json()).passwordForLogin, 'username-password');
@@ -215,7 +219,7 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
       assert.match(result.rows[0].detail, /SCIM create-only conflict/);
       assert.equal(result.rows[0].user, undefined);
       assert.deepEqual(scimRequests.splice(0), [{ url: 'https://scim.test/scim/v2/enterprises/test/Users', method: 'POST' }]);
-      assert.deepEqual(getUser('collision'), user);
+      assert.deepEqual(getUser(enterprise.id, 'collision'), user);
       assert.deepEqual(changes(), before);
     });
 
@@ -226,12 +230,17 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
         ['linked-state', { emuStatus: 'suspended' as const }],
       ] as const) {
         await seed(ssoUser);
-        const user = updateEmu(ssoUser, patch);
+        const user = updateEmu(enterprise.id, ssoUser, patch);
         const before = changes();
-        const result = await runSsoUserBatch({ operation: 'sync_emu', ssoUsers: [ssoUser], createOnly: true, assignCopilotSeat: true });
+        const result = await runSsoUserBatch(enterprise, {
+          operation: 'sync_emu',
+          ssoUsers: [ssoUser],
+          createOnly: true,
+          assignCopilotSeat: true,
+        });
         assert.equal(result.summary.failed, 1);
         assert.match(result.rows[0]?.detail ?? '', /SCIM create-only refused/);
-        assert.deepEqual(getUser(ssoUser), user);
+        assert.deepEqual(getUser(enterprise.id, ssoUser), user);
         assert.deepEqual(changes(), before);
       }
       assert.deepEqual(scimRequests, []);
@@ -240,10 +249,11 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
     await t.test('default and explicit false retain legacy conflict adoption behavior', async () => {
       await seed('legacy-sync');
       for (const createOnly of [undefined, false]) {
-        updateEmu('legacy-sync', { emuStatus: 'not_synced' });
-        const result = await runSsoUserBatch({ operation: 'sync_emu', ssoUsers: ['legacy-sync'], createOnly });
+        updateEmu(enterprise.id, 'legacy-sync', { emuStatus: 'not_synced' });
+        const batch = { operation: 'sync_emu' as const, ssoUsers: ['legacy-sync'], createOnly };
+        const result = await runSsoUserBatch(enterprise, batch);
         assert.equal(result.summary.success, 1);
-        assert.equal(getUser('legacy-sync')?.ghScimId, 'preexisting-id');
+        assert.equal(getUser(enterprise.id, 'legacy-sync')?.ghScimId, 'preexisting-id');
         assert.deepEqual(scimRequests.splice(0).map(({ method }) => method), ['POST', 'GET', 'PUT']);
       }
     });
@@ -251,30 +261,35 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
     await t.test('createOnly successfully creates new SCIM users and still supports requested seats', async () => {
       conflict = false;
       await seed('new-pool-user');
-      const result = await runSsoUserBatch({ operation: 'sync_emu', ssoUsers: ['new-pool-user'], createOnly: true, assignCopilotSeat: true });
+      const result = await runSsoUserBatch(enterprise, {
+        operation: 'sync_emu',
+        ssoUsers: ['new-pool-user'],
+        createOnly: true,
+        assignCopilotSeat: true,
+      });
       assert.equal(result.summary.success, 1);
-      assert.equal(getUser('new-pool-user')?.ghScimId, 'new-new-pool-user');
-      assert.equal(getUser('new-pool-user')?.copilotSeatStatus, 'assigned');
+      assert.equal(getUser(enterprise.id, 'new-pool-user')?.ghScimId, 'new-new-pool-user');
+      assert.equal(getUser(enterprise.id, 'new-pool-user')?.copilotSeatStatus, 'assigned');
       assert.deepEqual(scimRequests.splice(0).map(({ method }) => method), ['POST', 'POST']);
     });
     await t.test('pool creation rejects weak defaults and invalid flags before writing users', async () => {
-      const configured = config.defaultUserPassword;
+      const configured = process.env.SSO_DEFAULT_USER_PASSWORD;
       try {
         for (const password of [undefined, '', 'short', ' '.repeat(20), 'pool-password-user', 'POOL-PASSWORD-USER']) {
-          config.defaultUserPassword = password;
+          setDefaultPassword(password);
           const before = changes();
           const response = await request('/users', { ssoUser: 'pool-password-user', poolManaged: true });
           assert.equal(response.status, 400);
           assert.equal((await response.json()).error.code, 'pool_password_policy');
-          assert.equal(getUser('pool-password-user'), undefined);
-          assert.equal(isPoolManagedSsoUser('pool-password-user'), false);
+          assert.equal(getUser(enterprise.id, 'pool-password-user'), undefined);
+          assert.equal(isPoolManagedSsoUser(enterprise.id, 'pool-password-user'), false);
           assert.deepEqual(changes(), before);
         }
-        config.defaultUserPassword = configured;
+        setDefaultPassword(configured);
         const explicit = await request('/users', { ssoUser: 'pool-custom-password', poolManaged: true, password: 'short' });
         assert.equal(explicit.status, 400);
         assert.equal((await explicit.json()).error.code, 'pool_password_policy');
-        assert.equal(getUser('pool-custom-password'), undefined);
+        assert.equal(getUser(enterprise.id, 'pool-custom-password'), undefined);
         for (const poolManaged of ['true', 1, null]) {
           const response = await request('/users', { ssoUser: 'bad-pool-flag', poolManaged });
           assert.equal(response.status, 400);
@@ -282,9 +297,9 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
         }
         const admin = await request('/users', { ssoUser: 'pool-admin', poolManaged: true, role: 'admin' });
         assert.equal(admin.status, 400);
-        assert.equal(getUser('pool-admin'), undefined);
+        assert.equal(getUser(enterprise.id, 'pool-admin'), undefined);
       } finally {
-        config.defaultUserPassword = configured;
+        setDefaultPassword(configured);
       }
       assert.deepEqual(scimRequests, []);
       assert.deepEqual(proxyRequests, []);
@@ -294,30 +309,34 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
       const response = await request('/users', { ssoUser: 'managed-user', poolManaged: true });
       assert.equal(response.status, 201);
       const created = await response.json();
-      const stored = getUser('managed-user')!;
-      assert.equal(await verifyPassword(config.defaultUserPassword!, stored.passwordHash, stored.salt), true);
+      const stored = getUser(enterprise.id, 'managed-user')!;
+      const defaultPassword = process.env.SSO_DEFAULT_USER_PASSWORD!;
+      assert.equal(await verifyPassword(defaultPassword, stored.passwordHash, stored.salt), true);
       assert.equal(await verifyPassword(stored.ssoUser, stored.passwordHash, stored.salt), false);
-      assert.equal(isPoolManagedSsoUser('MANAGED-USER'), true);
-      runMigrations(getDb());
-      assert.deepEqual(getDb().prepare('SELECT * FROM sso_pool_managed_users').all(), [{ sso_user: 'managed-user' }]);
+      assert.equal(isPoolManagedSsoUser(enterprise.id, 'MANAGED-USER'), true);
+      runMigrations(getDb(), ssoEnterprises().map((entry) => ssoEnterpriseSeed(entry.profile)));
+      assert.deepEqual(getDb().prepare('SELECT * FROM sso_pool_managed_users').all(), [
+        { enterprise_id: 'default', sso_user: 'managed-user' },
+      ]);
       for (const dto of [created, await (await request('/users/managed-user', undefined, undefined, 'GET')).json(),
         await (await request('/users', undefined, undefined, 'GET')).json()]) {
         const text = JSON.stringify(dto);
-        for (const secret of ['poolManaged', 'pool_managed', 'passwordForLogin', 'passwordHash', 'salt', 'token', config.defaultUserPassword!]) {
+        const secrets = ['poolManaged', 'pool_managed', 'passwordForLogin', 'passwordHash', 'salt', 'token'];
+        for (const secret of [...secrets, defaultPassword]) {
           assert.equal(text.includes(secret), false);
         }
       }
       const credentials = await request('/users/managed-user/login-credentials', ownership(stored));
       assert.equal(credentials.status, 200);
-      assert.equal((await credentials.json()).passwordForLogin, config.defaultUserPassword);
+      assert.equal((await credentials.json()).passwordForLogin, process.env.SSO_DEFAULT_USER_PASSWORD);
       // An ownership insert failure must roll back the user insert in the same transaction.
       getDb().exec(`CREATE TRIGGER fail_pool_marker BEFORE INSERT ON sso_pool_managed_users
         WHEN NEW.sso_user = 'marker-failure' BEGIN SELECT RAISE(ABORT, 'marker insert failed'); END;`);
       try {
         const failed = await request('/users', { ssoUser: 'marker-failure', poolManaged: true });
         assert.equal(failed.status, 400);
-        assert.equal(getUser('marker-failure'), undefined);
-        assert.equal(isPoolManagedSsoUser('marker-failure'), false);
+        assert.equal(getUser(enterprise.id, 'marker-failure'), undefined);
+        assert.equal(isPoolManagedSsoUser(enterprise.id, 'marker-failure'), false);
       } finally {
         getDb().exec('DROP TRIGGER fail_pool_marker');
       }
@@ -327,48 +346,50 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
       const created = await request('/users', { ssoUser: 'managed-conflict', poolManaged: true });
       assert.equal(created.status, 201);
       conflict = true;
-      const rejected = await runSsoUserBatch({ operation: 'sync_emu', ssoUsers: ['managed-conflict'], createOnly: true });
+      const createOnlySync = { operation: 'sync_emu' as const, ssoUsers: ['managed-conflict'], createOnly: true };
+      const rejected = await runSsoUserBatch(enterprise, createOnlySync);
       assert.equal(rejected.summary.failed, 1);
       assert.deepEqual(scimRequests.splice(0).map(({ method }) => method), ['POST']);
-      const before = getUser('managed-conflict');
+      const before = getUser(enterprise.id, 'managed-conflict');
       for (const options of [{}, { createOnly: false }, { createOnly: true, enterpriseRole: 'enterprise_owner' as const }]) {
-        const result = await runSsoUserBatch({ operation: 'sync_emu', ssoUsers: ['managed-conflict'], ...options });
+        const sync = { operation: 'sync_emu' as const, ssoUsers: ['managed-conflict'], ...options };
+        const result = await runSsoUserBatch(enterprise, sync);
         assert.equal(result.summary.failed, 1);
         assert.match(result.rows[0].detail ?? '', /pool_member_managed/);
-        assert.deepEqual(getUser('managed-conflict'), before);
+        assert.deepEqual(getUser(enterprise.id, 'managed-conflict'), before);
         assert.deepEqual(scimRequests, []);
       }
       conflict = false;
-      const allowed = await runSsoUserBatch({ operation: 'sync_emu', ssoUsers: ['managed-conflict'], createOnly: true });
+      const allowed = await runSsoUserBatch(enterprise, createOnlySync);
       assert.equal(allowed.summary.success, 1);
       assert.deepEqual(scimRequests.splice(0).map(({ method }) => method), ['POST']);
     });
 
     await t.test('direct creation keeps username fallback and custom passwords without marking or Proxy calls', async () => {
-      const configured = config.defaultUserPassword;
+      const configured = process.env.SSO_DEFAULT_USER_PASSWORD;
       try {
-        config.defaultUserPassword = undefined;
+        setDefaultPassword(undefined);
         for (const poolManaged of [undefined, false]) {
           const ssoUser = poolManaged === false ? 'direct-false' : 'direct-default';
           const response = await request('/users', { ssoUser, poolManaged });
           assert.equal(response.status, 201);
-          const user = getUser(ssoUser)!;
+          const user = getUser(enterprise.id, ssoUser)!;
           assert.equal(await verifyPassword(ssoUser, user.passwordHash, user.salt), true);
-          assert.equal(isPoolManagedSsoUser(ssoUser), false);
+          assert.equal(isPoolManagedSsoUser(enterprise.id, ssoUser), false);
         }
         const response = await request('/users', { ssoUser: 'direct-custom', password: 'custom-password' });
         assert.equal(response.status, 201);
-        const user = getUser('direct-custom')!;
+        const user = getUser(enterprise.id, 'direct-custom')!;
         assert.equal(await verifyPassword('custom-password', user.passwordHash, user.salt), true);
       } finally {
-        config.defaultUserPassword = configured;
+        setDefaultPassword(configured);
       }
       assert.deepEqual(proxyRequests, []);
     });
 
     await t.test('marked users block password email role and CSV edits locally without relying on Proxy', async () => {
       membershipResponse = () => { throw new Error('Proxy unavailable secret-token'); };
-      const user = getUser('managed-user')!;
+      const user = getUser(enterprise.id, 'managed-user')!;
       const before = changes();
       for (const patch of [{ password: 'replacement-secret' }, { email: 'changed@pool.test' }, { role: 'admin' }, { password: '' }]) {
         const response = await request('/users/MANAGED-USER', patch, undefined, 'PATCH');
@@ -377,20 +398,21 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
       }
       const imported = await request('/users/import', { csvText: 'managed-user,replacement-secret' });
       assert.equal((await imported.json()).rows[0].status, 'failed');
-      assert.deepEqual(getUser('managed-user'), user);
+      assert.deepEqual(getUser(enterprise.id, 'managed-user'), user);
       assert.deepEqual(changes(), before);
       const response = await request('/users/direct-default', { password: 'changed', email: 'changed@pool.test', role: 'admin' }, undefined, 'PATCH');
       assert.equal(response.status, 200);
-      assert.equal(getUser('direct-default')?.role, 'admin');
+      assert.equal(getUser(enterprise.id, 'direct-default')?.role, 'admin');
       assert.deepEqual(proxyRequests, []);
     });
 
     await t.test('marked users block every destructive operation before any external action or local mutation', async () => {
       // Covers both in-flight local-only provisioning and fully linked pool users.
       for (const linked of [false, true]) {
-        if (linked) updateEmu('managed-user', { ghLogin: 'managed_emu', ghScimId: 'managed-id', emuStatus: 'active' });
+        const linkedEmu = { ghLogin: 'managed_emu', ghScimId: 'managed-id', emuStatus: 'active' } as const;
+        if (linked) updateEmu(enterprise.id, 'managed-user', linkedEmu);
         const before = changes();
-        const user = getUser('managed-user');
+        const user = getUser(enterprise.id, 'managed-user');
         for (const operation of ['delete_sso', 'delete_emu', 'suspend_emu', 'remove_copilot']) {
           const response = await request('/users/batch', { operation, ssoUsers: ['MANAGED-USER'] });
           assert.equal(response.status, 200);
@@ -401,7 +423,7 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
         const response = await request('/users/managed-user/copilot-seat', undefined, undefined, 'DELETE');
         assert.equal(response.status, 409);
         assert.equal((await response.json()).error.code, 'pool_member_managed');
-        assert.deepEqual(getUser('managed-user'), user);
+        assert.deepEqual(getUser(enterprise.id, 'managed-user'), user);
         assert.deepEqual(changes(), before);
       }
       assert.deepEqual(proxyRequests, []);
@@ -410,7 +432,8 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
 
     await t.test('legacy unmarked pool users are protected by read-only Proxy preflight before GitHub calls', async () => {
       await seed('pre-marker');
-      const user = updateEmu('pre-marker', { ghLogin: 'legacy_emu', ghScimId: 'legacy-id', emuStatus: 'active' });
+      const legacyEmu = { ghLogin: 'legacy_emu', ghScimId: 'legacy-id', emuStatus: 'active' } as const;
+      const user = updateEmu(enterprise.id, 'pre-marker', legacyEmu);
       membershipResponse = () => jsonResponse(200, { managed: true });
       const before = changes();
       for (const operation of ['delete_sso', 'delete_emu', 'suspend_emu', 'remove_copilot']) {
@@ -418,16 +441,16 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
         const result = await response.json();
         assert.equal(result.summary.failed, 1);
         assert.match(result.rows[0].detail, /^pool_member_managed:/);
-        assert.deepEqual(proxyRequests.splice(0), [{ url: 'https://proxy.test/internal/accounts/by-sso-user/pre-marker/pool-membership', method: 'GET' }]);
+        assert.deepEqual(proxyRequests.splice(0), [{ url: membershipUrl('pre-marker'), method: 'GET' }]);
       }
-      assert.equal(isPoolManagedSsoUser('pre-marker'), false);
+      assert.equal(isPoolManagedSsoUser(enterprise.id, 'pre-marker'), false);
       assert.deepEqual(changes(), before);
-      assert.deepEqual(getUser('pre-marker'), user);
+      assert.deepEqual(getUser(enterprise.id, 'pre-marker'), user);
       assert.deepEqual(scimRequests, []);
     });
 
     await t.test('unavailable or malformed Proxy preflight fails closed and returns only safe errors', async () => {
-      const user = getUser('pre-marker');
+      const user = getUser(enterprise.id, 'pre-marker');
       const before = changes();
       const badResponses = [
         () => { throw new Error('private-token transport failure'); },
@@ -454,7 +477,7 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
       assert.equal(proxyRequests.splice(0).every(({ method, url }) => method === 'GET' && url.endsWith('/pool-membership')), true);
       assert.deepEqual(scimRequests, []);
       assert.deepEqual(changes(), before);
-      assert.deepEqual(getUser('pre-marker'), user);
+      assert.deepEqual(getUser(enterprise.id, 'pre-marker'), user);
     });
 
     await t.test('direct nonpool destructive operations still run after explicit negative membership preflight', async () => {
@@ -462,19 +485,25 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
       for (const operation of ['delete_sso', 'delete_emu', 'suspend_emu', 'remove_copilot']) {
         const ssoUser = `direct-${operation}`;
         await seed(ssoUser);
-        updateEmu(ssoUser, { ghLogin: `${ssoUser}_emu`, ghScimId: `${ssoUser}-id`, emuStatus: 'active' });
+        updateEmu(enterprise.id, ssoUser, {
+          ghLogin: `${ssoUser}_emu`,
+          ghScimId: `${ssoUser}-id`,
+          emuStatus: 'active',
+        });
         const response = await request('/users/batch', { operation, ssoUsers: [ssoUser] });
         const result = await response.json();
         assert.equal(result.summary.success, 1, JSON.stringify(result));
         const proxy = proxyRequests.splice(0);
-        assert.deepEqual(proxy[0], { url: `https://proxy.test/internal/accounts/by-sso-user/${ssoUser}/pool-membership`, method: 'GET' });
+        assert.deepEqual(proxy[0], { url: membershipUrl(ssoUser), method: 'GET' });
         assert.equal(proxy.length, operation === 'delete_sso' ? 2 : 1);
         assert.ok(scimRequests.splice(0).length > 0);
-        assert.equal(isPoolManagedSsoUser(ssoUser), false);
-        if (operation === 'delete_sso') assert.equal(getUser(ssoUser), undefined);
-        if (operation === 'delete_emu') assert.equal(getUser(ssoUser)?.emuStatus, 'not_synced');
-        if (operation === 'suspend_emu') assert.equal(getUser(ssoUser)?.emuStatus, 'suspended');
-        if (operation === 'remove_copilot') assert.equal(getUser(ssoUser)?.copilotSeatStatus, 'unassigned');
+        assert.equal(isPoolManagedSsoUser(enterprise.id, ssoUser), false);
+        if (operation === 'delete_sso') assert.equal(getUser(enterprise.id, ssoUser), undefined);
+        if (operation === 'delete_emu') assert.equal(getUser(enterprise.id, ssoUser)?.emuStatus, 'not_synced');
+        if (operation === 'suspend_emu') assert.equal(getUser(enterprise.id, ssoUser)?.emuStatus, 'suspended');
+        if (operation === 'remove_copilot') {
+          assert.equal(getUser(enterprise.id, ssoUser)?.copilotSeatStatus, 'unassigned');
+        }
       }
     });
   } finally {
@@ -482,6 +511,18 @@ test('pool safety APIs fail closed without adopting or recreating users', async 
     await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
   }
 });
+
+/** The default enterprise reads `{ env: 'SSO_DEFAULT_USER_PASSWORD' }` on every use. */
+function setDefaultPassword(value: string | undefined): void {
+  if (value === undefined) delete process.env.SSO_DEFAULT_USER_PASSWORD;
+  else process.env.SSO_DEFAULT_USER_PASSWORD = value;
+}
+
+const PROXY_ACCOUNTS = 'https://proxy.test/internal/enterprises/default/accounts/by-sso-user';
+
+function membershipUrl(ssoUser: string): string {
+  return `${PROXY_ACCOUNTS}/${ssoUser}/pool-membership`;
+}
 
 function jsonResponse(status: number, value: unknown): Response {
   return new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });

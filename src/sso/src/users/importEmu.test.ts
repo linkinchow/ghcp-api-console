@@ -45,10 +45,20 @@ test('imports direct seat snapshots, dates and date-only updates without changin
     const { getDb } = await import('../db/connection.js');
     const { updateSsoRuntimeSettings } = await import('../db/runtimeSettingsRepo.js');
     const { applyEmuImportPlan, createEmuImportPlan, importEmuUsers, listEmuImportPlanRows } = await import('./service.js');
-    updateSsoRuntimeSettings({ expectedVersion: 1, changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 } });
-    createUser({ ssoUser: 'bob', email: 'old@example.com', passwordHash: 'keep-hash', salt: 'keep-salt', role: 'admin' });
-    const plan = await createEmuImportPlan();
-    const preview = listEmuImportPlanRows(plan.planId);
+    const enterprise = (await import('../enterprises.js')).defaultSsoEnterprise();
+    updateSsoRuntimeSettings(enterprise.id, {
+      expectedVersion: 1,
+      changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 },
+    });
+    createUser(enterprise.id, {
+      ssoUser: 'bob',
+      email: 'old@example.com',
+      passwordHash: 'keep-hash',
+      salt: 'keep-salt',
+      role: 'admin',
+    });
+    const plan = await createEmuImportPlan(enterprise);
+    const preview = listEmuImportPlanRows(enterprise, plan.planId);
     const previewByUser = new Map(preview.items.map((row) => [row.ssoUser, row]));
 
     assert.equal(previewByUser.get('bob')?.copilotSeatStatus, 'assigned');
@@ -57,52 +67,57 @@ test('imports direct seat snapshots, dates and date-only updates without changin
     assert.equal(previewByUser.get('bob')?.status, 'pending_update');
     assert.equal(previewByUser.get('carol')?.status, 'pending_create');
     for (const name of ['dave', 'org-only', 'team-only']) assert.equal(previewByUser.get(name)?.copilotSeatStatus, 'unassigned');
-    assert.equal(getUser('carol'), undefined, 'Preview does not create a user');
+    assert.equal(getUser(enterprise.id, 'carol'), undefined, 'Preview does not create a user');
 
     seats[1]!.pending_cancellation_date = '2026-11-17';
-    await applyEmuImportPlan(plan.planId);
+    await applyEmuImportPlan(enterprise, plan.planId);
 
-    assert.equal(getUser('bob')?.copilotSeatStatus, 'assigned');
-    assert.equal(getUser('bob')?.passwordHash, 'keep-hash');
-    assert.equal(getUser('bob')?.role, 'admin');
-    assert.equal(getUser('carol')?.copilotSeatStatus, 'pending_cancellation');
-    assert.equal(getUser('carol')?.copilotSeatPendingCancellationDate, '2026-10-17', 'Apply uses the stored snapshot');
-    assert.equal(listEmuImportPlanRows(plan.planId).items.find((row) => row.ssoUser === 'carol')?.copilotSeatPendingCancellationDate, '2026-10-17');
-    const second = await createEmuImportPlan();
+    assert.equal(getUser(enterprise.id, 'bob')?.copilotSeatStatus, 'assigned');
+    assert.equal(getUser(enterprise.id, 'bob')?.passwordHash, 'keep-hash');
+    assert.equal(getUser(enterprise.id, 'bob')?.role, 'admin');
+    assert.equal(getUser(enterprise.id, 'carol')?.copilotSeatStatus, 'pending_cancellation');
+    const carolDate = () => getUser(enterprise.id, 'carol')?.copilotSeatPendingCancellationDate;
+    assert.equal(carolDate(), '2026-10-17', 'Apply uses the stored snapshot');
+    const carolRow = listEmuImportPlanRows(enterprise, plan.planId).items.find((row) => row.ssoUser === 'carol');
+    assert.equal(carolRow?.copilotSeatPendingCancellationDate, '2026-10-17');
+    const second = await createEmuImportPlan(enterprise);
     assert.equal(second.summary.pendingUpdate, 1, 'A date-only change must not be skipped');
-    assert.equal(listEmuImportPlanRows(second.planId, { status: 'pending_update', pageSize: 1 }).items[0]?.copilotSeatPendingCancellationDate, '2026-11-17');
-    await applyEmuImportPlan(second.planId);
-    assert.equal(getUser('carol')?.copilotSeatPendingCancellationDate, '2026-11-17');
-    assert.equal((await applyEmuImportPlan(second.planId)).summary.updated, 1, 'Apply is reentrant');
-    assert.equal((await createEmuImportPlan()).summary.skipped, 5);
+    const pendingRows = listEmuImportPlanRows(enterprise, second.planId, { status: 'pending_update', pageSize: 1 });
+    assert.equal(pendingRows.items[0]?.copilotSeatPendingCancellationDate, '2026-11-17');
+    await applyEmuImportPlan(enterprise, second.planId);
+    assert.equal(getUser(enterprise.id, 'carol')?.copilotSeatPendingCancellationDate, '2026-11-17');
+    assert.equal((await applyEmuImportPlan(enterprise, second.planId)).summary.updated, 1, 'Apply is reentrant');
+    assert.equal((await createEmuImportPlan(enterprise)).summary.skipped, 5);
 
-    recordCopilotSeatError('carol', 'remove', 'Previous readback failed');
-    const clearErrorPlan = await createEmuImportPlan();
+    recordCopilotSeatError(enterprise.id, 'carol', 'remove', 'Previous readback failed');
+    const clearErrorPlan = await createEmuImportPlan(enterprise);
     assert.equal(clearErrorPlan.summary.pendingUpdate, 1);
-    await applyEmuImportPlan(clearErrorPlan.planId);
-    assert.equal(Boolean(getUser('carol')?.copilotSeatLastError), false);
+    await applyEmuImportPlan(enterprise, clearErrorPlan.planId);
+    assert.equal(Boolean(getUser(enterprise.id, 'carol')?.copilotSeatLastError), false);
 
     seats[1]!.pending_cancellation_date = null;
-    await importEmuUsers();
-    assert.equal(getUser('carol')?.copilotSeatStatus, 'assigned');
-    assert.equal(getUser('carol')?.copilotSeatPendingCancellationDate, undefined);
+    await importEmuUsers(enterprise);
+    assert.equal(getUser(enterprise.id, 'carol')?.copilotSeatStatus, 'assigned');
+    assert.equal(getUser(enterprise.id, 'carol')?.copilotSeatPendingCancellationDate, undefined);
     seats[1]!.pending_cancellation_date = '2000-01-01';
-    await importEmuUsers();
-    assert.equal(getUser('carol')?.copilotSeatStatus, 'pending_cancellation');
-    assert.equal(getUser('carol')?.copilotSeatPendingCancellationDate, '2000-01-01', 'Even a past date remains the GitHub snapshot');
+    await importEmuUsers(enterprise);
+    assert.equal(getUser(enterprise.id, 'carol')?.copilotSeatStatus, 'pending_cancellation');
+    assert.equal(carolDate(), '2000-01-01', 'Even a past date remains the GitHub snapshot');
     seats = seats.filter((seat) => seat.organization || seat.assigning_team);
-    await importEmuUsers();
-    assert.equal(getUser('carol')?.copilotSeatStatus, 'unassigned', 'Other sources cannot restore the direct seat');
-    assert.equal(getUser('bob')?.copilotSeatStatus, 'unassigned');
+    await importEmuUsers(enterprise);
+    const carolStatus = getUser(enterprise.id, 'carol')?.copilotSeatStatus;
+    assert.equal(carolStatus, 'unassigned', 'Other sources cannot restore the direct seat');
+    assert.equal(getUser(enterprise.id, 'bob')?.copilotSeatStatus, 'unassigned');
     const planCount = () => (getDb().prepare('SELECT COUNT(*) AS count FROM sso_emu_import_plans').get() as { count: number }).count;
     const beforeFailure = planCount();
-    updateCopilotSeatFromGitHub('bob', { status: 'pending_cancellation', pendingCancellationDate: '2026-10-17' });
+    const bobSeat = { status: 'pending_cancellation', pendingCancellationDate: '2026-10-17' } as const;
+    updateCopilotSeatFromGitHub(enterprise.id, 'bob', bobSeat);
     seatStatus = 503;
-    await assert.rejects(createEmuImportPlan(), /503/);
+    await assert.rejects(createEmuImportPlan(enterprise), /503/);
     assert.equal(planCount(), beforeFailure, 'Failed lookup does not create an unassigned preview');
-    assert.equal(getUser('bob')?.copilotSeatPendingCancellationDate, '2026-10-17');
-    assert.equal(getUser('bob')?.copilotSeatStatus, 'pending_cancellation');
-    assert.equal(getUser('carol')?.copilotSeatStatus, 'unassigned');
+    assert.equal(getUser(enterprise.id, 'bob')?.copilotSeatPendingCancellationDate, '2026-10-17');
+    assert.equal(getUser(enterprise.id, 'bob')?.copilotSeatStatus, 'pending_cancellation');
+    assert.equal(getUser(enterprise.id, 'carol')?.copilotSeatStatus, 'unassigned');
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -466,7 +466,7 @@ SAML 会话**不建表**（§5.5）。
 
 **会话持久化**
 
-- 采用每个企业一个**签名 cookie**，沿用基线 `cookie-session`。不使用旧分支 `src/sso/src/saml/sessionStore.ts` 的进程内存 store。
+- 采用每个企业一个**签名 cookie**，线上格式与基线 `cookie-session` 完全相同（base64 JSON + keygrip `.sig`），所以基线 cookie 可以原样读取。由 `saml/enterpriseSession.ts` 用 `res.cookie` 写出：`cookie-session` 在 TLS 由前置代理终止时写 Secure cookie 会静默失败。不使用旧分支 `src/sso/src/saml/sessionStore.ts` 的进程内存 store。
 - 会话状态只在客户端 cookie 中，服务端没有内存状态，所以 SSO 重启后会话仍然有效；多实例共用同一 secret 时也可以工作。
 
 | 企业 | cookie 名 | path | 签名 key |
@@ -478,7 +478,8 @@ SAML 会话**不建表**（§5.5）。
 - 载荷中的 `e` 必须等于路由所属企业。基线留下的旧 cookie 没有 `e`，只有 default 路由接受。
 - `user.createdAt` 必须等于 `sso_users` 行的 `created_at`。用户被删除再重建后，旧 cookie 自动失效。
 - `pending` 在 5 分钟后过期，完成一次响应后清除。
-- `POST /login` 和 `POST /logout` 校验 `Origin`，并拒绝 `Sec-Fetch-Site: cross-site`（从旧分支移植）。
+- `POST /login` 和 `POST /logout` 校验 `Origin`，并拒绝 `Sec-Fetch-Site: cross-site`（从旧分支移植）。Origin 的 host 等于 `BASE_URL` 的 host 或请求的 Host 头即为同源（内网地址打开登录页仍可用）；没有 Origin 时接受（与基线相同）；`Origin: null` 拒绝。
+- 基线 cookie（没有 `e`、没有 `createdAt`）只在 default 路由上接受：用户存在时接受一次并改写为新格式；基线的 pending 字段映射为 5 分钟的 pending。
 - 登录时按 `(enterpriseId, ssoUser)` 查用户。另一企业的同名用户无法登录本企业。
 
 ### 5.6 SSO 用户、SCIM、席位、预算
@@ -499,6 +500,8 @@ SAML 会话**不建表**（§5.5）。
   - `service.ts` 的 `assertDestructiveOperationAllowed`，它会调用带作用域的 Proxy pool-membership；
   - 异步 scrypt 密码（`auth/password.ts`）和 `routes/loginCredentials.ts` 的并发上限。
 - 事件日志：default 仍写 `SSO_USER_EVENTS_LOG`；其他企业写 `<dir>/<enterpriseId>/<basename>`。
+- 企业缺少 `scimToken` 或 `seatPat` 时，相关操作返回 503 `enterprise_secret_unconfigured`（基线为 400 或发出空凭据）。
+- 启动时，库中有用户、但 registry 中已不存在的企业，报 `enterprise_missing_from_registry`。
 - 外部写请求使用 `redirect: 'error'`。传输失败或 5xx 视为“结果不确定”（从旧分支 `clients/externalFetch.ts` 移植到 shared）。
 
 ### 5.7 Login 任务绑定

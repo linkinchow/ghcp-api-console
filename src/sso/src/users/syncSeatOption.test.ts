@@ -38,17 +38,21 @@ test('sync_emu assigns a Copilot seat only when explicitly requested', async () 
     const { createUser, getUser } = await import('../db/usersRepo.js');
     const { updateSsoRuntimeSettings } = await import('../db/runtimeSettingsRepo.js');
     const { runSsoUserBatch } = await import('./service.js');
+    const enterprise = (await import('../enterprises.js')).defaultSsoEnterprise();
     for (const ssoUser of ['login-only', 'login-with-seat']) {
-      createUser({ ssoUser, passwordHash: 'hash', salt: 'salt', email: `${ssoUser}@example.com` });
+      createUser(enterprise.id, { ssoUser, passwordHash: 'hash', salt: 'salt', email: `${ssoUser}@example.com` });
     }
-    updateSsoRuntimeSettings({ expectedVersion: 1, changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 } });
+    updateSsoRuntimeSettings(enterprise.id, {
+      expectedVersion: 1,
+      changes: { scimRequestDelayMs: 0, scimMaxRetries: 0 },
+    });
 
-    const loginOnly = await runSsoUserBatch({
+    const loginOnly = await runSsoUserBatch(enterprise, {
       operation: 'sync_emu',
       ssoUsers: ['login-only'],
       assignCopilotSeat: false,
     });
-    const loginWithSeat = await runSsoUserBatch({
+    const loginWithSeat = await runSsoUserBatch(enterprise, {
       operation: 'sync_emu',
       ssoUsers: ['login-with-seat'],
       assignCopilotSeat: true,
@@ -56,7 +60,7 @@ test('sync_emu assigns a Copilot seat only when explicitly requested', async () 
 
     assert.equal(loginOnly.rows[0]?.detail, 'Synced to EMU.');
     assert.equal(loginOnly.rows[0]?.user?.copilotSeatStatus, 'unknown');
-    assert.equal(getUser('login-only')?.copilotSeatStatus, 'unknown');
+    assert.equal(getUser(enterprise.id, 'login-only')?.copilotSeatStatus, 'unknown');
     assert.equal(loginWithSeat.rows[0]?.detail, 'Synced to EMU and assigned Copilot seat.');
     assert.equal(loginWithSeat.rows[0]?.user?.copilotSeatStatus, 'assigned');
     assert.deepEqual(seatAssignments, ['login-with-seat_emu']);

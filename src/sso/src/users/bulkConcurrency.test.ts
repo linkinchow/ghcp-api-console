@@ -35,15 +35,16 @@ test('limits sync_emu concurrency and preserves result order', async () => {
     const { createUser } = await import('../db/usersRepo.js');
     const { updateSsoRuntimeSettings } = await import('../db/runtimeSettingsRepo.js');
     const { runSsoUserBatch } = await import('./service.js');
+    const enterprise = (await import('../enterprises.js')).defaultSsoEnterprise();
     for (const ssoUser of ['charlie', 'alice', 'bob']) {
-      createUser({ ssoUser, passwordHash: 'hash', salt: 'salt', email: `${ssoUser}@example.com` });
+      createUser(enterprise.id, { ssoUser, passwordHash: 'hash', salt: 'salt', email: `${ssoUser}@example.com` });
     }
-    updateSsoRuntimeSettings({
+    updateSsoRuntimeSettings(enterprise.id, {
       expectedVersion: 1,
       changes: { bulkSyncConcurrency: 2, scimRequestDelayMs: 0, scimMaxRetries: 0 },
     });
 
-    const result = await runSsoUserBatch({
+    const result = await runSsoUserBatch(enterprise, {
       operation: 'sync_emu',
       ssoUsers: ['charlie', 'alice', 'bob'],
     });

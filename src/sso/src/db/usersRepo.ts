@@ -1,5 +1,16 @@
-import type { CopilotSeatOperation, CopilotSeatSnapshot, CopilotSeatStatus, EmuStatus, ManagementQuery, ManagementSummary, PageResponse, SsoUserDto } from '@ghcp/shared';
+import type {
+  CopilotSeatOperation,
+  CopilotSeatSnapshot,
+  CopilotSeatStatus,
+  EmuStatus,
+  EnterpriseId,
+  ManagementQuery,
+  ManagementSummary,
+  PageResponse,
+  SsoUserDto,
+} from '@ghcp/shared';
 import { HttpApiError, LIKE_ESCAPE_CLAUSE, likeContains, nowIso, pageResponse } from '@ghcp/shared';
+import type Database from 'better-sqlite3';
 import { getDb } from './connection.js';
 import { readMaxSsoUsers } from './runtimeSettingsRepo.js';
 
@@ -28,6 +39,51 @@ interface UserRow {
 
 export interface UserListQuery extends ManagementQuery { }
 
+export interface NewSsoUser {
+  ssoUser: string;
+  passwordHash: string;
+  salt: string;
+  email: string;
+  role?: 'user' | 'admin';
+  poolManaged?: boolean;
+}
+
+export type UserPatch = Partial<Pick<SsoUserRecord, 'email' | 'role' | 'passwordHash' | 'salt'>>;
+
+export type EmuPatch = { ghLogin?: string; ghScimId?: string; emuStatus: EmuStatus };
+
+export type CopilotSeatPatch = (CopilotSeatSnapshot | {
+  status: Exclude<CopilotSeatStatus, CopilotSeatSnapshot['status']>;
+  pendingCancellationDate?: never;
+}) & {
+  lastOperation: CopilotSeatOperation;
+  lastError?: string;
+};
+
+interface WhereClause {
+  sql: string;
+  args: unknown[];
+}
+
+const SORT_COLUMNS: Readonly<Record<string, string>> = {
+  ssoUser: 'sso_user',
+  email: 'email',
+  role: 'role',
+  emuStatus: 'emu_status',
+  createdAt: 'created_at',
+  updatedAt: 'updated_at',
+};
+
+const LIST_FILTERS = [
+  ['status', 'emu_status', ['active', 'suspended', 'deleted', 'not_synced']],
+  [
+    'seatStatus',
+    'copilot_seat_status',
+    ['unknown', 'assigned', 'pending_cancellation', 'unassigned', 'assign_failed', 'remove_failed'],
+  ],
+  ['role', 'role', ['user', 'admin']],
+] as const;
+
 export class SsoUserLimitReachedError extends Error {
   constructor(
     readonly current: number,
@@ -48,190 +104,190 @@ export class PoolMemberManagedError extends Error {
 }
 
 // Kept separate from user records/DTOs: this is local ownership metadata only.
-export function isPoolManagedSsoUser(ssoUser: string): boolean {
-  return Boolean(getDb().prepare('SELECT 1 FROM sso_pool_managed_users WHERE lower(sso_user) = lower(?)').get(ssoUser));
+export function isPoolManagedSsoUser(enterpriseId: EnterpriseId, ssoUser: string): boolean {
+  const row = getDb().prepare(`
+    SELECT 1
+    FROM sso_pool_managed_users
+    WHERE enterprise_id = ?
+      AND lower(sso_user) = lower(?)
+  `).get(enterpriseId, ssoUser);
+  return Boolean(row);
 }
 
-export function assertNotLocallyPoolManaged(ssoUser: string): void {
-  if (isPoolManagedSsoUser(ssoUser)) throw new PoolMemberManagedError();
+export function assertNotLocallyPoolManaged(enterpriseId: EnterpriseId, ssoUser: string): void {
+  if (isPoolManagedSsoUser(enterpriseId, ssoUser)) throw new PoolMemberManagedError();
 }
 
-export function listUsers(query: UserListQuery = {}, database = getDb()): PageResponse<SsoUserDto> {
-  let page = Math.max(1, Math.trunc(query.page ?? 1));
+export function listUsers(
+  enterpriseId: EnterpriseId,
+  query: UserListQuery = {},
+  database = getDb(),
+): PageResponse<SsoUserDto> {
   const pageSize = Math.max(1, Math.min(Math.trunc(query.pageSize ?? 25), 100));
-  const q = query.q?.trim();
-  if (query.sort && !['ssoUser', 'email', 'role', 'emuStatus', 'createdAt', 'updatedAt'].includes(query.sort)) {
-    throw new HttpApiError(400, 'invalid_sort', 'Unknown SSO user sort field.');
-  }
-  const sort = sortColumn(query.sort);
-  const dir = query.dir === 'desc' ? 'DESC' : 'ASC';
-  const clauses = q ? [`(sso_user LIKE ? ${LIKE_ESCAPE_CLAUSE} OR email LIKE ? ${LIKE_ESCAPE_CLAUSE} OR gh_login LIKE ? ${LIKE_ESCAPE_CLAUSE})`] : [];
-  const args = q ? [likeContains(q), likeContains(q), likeContains(q)] : [];
-  if (query.ids?.length) { clauses.push(`sso_user IN (${query.ids.map(() => '?').join(',')})`); args.push(...query.ids); }
-  const filters = [
-    ['status', 'emu_status', ['active', 'suspended', 'deleted', 'not_synced']],
-    ['seatStatus', 'copilot_seat_status', ['unknown', 'assigned', 'pending_cancellation', 'unassigned', 'assign_failed', 'remove_failed']],
-    ['role', 'role', ['user', 'admin']],
-  ] as const;
-  for (const [key, column, allowed] of filters) {
-    if (!query[key]) continue;
-    const values = query[key].split(',');
-    if (values.some((value) => !allowed.some((entry) => entry === value))) throw new HttpApiError(400, 'invalid_filter', `Invalid ${key}.`);
-    clauses.push(`${column} IN (${values.map(() => '?').join(',')})`);
-    args.push(...values);
-  }
-  if (query.from) { clauses.push('updated_at >= ?'); args.push(query.from); }
-  if (query.to) { clauses.push('updated_at < ?'); args.push(query.to); }
-  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-  const total = (database.prepare(`SELECT COUNT(*) AS count FROM sso_users ${where}`).get(...args) as { count: number }).count;
-  page = Math.min(page, Math.max(1, Math.ceil(total / pageSize)));
-  const rows = database
-    .prepare(`SELECT * FROM sso_users ${where} ORDER BY ${sort} ${dir}, sso_user ${dir} LIMIT ? OFFSET ?`)
-    .all(...args, pageSize, (page - 1) * pageSize) as UserRow[];
+  const order = orderBy(query);
+  const where = listWhere(enterpriseId, query);
+  const total = countWhere(database, where);
+  const lastPage = Math.max(1, Math.ceil(total / pageSize));
+  const page = Math.min(Math.max(1, Math.trunc(query.page ?? 1)), lastPage);
+  const rows = database.prepare(`
+    SELECT *
+    FROM sso_users
+    WHERE ${where.sql}
+    ORDER BY ${order}
+    LIMIT ? OFFSET ?
+  `).all(...where.args, pageSize, (page - 1) * pageSize) as UserRow[];
   return pageResponse(rows.map(mapRow).map(toDto), total, page, pageSize);
 }
 
-export function summarizeUsers(): ManagementSummary {
-  const rows = getDb().prepare('SELECT emu_status AS status, COUNT(*) AS count FROM sso_users GROUP BY emu_status').all() as Array<{ status: string; count: number }>;
-  return { total: rows.reduce((total, row) => total + row.count, 0), counts: Object.fromEntries(rows.map((row) => [row.status, row.count])), updatedAt: nowIso() };
+export function summarizeUsers(enterpriseId: EnterpriseId): ManagementSummary {
+  const rows = getDb().prepare(`
+    SELECT emu_status AS status, COUNT(*) AS count
+    FROM sso_users
+    WHERE enterprise_id = ?
+    GROUP BY emu_status
+  `).all(enterpriseId) as Array<{ status: string; count: number }>;
+  return {
+    total: rows.reduce((total, row) => total + row.count, 0),
+    counts: Object.fromEntries(rows.map((row) => [row.status, row.count])),
+    updatedAt: nowIso(),
+  };
 }
 
-export function listAllUsers(): SsoUserRecord[] {
-  return (getDb().prepare('SELECT * FROM sso_users ORDER BY sso_user ASC').all() as UserRow[]).map(mapRow);
+export function listAllUsers(enterpriseId: EnterpriseId): SsoUserRecord[] {
+  const rows = getDb().prepare(`
+    SELECT *
+    FROM sso_users
+    WHERE enterprise_id = ?
+    ORDER BY sso_user ASC
+  `).all(enterpriseId) as UserRow[];
+  return rows.map(mapRow);
 }
 
-export function countUsers(): number {
-  return (getDb().prepare('SELECT COUNT(*) AS count FROM sso_users').get() as { count: number }).count;
+export function countUsers(enterpriseId: EnterpriseId): number {
+  const row = getDb().prepare(`
+    SELECT COUNT(*) AS count
+    FROM sso_users
+    WHERE enterprise_id = ?
+  `).get(enterpriseId) as { count: number };
+  return row.count;
 }
 
-export function getUser(ssoUser: string): SsoUserRecord | undefined {
-  const row = getDb().prepare('SELECT * FROM sso_users WHERE lower(sso_user) = lower(?)').get(ssoUser) as UserRow | undefined;
+export function getUser(enterpriseId: EnterpriseId, ssoUser: string): SsoUserRecord | undefined {
+  const row = getDb().prepare(`
+    SELECT *
+    FROM sso_users
+    WHERE enterprise_id = ?
+      AND lower(sso_user) = lower(?)
+  `).get(enterpriseId, ssoUser) as UserRow | undefined;
   return row ? mapRow(row) : undefined;
 }
 
-export function getUserByGhLogin(ghLogin: string): SsoUserRecord | undefined {
+export function getUserByGhLogin(enterpriseId: EnterpriseId, ghLogin: string): SsoUserRecord | undefined {
   const trimmed = ghLogin.trim();
   if (!trimmed) return undefined;
-  const row = getDb().prepare('SELECT * FROM sso_users WHERE gh_login = ? COLLATE NOCASE').get(trimmed) as UserRow | undefined;
+  const row = getDb().prepare(`
+    SELECT *
+    FROM sso_users
+    WHERE enterprise_id = ?
+      AND gh_login = ? COLLATE NOCASE
+  `).get(enterpriseId, trimmed) as UserRow | undefined;
   return row ? mapRow(row) : undefined;
 }
 
-export function createUser(input: {
-  ssoUser: string;
-  passwordHash: string;
-  salt: string;
-  email: string;
-  role?: 'user' | 'admin';
-  poolManaged?: boolean;
-}): SsoUserRecord {
+export function createUser(enterpriseId: EnterpriseId, input: NewSsoUser): SsoUserRecord {
   const db = getDb();
   return db.transaction(() => {
-    const current = countUsers();
-    const limit = readMaxSsoUsers(db);
-    if (limit !== null && current >= limit) {
-      throw new SsoUserLimitReachedError(current, limit);
-    }
-    const now = nowIso();
-    db.prepare(`
-        INSERT INTO sso_users (sso_user, password_hash, salt, email, role, emu_status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, 'not_synced', ?, ?)
-      `)
-      .run(input.ssoUser, input.passwordHash, input.salt, input.email, input.role ?? 'user', now, now);
-    if (input.poolManaged === true) {
-      db.prepare('INSERT INTO sso_pool_managed_users (sso_user) VALUES (?)').run(input.ssoUser);
-    }
-    const created = getUser(input.ssoUser);
+    assertBelowUserLimit(db, enterpriseId);
+    insertUser(db, enterpriseId, input);
+    if (input.poolManaged === true) insertPoolMarker(db, enterpriseId, input.ssoUser);
+    const created = getUser(enterpriseId, input.ssoUser);
     if (!created) throw new Error(`Failed to read newly created SSO user "${input.ssoUser}".`);
     return created;
   }).immediate();
 }
 
-export function updateUser(ssoUser: string, patch: Partial<Pick<SsoUserRecord, 'email' | 'role' | 'passwordHash' | 'salt'>>): SsoUserRecord | undefined {
-  const current = getUser(ssoUser);
+export function updateUser(enterpriseId: EnterpriseId, ssoUser: string, patch: UserPatch): SsoUserRecord | undefined {
+  const current = getUser(enterpriseId, ssoUser);
   if (!current) return undefined;
-  assertNotLocallyPoolManaged(current.ssoUser);
-  getDb()
-    .prepare(`
-      UPDATE sso_users
-      SET email = ?, role = ?, password_hash = ?, salt = ?, updated_at = ?
-      WHERE lower(sso_user) = lower(?)
-    `)
-    .run(
-      patch.email ?? current.email,
-      patch.role ?? current.role,
-      patch.passwordHash ?? current.passwordHash,
-      patch.salt ?? current.salt,
-      nowIso(),
-      ssoUser,
-    );
-  return getUser(ssoUser);
+  assertNotLocallyPoolManaged(enterpriseId, current.ssoUser);
+  getDb().prepare(`
+    UPDATE sso_users
+    SET email = ?, role = ?, password_hash = ?, salt = ?, updated_at = ?
+    WHERE enterprise_id = ?
+      AND lower(sso_user) = lower(?)
+  `).run(
+    patch.email ?? current.email,
+    patch.role ?? current.role,
+    patch.passwordHash ?? current.passwordHash,
+    patch.salt ?? current.salt,
+    nowIso(),
+    enterpriseId,
+    ssoUser,
+  );
+  return getUser(enterpriseId, ssoUser);
 }
 
-export function updateEmu(ssoUser: string, patch: { ghLogin?: string; ghScimId?: string; emuStatus: EmuStatus }): SsoUserRecord {
-  getDb()
-    .prepare(`
-      UPDATE sso_users
-      SET gh_login = ?, gh_scim_id = ?, emu_status = ?, updated_at = ?
-      WHERE lower(sso_user) = lower(?)
-    `)
-    .run(patch.ghLogin, patch.ghScimId, patch.emuStatus, nowIso(), ssoUser);
-  const user = getUser(ssoUser);
-  if (!user) throw new Error(`Unknown SSO user "${ssoUser}".`);
-  return user;
+export function updateEmu(enterpriseId: EnterpriseId, ssoUser: string, patch: EmuPatch): SsoUserRecord {
+  getDb().prepare(`
+    UPDATE sso_users
+    SET gh_login = ?, gh_scim_id = ?, emu_status = ?, updated_at = ?
+    WHERE enterprise_id = ?
+      AND lower(sso_user) = lower(?)
+  `).run(patch.ghLogin, patch.ghScimId, patch.emuStatus, nowIso(), enterpriseId, ssoUser);
+  return requireUser(enterpriseId, ssoUser);
 }
 
-export function updateCopilotSeat(
+export function updateCopilotSeat(enterpriseId: EnterpriseId, ssoUser: string, patch: CopilotSeatPatch): SsoUserRecord {
+  const now = nowIso();
+  const pendingDate = patch.status === 'pending_cancellation' ? patch.pendingCancellationDate : null;
+  getDb().prepare(`
+    UPDATE sso_users
+    SET copilot_seat_status = ?, copilot_seat_last_operation = ?, copilot_seat_last_error = ?,
+        copilot_seat_pending_cancellation_date = ?, copilot_seat_updated_at = ?, updated_at = ?
+    WHERE enterprise_id = ?
+      AND lower(sso_user) = lower(?)
+  `).run(patch.status, patch.lastOperation, patch.lastError ?? null, pendingDate, now, now, enterpriseId, ssoUser);
+  return requireUser(enterpriseId, ssoUser);
+}
+
+export function updateCopilotSeatFromGitHub(
+  enterpriseId: EnterpriseId,
   ssoUser: string,
-  patch: (CopilotSeatSnapshot | {
-    status: Exclude<CopilotSeatStatus, CopilotSeatSnapshot['status']>;
-    pendingCancellationDate?: never;
-  }) & {
-    lastOperation: CopilotSeatOperation;
-    lastError?: string;
-  },
+  seat: CopilotSeatSnapshot,
 ): SsoUserRecord {
   const now = nowIso();
-  getDb()
-    .prepare(`
-      UPDATE sso_users
-      SET copilot_seat_status = ?, copilot_seat_last_operation = ?, copilot_seat_last_error = ?,
-          copilot_seat_pending_cancellation_date = ?, copilot_seat_updated_at = ?, updated_at = ?
-      WHERE lower(sso_user) = lower(?)
-    `)
-    .run(patch.status, patch.lastOperation, patch.lastError ?? null,
-      patch.status === 'pending_cancellation' ? patch.pendingCancellationDate : null, now, now, ssoUser);
-  const user = getUser(ssoUser);
-  if (!user) throw new Error(`Unknown SSO user "${ssoUser}".`);
-  return user;
+  getDb().prepare(`
+    UPDATE sso_users
+    SET copilot_seat_status = ?, copilot_seat_last_operation = NULL, copilot_seat_last_error = NULL,
+        copilot_seat_pending_cancellation_date = ?, copilot_seat_updated_at = ?, updated_at = ?
+    WHERE enterprise_id = ?
+      AND lower(sso_user) = lower(?)
+  `).run(seat.status, seat.pendingCancellationDate ?? null, now, now, enterpriseId, ssoUser);
+  return requireUser(enterpriseId, ssoUser);
 }
 
-export function updateCopilotSeatFromGitHub(ssoUser: string, seat: CopilotSeatSnapshot): SsoUserRecord {
-  const now = nowIso();
-  getDb()
-    .prepare(`
-      UPDATE sso_users
-      SET copilot_seat_status = ?, copilot_seat_last_operation = NULL, copilot_seat_last_error = NULL,
-          copilot_seat_pending_cancellation_date = ?, copilot_seat_updated_at = ?, updated_at = ?
-      WHERE lower(sso_user) = lower(?)
-    `)
-    .run(seat.status, seat.pendingCancellationDate ?? null, now, now, ssoUser);
-  const user = getUser(ssoUser);
-  if (!user) throw new Error(`Unknown SSO user "${ssoUser}".`);
-  return user;
-}
-
-export function recordCopilotSeatError(ssoUser: string, operation: CopilotSeatOperation, message: string): void {
+export function recordCopilotSeatError(
+  enterpriseId: EnterpriseId,
+  ssoUser: string,
+  operation: CopilotSeatOperation,
+  message: string,
+): void {
   const result = getDb().prepare(`
     UPDATE sso_users
     SET copilot_seat_last_operation = ?, copilot_seat_last_error = ?, updated_at = ?
-    WHERE lower(sso_user) = lower(?)
-  `).run(operation, message, nowIso(), ssoUser);
+    WHERE enterprise_id = ?
+      AND lower(sso_user) = lower(?)
+  `).run(operation, message, nowIso(), enterpriseId, ssoUser);
   if (!result.changes) throw new Error(`Unknown SSO user "${ssoUser}".`);
 }
 
-export function deleteUser(ssoUser: string): boolean {
-  assertNotLocallyPoolManaged(ssoUser);
-  const result = getDb().prepare('DELETE FROM sso_users WHERE lower(sso_user) = lower(?)').run(ssoUser);
+export function deleteUser(enterpriseId: EnterpriseId, ssoUser: string): boolean {
+  assertNotLocallyPoolManaged(enterpriseId, ssoUser);
+  const result = getDb().prepare(`
+    DELETE FROM sso_users
+    WHERE enterprise_id = ?
+      AND lower(sso_user) = lower(?)
+  `).run(enterpriseId, ssoUser);
   return result.changes > 0;
 }
 
@@ -253,6 +309,90 @@ export function toDto(user: SsoUserRecord): SsoUserDto {
   };
 }
 
+function requireUser(enterpriseId: EnterpriseId, ssoUser: string): SsoUserRecord {
+  const user = getUser(enterpriseId, ssoUser);
+  if (!user) throw new Error(`Unknown SSO user "${ssoUser}".`);
+  return user;
+}
+
+function assertBelowUserLimit(db: Database.Database, enterpriseId: EnterpriseId): void {
+  const current = countUsers(enterpriseId);
+  const limit = readMaxSsoUsers(enterpriseId, db);
+  if (limit !== null && current >= limit) throw new SsoUserLimitReachedError(current, limit);
+}
+
+function insertUser(db: Database.Database, enterpriseId: EnterpriseId, input: NewSsoUser): void {
+  const now = nowIso();
+  db.prepare(`
+    INSERT INTO sso_users (
+      enterprise_id, sso_user, password_hash, salt, email, role, emu_status, created_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, 'not_synced', ?, ?)
+  `).run(enterpriseId, input.ssoUser, input.passwordHash, input.salt, input.email, input.role ?? 'user', now, now);
+}
+
+function insertPoolMarker(db: Database.Database, enterpriseId: EnterpriseId, ssoUser: string): void {
+  db.prepare(`
+    INSERT INTO sso_pool_managed_users (enterprise_id, sso_user)
+    VALUES (?, ?)
+  `).run(enterpriseId, ssoUser);
+}
+
+function listWhere(enterpriseId: EnterpriseId, query: UserListQuery): WhereClause {
+  const clauses = ['enterprise_id = ?'];
+  const args: unknown[] = [enterpriseId];
+  const add = (sql: string, ...values: unknown[]) => {
+    clauses.push(sql);
+    args.push(...values);
+  };
+  const q = query.q?.trim();
+  if (q) add(searchClause(), likeContains(q), likeContains(q), likeContains(q));
+  if (query.ids?.length) add(`sso_user IN (${placeholders(query.ids.length)})`, ...query.ids);
+  for (const [key, column, allowed] of LIST_FILTERS) {
+    const values = filterValues(query[key], key, allowed);
+    if (values) add(`${column} IN (${placeholders(values.length)})`, ...values);
+  }
+  if (query.from) add('updated_at >= ?', query.from);
+  if (query.to) add('updated_at < ?', query.to);
+  return { sql: clauses.join(' AND '), args };
+}
+
+function searchClause(): string {
+  const like = `LIKE ? ${LIKE_ESCAPE_CLAUSE}`;
+  return `(sso_user ${like} OR email ${like} OR gh_login ${like})`;
+}
+
+function filterValues(raw: string | undefined, key: string, allowed: readonly string[]): string[] | undefined {
+  if (!raw) return undefined;
+  const values = raw.split(',');
+  if (values.some((value) => !allowed.includes(value))) {
+    throw new HttpApiError(400, 'invalid_filter', `Invalid ${key}.`);
+  }
+  return values;
+}
+
+function orderBy(query: UserListQuery): string {
+  if (query.sort && !Object.hasOwn(SORT_COLUMNS, query.sort)) {
+    throw new HttpApiError(400, 'invalid_sort', 'Unknown SSO user sort field.');
+  }
+  const column = SORT_COLUMNS[query.sort ?? 'ssoUser'] ?? 'sso_user';
+  const dir = query.dir === 'desc' ? 'DESC' : 'ASC';
+  return `${column} ${dir}, sso_user ${dir}`;
+}
+
+function countWhere(database: Database.Database, where: WhereClause): number {
+  const row = database.prepare(`
+    SELECT COUNT(*) AS count
+    FROM sso_users
+    WHERE ${where.sql}
+  `).get(...where.args) as { count: number };
+  return row.count;
+}
+
+function placeholders(count: number): string {
+  return Array.from({ length: count }, () => '?').join(',');
+}
+
 function mapRow(row: UserRow): SsoUserRecord {
   return {
     ssoUser: row.sso_user,
@@ -271,21 +411,4 @@ function mapRow(row: UserRow): SsoUserRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
-}
-
-function sortColumn(sort: UserListQuery['sort']): string {
-  switch (sort) {
-    case 'email':
-      return 'email';
-    case 'role':
-      return 'role';
-    case 'emuStatus':
-      return 'emu_status';
-    case 'createdAt':
-      return 'created_at';
-    case 'updatedAt':
-      return 'updated_at';
-    default:
-      return 'sso_user';
-  }
 }

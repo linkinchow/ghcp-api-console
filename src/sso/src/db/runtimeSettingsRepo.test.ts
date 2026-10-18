@@ -9,12 +9,14 @@ test('updates SSO runtime settings with validation and optimistic version checks
     SsoSettingsVersionConflictError,
     updateSsoRuntimeSettings,
   } = await import('./runtimeSettingsRepo.js');
+  const { defaultSsoEnterprise } = await import('../enterprises.js');
+  const enterpriseId = defaultSsoEnterprise().id;
 
-  const initial = getSsoRuntimeSettings();
+  const initial = getSsoRuntimeSettings(enterpriseId);
   assert.equal(initial.version, 1);
   assert.equal(initial.maxSsoUsers, null);
 
-  const updated = updateSsoRuntimeSettings({
+  const updated = updateSsoRuntimeSettings(enterpriseId, {
     expectedVersion: initial.version,
     changes: {
       maxSsoUsers: 25,
@@ -28,24 +30,27 @@ test('updates SSO runtime settings with validation and optimistic version checks
   assert.equal(updated.userPrefix, 'team-user');
   assert.equal(updated.emailDomain, 'example.com');
   assert.equal(updated.scimRequestDelayMs, 0);
-  assert.equal(getSsoRuntimeSettings(), updated);
+  assert.equal(getSsoRuntimeSettings(enterpriseId), updated);
 
   assert.throws(
-    () => updateSsoRuntimeSettings({ expectedVersion: 1, changes: { maxSsoUsers: null } }),
+    () => updateSsoRuntimeSettings(enterpriseId, { expectedVersion: 1, changes: { maxSsoUsers: null } }),
     (err: unknown) => err instanceof SsoSettingsVersionConflictError && err.currentVersion === 2,
   );
   assert.throws(
-    () => updateSsoRuntimeSettings({ expectedVersion: 2, changes: { bulkSyncConcurrency: 0 } }),
+    () => updateSsoRuntimeSettings(enterpriseId, { expectedVersion: 2, changes: { bulkSyncConcurrency: 0 } }),
     (err: unknown) => err instanceof InvalidSsoRuntimeSettingsError && Boolean(err.fields.bulkSyncConcurrency),
   );
   assert.throws(
-    () => updateSsoRuntimeSettings({ expectedVersion: 2, changes: { userPrefix: '...', emailDomain: 'http://example.com' } }),
+    () => updateSsoRuntimeSettings(enterpriseId, {
+      expectedVersion: 2,
+      changes: { userPrefix: '...', emailDomain: 'http://example.com' },
+    }),
     (err: unknown) => err instanceof InvalidSsoRuntimeSettingsError
       && Boolean(err.fields.userPrefix)
       && Boolean(err.fields.emailDomain),
   );
 
-  const unlimited = updateSsoRuntimeSettings({ expectedVersion: 2, changes: { maxSsoUsers: null } });
+  const unlimited = updateSsoRuntimeSettings(enterpriseId, { expectedVersion: 2, changes: { maxSsoUsers: null } });
   assert.equal(unlimited.maxSsoUsers, null);
   assert.equal(unlimited.version, 3);
 });
