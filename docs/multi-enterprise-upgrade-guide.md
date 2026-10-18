@@ -22,12 +22,12 @@
 
 | 组件 | 按 digest 引用（linux/amd64） |
 | --- | --- |
-| Proxy | `docker.io/linkinchow/ghcp-proxy@<to be filled after release>` |
-| SSO | `docker.io/linkinchow/ghcp-sso@<to be filled after release>` |
-| Login | `docker.io/linkinchow/ghcp-login@<to be filled after release>` |
-| Console | `docker.io/linkinchow/ghcp-console@<to be filled after release>` |
+| Proxy | `docker.io/linkinchow/ghcp-proxy@sha256:e2632d5120e333824c57436879fdff795b3d14ad57ca5f44e60747a719aba648` |
+| SSO | `docker.io/linkinchow/ghcp-sso@sha256:29e3e9adefc225c1325d93eab43bbadb6a114f6c5dd6a4f236889292d33cf1a9` |
+| Login | `docker.io/linkinchow/ghcp-login@sha256:7c71e1e85c703a580413f5776640ea656f8b0eebbef903ea24a8fb4ad412b0fd` |
+| Console | `docker.io/linkinchow/ghcp-console@sha256:52f6677539dd45ef70805f374c1d468bf17c32dfa632c03ed8779fffc9503c53` |
 
-对应 tag：`multi-<to be filled after release>-amd64`。源码提交：`<to be filled after release>`。部署时请按 **digest** 引用，建议先同步到客户自己的镜像仓库。
+对应 tag 均为 `multi-41ecffc-amd64-r1`（linux/amd64，2026-10-19 发布，仓库公开，无需登录即可拉取）。源码提交：`41ecffc`（已合入 main）。部署时请按 **digest** 引用，建议先同步到客户自己的镜像仓库。
 
 ## 3. 首次升级需要短暂停机
 
