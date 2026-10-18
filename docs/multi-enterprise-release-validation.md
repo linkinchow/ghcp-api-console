@@ -15,6 +15,17 @@
 | Login | `ghcp-release-login:multi-41ecffc-amd64-r1` | `sha256:08601c95c6d5460a99333cb78249a40ea50bc287c48bbfd464d12fac64ab0b60` |
 | Console | `ghcp-release-console:multi-41ecffc-amd64-r1` | `sha256:2430525644eb53ebb7d2daee1cc8c688240a4263f5889e870f3b2c1686bbafa0` |
 
+已发布到 Docker Hub（公开仓库）：
+
+| 组件 | 按 digest 引用 |
+| --- | --- |
+| Proxy | `docker.io/linkinchow/ghcp-proxy@sha256:e2632d5120e333824c57436879fdff795b3d14ad57ca5f44e60747a719aba648` |
+| SSO | `docker.io/linkinchow/ghcp-sso@sha256:29e3e9adefc225c1325d93eab43bbadb6a114f6c5dd6a4f236889292d33cf1a9` |
+| Login | `docker.io/linkinchow/ghcp-login@sha256:7c71e1e85c703a580413f5776640ea656f8b0eebbef903ea24a8fb4ad412b0fd` |
+| Console | `docker.io/linkinchow/ghcp-console@sha256:52f6677539dd45ef70805f374c1d468bf17c32dfa632c03ed8779fffc9503c53` |
+
+发布后不登录核对：tag `multi-41ecffc-amd64-r1` 指向上述 digest；每个 manifest 的 config digest 等于上表经资格测试的镜像 ID；按 digest 拉起 Proxy，`/healthz` 返回 `releaseLine: "multi"`，停止时退出码 0。
+
 四个镜像的 label：`org.opencontainers.image.revision=41ecffc`、`com.ghcp.release-line=multi`、`org.opencontainers.image.version=multi-41ecffc-amd64-r1`。
 
 ## 2. 原地升级资格测试（设计 §9.4）
