@@ -6,11 +6,12 @@ import { readPoolConfig } from './config.js';
 import { UserPoolStore } from './store.js';
 import { PrewarmWorker } from './worker.js';
 import type { ProvisionAdapter, ProvisionContext, ProvisionPatch } from './provisioner.js';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 
 function setup(t: TestContext, target = 20, cap = target) {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  runMigrations(db, defaultEnterpriseSeed({}));
   const config = readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease', POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test',
     POOL_WARMUP_MODEL: 'test-model', READY_IDLE_TARGET: String(target), POOL_MAX_ACCOUNTS: String(cap) });
   const store = new UserPoolStore(db, config);

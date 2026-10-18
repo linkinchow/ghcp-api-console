@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import { runMysqlMigrations } from '../db/mysqlMigrations.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import { readPoolConfig, UserPoolError } from './config.js';
 import { MysqlPoolStore } from './mysqlStore.js';
 
@@ -13,6 +14,7 @@ const env = {
 };
 const options = readPoolConfig(env); // Real 120s legacy deadline and 300s provisional lease, not accelerated settings.
 const mysqlUrl = process.env.MYSQL_TEST_URL;
+const seed = { id: DEFAULT_ENTERPRISE_ID, fingerprint: 'f'.repeat(64), maxAccounts: options.maxAccounts };
 const skip = Boolean(mysqlUrl) && process.env.MYSQL_POOL_TEST_DISPOSABLE === '1' ? false
   : 'Requires loopback MYSQL_TEST_URL and MYSQL_POOL_TEST_DISPOSABLE=1; creates a fresh synthetic database.';
 const caller = (n: number) => `sha256:${n.toString(16).padStart(64, '0')}`;
@@ -40,7 +42,7 @@ async function withDatabase(run: (f: Fixture) => Promise<void>) {
     for (let i = 0; i < 2; i++) pools.push(createPool({ uri: url.toString(), connectionLimit: 4,
       connectTimeout: 5000, timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true }));
     const [db, other] = pools;
-    await runMysqlMigrations(db);
+    await runMysqlMigrations(db, seed);
     assert.equal(options.requestTimeoutMs, 120000);
     const extendedConfig = readPoolConfig({ ...env, POOL_INFERENCE_TIMEOUT_SECONDS: '600' });
     assert.deepEqual(extendedConfig, options, 'runtime-only setting cannot alter fingerprint inputs');

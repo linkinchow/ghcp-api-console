@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import test from 'node:test';
 import express from 'express';
-import { HttpApiError, type CreateLoginTaskRequest, type LoginTaskDto } from '@ghcp/shared';
+import { DEFAULT_ENTERPRISE_ID, HttpApiError, type CreateLoginTaskRequest, type LoginTaskDto } from '@ghcp/shared';
 
 test('lost Login responses reconcile accepted tasks and roll back rejected attempts without touching committed tokens', async (t) => {
   let task: LoginTaskDto | undefined;
@@ -30,7 +30,12 @@ test('lost Login responses reconcile accepted tasks and roll back rejected attem
   const { copilotAuthManager } = await import('../copilot/copilotAuthManager.js');
   const { createAccount, deleteAccount, getAccount, saveCopilotOauthToken } = await import('../db/accountsRepo.js');
   const credentials = { credentialMode: 'override' as const, ssoPassword: 'fixture-only-password' };
-  for (const identity of ['accepted', 'uncertain', 'committed']) await createAccount({ identity, ssoUser: identity, ghLogin: `${identity}-gh` });
+  for (const identity of ['accepted', 'uncertain', 'committed']) await createAccount({
+    enterpriseId: DEFAULT_ENTERPRISE_ID,
+    identity,
+    ssoUser: identity,
+    ghLogin: `${identity}-gh`,
+  });
   assert.equal((await copilotAuthManager.triggerOauthRefresh('accepted', credentials)).id, 'task-accepted');
   assert.equal((await getAccount('accepted'))?.copilotOauthStatus, 'refreshing');
 
@@ -48,7 +53,12 @@ test('lost Login responses reconcile accepted tasks and roll back rejected attem
   assert.equal(committed?.copilotOauthStatus, 'valid');
   lookupAvailable = true;
   commit = async (payload) => { await deleteAccount(payload.identity); };
-  await createAccount({ identity: 'removed', ssoUser: 'removed', ghLogin: 'removed-gh' });
+  await createAccount({
+    enterpriseId: DEFAULT_ENTERPRISE_ID,
+    identity: 'removed',
+    ssoUser: 'removed',
+    ghLogin: 'removed-gh',
+  });
   const { adminApiRouter } = await import('../routes/adminApi.js');
   const proxy = express();
   proxy.use(express.json());

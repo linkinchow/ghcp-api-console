@@ -41,13 +41,20 @@ test('secrets are references only, and errors never echo values', () => {
   assert.deepEqual(normalizeField('sso.scimToken', { file: '/run/secrets/scim' }, 'x'), { file: '/run/secrets/scim' });
 });
 
-test('URLs: github.baseUrl and API URLs are origins; other URLs keep their path', () => {
+test('shortcodes are lower-cased before validation', () => {
+  assert.equal(normalizeField('github.shortcode', ' ACME ', 'x'), 'acme');
+  rejects('github.shortcode', 'acme_1');
+});
+
+test('URLs: github.baseUrl is an origin; API and other URLs keep their path', () => {
   assert.equal(normalizeField('github.baseUrl', ' https://GitHub.com/ ', 'x'), 'https://github.com');
   assert.equal(normalizeField('github.apiBaseUrl', 'http://mock:8002/', 'x'), 'http://mock:8002');
   assert.equal(normalizeField('sso.spAcsUrl', 'http://mock:8002/saml/acs/', 'x'), 'http://mock:8002/saml/acs');
   rejects('github.baseUrl', 'https://github.com/enterprises');
   rejects('github.baseUrl', 'https://user@github.com');
-  rejects('github.apiBaseUrl', 'http://mock:8002/api');
+  assert.equal(normalizeField('github.apiBaseUrl', 'https://gw.example.test/github/', 'x'),
+    'https://gw.example.test/github');
+  rejects('github.apiBaseUrl', 'http://mock:8002/api?x=1');
   rejects('github.copilotApiBaseUrl', 'ftp://mock');
   rejects('sso.spAcsUrl', 'https://github.com/a/../b');
   rejects('login.ssoLoginUrl', 'http://sso/login#x');
@@ -62,10 +69,10 @@ test('allowedLoginUrls holds 1 to 16 trusted URLs', () => {
   rejects('login.allowedLoginUrls', Array.from({ length: 17 }, (_, index) => `http://sso/${index}`));
 });
 
-test('shortcode is empty or ^[a-z0-9]{3,8}$; the github.com rule is applied per profile', () => {
+test('shortcode is empty or (lower-cased) ^[a-z0-9]{3,8}$; the github.com rule is applied per profile', () => {
   assert.equal(normalizeField('github.shortcode', '', 'x'), '');
   assert.equal(normalizeField('github.shortcode', 'octo', 'x'), 'octo');
-  for (const value of ['OCTO', 'ab', 'abcdefghi', 'oc_to', 7]) rejects('github.shortcode', value);
+  for (const value of ['ab', 'abcdefghi', 'oc_to', 7]) rejects('github.shortcode', value);
 });
 
 test('domains, slugs, providers, counts and text are validated', () => {

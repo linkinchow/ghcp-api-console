@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 
 const savedEnv = { ...process.env };
 for (const key of Object.keys(process.env)) {
@@ -56,7 +57,13 @@ before(async () => {
     }
     return json({ id: 'msg_synthetic', type: 'message', role: 'assistant', model: 'claude-opus-5.5', content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } });
   };
-  await importCopilotOauthToken({ identity, ssoUser: identity, ghLogin: 'synthetic_login', copilotOauthToken: oauth });
+  await importCopilotOauthToken({
+    enterpriseId: DEFAULT_ENTERPRISE_ID,
+    identity,
+    ssoUser: identity,
+    ghLogin: 'synthetic_login',
+    copilotOauthToken: oauth,
+  });
   server = buildApp().listen(0, '127.0.0.1');
   await new Promise<void>(resolve => server.once('listening', resolve));
   origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;

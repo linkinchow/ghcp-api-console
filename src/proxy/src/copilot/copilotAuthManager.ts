@@ -1,5 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { HttpApiError, readLoginCredentials, type CreateLoginTaskRequest, type EnsureSsoUserResponse, type LoginTaskDto, type SsoType } from '@ghcp/shared';
+import {
+  DEFAULT_ENTERPRISE_ID,
+  HttpApiError,
+  readLoginCredentials,
+  type CreateLoginTaskRequest,
+  type EnsureSsoUserResponse,
+  type LoginTaskDto,
+  type SsoType,
+} from '@ghcp/shared';
 import {
   claimIdentityInitialization,
   createAccount,
@@ -99,7 +107,12 @@ class CopilotAuthManager {
     if (existing) return existing.prepared;
 
     const claimId = randomUUID();
-    const claimed = await claimIdentityInitialization(identity, claimId, config.identityInitLeaseSeconds);
+    const claimed = await claimIdentityInitialization(
+      DEFAULT_ENTERPRISE_ID,
+      identity,
+      claimId,
+      config.identityInitLeaseSeconds,
+    );
     if (!claimed) return;
 
     this.logger.info('identity-init', 'Initializing unknown identity', { identity });
@@ -135,6 +148,7 @@ class CopilotAuthManager {
     const oauthAttemptId = randomUUID();
     const ssoPassword = ensured.passwordForLogin;
     await createAccount({
+      enterpriseId: DEFAULT_ENTERPRISE_ID,
       identity,
       ssoUser: ensured.user.ssoUser,
       ghLogin: synced.ghLogin,

@@ -61,7 +61,10 @@ Options:
   --sqlite <path>      Existing Proxy SQLite database (required)
   --mysql-url <url>    Empty MySQL 8 target; defaults to MYSQL_URL
   --dry-run            Validate source and target without creating schema or copying data
-  --help, -h           Show this help`);
+  --help, -h           Show this help
+
+The default enterprise (GitHub base URL, shortcode, ENTERPRISE_REGISTRY_FILE) is read from this
+environment; run the tool with exactly the configuration the Proxy will use.`);
 }
 
 void main().catch((err: unknown) => {

@@ -9,6 +9,7 @@ import type { LoginTaskDto, SsoUserDto } from '@ghcp/shared';
 import type { Awaitable, PoolStore } from './storage.js';
 import type { Inventory } from './store.js';
 import type { PrewarmStore, PrewarmWorker as Worker } from './worker.js';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 
 // Capture explicit shell opt-in before importing anything that could load dotenv.
 const mysqlUrl = process.env.MYSQL_TEST_URL;
@@ -70,7 +71,7 @@ async function fixture(t: TestContext, driver: Driver) {
   let mysqlDb: ReturnType<typeof createPool> | undefined;
   let storage: InstanceType<typeof SqliteStorage> | InstanceType<typeof MysqlStorage>;
   if (driver === 'sqlite') {
-    storage = new SqliteStorage(':memory:', 100);
+    storage = new SqliteStorage(':memory:', 100, defaultEnterpriseSeed({}));
     cleanup.push(() => storage.close());
   } else {
     // No default DB, remote address, URL options, or caller-named database is ever used.
@@ -89,7 +90,7 @@ async function fixture(t: TestContext, driver: Driver) {
     url.pathname = '/' + database;
     mysqlDb = createPool({ uri: url.toString(), connectionLimit: 4, connectTimeout: 5000,
       dateStrings: true, timezone: 'Z', supportBigNumbers: true, bigNumberStrings: true });
-    storage = new MysqlStorage(mysqlDb, 100);
+    storage = new MysqlStorage(mysqlDb, 100, true, defaultEnterpriseSeed({}));
     cleanup.push(async () => {
       try { await storage.close(); }
       finally { await admin.query(`DROP DATABASE \`${database}\``); }

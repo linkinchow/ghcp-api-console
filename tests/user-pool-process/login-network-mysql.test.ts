@@ -12,7 +12,8 @@ const taskPosts = (children: Process[]) => children.flatMap(child => child.messa
 
 async function seed(f: Fixture): Promise<Inventory> {
   const row = await f.store.reserve(); assert.ok(row);
-  await f.storage.createAccount({ identity: row.identity, ssoUser: row.identity, ghLogin: `${row.identity}_synthetic` });
+  await f.storage.createAccount({ enterpriseId: f.enterprise.id, identity: row.identity, ssoUser: row.identity,
+    ghLogin: `${row.identity}_synthetic` });
   assert.equal(await f.store.update(row.identity, { stage: 'synced', sso_created_at: CREATED_AT }), true);
   return (await f.store.inventory(row.identity))!;
 }

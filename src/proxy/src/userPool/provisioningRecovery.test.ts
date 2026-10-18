@@ -6,11 +6,12 @@ import { SqliteStorage } from '../db/sqliteStorage.js';
 import { readPoolConfig } from './config.js';
 import { realProvisioner } from './provisioner.js';
 import { PrewarmWorker, type PrewarmStore } from './worker.js';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 
 for (const fault of ['before-write', 'after-write-before-ack'] as const) {
   test(`terminal Login callback failure (${fault}) recovers with one new OAuth attempt, not new identities`,
     { timeout: 15000 }, async t => {
-      const storage = new SqliteStorage(':memory:', 100);
+      const storage = new SqliteStorage(':memory:', 100, defaultEnterpriseSeed({}));
       let worker: PrewarmWorker | undefined;
       t.after(async () => { await worker?.stop(); await storage.close(); });
       await storage.initialize();

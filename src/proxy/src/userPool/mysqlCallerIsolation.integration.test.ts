@@ -5,6 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { createConnection, createPool, type Connection, type Pool, type PoolConnection, type RowDataPacket } from 'mysql2/promise';
 import { runMysqlMigrations } from '../db/mysqlMigrations.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import type { PoolConfig } from './config.js';
 import { MysqlDeadlineError } from './mysqlDeadline.js';
 import { MysqlPoolStore } from './mysqlStore.js';
@@ -15,6 +16,7 @@ const options: PoolConfig = {
   leaseSeconds: 172800, provisionalSeconds: 300, pollMs: 5000, prewarmConcurrency: 2,
   retryAfterSeconds: 30, warmupModel: 'synthetic-no-http', requestTimeoutMs: 120000,
 };
+const seed = { id: DEFAULT_ENTERPRISE_ID, fingerprint: 'f'.repeat(64), maxAccounts: options.maxAccounts };
 const caller = (n: number) => `sha256:${n.toString(16).padStart(64, '0')}`;
 const lockName = (database: string, id: string) => createHash('sha256').update(JSON.stringify([database, id])).digest('hex');
 const mysqlUrl = process.env.MYSQL_TEST_URL;
@@ -101,7 +103,7 @@ test('MySQL caller isolation: local FIFO protects unrelated callers and shares t
     first = new MysqlPoolStore(firstPool, options);
     const store = first;
     const second = new MysqlPoolStore(secondPool, options);
-    await runMysqlMigrations(pool);
+    await runMysqlMigrations(pool, seed);
     await store.initialize();
     await second.initialize();
 

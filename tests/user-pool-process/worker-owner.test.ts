@@ -4,7 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import type { Connection, Pool, RowDataPacket } from 'mysql2/promise';
-import { childEnvironment, CREATED_AT, OAUTH_TOKEN, optedIn, options, siblingUrl, type WorkerMessage } from './worker-common.js';
+import { childEnvironment, CREATED_AT, enterpriseSeed, OAUTH_TOKEN, optedIn, options, siblingUrl,
+  type WorkerMessage } from './worker-common.js';
 import { WorkerMock } from './worker-mock.js';
 
 type Exit = { code: number | null; signal: NodeJS.Signals | null };
@@ -121,7 +122,8 @@ test('prepared independent-process worker owner-death acceptance', {
     pool = createPool({ uri: url.toString(), connectionLimit: 6, connectTimeout: 5000,
       timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true });
     pool.on('connection', track);
-    const storage = new MysqlStorage(pool, 2);
+    const enterprise = await enterpriseSeed();
+    const storage = new MysqlStorage(pool, 2, true, enterprise);
     await storage.initialize();
     const store = await storage.userPool(options);
     t.signal.throwIfAborted();
@@ -153,7 +155,8 @@ test('prepared independent-process worker owner-death acceptance', {
         await pool!.query({ sql: 'DELETE FROM proxy_accounts', timeout: 5000 });
         const seed = await store.reserve();
         assert.ok(seed);
-        await storage.createAccount({ identity: seed.identity, ssoUser: seed.identity, ghLogin: `${seed.identity}_synthetic` });
+        await storage.createAccount({ enterpriseId: enterprise.id, identity: seed.identity, ssoUser: seed.identity,
+          ghLogin: `${seed.identity}_synthetic` });
         assert.equal(await store.update(seed.identity, { stage: 'synced', sso_created_at: CREATED_AT }), true);
         mock.reset(seed.identity, stalled ? 16 * 60000 : 0);
         const owner = new WorkerProcess(url, database, true, mock.origin, sub.signal);

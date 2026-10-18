@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Pool, PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql2/promise';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import type { PoolConfig } from './config.js';
 import { normalizeCaller, normalizePoolConfig, UserPoolError } from './config.js';
 import { accountName, NAME_CAPACITY } from './names.js';
-import { runMysqlPoolMigrations, validateMysqlPoolSchema } from './mysqlMigrations.js';
+import { poolConfigFingerprint, runMysqlPoolMigrations, validateMysqlPoolSchema } from './mysqlMigrations.js';
+import { MYSQL_MIGRATION_LOCK_WAIT } from '../db/mysqlMigrationLock.js';
 import { leaseMysqlConnection, MysqlDeadline, MysqlDeadlineError } from './mysqlDeadline.js';
 import { acquireMysqlCaller, type MysqlCallerPermit } from './mysqlCallerGate.js';
 import type { HeldLease, Inventory, InventoryFence, Lease, PoolSettings } from './store.js';
@@ -38,7 +40,7 @@ const INVENTORY_KEYS = ['state', 'stage', 'attempt_id', 'oauth_attempt_id', 'sso
 const NUMERIC_KEYS = new Set(['id', 'at', 'n', 'total', 'version', 'idle_target', 'max_accounts', 'lease_seconds',
   'paused', 'owner_until', 'next_ordinal', 'ordinal', 'attempts', 'retry_at', 'updated_at',
   'cooldown_until', 'verified_at', 'generation', 'reauth_count', 'reauth_window_at', 'assigned_at',
-  'last_success_at', 'expires_at', 'deadline_at', 'active_requests', 'now']);
+  'last_success_at', 'expires_at', 'deadline_at', 'active_requests', 'now', 'inventory_count', 'actual']);
 const DB_NOW = "(TIMESTAMPDIFF(MICROSECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP(3)) DIV 1000)";
 const OWNER_SQL = `EXISTS (SELECT 1 FROM user_pool_settings WHERE id=1 AND owner=? AND owner_until>${DB_NOW})`;
 const READY_SQL = `p.state = 'ready' AND p.verified_at IS NOT NULL
@@ -50,28 +52,28 @@ export class MysqlPoolStore implements PoolStore {
   private reclaimCursor = '';
   private readonly pendingSelection = new PendingSelection();
 
-  constructor(private readonly pool: Pool, options: PoolConfig, private readonly autoMigrate = true) {
+  constructor(private readonly pool: Pool, options: PoolConfig, private readonly autoMigrate = true,
+    private readonly migrationLockWaitSeconds: number = MYSQL_MIGRATION_LOCK_WAIT.defaultSeconds) {
     this.options = normalizePoolConfig(options);
   }
 
   async initialize(): Promise<void> {
-    await (this.autoMigrate ? runMysqlPoolMigrations(this.pool) : validateMysqlPoolSchema(this.pool));
-    // Targets/cap/lease duration are initial seeds, subsequently shared mutable settings.
-    const { idleTarget: _idle, maxAccounts: _max, leaseSeconds: _lease, enabled: _enabled,
-      callerDomain: _legacy, ...invariants } = this.options;
-    const fingerprint = createHash('sha256')
-      .update(JSON.stringify(Object.entries(invariants).sort(([a], [b]) => a.localeCompare(b))))
-      .digest('hex');
-    await this.withConnection((connection) => connection.execute(`INSERT IGNORE INTO user_pool_settings
-      (id, idle_target, max_accounts, lease_seconds, account_domain, config_fingerprint)
+    await (this.autoMigrate
+      ? runMysqlPoolMigrations(this.pool, this.options, this.migrationLockWaitSeconds)
+      : validateMysqlPoolSchema(this.pool, this.options, this.migrationLockWaitSeconds));
+    // Targets/lease duration are initial seeds, subsequently shared mutable settings. The cap lives in
+    // proxy_enterprises; the account domain is covered by the enterprise identity fingerprint.
+    const fingerprint = poolConfigFingerprint(this.options);
+    const [inserted] = await this.withConnection((connection) => connection.execute<ResultSetHeader>(`INSERT IGNORE
+      INTO user_pool_settings (id, idle_target, max_accounts, lease_seconds, account_domain, config_fingerprint)
       VALUES (1, ?, ?, ?, ?, ?)`, [this.options.idleTarget, this.options.maxAccounts,
       this.options.leaseSeconds, this.options.accountDomain, fingerprint]));
     await this.tx(async (tx) => {
       const settings = await this.settingsRow(tx.connection);
-      if (settings.account_domain !== this.options.accountDomain) {
-        throw new Error('Pool account email domain differs from persisted inventory');
-      }
       if (settings.config_fingerprint !== fingerprint) throw new Error('Pool configuration differs between Proxy replicas');
+      // A newly created pool takes its configured cap, as before; afterwards the persisted cap wins.
+      if (inserted.affectedRows === 1) await this.updateCap(tx, this.options.maxAccounts);
+      await this.correctInventory(tx);
     });
   }
 
@@ -90,8 +92,9 @@ export class MysqlPoolStore implements PoolStore {
         || !Number.isInteger(next.max_accounts) || next.max_accounts < 1 || next.max_accounts > NAME_CAPACITY
         || !Number.isInteger(next.lease_seconds) || next.lease_seconds < 60 || next.lease_seconds > 2592000
         || ![0, 1].includes(next.paused)) throw new UserPoolError(400, 'invalid_pool_settings');
-      await this.exec(tx, `UPDATE user_pool_settings SET idle_target=?, max_accounts=?, lease_seconds=?,
-        paused=?, version=version+1 WHERE id=1`, [next.idle_target, next.max_accounts, next.lease_seconds, next.paused]);
+      await this.exec(tx, `UPDATE user_pool_settings SET idle_target=?, lease_seconds=?,
+        paused=?, version=version+1 WHERE id=1`, [next.idle_target, next.lease_seconds, next.paused]);
+      if (next.max_accounts !== current.max_accounts) await this.updateCap(tx, next.max_accounts);
       await this.addEvent(tx, 'settings_updated');
       return this.readSettings(tx.connection);
     });
@@ -565,8 +568,45 @@ export class MysqlPoolStore implements PoolStore {
   }
 
   private async readSettings(connection: Connection): Promise<PoolSettings> {
-    const { version, idle_target, max_accounts, lease_seconds, paused } = await this.settingsRow(connection);
+    const { version, idle_target, lease_seconds, paused } = await this.settingsRow(connection);
+    const { max_accounts } = await this.enterpriseRow(connection);
     return { version, idle_target, max_accounts, lease_seconds, paused };
+  }
+
+  /** Single-enterprise until scheduling is enterprise-aware: the pool is the `default` enterprise. */
+  private async enterpriseRow(connection: Connection, lock = false): Promise<{ max_accounts: number }> {
+    const row = await this.one<{ max_accounts: number }>(connection, `
+      SELECT max_accounts
+      FROM proxy_enterprises
+      WHERE id=?${lock ? '\n      FOR UPDATE' : ''}`, [DEFAULT_ENTERPRISE_ID]);
+    if (!row) throw new Error('The default enterprise has not been initialized');
+    return row;
+  }
+
+  /** Lock order: user_pool_settings row, then proxy_enterprises rows, then members. */
+  private async updateCap(tx: Tx, maxAccounts: number): Promise<void> {
+    await this.exec(tx, `
+      UPDATE proxy_enterprises
+      SET max_accounts=?, policy_version=policy_version+1, updated_at=${DB_NOW}
+      WHERE id=?`, [maxAccounts, DEFAULT_ENTERPRISE_ID]);
+  }
+
+  /** Design §5.8: re-derive the incremental inventory counters at start and record any drift. */
+  private async correctInventory(tx: Tx): Promise<void> {
+    const rows = await this.rows<{ enterprise_id: string; inventory_count: number; actual: number }>(tx.connection, `
+      SELECT e.id AS enterprise_id, e.inventory_count,
+        (SELECT COUNT(*) FROM user_pool_accounts p WHERE p.enterprise_id=e.id) AS actual
+      FROM proxy_enterprises e
+      ORDER BY e.id
+      FOR UPDATE`);
+    for (const row of rows.filter((candidate) => candidate.inventory_count !== candidate.actual)) {
+      await this.exec(tx, `
+        UPDATE proxy_enterprises
+        SET inventory_count=?
+        WHERE id=?`, [row.actual, row.enterprise_id]);
+      const detail = JSON.stringify({ stored: row.inventory_count, actual: row.actual });
+      await this.addEvent(tx, 'enterprise_inventory_drift', undefined, undefined, undefined, detail, row.enterprise_id);
+    }
   }
 
   private readInventory(connection: Connection, identity: string): Promise<Inventory | undefined> {
@@ -583,9 +623,14 @@ export class MysqlPoolStore implements PoolStore {
     return row;
   }
 
-  private async addEvent(tx: Tx, action: string, identity?: string, caller?: string, leaseId?: string, detail?: string): Promise<void> {
-    await this.exec(tx, `INSERT INTO user_pool_events(at, action, identity, caller_id, lease_id, detail) VALUES (?, ?, ?, ?, ?, ?)`,
-      [await this.time(tx.connection), action, identity ?? null, caller ?? null, leaseId ?? null, detail ?? null]);
+  /** A member's event belongs to the member's enterprise; settings and owner events are global (NULL). */
+  private async addEvent(tx: Tx, action: string, identity?: string, caller?: string, leaseId?: string, detail?: string,
+    enterpriseId?: string): Promise<void> {
+    await this.exec(tx, `
+      INSERT INTO user_pool_events(at, action, identity, caller_id, lease_id, detail, enterprise_id)
+      VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, (SELECT enterprise_id FROM user_pool_accounts WHERE identity=?)))`,
+    [await this.time(tx.connection), action, identity ?? null, caller ?? null, leaseId ?? null, detail ?? null,
+      enterpriseId ?? null, identity ?? null]);
     // MySQL forbids directly selecting a DELETE target in its scalar subquery.
     const cutoff = (await this.one<{ n: number }>(tx.connection, 'SELECT CAST(COALESCE(MAX(id), 0) AS SIGNED)-10000 AS n FROM user_pool_events'))!.n;
     if (cutoff > 0) await this.exec(tx, 'DELETE FROM user_pool_events WHERE id<=?', [cutoff]);
@@ -850,6 +895,8 @@ export class MysqlPoolStore implements PoolStore {
   }
 
   private async reserveCandidate(tx: Tx, owner?: string): Promise<Inventory | UserPoolError> {
+    // Before any member row: a reservation also increments the enterprise inventory counter.
+    await this.enterpriseRow(tx.connection, true);
     let ordinal = (await this.settingsRow(tx.connection)).next_ordinal;
     // A bounded scan also prevents a populated direct-mode namespace monopolizing the gate.
     const end = Math.min(NAME_CAPACITY, ordinal + 128);
@@ -865,8 +912,9 @@ export class MysqlPoolStore implements PoolStore {
       // The savepoint also discards a newly inserted Proxy row if ownership expires while waiting.
       await this.exec(tx, 'SAVEPOINT pool_reservation');
       try {
-        await this.exec(tx, `INSERT INTO proxy_accounts(identity, sso_user, copilot_oauth_status, created_at, updated_at)
-          VALUES (?, ?, 'missing', ?, ?)`, [identity, identity, timestamp, timestamp]);
+        await this.exec(tx, `
+          INSERT INTO proxy_accounts(identity, sso_user, copilot_oauth_status, created_at, updated_at, enterprise_id)
+          VALUES (?, ?, 'missing', ?, ?, ?)`, [identity, identity, timestamp, timestamp, DEFAULT_ENTERPRISE_ID]);
       } catch (error) {
         if (mysqlCode(error) === 'ER_DUP_ENTRY') {
           await this.exec(tx, 'ROLLBACK TO SAVEPOINT pool_reservation');
@@ -875,14 +923,19 @@ export class MysqlPoolStore implements PoolStore {
         }
         throw error;
       }
-      const inserted = await this.exec(tx, `INSERT INTO user_pool_accounts(identity, ordinal, state, attempt_id, updated_at, retry_at)
-        SELECT ?, ?, 'provisioning', ?, ?, ? ${owner === undefined ? '' : `WHERE ${OWNER_SQL}`}`,
-      [identity, ordinal - 1, randomUUID(), now, now, ...(owner === undefined ? [] : [owner])]);
+      const inserted = await this.exec(tx, `
+        INSERT INTO user_pool_accounts(identity, ordinal, state, attempt_id, updated_at, retry_at, enterprise_id)
+        SELECT ?, ?, 'provisioning', ?, ?, ?, ? ${owner === undefined ? '' : `WHERE ${OWNER_SQL}`}`,
+      [identity, ordinal - 1, randomUUID(), now, now, DEFAULT_ENTERPRISE_ID, ...(owner === undefined ? [] : [owner])]);
       if (!inserted.affectedRows) {
         await this.exec(tx, 'ROLLBACK TO SAVEPOINT pool_reservation');
         await this.exec(tx, 'RELEASE SAVEPOINT pool_reservation');
         return new UserPoolError(503, 'pool_owner_expired');
       }
+      await this.exec(tx, `
+        UPDATE proxy_enterprises
+        SET inventory_count=inventory_count+1
+        WHERE id=?`, [DEFAULT_ENTERPRISE_ID]);
       await this.exec(tx, 'RELEASE SAVEPOINT pool_reservation');
       await this.addEvent(tx, 'name_reserved', identity);
       return (await this.readInventory(tx.connection, identity))!;

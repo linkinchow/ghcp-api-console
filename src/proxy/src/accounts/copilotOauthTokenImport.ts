@@ -1,5 +1,5 @@
 import type { BatchResult, ImportCopilotOauthTokenRow } from '@ghcp/shared';
-import { HttpApiError, newBatchId, nowIso } from '@ghcp/shared';
+import { DEFAULT_ENTERPRISE_ID, HttpApiError, newBatchId, nowIso } from '@ghcp/shared';
 import { getSsoUser } from '../clients/ssoClient.js';
 import { clearModelsCache, CopilotApiError, validateCopilotOauthToken } from '../copilot/copilotClient.js';
 import { importCopilotOauthToken, toAccountDto } from '../db/accountsRepo.js';
@@ -47,6 +47,7 @@ async function importCopilotOauthTokenRow(row: ImportRow): Promise<ImportCopilot
     const ssoUser = await getSsoUser(row.name);
     await validateCopilotOauthToken(row.name, row.copilotOauthToken);
     const account = await importCopilotOauthToken({
+      enterpriseId: DEFAULT_ENTERPRISE_ID,
       identity: row.name,
       ssoUser: ssoUser.ssoUser,
       ghLogin: ssoUser.ghLogin ?? row.name,

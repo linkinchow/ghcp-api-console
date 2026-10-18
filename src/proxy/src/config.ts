@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { parseGithubBaseUrl } from '@ghcp/shared';
+import { assertMysqlMigrationLockWait, MYSQL_MIGRATION_LOCK_WAIT } from './db/mysqlMigrationLock.js';
 
 export interface ProxyConfig {
   port: number;
@@ -7,6 +8,8 @@ export interface ProxyConfig {
   dbPath: string;
   mysqlUrl?: string;
   mysqlAutoMigrate: boolean;
+  /** MYSQL_MIGRATION_LOCK_WAIT_SECONDS: how long a replica waits for another replica's schema migration. */
+  mysqlMigrationLockWaitSeconds: number;
   mysqlConnectionLimit: number;
   mysqlSslMode: 'disabled' | 'required' | 'verify-ca';
   mysqlSslCaPath?: string;
@@ -43,6 +46,7 @@ export const config: ProxyConfig = {
   dbPath: process.env.DB_PATH ?? './data/proxy.sqlite',
   mysqlUrl: readOptionalString(process.env.MYSQL_URL),
   mysqlAutoMigrate: readBoolean(process.env.MYSQL_AUTO_MIGRATE, true),
+  mysqlMigrationLockWaitSeconds: readMigrationLockWait(process.env.MYSQL_MIGRATION_LOCK_WAIT_SECONDS),
   mysqlConnectionLimit: readPositiveInteger(process.env.MYSQL_CONNECTION_LIMIT, 10),
   mysqlSslMode: readMysqlSslMode(process.env.MYSQL_SSL_MODE),
   mysqlSslCaPath: readOptionalString(process.env.MYSQL_SSL_CA_PATH),
@@ -95,6 +99,11 @@ function readPositiveInteger(value: string | undefined, defaultValue: number): n
   const parsed = Number(value ?? defaultValue);
   if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`Invalid positive integer "${value}".`);
   return parsed;
+}
+
+function readMigrationLockWait(value: string | undefined): number {
+  const seconds = value?.trim() ? Number(value) : MYSQL_MIGRATION_LOCK_WAIT.defaultSeconds;
+  return assertMysqlMigrationLockWait(seconds);
 }
 
 function readBoolean(value: string | undefined, defaultValue: boolean): boolean {

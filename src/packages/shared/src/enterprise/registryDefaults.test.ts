@@ -133,8 +133,8 @@ test('GHE.com: a missing slug blocks SSO and Login but not the Proxy', () => {
   assert.equal(only(json, { service: 'sso' }).sso.spEntityId, undefined);
 });
 
-test('github.com: shortcode must match ^[a-z0-9]{3,8}$; a missing one blocks Proxy and SSO only', () => {
-  for (const shortcode of ['', 'OCTO', 'ab', 'abcdefghi', 'oc_to', 7]) {
+test('github.com: shortcode (lower-cased) must match ^[a-z0-9]{3,8}$; a missing one blocks Proxy and SSO only', () => {
+  for (const shortcode of ['', 'ab', 'abcdefghi', 'oc_to', 7]) {
     rejects(registryOf({ id: 'acme', github: { baseUrl: 'https://github.com', shortcode } }), 'acme.github.shortcode');
   }
   assert.equal(only(registryOf(githubCom('acme'))).github.shortcode, 'octo');
@@ -145,10 +145,13 @@ test('github.com: shortcode must match ^[a-z0-9]{3,8}$; a missing one blocks Pro
   assert.ok(only(json, { service: 'sso' }).blockers.some((blocker) => blocker.field === 'github.shortcode'));
 });
 
-test('github.com: an explicit apiBaseUrl must be an http(s) origin (test mocks)', () => {
+test('github.com: an explicit apiBaseUrl is a trusted http(s) URL and may carry a gateway path', () => {
   const mock = { baseUrl: 'https://github.com', shortcode: 'octo', apiBaseUrl: 'http://mock:8002/' };
   assert.equal(only(registryOf({ id: 'acme', github: mock })).github.apiBaseUrl, 'http://mock:8002');
-  rejects(registryOf({ id: 'acme', github: { ...mock, apiBaseUrl: 'http://mock:8002/api' } }),
+  const gateway = { ...mock, copilotApiBaseUrl: 'https://gw.example.test/copilot/' };
+  assert.equal(only(registryOf({ id: 'acme', github: gateway })).github.copilotApiBaseUrl,
+    'https://gw.example.test/copilot');
+  rejects(registryOf({ id: 'acme', github: { ...mock, apiBaseUrl: 'http://mock:8002/a/../b' } }),
     'acme.github.apiBaseUrl');
   rejects(registryOf({ id: 'acme', github: { ...mock, apiBaseUrl: 'ftp://mock' } }), 'acme.github.apiBaseUrl');
 });

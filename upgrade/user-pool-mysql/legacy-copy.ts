@@ -3,10 +3,9 @@ import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, writeFileSync 
 import { isAbsolute, resolve } from 'node:path';
 import { serialize } from 'node:v8';
 import Database from 'better-sqlite3';
-import { runMigrations } from '../../src/proxy/src/db/migrations.js';
 import { canonicalSql } from '../../src/proxy/src/db/mysqlSchema.js';
-import { UserPoolStore } from '../../src/proxy/src/userPool/store.js';
 import { preflightSqlite, type MigrationResult } from './migrate.js';
+import { referenceSchema, schemaObjects as objects, type SchemaObject } from './sqlite-schema.js';
 
 const COOLDOWN_DDL = `CREATE TABLE user_pool_catalog_cooldowns (
   caller_id TEXT PRIMARY KEY,
@@ -29,7 +28,6 @@ const LEGACY_ACCOUNTS_DDL = `CREATE TABLE user_pool_accounts (
   CHECK(state IN ('provisioning', 'ready', 'cooling', 'failed', 'disabled'))
 )`;
 
-interface SchemaObject { name: string; type: string; tbl_name: string; sql: string | null }
 export interface LegacyCopyOptions {
   sourcePath: string;
   outputPath: string;
@@ -52,9 +50,6 @@ function standalone(path: string): void {
   requireSafe(!['-wal', '-shm', '-journal'].some(suffix => exists(path + suffix)), 'SQLite sidecars are not supported.');
 }
 function digest(bytes: Buffer): string { return createHash('sha256').update(bytes).digest('hex'); }
-function objects(db: Database.Database): SchemaObject[] {
-  return db.prepare('SELECT name, type, tbl_name, sql FROM sqlite_schema ORDER BY name').all() as SchemaObject[];
-}
 function schemaKey(object: SchemaObject): string {
   return JSON.stringify([object.name, object.type, object.tbl_name, object.sql === null ? null : canonicalSql(object.sql)]);
 }
@@ -73,25 +68,18 @@ function requireRowsUnchanged(db: Database.Database, before: Map<string, string>
   requireSafe([...before].every(([name, hash]) => after.get(name) === hash), 'Existing row preservation check failed.');
 }
 function validateLegacySchema(db: Database.Database): void {
-  const expected = new Database(':memory:');
-  try {
-    // Application migrations run ONLY on this empty synthetic database, never on
-    // the source image or output. No runtime/server/worker is instantiated.
-    runMigrations(expected);
-    new UserPoolStore(expected, { enabled: true, accountDomain: 'fixture.invalid', idleTarget: 2,
-      maxAccounts: 20, leaseSeconds: 172800, provisionalSeconds: 300, pollMs: 5000,
-      retryAfterSeconds: 30, warmupModel: 'unused-offline', requestTimeoutMs: 120000 });
-    expected.exec('DROP TABLE user_pool_catalog_cooldowns');
-    const wanted = objects(expected);
-    const actual = objects(db);
-    requireSafe(actual.length === wanted.length && actual.every((object, index) => {
-      const match = wanted[index];
-      if (schemaKey(object) === schemaKey(match)) return true;
-      return object.name === 'user_pool_accounts' && object.type === 'table'
-        && object.tbl_name === object.name && match.name === object.name
-        && object.sql !== null && canonicalSql(object.sql) === canonicalSql(LEGACY_ACCOUNTS_DDL);
-    }), 'Source is not the exact supported missing-cooldown legacy schema.');
-  } finally { expected.close(); }
+  // The reviewed legacy schema predates both the cooldown table and multi-enterprise: the single-enterprise
+  // reference (built only in memory, never on the source image or output) without the cooldown table.
+  const wanted = referenceSchema('single-enterprise')
+    .filter(object => object.tbl_name !== 'user_pool_catalog_cooldowns');
+  const actual = objects(db);
+  requireSafe(actual.length === wanted.length && actual.every((object, index) => {
+    const match = wanted[index];
+    if (schemaKey(object) === schemaKey(match)) return true;
+    return object.name === 'user_pool_accounts' && object.type === 'table'
+      && object.tbl_name === object.name && match.name === object.name
+      && object.sql !== null && canonicalSql(object.sql) === canonicalSql(LEGACY_ACCOUNTS_DDL);
+  }), 'Source is not the exact supported missing-cooldown legacy schema.');
 }
 
 /**

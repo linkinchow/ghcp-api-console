@@ -5,25 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
-import { runMigrations } from '../../src/proxy/src/db/migrations.js';
-import { UserPoolStore } from '../../src/proxy/src/userPool/store.js';
 import { accountName } from '../../src/proxy/src/userPool/names.js';
 import { prepareLegacySqliteCopy } from './legacy-copy.js';
 import { preflightSqlite } from './migrate.js';
+import { createSchema, referenceSchema, type SchemaObject } from './sqlite-schema.js';
 
 const token = 'SYNTHETIC_ONLY_LEGACY_COPY_AbCdEf';
 function hash(path: string): string { return createHash('sha256').update(readFileSync(path)).digest('hex'); }
-function fixture(historicalLayout = false) {
-  const dir = mkdtempSync(join(tmpdir(), 'pool-legacy-copy-synthetic-'));
-  const sourcePath = join(dir, 'immutable.sqlite');
-  const outputPath = join(dir, 'prepared.sqlite');
-  const db = new Database(sourcePath);
-  const now = Date.now();
-  const timestamp = new Date(now - 10000).toISOString();
-  try {
-    db.pragma('foreign_keys = ON');
-    runMigrations(db);
-    if (historicalLayout) db.exec(`CREATE TABLE user_pool_accounts (
+const HISTORICAL_ACCOUNTS_DDL = `CREATE TABLE user_pool_accounts (
       identity TEXT PRIMARY KEY REFERENCES proxy_accounts(identity) ON DELETE RESTRICT,
       ordinal INTEGER UNIQUE NOT NULL, state TEXT NOT NULL, stage TEXT NOT NULL DEFAULT 'new',
       attempt_id TEXT NOT NULL, oauth_attempt_id TEXT, sso_created_at TEXT,
@@ -33,11 +22,29 @@ function fixture(historicalLayout = false) {
       generation INTEGER NOT NULL DEFAULT 0, reauth_count INTEGER NOT NULL DEFAULT 0,
       reauth_window_at INTEGER NOT NULL DEFAULT 0,
       CHECK(state IN ('provisioning', 'ready', 'cooling', 'failed', 'disabled'))
-    )`);
-    new UserPoolStore(db, { enabled: true, accountDomain: 'fixture.invalid', idleTarget: 2, maxAccounts: 20,
-      leaseSeconds: 172800, provisionalSeconds: 300, pollMs: 5000, retryAfterSeconds: 30,
-      warmupModel: 'unused-offline', requestTimeoutMs: 120000 });
-    db.exec('DROP TABLE user_pool_catalog_cooldowns');
+    )`;
+/** The reviewed legacy source: the single-enterprise (r4) schema without the cooldown table. */
+function legacySchema(historicalLayout: boolean): SchemaObject[] {
+  return referenceSchema('single-enterprise')
+    .filter((object) => object.tbl_name !== 'user_pool_catalog_cooldowns')
+    .map((object) => historicalLayout && object.type === 'table' && object.name === 'user_pool_accounts'
+      ? { ...object, sql: HISTORICAL_ACCOUNTS_DDL }
+      : object);
+}
+function fixture(historicalLayout = false) {
+  const dir = mkdtempSync(join(tmpdir(), 'pool-legacy-copy-synthetic-'));
+  const sourcePath = join(dir, 'immutable.sqlite');
+  const outputPath = join(dir, 'prepared.sqlite');
+  const db = new Database(sourcePath);
+  const now = Date.now();
+  const timestamp = new Date(now - 10000).toISOString();
+  try {
+    db.pragma('foreign_keys = ON');
+    createSchema(db, legacySchema(historicalLayout));
+    db.prepare(`
+      INSERT INTO user_pool_settings (id, idle_target, max_accounts, lease_seconds, account_domain)
+      VALUES (1, 2, 20, 172800, 'fixture.invalid')
+    `).run();
     db.prepare('UPDATE user_pool_settings SET paused=1, next_ordinal=2, version=7, owner=?, owner_until=?')
       .run(randomUUID(), now - 1000);
     for (let ordinal = 0; ordinal < 2; ordinal++) {
@@ -112,6 +119,8 @@ const schemaCases: [string, string][] = [
   ['conflicting cooldown table', 'CREATE TABLE user_pool_catalog_cooldowns(caller_id TEXT)'],
   ['conflicting cooldown index', 'CREATE INDEX user_pool_catalog_cooldown_expiry ON user_pool_events(at)'],
   ['view', 'CREATE VIEW unexpected_view AS SELECT 1'],
+  ['multi-enterprise column', 'ALTER TABLE proxy_accounts ADD COLUMN enterprise_id TEXT'],
+  ['multi-enterprise table', 'CREATE TABLE proxy_enterprises(id TEXT PRIMARY KEY)'],
 ];
 for (const [name, sql] of schemaCases) test(`refuses ${name} without source or output writes`, () => {
   const f = fixture();

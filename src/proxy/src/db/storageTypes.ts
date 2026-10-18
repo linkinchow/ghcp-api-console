@@ -5,10 +5,13 @@ import type {
   ProxyRequestStatDto,
   ManagementQuery,
   ManagementSummary,
+  EnterpriseId,
+  EnterpriseLifecycleState,
 } from '@ghcp/shared';
 
 export interface ProxyAccountRecord {
   identity: string;
+  enterpriseId: EnterpriseId;
   ssoUser: string;
   ghLogin?: string;
   copilotOauthToken?: string;
@@ -22,6 +25,7 @@ export interface ProxyAccountRecord {
 export interface AccountListQuery extends ManagementQuery { }
 
 export interface CreateAccountInput {
+  enterpriseId: EnterpriseId;
   identity: string;
   ssoUser: string;
   ghLogin?: string;
@@ -30,6 +34,7 @@ export interface CreateAccountInput {
 }
 
 export interface ImportCopilotOauthTokenInput {
+  enterpriseId: EnterpriseId;
   identity: string;
   ssoUser: string;
   ghLogin?: string;
@@ -44,6 +49,7 @@ export interface DeleteAccountsBySsoUserResult {
 }
 
 export interface RecordRequestStatInput {
+  enterpriseId: EnterpriseId;
   identity: string;
   callerId?: string;
   leaseId?: string;
@@ -96,11 +102,31 @@ export interface ProxyStorage {
     status: Extract<CopilotOauthStatus, 'expired' | 'failed'>,
   ): Promise<boolean>;
 
-  claimIdentityInitialization(identity: string, claimId: string, leaseSeconds: number): Promise<boolean>;
+  claimIdentityInitialization(
+    enterpriseId: EnterpriseId,
+    identity: string,
+    claimId: string,
+    leaseSeconds: number,
+  ): Promise<boolean>;
   releaseIdentityInitialization(identity: string, claimId: string): Promise<boolean>;
 
   recordRequestStat(input: RecordRequestStatInput): Promise<void>;
   listRequestStats(identity?: string, limit?: number): Promise<ProxyRequestStatDto[]>;
   listRequestStatsPage(query?: ManagementQuery): Promise<PageResponse<ProxyRequestStatDto>>;
   pruneAllRequestStats(): Promise<void>;
+
+  listEnterprises(): Promise<ProxyEnterpriseRecord[]>;
+}
+
+/** One `proxy_enterprises` row (design §4.2). */
+export interface ProxyEnterpriseRecord {
+  id: EnterpriseId;
+  state: EnterpriseLifecycleState;
+  maxAccounts: number;
+  /** N_e: every pool member of the enterprise, maintained incrementally. */
+  inventoryCount: number;
+  policyVersion: number;
+  profileFingerprint: string;
+  createdAt: number;
+  updatedAt: number;
 }

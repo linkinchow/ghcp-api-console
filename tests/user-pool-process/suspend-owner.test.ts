@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import type { Connection, Pool, RowDataPacket } from 'mysql2/promise';
-import { CREATED_AT, options, siblingUrl } from './worker-common.js';
+import { CREATED_AT, enterpriseSeed, options, siblingUrl } from './worker-common.js';
 import { WorkerMock } from './worker-mock.js';
 import { BASELINE, bounded, pause, pollUntil, suspendEnvironment, suspendGate, type SuspendMessage } from './suspend-common.js';
 
@@ -123,14 +123,17 @@ test('SIGSTOP expires real owner TTL; SIGCONT checkpoint is SQL/local fenced; su
     pool = createPool({ uri: url.toString(), connectionLimit: 6, connectTimeout: 5000,
       timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true });
     pool.on('connection', track);
-    const storage = new MysqlStorage(pool, 2);
+    const enterprise = await enterpriseSeed();
+    const storage = new MysqlStorage(pool, 2, true, enterprise);
     await bounded('fixture migration', storage.initialize(), 20000);
     const store = await bounded('fixture store init', storage.userPool(options), 20000);
     t.signal.throwIfAborted();
     const seed = await bounded('seed reserve', store.reserve(), 20000);
     t.signal.throwIfAborted();
     assert.ok(seed);
-    await bounded('seed credential', storage.createAccount({ identity: seed.identity, ssoUser: seed.identity, ghLogin: `${seed.identity}_synthetic` }), 20000);
+    const seedAccount = { enterpriseId: enterprise.id, identity: seed.identity, ssoUser: seed.identity,
+      ghLogin: `${seed.identity}_synthetic` };
+    await bounded('seed credential', storage.createAccount(seedAccount), 20000);
     t.signal.throwIfAborted();
     assert.equal(await bounded('seed inventory', store.update(seed.identity, { stage: 'synced', sso_created_at: CREATED_AT }), 20000), true);
     t.signal.throwIfAborted();

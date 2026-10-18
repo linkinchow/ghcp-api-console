@@ -219,7 +219,8 @@
   - `apiBaseUrl` 和 `copilotApiBaseUrl` 的主机必须属于同一 `<sub>.ghe.com`。
 - github.com：`shortcode` 必须匹配 `^[a-z0-9]{3,8}$`；`apiBaseUrl` 默认 `api.github.com`，显式值只能是 http(s) origin（测试 mock 用）。
 - 容量：所有 `initialMaxAccounts` 之和，以及运行时所有 cap 之和，都不能超过 `NAME_CAPACITY`（10,000）。
-- 不可变身份：每个服务的库中记录了每个企业的 `profile_fingerprint`（§4.2）。如果某企业在库中已有数据，而 fingerprint 变化（例如改了 `baseUrl`、`shortcode` 或 `accountDomain`），启动报 `enterprise_identity_changed`。企业没有数据时允许修改。
+- 不可变身份：每个服务的库中记录了每个企业的 `profile_fingerprint`（§4.2）。如果某企业在库中已有数据，而 fingerprint 变化（例如改了 `baseUrl`、`shortcode` 或 `accountDomain`），启动报 `enterprise_identity_changed`。企业没有数据时允许修改，并更新库中的 fingerprint。
+  - Proxy 中“有数据”指该企业已有账号池成员（`inventory_count > 0`）。直连账号从不依赖 `accountDomain` 和 `shortcode`，所以直连部署切换到 caller-lease（首次设置 `POOL_ACCOUNT_EMAIL_DOMAIN`）仍然允许。
 - 删除企业：registry 中去掉的企业如果在库中仍有数据，启动报 `enterprise_missing_from_registry`。
 - 保留 ID：`default` 只能表示升级前的企业。不能在全新部署中把另一个已有企业改名为 `default`。
 
@@ -305,7 +306,7 @@ CREATE TABLE proxy_enterprises (
 
 #### SQLite 迁移步骤
 
-在 `src/proxy/src/db/migrations.ts` 的 `runMigrations` 末尾追加 `runEnterpriseMigrations(db, defaults)`；池表部分在 `UserPoolStore` 构造时执行。整体在一个 `BEGIN IMMEDIATE` 事务中：
+在 `src/proxy/src/db/migrations.ts` 的 `runMigrations` 末尾追加 `runEnterpriseMigrations(db, seed)`；池表部分在 `UserPoolStore` 构造时执行。使用共享的 `runSqliteMigrations`：每个步骤一个 `BEGIN IMMEDIATE` 事务，成功后写入 `schema_migrations`；步骤只补缺失部分，所以“已生效未记录”时重跑安全：
 
 1. `enterprise-v1/01-create-proxy-enterprises`：建表。
 2. `.../02-seed-default`：`INSERT OR IGNORE` 插入 `default`：
@@ -323,7 +324,9 @@ CREATE TABLE proxy_enterprises (
 5. `.../05-initializations-and-stats`：两张表同样执行“加列 → 回填 → 索引 → required trigger”。大量统计行的回填在同一事务内完成。
 6. `.../06-pool-accounts`：仅当池表存在时执行。加列、回填，再建 `user_pool_accounts_enterprise_matches` trigger：INSERT 时校验 `NEW.enterprise_id` 等于 `proxy_accounts` 对应行。
 7. `.../07-pool-events`：仅当池表存在时执行。
-8. 执行 `PRAGMA foreign_key_check`，非空则回滚并报错，然后提交。
+8. 步骤 03 在提交前对 `proxy_accounts` 执行 `PRAGMA foreign_key_check`，非空则回滚并报错。
+
+每次启动还会：`default` 行缺失时补插；执行身份检查（§3.6）；按 `COUNT(*)` 校正 `inventory_count`，有偏差时记录 `enterprise_inventory_drift` 事件。同一 identity 换企业写入在两个后端都失败（`enterprise_id_immutable`）。
 
 新建库直接使用包含新列的 `CREATE TABLE`，迁移步骤的 `isApplied` 会全部为真。
 
@@ -343,8 +346,8 @@ CREATE TABLE proxy_enterprises (
 
 #### `MYSQL_AUTO_MIGRATE=false`
 
-- `scripts/proxy-mysql-initial.sql`：由 `src/proxy/src/db/mysqlInitialSql.ts` 的 `renderMysqlInitialSql()` 生成，包含新表、新列和 `default` 种子行。`mysqlInitialSql.test.ts` 继续做漂移检查。
-- 新增生成脚本 `scripts/proxy-mysql-enterprise-upgrade.sql`：只适用于基线 r4 schema 的 DBA 升级，由同一组步骤定义渲染。
+- `scripts/proxy-mysql-initial.sql`：由 `src/proxy/src/db/mysqlInitialSql.ts` 的 `renderMysqlInitialSql()` 生成，包含新表和新列，**不含** `default` 行：fingerprint 取决于部署配置，由 Proxy 启动时插入并校验（只需 INSERT/UPDATE 权限）。`mysqlInitialSql.test.ts` 继续做漂移检查。
+- 新增生成脚本 `scripts/proxy-mysql-enterprise-upgrade.sql`：只适用于基线 r4 schema 的 DBA 升级，由同一组步骤定义渲染。因外键需要，脚本先插入 fingerprint 为空的 `default` 行，Proxy 下次启动时补全并执行步骤 08。脚本不可重入：中途失败时恢复备份，或用一个开启自动迁移的副本续跑。
 - 只读校验 `validatePreparedMysqlSchema` 覆盖新表和新列；不一致时提示应执行哪个脚本。
 
 ### 4.3 SSO（SQLite，`src/sso/src/db/migrations.ts`）
@@ -536,7 +539,7 @@ SAML 会话**不建表**（§5.5）。
 | 方面 | 旧实现 | 新设计 |
 | --- | --- | --- |
 | 排名函数 | 写在 Proxy 内，两个存储各自拼 SQL | 纯函数 `rankEnterprisesForCreation` / `rankEnterprisesForAdmission`，放在 `src/packages/shared/src/enterprise/poolRanking.ts`，SQLite 与 MySQL 共用 |
-| `N_e` | 每次决策 GROUP BY `user_pool_accounts ⋈ proxy_accounts` | `proxy_enterprises.inventory_count` 增量计数：插入或删除 member 时在同一事务内 ±1 |
+| `N_e` | 每次决策 GROUP BY `user_pool_accounts ⋈ proxy_accounts` | `proxy_enterprises.inventory_count` 增量计数：预留 member 时在同一事务内 +1（member 不删除，外键 RESTRICT）；每次启动按 `COUNT(*)` 校正 |
 | 建号（`reserveDeficit`） | SQLite 每插入一个成员约做 2 次全表聚合，一个事务内最多约 200 次；MySQL 每批约 64 次 | **每批只做一次聚合**算出 `I`、`P` 和 `D`；锁住 `proxy_enterprises` 行后，用内存计数逐个选择企业并插入 |
 | 租号（`admit`） | 每次准入都做一次全量 snapshot | 只读 `proxy_enterprises`（≤ 32 行）来排名，然后按顺序在每个企业内做带索引的单行挑选（MySQL 用 `FOR UPDATE SKIP LOCKED`），无聚合 |
 | 生命周期 | `draft`/`validated`/`active`/`draining`，加持久化 evidence JSON 和 identity hash | `draft` → `active` → `draining`（可恢复到 `active`）。激活和恢复时做实时 readiness 检查，不持久化证据 |

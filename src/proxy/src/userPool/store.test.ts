@@ -9,6 +9,7 @@ import { runMigrations } from '../db/migrations.js';
 import { readPoolConfig, UserPoolError, type PoolConfig } from './config.js';
 import { accountName, NAME_CAPACITY } from './names.js';
 import { UserPoolStore, type HeldLease } from './store.js';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 
 const options = readPoolConfig({
   ACCOUNT_ROUTING_MODE: 'caller-lease', POOL_ACCOUNT_EMAIL_DOMAIN: 'accounts.example.test',
@@ -28,7 +29,7 @@ function fixture(t: TestContext, patch: Partial<PoolConfig> = {}) {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
     db.pragma('busy_timeout = 5000');
-    runMigrations(db);
+    runMigrations(db, defaultEnterpriseSeed({}));
     const store = new UserPoolStore(db, config);
     store.now = () => clock.now;
     return { db, store };
@@ -105,7 +106,7 @@ if (!isMainThread) {
       rmSync(dir, { recursive: true, force: true });
     });
     db.pragma('foreign_keys = ON');
-    runMigrations(db);
+    runMigrations(db, defaultEnterpriseSeed({}));
     db.exec(`
       CREATE TABLE user_pool_settings (
         id INTEGER PRIMARY KEY, version INTEGER NOT NULL DEFAULT 1, idle_target INTEGER NOT NULL,
@@ -135,8 +136,8 @@ if (!isMainThread) {
       (id, idle_target, max_accounts, lease_seconds, account_domain, next_ordinal) VALUES (1, 10, 100, 172800, ?, 1)`)
       .run(options.accountDomain);
     db.prepare(`INSERT INTO proxy_accounts
-      (identity, sso_user, copilot_oauth_status, copilot_oauth_token, created_at, updated_at)
-      VALUES (?, ?, 'valid', 'old-token', 'old', 'old')`).run(member, member);
+      (identity, enterprise_id, sso_user, copilot_oauth_status, copilot_oauth_token, created_at, updated_at)
+      VALUES (?, 'default', ?, 'valid', 'old-token', 'old', 'old')`).run(member, member);
     db.prepare(`INSERT INTO user_pool_accounts(identity, ordinal, state, stage, attempt_id, updated_at, verified_at)
       VALUES (?, 0, 'ready', 'ready', 'old-attempt', ?, ?)`).run(member, now, now);
     db.prepare('INSERT INTO user_pool_leases VALUES (?, ?, ?, ?, ?, NULL, ?)')
@@ -506,14 +507,16 @@ if (!isMainThread) {
       errorCode(() => f.store.updateSettings(updated.version, patch as never), 'invalid_pool_settings', 400);
     }
     assert.deepEqual(new UserPoolStore(other.db, { ...f.config, idleTarget: 99, leaseSeconds: 60 }).settings(), updated);
-    assert.throws(() => new UserPoolStore(other.db, { ...f.config, accountDomain: 'other.test' }), /domain differs/);
+    // The account domain is part of the enterprise identity now, which the Proxy migrations verify.
+    assert.deepEqual(new UserPoolStore(other.db, { ...f.config, accountDomain: 'other.test' }).settings(), updated);
   });
 
   test('reservation counts provisioning and leased capacity and safely skips existing aliases', (t) => {
     const f = fixture(t, { idleTarget: 2, maxAccounts: 3 });
     const timestamp = new Date(f.clock.now).toISOString();
     f.db.prepare(`
-      INSERT INTO proxy_accounts(identity, sso_user, created_at, updated_at) VALUES (?, ?, ?, ?), (?, ?, ?, ?)
+      INSERT INTO proxy_accounts(identity, enterprise_id, sso_user, created_at, updated_at)
+      VALUES (?, 'default', ?, ?, ?), (?, 'default', ?, ?, ?)
     `).run(accountName(0).toUpperCase(), 'direct', timestamp, timestamp,
       'another-direct-account', accountName(1).toUpperCase(), timestamp, timestamp);
     const first = f.store.reserve()!;

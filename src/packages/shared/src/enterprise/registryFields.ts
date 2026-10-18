@@ -58,8 +58,9 @@ type FieldKind =
 const FIELD_KINDS: ReadonlyMap<string, FieldKind> = new Map<string, FieldKind>([
   ['displayName', 'text'],
   ['github.baseUrl', 'githubBaseUrl'],
-  ['github.apiBaseUrl', 'origin'],
-  ['github.copilotApiBaseUrl', 'origin'],
+  // API roots may sit behind a gateway path; r4 accepted any GITHUB_API_BASE_URL / COPILOT_API_BASE_URL.
+  ['github.apiBaseUrl', 'url'],
+  ['github.copilotApiBaseUrl', 'url'],
   ['github.slug', 'slug'],
   ['github.shortcode', 'shortcode'],
   ['github.oauthClientId', 'text'],
@@ -162,8 +163,9 @@ function readSlug(value: unknown): string {
 }
 
 /** '' is kept so GHE.com profiles can state it; github.com rejects it when the profile is resolved. */
+/** Lower-cased like the baseline SSO did when it built logins, so `ACME` keeps working. */
 function readShortcode(value: unknown): string {
-  const shortcode = readString(value);
+  const shortcode = readString(value).toLowerCase();
   if (shortcode && !SHORTCODE.test(shortcode)) throw new Error('must match ^[a-z0-9]{3,8}$');
   return shortcode;
 }

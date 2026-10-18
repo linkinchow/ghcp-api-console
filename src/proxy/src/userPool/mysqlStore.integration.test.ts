@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import { runMysqlMigrations } from '../db/mysqlMigrations.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import { UserPoolError, type PoolConfig } from './config.js';
 import { MysqlPoolStore } from './mysqlStore.js';
 import { MysqlConnectionError } from './mysqlDeadline.js';
@@ -17,6 +18,7 @@ const options: PoolConfig = {
 const caller = (n: number): string => `sha256:${n.toString(16).padStart(64, '0')}`;
 const mysqlUrl = process.env.MYSQL_TEST_URL;
 const enabled = Boolean(mysqlUrl) && process.env.MYSQL_POOL_TEST_DISPOSABLE === '1';
+const seed = { id: DEFAULT_ENTERPRISE_ID, fingerprint: 'f'.repeat(64), maxAccounts: options.maxAccounts };
 
 async function rejectsCode(action: Promise<unknown>, code: string): Promise<void> {
   await assert.rejects(action, (error: unknown) => error instanceof UserPoolError && error.code === code);
@@ -50,7 +52,7 @@ test('MySQL user pool: isolated real multi-connection contract', {
     const [db, otherDb] = pools;
     const first = new MysqlPoolStore(db, options);
     const second = new MysqlPoolStore(otherDb, options);
-    await runMysqlMigrations(db);
+    await runMysqlMigrations(db, seed);
     await Promise.all([first.initialize(), second.initialize()]);
 
     const reset = async (patch: { idle_target?: number; max_accounts?: number } = {}) => {
@@ -60,6 +62,8 @@ test('MySQL user pool: isolated real multi-connection contract', {
       await db.execute(`UPDATE user_pool_settings SET version=1, idle_target=?, max_accounts=?,
         lease_seconds=?, paused=0, next_ordinal=0, owner=NULL, owner_until=0 WHERE id=1`,
       [patch.idle_target ?? options.idleTarget, patch.max_accounts ?? options.maxAccounts, options.leaseSeconds]);
+      await db.execute('UPDATE proxy_enterprises SET max_accounts=?, inventory_count=0 WHERE id=?',
+        [patch.max_accounts ?? options.maxAccounts, DEFAULT_ENTERPRISE_ID]);
     };
     const ready = async (count = 1): Promise<string[]> => {
       const identities: string[] = [];
@@ -99,7 +103,8 @@ test('MySQL user pool: isolated real multi-connection contract', {
       const restarted = new MysqlPoolStore(otherDb, { ...options, idleTarget: 2, maxAccounts: 2, leaseSeconds: 60 });
       await restarted.initialize();
       assert.deepEqual(await restarted.settings(), settings, 'seed changes cannot overwrite settings');
-      await assert.rejects(new MysqlPoolStore(otherDb, { ...options, accountDomain: 'other.test' }).initialize(), /domain differs/);
+      // The account domain is per enterprise: its identity fingerprint (MysqlStorage), not the pool's, guards it.
+      await new MysqlPoolStore(otherDb, { ...options, accountDomain: 'other.test' }).initialize();
       await assert.rejects(new MysqlPoolStore(otherDb, { ...options, requestTimeoutMs: 5000 }).initialize(), /configuration differs/);
       assert.equal(JSON.stringify(await first.accounts()).includes('SyntheticToken'), false);
       const page = await first.page('accounts', { page: 1, pageSize: 1, q: member.toUpperCase(), state: 'ready_idle' });
@@ -328,8 +333,9 @@ test('MySQL user pool: isolated real multi-connection contract', {
       assert.equal((await first.counts()).total, count);
       assert.equal(await first.reserveDeficit(randomUUID()), 0);
       await reset();
-      await db.execute(`INSERT INTO proxy_accounts(identity,sso_user,created_at,updated_at)
-        VALUES (?, 'direct', UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)), ('direct-alias', ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))`,
+      await db.execute(`INSERT INTO proxy_accounts(identity,sso_user,created_at,updated_at,enterprise_id)
+        VALUES (?, 'direct', UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), 'default'),
+          ('direct-alias', ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), 'default')`,
       [accountName(0).toUpperCase(), accountName(1).toUpperCase()]);
       assert.equal((await first.reserve())!.ordinal, 2);
       await db.execute('UPDATE user_pool_settings SET next_ordinal=?', [NAME_CAPACITY - 1]);

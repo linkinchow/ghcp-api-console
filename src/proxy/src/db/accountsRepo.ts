@@ -1,6 +1,7 @@
 import type {
   CopilotOauthStatus,
   DeleteProxyAccountResult,
+  EnterpriseId,
   PageResponse,
   ProxyAccountDto,
 } from '@ghcp/shared';
@@ -84,12 +85,13 @@ export async function invalidateCopilotOauthToken(
 }
 
 export async function claimIdentityInitialization(
+  enterpriseId: EnterpriseId,
   identity: string,
   claimId: string,
   leaseSeconds: number,
 ): Promise<boolean> {
   await initializeStorage();
-  return getStorage().claimIdentityInitialization(identity, claimId, leaseSeconds);
+  return getStorage().claimIdentityInitialization(enterpriseId, identity, claimId, leaseSeconds);
 }
 
 export async function releaseIdentityInitialization(identity: string, claimId: string): Promise<boolean> {

@@ -4,12 +4,19 @@ import { SqliteStorage } from './sqliteStorage.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { defaultEnterpriseSeed } from './enterpriseSeed.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 
 test('the account attempt id fences late writes, stale retries and superseded attempts', async (t) => {
-  const storage = new SqliteStorage(':memory:', 2000);
+  const storage = new SqliteStorage(':memory:', 2000, defaultEnterpriseSeed({}));
   await storage.initialize();
   t.after(() => storage.close());
-  await storage.createAccount({ identity: 'account', ssoUser: 'user', ghLogin: 'github-user' });
+  await storage.createAccount({
+    enterpriseId: DEFAULT_ENTERPRISE_ID,
+    identity: 'account',
+    ssoUser: 'user',
+    ghLogin: 'github-user',
+  });
 
   assert.equal(await storage.beginCopilotOauthAuthorization('account', 'first', null), true);
   assert.equal(await storage.failCopilotOauthAuthorization('account', 'first'), true);
@@ -38,25 +45,26 @@ test('the account attempt id fences late writes, stale retries and superseded at
 
 test('SQLite export snapshots do not change while matching records are inserted or removed', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'proxy-snapshot-'));
-  const storage = new SqliteStorage(join(directory, 'snapshot.sqlite'), 1000);
+  const storage = new SqliteStorage(join(directory, 'snapshot.sqlite'), 1000, defaultEnterpriseSeed({}));
   await storage.initialize();
   t.after(async () => { await storage.close(); await rm(directory, { recursive: true, force: true }); });
-  await storage.createAccount({ identity: 'before', ssoUser: 'before' });
+  await storage.createAccount({ enterpriseId: DEFAULT_ENTERPRISE_ID, identity: 'before', ssoUser: 'before' });
   await storage.withReadSnapshot(async (reader) => {
     assert.equal((await reader.listAccounts()).total, 1);
     await storage.deleteAccount('before');
-    await storage.createAccount({ identity: 'after', ssoUser: 'after' });
+    await storage.createAccount({ enterpriseId: DEFAULT_ENTERPRISE_ID, identity: 'after', ssoUser: 'after' });
     assert.equal((await reader.listAccounts()).items[0]?.identity, 'before');
     assert.equal((await storage.listAccounts()).items[0]?.identity, 'after');
   });
 });
 
 test('management counts and request filters cover data beyond old page and sample limits', async (t) => {
-  const storage = new SqliteStorage(':memory:', 2000);
+  const storage = new SqliteStorage(':memory:', 2000, defaultEnterpriseSeed({}));
   await storage.initialize();
   t.after(() => storage.close());
   for (let index = 0; index < 137; index++) {
     await storage.createAccount({
+      enterpriseId: DEFAULT_ENTERPRISE_ID,
       identity: `account-${String(index).padStart(3, '0')}`, ssoUser: `user-${index}`,
       copilotOauthStatus: index % 2 === 0 ? 'failed' : 'valid',
     });
@@ -72,6 +80,7 @@ test('management counts and request filters cover data beyond old page and sampl
 
   for (let index = 0; index < 1501; index++) {
     await storage.recordRequestStat({
+      enterpriseId: DEFAULT_ENTERPRISE_ID,
       identity: 'account-000', path: '/chat/completions', model: index === 0 ? 'old-only' : 'recent',
       success: index !== 0, inputTokens: index,
     });

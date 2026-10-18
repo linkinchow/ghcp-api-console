@@ -1,5 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
+import { runPoolEnterpriseMigrations } from '../db/enterpriseMigrations.js';
+import {
+  correctInventoryCounts,
+  getEnterpriseRecord,
+  incrementInventory,
+  setEnterpriseCap,
+} from '../db/enterpriseRepo.js';
 import type { PoolConfig } from './config.js';
 import { normalizeCaller, UserPoolError } from './config.js';
 import { accountName, NAME_CAPACITY } from './names.js';
@@ -10,6 +18,7 @@ import { inferenceHoldTimeoutMs } from './inferenceTimeout.js';
 
 export interface Inventory {
   identity: string;
+  enterprise_id: string;
   ordinal: number;
   state: string;
   stage: string;
@@ -58,6 +67,16 @@ export interface PoolSettings {
 
 export type InventoryFence = string | (Pick<Inventory, 'attempt_id' | 'generation'> & Partial<Pick<Inventory, 'stage'>>);
 
+interface EventFields {
+  action: string;
+  identity?: string;
+  caller?: string;
+  leaseId?: string;
+  detail?: string;
+  /** Defaults to the member's enterprise; global events have none. */
+  enterpriseId?: string;
+}
+
 interface HoldRow {
   request_id: string;
   lease_id: string;
@@ -82,7 +101,16 @@ export class UserPoolStore {
   private readonly pendingSelection = new PendingSelection();
 
   constructor(private readonly db: Database.Database, private readonly options: PoolConfig) {
-    db.transaction(() => {
+    const created = this.createTables();
+    runPoolEnterpriseMigrations(db);
+    db.transaction(() => this.initializeEnterprise(created)).immediate();
+  }
+
+  /** Creates or upgrades the pool tables; returns whether this call created the settings row. */
+  private createTables(): boolean {
+    const db = this.db;
+    const options = this.options;
+    return db.transaction(() => {
       db.exec(`
         CREATE TABLE IF NOT EXISTS user_pool_settings (
           id INTEGER PRIMARY KEY CHECK(id = 1), version INTEGER NOT NULL DEFAULT 1,
@@ -97,7 +125,7 @@ export class UserPoolStore {
           task_id TEXT, attempts INTEGER NOT NULL DEFAULT 0,
           retry_at INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at INTEGER NOT NULL,
           cooldown_until INTEGER NOT NULL DEFAULT 0, verified_at INTEGER,
-          generation INTEGER NOT NULL DEFAULT 0,
+          generation INTEGER NOT NULL DEFAULT 0, enterprise_id TEXT,
           CHECK(state IN ('provisioning', 'ready', 'cooling', 'failed', 'disabled'))
         );
         CREATE TABLE IF NOT EXISTS user_pool_leases (
@@ -124,7 +152,7 @@ export class UserPoolStore {
         CREATE INDEX IF NOT EXISTS user_pool_catalog_caller ON user_pool_catalog_holds(caller_id);
         CREATE TABLE IF NOT EXISTS user_pool_events (
           id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, action TEXT NOT NULL,
-          identity TEXT, caller_id TEXT, lease_id TEXT, detail TEXT
+          identity TEXT, caller_id TEXT, lease_id TEXT, detail TEXT, enterprise_id TEXT
         );
       `);
       // Upgrade the initial pool schema without dropping inventory or live holds. Legacy
@@ -156,16 +184,30 @@ export class UserPoolStore {
           WHERE identity = NEW.identity;
         END;
       `);
-      db.prepare(`
+      // The enterprise fingerprint covers the account domain now; this column is no longer compared.
+      return db.prepare(`
         INSERT OR IGNORE INTO user_pool_settings
           (id, idle_target, max_accounts, lease_seconds, account_domain) VALUES (1, ?, ?, ?, ?)
-      `).run(options.idleTarget, options.maxAccounts, options.leaseSeconds, options.accountDomain);
-      const persisted = db.prepare('SELECT account_domain FROM user_pool_settings WHERE id = 1')
-        .get() as { account_domain: string };
-      if (persisted.account_domain !== options.accountDomain) {
-        throw new Error('Pool account email domain differs from persisted inventory');
-      }
+      `).run(options.idleTarget, options.maxAccounts, options.leaseSeconds, options.accountDomain).changes === 1;
     }).immediate();
+  }
+
+  /**
+   * The `default` enterprise owns the pool cap. A newly created pool takes its configured cap, as the
+   * single-enterprise pool did; afterwards the persisted cap wins. N_e drift is corrected and recorded.
+   */
+  private initializeEnterprise(created: boolean): void {
+    if (!getEnterpriseRecord(this.db, DEFAULT_ENTERPRISE_ID)) {
+      throw new Error('The default enterprise is missing; run the Proxy migrations first.');
+    }
+    if (created) setEnterpriseCap(this.db, DEFAULT_ENTERPRISE_ID, this.options.maxAccounts);
+    for (const drift of correctInventoryCounts(this.db)) {
+      this.recordEvent({
+        action: 'enterprise_inventory_drift',
+        enterpriseId: drift.enterpriseId,
+        detail: `stored=${drift.stored} actual=${drift.actual}`,
+      });
+    }
   }
 
   private addColumn(table: string, name: string, definition: string): void {
@@ -182,8 +224,11 @@ export class UserPoolStore {
 
   settings(): PoolSettings {
     return this.db.prepare(`
-      SELECT version, idle_target, max_accounts, lease_seconds, paused FROM user_pool_settings WHERE id = 1
-    `).get() as PoolSettings;
+      SELECT s.version, s.idle_target, e.max_accounts, s.lease_seconds, s.paused
+      FROM user_pool_settings s
+      JOIN proxy_enterprises e ON e.id = ?
+      WHERE s.id = 1
+    `).get(DEFAULT_ENTERPRISE_ID) as PoolSettings;
   }
 
   updateSettings(version: number, patch: Partial<PoolSettings>): PoolSettings {
@@ -203,9 +248,11 @@ export class UserPoolStore {
       }
       // Lowering the cap stops growth; it never deletes accounts or evicts active callers.
       this.db.prepare(`
-        UPDATE user_pool_settings SET idle_target = ?, max_accounts = ?, lease_seconds = ?,
-          paused = ?, version = version + 1 WHERE id = 1
-      `).run(next.idle_target, next.max_accounts, next.lease_seconds, next.paused);
+        UPDATE user_pool_settings
+        SET idle_target = ?, lease_seconds = ?, paused = ?, version = version + 1
+        WHERE id = 1
+      `).run(next.idle_target, next.lease_seconds, next.paused);
+      if (patch.max_accounts !== undefined) setEnterpriseCap(this.db, DEFAULT_ENTERPRISE_ID, next.max_accounts);
       this.event('settings_updated');
       return this.settings();
     }).immediate();
@@ -286,9 +333,25 @@ export class UserPoolStore {
   }
 
   event(action: string, identity?: string, caller?: string, leaseId?: string, detail?: string): void {
+    this.recordEvent({ action, identity, caller, leaseId, detail });
+  }
+
+  private recordEvent(fields: EventFields): void {
     this.db.prepare(`
-      INSERT INTO user_pool_events(at, action, identity, caller_id, lease_id, detail) VALUES (?, ?, ?, ?, ?, ?)
-    `).run(this.now(), action, identity ?? null, caller ?? null, leaseId ?? null, detail ?? null);
+      INSERT INTO user_pool_events(at, action, identity, caller_id, lease_id, detail, enterprise_id)
+      VALUES (@at, @action, @identity, @caller, @leaseId, @detail, COALESCE(
+        @enterpriseId,
+        (SELECT enterprise_id FROM user_pool_accounts WHERE identity = @identity)
+      ))
+    `).run({
+      at: this.now(),
+      action: fields.action,
+      identity: fields.identity ?? null,
+      caller: fields.caller ?? null,
+      leaseId: fields.leaseId ?? null,
+      detail: fields.detail ?? null,
+      enterpriseId: fields.enterpriseId ?? null,
+    });
     this.db.prepare(`
       DELETE FROM user_pool_events WHERE id <= (SELECT COALESCE(MAX(id), 0) - 10000 FROM user_pool_events)
     `).run();
@@ -708,20 +771,26 @@ export class UserPoolStore {
         SELECT 1 FROM proxy_accounts WHERE lower(identity) = lower(?) OR lower(sso_user) = lower(?)
       `).get(identity, identity);
       if (collision) continue;
-      const now = this.now();
-      const timestamp = new Date(now).toISOString();
-      this.db.prepare(`
-        INSERT INTO proxy_accounts(identity, sso_user, copilot_oauth_status, created_at, updated_at)
-        VALUES (?, ?, 'missing', ?, ?)
-      `).run(identity, identity, timestamp, timestamp);
-      this.db.prepare(`
-        INSERT INTO user_pool_accounts(identity, ordinal, state, attempt_id, updated_at, retry_at)
-        VALUES (?, ?, 'provisioning', ?, ?, ?)
-      `).run(identity, ordinal - 1, randomUUID(), now, now);
+      this.insertMember(identity, ordinal - 1);
       this.event('name_reserved', identity);
       return this.inventory(identity)!;
     }
     return new UserPoolError(503, 'name_catalog_exhausted');
+  }
+
+  /** Pool scheduling is single-enterprise until M5: every member belongs to `default`. */
+  private insertMember(identity: string, ordinal: number): void {
+    const now = this.now();
+    const timestamp = new Date(now).toISOString();
+    this.db.prepare(`
+      INSERT INTO proxy_accounts(identity, enterprise_id, sso_user, copilot_oauth_status, created_at, updated_at)
+      VALUES (?, ?, ?, 'missing', ?, ?)
+    `).run(identity, DEFAULT_ENTERPRISE_ID, identity, timestamp, timestamp);
+    this.db.prepare(`
+      INSERT INTO user_pool_accounts(identity, enterprise_id, ordinal, state, attempt_id, updated_at, retry_at)
+      VALUES (?, ?, ?, 'provisioning', ?, ?, ?)
+    `).run(identity, DEFAULT_ENTERPRISE_ID, ordinal, randomUUID(), now, now);
+    incrementInventory(this.db, DEFAULT_ENTERPRISE_ID);
   }
 
   pending(excluded: readonly string[] = []): Inventory | undefined {

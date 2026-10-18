@@ -10,6 +10,7 @@ import test from 'node:test';
 import { createPool, type Pool } from 'mysql2/promise';
 import type { PoolStore } from '../userPool/storage.js';
 import type { PrewarmWorker as Worker } from '../userPool/worker.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 
 // Capture explicit opt-in before loading any production module or dotenv.
 const mysqlTestUrl = process.env.MYSQL_TEST_URL;
@@ -155,7 +156,13 @@ async function race(engine: 'sqlite' | 'mysql', scenario: Scenario): Promise<voi
     assert.ok(store);
     identity = (await store.reserve())!.identity;
     const memberIdentity = identity;
-    await importCopilotOauthToken({ identity, ssoUser: identity, ghLogin: 'synthetic-gh-race', copilotOauthToken: tokenA });
+    await importCopilotOauthToken({
+      enterpriseId: DEFAULT_ENTERPRISE_ID,
+      identity,
+      ssoUser: identity,
+      ghLogin: 'synthetic-gh-race',
+      copilotOauthToken: tokenA,
+    });
     assert.equal(await store.update(identity, { state: 'provisioning', stage: 'warmup', sso_created_at: createdAt }), true);
 
     // This is the existing client-boundary fetch pattern, not storage/runtime mocks.
@@ -243,7 +250,13 @@ async function race(engine: 'sqlite' | 'mysql', scenario: Scenario): Promise<voi
       responses.success.resolve(success());
       assert.equal((await bounded(oldSuccess, 'old 200 response')).status, 200);
     };
-    const importToken = async (token: string) => importCopilotOauthToken({ identity: memberIdentity, ssoUser: memberIdentity, ghLogin: 'synthetic-gh-race', copilotOauthToken: token });
+    const importToken = async (token: string) => importCopilotOauthToken({
+      enterpriseId: DEFAULT_ENTERPRISE_ID,
+      identity: memberIdentity,
+      ssoUser: memberIdentity,
+      ghLogin: 'synthetic-gh-race',
+      copilotOauthToken: token,
+    });
     const beforeRotation = (await store.inventory(identity))!.generation;
     await importToken(tokenB);
     const intermediate = (await store.inventory(identity))!;

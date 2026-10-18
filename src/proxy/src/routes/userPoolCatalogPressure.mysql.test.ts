@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import type { Connection, RowDataPacket } from 'mysql2/promise';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import type { PoolRequest } from '../userPool/runtime.js';
 
 const mysqlUrl = process.env.MYSQL_TEST_URL;
@@ -207,7 +208,8 @@ async function fixture(t: TestContext) {
     members.push(member.identity);
     tokens.set(`Bearer catalog-pressure-mysql-token-${i}`, member.identity);
     m.clearModelsCache(member.identity);
-    await m.importCopilotOauthToken({ identity: member.identity, ssoUser: member.identity,
+    await m.importCopilotOauthToken({ enterpriseId: DEFAULT_ENTERPRISE_ID, identity: member.identity,
+      ssoUser: member.identity,
       ghLogin: 'catalog-pressure-mysql-synthetic', copilotOauthToken: `catalog-pressure-mysql-token-${i}` });
     await store.update(member.identity, { state: 'ready', stage: 'ready', verified_at: await store.now() });
   }

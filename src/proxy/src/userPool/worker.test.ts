@@ -7,6 +7,7 @@ import { readPoolConfig } from './config.js';
 import { UserPoolStore } from './store.js';
 import { PrewarmWorker, type PrewarmStore } from './worker.js';
 import { ProvisionFailure, type ProvisionAdapter, type ProvisionContext, type ProvisionInventory } from './provisioner.js';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 
 function fixture(target = 2) {
   let owner = '';
@@ -46,7 +47,8 @@ function fixture(target = 2) {
       if (paused || ready + provisioning >= target || rows.size >= 20) return undefined;
       const identity = `member-${rows.size}`;
       const row: ProvisionInventory = {
-        identity, ordinal: rows.size, state: 'provisioning', stage: 'new', attempt_id: `attempt-${identity}`,
+        identity, enterprise_id: 'default', ordinal: rows.size, state: 'provisioning', stage: 'new',
+        attempt_id: `attempt-${identity}`,
         task_id: null, attempts: 0, retry_at: Date.now(), last_error: null, updated_at: Date.now(),
         cooldown_until: 0, verified_at: null, generation: 0, sso_created_at: null, oauth_attempt_id: null,
       };
@@ -379,7 +381,7 @@ test('SQLite persists worker intents across recreation and excludes live holds d
   const db = new BetterSqlite3(':memory:');
   t.after(() => db.close());
   db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  runMigrations(db, defaultEnterpriseSeed({}));
   const options = readPoolConfig({
     ACCOUNT_ROUTING_MODE: 'caller-lease', POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test',
     POOL_WARMUP_MODEL: 'test-model', READY_IDLE_TARGET: '1', POOL_MAX_ACCOUNTS: '1',

@@ -9,6 +9,7 @@ import { buildApp, startServer } from '../server.js';
 import { getUserPool, stopUserPool } from '../userPool/runtime.js';
 import { UserPoolStore } from '../userPool/store.js';
 import { clearModelsCache } from '../copilot/copilotClient.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 
 const originalFetch = globalThis.fetch;
 const caller = `sha256:${'a'.repeat(64)}`;
@@ -32,7 +33,13 @@ async function fixture() {
   let now = store.now(); store.now = () => now;
   const member = store.reserve()!;
   clearModelsCache(member.identity);
-  await importCopilotOauthToken({ identity: member.identity, ssoUser: member.identity, ghLogin: 'synthetic', copilotOauthToken: 'synthetic-token' });
+  await importCopilotOauthToken({
+    enterpriseId: DEFAULT_ENTERPRISE_ID,
+    identity: member.identity,
+    ssoUser: member.identity,
+    ghLogin: 'synthetic',
+    copilotOauthToken: 'synthetic-token',
+  });
   store.update(member.identity, { state: 'ready', stage: 'ready', verified_at: now });
   let forwarded = 0;
   globalThis.fetch = async input => {

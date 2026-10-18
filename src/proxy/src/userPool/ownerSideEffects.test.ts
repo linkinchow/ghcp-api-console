@@ -13,6 +13,7 @@ import type { Inventory } from './store.js';
 import type { PoolConfig } from './config.js';
 import type { ProvisionAdapter } from './provisioner.js';
 import type { PrewarmStore } from './worker.js';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 
 // Capture opt-in BEFORE application imports; never load the checkout's .env or
 // use application credentials. Restore the whole environment even on import failure.
@@ -103,7 +104,8 @@ async function withDatabase(driver: 'SQLite' | 'MySQL', run: (f: Fixture) => Pro
   if (driver === 'SQLite') {
     const directory = mkdtempSync(join(tmpdir(), 'owner-side-effects-'));
     const path = join(directory, 'test.sqlite');
-    const storage = new SqliteStorage(path, 10), other = new SqliteStorage(path, 10);
+    const storage = new SqliteStorage(path, 10, defaultEnterpriseSeed({}));
+    const other = new SqliteStorage(path, 10, defaultEnterpriseSeed({}));
     try {
       await storage.initialize(); await other.initialize();
       const first = storage.userPool(options), second = other.userPool(options);
@@ -159,7 +161,8 @@ async function withDatabase(driver: 'SQLite' | 'MySQL', run: (f: Fixture) => Pro
     for (let i = 0; i < 2; i++) pools.push(createPool({ uri: url.toString(), connectionLimit: 4,
       connectTimeout: 5000, timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true }));
     const [db, otherDb] = pools;
-    const storage = new MysqlStorage(tracedPool(db, writes), 10), other = new MysqlStorage(otherDb, 10);
+    const storage = new MysqlStorage(tracedPool(db, writes), 10, true, defaultEnterpriseSeed({}));
+    const other = new MysqlStorage(otherDb, 10, true, defaultEnterpriseSeed({}));
     await storage.initialize();
     const first = await storage.userPool(options), second = await other.userPool(options);
     await run({ first, second, storage, writes,

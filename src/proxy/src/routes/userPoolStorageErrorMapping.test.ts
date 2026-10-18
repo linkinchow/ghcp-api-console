@@ -14,6 +14,8 @@ import { buildApp } from '../server.js';
 import { MysqlDeadlineError } from '../userPool/mysqlDeadline.js';
 import { getUserPool, stopUserPool } from '../userPool/runtime.js';
 import { UserPoolStore } from '../userPool/store.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 
 const originalFetch = globalThis.fetch;
 const caller = `sha256:${'d'.repeat(64)}`;
@@ -25,7 +27,7 @@ function failingStorage(cause: unknown) {
     async execute() { throw cause; }, release() {}, destroy() {},
   } as unknown as PoolConnection;
   const pool = { async getConnection() { calls++; return connection; } } as unknown as Pool;
-  return { storage: new MysqlStorage(pool, 100), calls: () => calls };
+  return { storage: new MysqlStorage(pool, 100, true, defaultEnterpriseSeed({})), calls: () => calls };
 }
 
 async function fixture(t: TestContext, direct = false) {
@@ -44,7 +46,13 @@ async function fixture(t: TestContext, direct = false) {
   if (!direct) {
     assert.ok(pool instanceof UserPoolStore);
     member = pool.reserve()!.identity;
-    await importCopilotOauthToken({ identity: member, ssoUser: member, ghLogin: 'synthetic', copilotOauthToken: 'synthetic-token' });
+    await importCopilotOauthToken({
+      enterpriseId: DEFAULT_ENTERPRISE_ID,
+      identity: member,
+      ssoUser: member,
+      ghLogin: 'synthetic',
+      copilotOauthToken: 'synthetic-token',
+    });
     pool.update(member, { state: 'ready', stage: 'ready', verified_at: pool.now() });
   }
   clearModelsCache(member);

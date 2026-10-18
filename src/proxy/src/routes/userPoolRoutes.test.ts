@@ -13,6 +13,7 @@ import { buildApp } from '../server.js';
 import { getUserPool, stopUserPool } from '../userPool/runtime.js';
 import { UserPoolStore } from '../userPool/store.js';
 import { MysqlDeadlineError } from '../userPool/mysqlDeadline.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 
 const originalFetch = globalThis.fetch;
 const originalConfig = { ...config };
@@ -46,7 +47,13 @@ beforeEach(async () => {
     const row = store.reserve()!;
     members.push(row.identity);
     clearModelsCache(row.identity);
-    await importCopilotOauthToken({ identity: row.identity, ssoUser: row.identity, ghLogin: `${row.identity}_test`, copilotOauthToken: `test-token-${i}` });
+    await importCopilotOauthToken({
+      enterpriseId: DEFAULT_ENTERPRISE_ID,
+      identity: row.identity,
+      ssoUser: row.identity,
+      ghLogin: `${row.identity}_test`,
+      copilotOauthToken: `test-token-${i}`,
+    });
     store.update(row.identity, { state: 'ready', stage: 'ready', verified_at: now });
   }
   upstreamCalls = [];
@@ -261,7 +268,12 @@ test('broken model-catalog 401 body still schedules credential recovery', async 
 
 test('late 401 cannot invalidate an administrator replacement token or schedule another login', async () => {
   respond = async () => {
-    await importCopilotOauthToken({ identity: members[0], ssoUser: members[0], copilotOauthToken: 'replacement-valid-token' });
+    await importCopilotOauthToken({
+      enterpriseId: DEFAULT_ENTERPRISE_ID,
+      identity: members[0],
+      ssoUser: members[0],
+      copilotOauthToken: 'replacement-valid-token',
+    });
     return json({ error: 'old token rejected' }, 401);
   };
   const response = await request();

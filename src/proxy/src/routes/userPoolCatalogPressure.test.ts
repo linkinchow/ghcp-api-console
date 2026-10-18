@@ -8,17 +8,20 @@ import type { AddressInfo } from 'node:net';
 import { after, before, test, type TestContext } from 'node:test';
 import type { PoolRequest } from '../userPool/runtime.js';
 import type { HeldLease, UserPoolStore } from '../userPool/store.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 
 // Intentionally one process: two real Express listeners share real SQLite storage
 // and the production process-local model cache. This is NOT a MySQL/replica test.
 // Import application modules only after preventing dotenv from reading real secrets.
+// The enterprise registry accepts only an origin, so the path-prefixed upstream is set on config directly.
+const upstreamBaseUrl = 'http://127.0.0.1:1/catalog-pressure-upstream';
 const safeEnv = {
   DOTENV_CONFIG_PATH: join(tmpdir(), `catalog-pressure-no-dotenv-${randomUUID()}.env`),
   ACCOUNT_ROUTING_MODE: 'caller-lease', STORAGE_DRIVER: 'sqlite', DB_PATH: ':memory:',
   MYSQL_URL: '', MYSQL_SSL_MODE: 'disabled', MYSQL_SSL_CA_PATH: '',
   API_KEY: 'catalog-pressure-synthetic-key', INTERNAL_API_TOKEN: 'catalog-pressure-internal',
   IDENTITY_HEADER: 'X-User-Identity', IDENTITY_HEADER_REQUIRED: 'true', CLAUDE_CODE_OPTIMIZED: 'true',
-  COPILOT_API_BASE_URL: 'http://127.0.0.1:1/catalog-pressure-upstream',
+  COPILOT_API_BASE_URL: 'http://127.0.0.1:1',
   SSO_BASE_URL: 'http://127.0.0.1:1', LOGIN_BASE_URL: 'http://127.0.0.1:1',
   PROXY_ERROR_DIAGNOSTICS_ENABLED: 'false',
   POOL_ACCOUNT_EMAIL_DOMAIN: 'catalog-pressure.test', POOL_WARMUP_MODEL: 'claude-opus-5-2',
@@ -47,7 +50,7 @@ before(async () => {
   modules = await loadModules();
   savedConfig = { ...modules.config };
   Object.assign(modules.config, { storageDriver: 'sqlite', dbPath: ':memory:', apiKey: safeEnv.API_KEY,
-    copilotApiBaseUrl: safeEnv.COPILOT_API_BASE_URL, errorDiagnosticsEnabled: false, claudeCodeOptimized: true,
+    copilotApiBaseUrl: upstreamBaseUrl, errorDiagnosticsEnabled: false, claudeCodeOptimized: true,
     requestStatsPerAccountLimit: 100 });
 });
 after(() => {
@@ -135,7 +138,8 @@ async function fixture(t: TestContext) {
     members.push(member.identity);
     tokens.set(`Bearer catalog-pressure-token-${i}`, member.identity);
     clearModelsCache(member.identity);
-    await importCopilotOauthToken({ identity: member.identity, ssoUser: member.identity,
+    await importCopilotOauthToken({ enterpriseId: DEFAULT_ENTERPRISE_ID,
+      identity: member.identity, ssoUser: member.identity,
       ghLogin: 'catalog-pressure-synthetic', copilotOauthToken: `catalog-pressure-token-${i}` });
     store.update(member.identity, { state: 'ready', stage: 'ready', verified_at: now });
   }

@@ -1,17 +1,25 @@
 import assert from 'node:assert/strict';
+import type { EnterpriseSeed } from '../../src/proxy/src/db/enterpriseSeed.js';
 import { readPoolConfig } from '../../src/proxy/src/userPool/config.js';
-import { childEnvironment, validateMysqlUrl, validateMockOrigin } from './worker-common.js';
+import { childEnvironment, enterpriseSeed as workerEnterpriseSeed, validateMysqlUrl,
+  validateMockOrigin } from './worker-common.js';
 export { CREATED_AT, INTERNAL_TOKEN, OAUTH_TOKEN, PASSWORD, siblingUrl, validateMockOrigin } from './worker-common.js';
 
 export const SUITE_MS = 360000;
 export const CLEANUP_MS = 30000;
 export const CHILD_MS = SUITE_MS + CLEANUP_MS + 10000;
-// Read the real production default, never a fixture-shortened HTTP timeout.
-export const options = readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease', STORAGE_DRIVER: 'mysql',
+const POOL_ENV: NodeJS.ProcessEnv = { ACCOUNT_ROUTING_MODE: 'caller-lease', STORAGE_DRIVER: 'mysql',
   POOL_ACCOUNT_EMAIL_DOMAIN: 'worker.synthetic.test', POOL_WARMUP_MODEL: 'worker-synthetic-model',
   READY_IDLE_TARGET: '2', POOL_MAX_ACCOUNTS: '2', PREWARM_CONCURRENCY: '1',
-  POOL_LOGIN_MAX_PENDING: '1', PREWARM_POLL_SECONDS: '1' });
+  POOL_LOGIN_MAX_PENDING: '1', PREWARM_POLL_SECONDS: '1' };
+// Read the real production default, never a fixture-shortened HTTP timeout.
+export const options = readPoolConfig(POOL_ENV);
 assert.equal(options.requestTimeoutMs, 120000, 'Review runtime budget if the production default changes');
+
+/** The parent and every worker child derive their `default` enterprise from the same pool environment. */
+export function enterpriseSeed(): Promise<EnterpriseSeed> {
+  return workerEnterpriseSeed(POOL_ENV);
+}
 
 export function gate(env: NodeJS.ProcessEnv): URL {
   assert.equal(env.MYSQL_POOL_LOGIN_NETWORK_TEST, '1', 'REFUSED: MYSQL_POOL_LOGIN_NETWORK_TEST=1 required');

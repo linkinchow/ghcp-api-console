@@ -12,9 +12,12 @@ import {
   type ProxyRequestStatDto,
   type ManagementQuery,
   type ManagementSummary,
+  type EnterpriseId,
   withSqliteReadSnapshot,
 } from '@ghcp/shared';
 import { runMigrations } from './migrations.js';
+import { listEnterpriseRecords } from './enterpriseRepo.js';
+import type { EnterpriseSeed } from './enterpriseSeed.js';
 import { UserPoolStore } from '../userPool/store.js';
 import type { PoolConfig } from '../userPool/config.js';
 import { managementSql } from './managementQueries.js';
@@ -24,12 +27,14 @@ import type {
   DeleteAccountsBySsoUserResult,
   ImportCopilotOauthTokenInput,
   ProxyAccountRecord,
+  ProxyEnterpriseRecord,
   ProxyStorage,
   RecordRequestStatInput,
 } from './storageTypes.js';
 
 interface AccountRow {
   identity: string;
+  enterprise_id: string;
   sso_user: string;
   gh_login: string | null;
   copilot_oauth_token: string | null;
@@ -76,6 +81,7 @@ export class SqliteStorage implements ProxyStorage {
   constructor(
     private readonly path: string,
     private readonly requestStatsPerAccountLimit: number,
+    private readonly enterpriseSeed: EnterpriseSeed,
   ) { }
 
   async initialize(): Promise<void> {
@@ -85,7 +91,12 @@ export class SqliteStorage implements ProxyStorage {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
     db.pragma('busy_timeout = 5000');
-    runMigrations(db);
+    try {
+      runMigrations(db, this.enterpriseSeed);
+    } catch (error) {
+      db.close();
+      throw error;
+    }
     this.db = db;
   }
 
@@ -175,15 +186,18 @@ export class SqliteStorage implements ProxyStorage {
     this.database()
       .prepare(`
         INSERT INTO proxy_accounts (
-          identity, sso_user, gh_login, copilot_oauth_status, copilot_oauth_attempt_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          identity, enterprise_id, sso_user, gh_login, copilot_oauth_status, copilot_oauth_attempt_id,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(identity) DO UPDATE SET
+          enterprise_id = excluded.enterprise_id,
           sso_user = excluded.sso_user,
           gh_login = COALESCE(excluded.gh_login, proxy_accounts.gh_login),
           updated_at = excluded.updated_at
       `)
       .run(
         input.identity,
+        input.enterpriseId,
         input.ssoUser,
         input.ghLogin,
         input.copilotOauthStatus ?? 'missing',
@@ -199,10 +213,11 @@ export class SqliteStorage implements ProxyStorage {
     this.database()
       .prepare(`
         INSERT INTO proxy_accounts (
-          identity, sso_user, gh_login, copilot_oauth_token, copilot_oauth_status,
+          identity, enterprise_id, sso_user, gh_login, copilot_oauth_token, copilot_oauth_status,
           copilot_oauth_updated_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 'valid', ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, 'valid', ?, ?, ?)
         ON CONFLICT(identity) DO UPDATE SET
+          enterprise_id = excluded.enterprise_id,
           sso_user = excluded.sso_user,
           gh_login = COALESCE(excluded.gh_login, proxy_accounts.gh_login),
           copilot_oauth_token = excluded.copilot_oauth_token,
@@ -211,7 +226,16 @@ export class SqliteStorage implements ProxyStorage {
           copilot_oauth_attempt_id = NULL,
           updated_at = excluded.updated_at
       `)
-      .run(input.identity, input.ssoUser, input.ghLogin, input.copilotOauthToken, now, now, now);
+      .run(
+        input.identity,
+        input.enterpriseId,
+        input.ssoUser,
+        input.ghLogin,
+        input.copilotOauthToken,
+        now,
+        now,
+        now,
+      );
     return (await this.getAccount(input.identity))!;
   }
 
@@ -280,21 +304,27 @@ export class SqliteStorage implements ProxyStorage {
       .run(status, now, now, identity, expectedToken).changes > 0;
   }
 
-  async claimIdentityInitialization(identity: string, claimId: string, leaseSeconds: number): Promise<boolean> {
+  async claimIdentityInitialization(
+    enterpriseId: EnterpriseId,
+    identity: string,
+    claimId: string,
+    leaseSeconds: number,
+  ): Promise<boolean> {
     const now = nowIso();
     const leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
     return this.database()
       .prepare(`
         INSERT INTO proxy_identity_initializations (
-          identity, claim_id, lease_expires_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?)
+          identity, enterprise_id, claim_id, lease_expires_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(identity) DO UPDATE SET
+          enterprise_id = excluded.enterprise_id,
           claim_id = excluded.claim_id,
           lease_expires_at = excluded.lease_expires_at,
           updated_at = excluded.updated_at
         WHERE proxy_identity_initializations.lease_expires_at <= excluded.updated_at
       `)
-      .run(identity, claimId, leaseExpiresAt, now, now).changes > 0;
+      .run(identity, enterpriseId, claimId, leaseExpiresAt, now, now).changes > 0;
   }
 
   async releaseIdentityInitialization(identity: string, claimId: string): Promise<boolean> {
@@ -307,12 +337,13 @@ export class SqliteStorage implements ProxyStorage {
     this.database()
       .prepare(`
         INSERT INTO proxy_request_stats (
-          id, identity, gh_login, requested_at, path, model, success, failure_reason,
+          id, enterprise_id, identity, gh_login, requested_at, path, model, success, failure_reason,
           input_tokens, output_tokens, cache_tokens, cache_input_tokens, cache_write_tokens, caller_id, lease_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         newRequestId(),
+        input.enterpriseId,
         input.identity,
         input.ghLogin,
         nowIso(),
@@ -374,6 +405,10 @@ export class SqliteStorage implements ProxyStorage {
       .run(this.requestStatsPerAccountLimit);
   }
 
+  async listEnterprises(): Promise<ProxyEnterpriseRecord[]> {
+    return listEnterpriseRecords(this.database());
+  }
+
   private pruneStats(identity: string): void {
     this.database()
       .prepare(`
@@ -398,6 +433,7 @@ export class SqliteStorage implements ProxyStorage {
 function mapAccountRow(row: AccountRow): ProxyAccountRecord {
   return {
     identity: row.identity,
+    enterpriseId: row.enterprise_id as EnterpriseId,
     ssoUser: row.sso_user,
     ghLogin: row.gh_login ?? undefined,
     copilotOauthToken: row.copilot_oauth_token ?? undefined,

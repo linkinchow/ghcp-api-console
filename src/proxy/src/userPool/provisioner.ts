@@ -5,6 +5,7 @@ import {
   type LoginTaskDto,
   type PageResponse,
   type SsoUserDto,
+  type EnterpriseId,
 } from '@ghcp/shared';
 import { config } from '../config.js';
 import type { getAccount, beginCopilotOauthAuthorization, invalidateCopilotOauthToken } from '../db/accountsRepo.js';
@@ -100,7 +101,12 @@ export function realProvisioner(
     // Only explicitly injected test dependencies may use the old non-atomic fixture API.
     // Missing mutation support must never silently fall through to a real repository write.
     if (mutation.type === 'link' && dependencies.createAccount) {
-      await dependencies.createAccount({ identity: row.identity, ssoUser: row.identity, ghLogin: mutation.ghLogin });
+      await dependencies.createAccount({
+        enterpriseId: row.enterprise_id as EnterpriseId,
+        identity: row.identity,
+        ssoUser: row.identity,
+        ghLogin: mutation.ghLogin,
+      });
       return true;
     }
     if (mutation.type === 'begin' && dependencies.beginAuthorization) {

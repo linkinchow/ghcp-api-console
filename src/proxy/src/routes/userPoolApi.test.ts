@@ -10,6 +10,7 @@ import { runMigrations } from '../db/migrations.js';
 import { UserPoolStore } from '../userPool/store.js';
 import { readPoolConfig, UserPoolError } from '../userPool/config.js';
 import { createUserPoolApiRouter } from './userPoolApi.js';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 
 const HASH = `sha256:${'a'.repeat(64)}`;
 const TOKEN = 'local-pool-admin-test';
@@ -17,7 +18,7 @@ const TOKEN = 'local-pool-admin-test';
 async function fixture() {
   const db = new BetterSqlite3(':memory:');
   db.pragma('foreign_keys = ON');
-  runMigrations(db);
+  runMigrations(db, defaultEnterpriseSeed({}));
   const store = new UserPoolStore(db, {
     ...readPoolConfig({}), enabled: true, accountDomain: 'example.test', idleTarget: 3, maxAccounts: 10,
   });

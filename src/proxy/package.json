@@ -10,6 +10,7 @@
     "test": "tsx --test src/*.test.ts src/accounts/*.test.ts src/clients/*.test.ts src/copilot/*.test.ts src/db/*.test.ts src/diagnostics/*.test.ts src/routes/*.test.ts src/userPool/*.test.ts",
     "test:mysql": "tsx --test src/db/mysqlStorage.integration.test.ts",
     "mysql:initial-sql": "tsx src/db/mysqlInitialSql.ts ../../scripts/proxy-mysql-initial.sql",
+    "mysql:enterprise-upgrade-sql": "tsx src/db/mysqlInitialSql.ts ../../scripts/proxy-mysql-enterprise-upgrade.sql enterprise-upgrade",
     "typecheck": "tsc --noEmit",
     "build": "tsc"
   },

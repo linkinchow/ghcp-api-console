@@ -6,6 +6,9 @@
 --   plus TRIGGER on proxy_accounts when the user pool is enabled (caller-lease mode):
 --   MySQL only shows trigger metadata to accounts holding TRIGGER, and Proxy verifies the
 --   credential fence trigger at startup.
+--
+-- The `default` row of proxy_enterprises is not created here: its identity fingerprint and cap
+-- come from the deployment configuration. Proxy inserts it at its first start (INSERT only).
 
 CREATE DATABASE IF NOT EXISTS ghcp_proxy
   CHARACTER SET utf8mb4
@@ -20,6 +23,21 @@ CREATE TABLE IF NOT EXISTS `schema_migrations` (
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB;
 
+CREATE TABLE IF NOT EXISTS `proxy_enterprises` (
+  `id` VARCHAR(32) COLLATE ascii_bin,
+  `state` VARCHAR(16) COLLATE ascii_bin NOT NULL,
+  `max_accounts` INT NOT NULL,
+  `inventory_count` INT NOT NULL DEFAULT 0,
+  `policy_version` INT NOT NULL DEFAULT 1,
+  `profile_fingerprint` CHAR(64) COLLATE ascii_bin NOT NULL,
+  `created_at` BIGINT NOT NULL,
+  `updated_at` BIGINT NOT NULL,
+  PRIMARY KEY (`id`),
+  CHECK (state IN ('draft', 'active', 'draining')),
+  CHECK (max_accounts BETWEEN 1 AND 10000),
+  CHECK (inventory_count >= 0)
+) ENGINE=InnoDB;
+
 CREATE TABLE IF NOT EXISTS `proxy_accounts` (
   `identity` VARCHAR(255) COLLATE utf8mb4_bin,
   `sso_user` VARCHAR(255) NOT NULL,
@@ -30,9 +48,13 @@ CREATE TABLE IF NOT EXISTS `proxy_accounts` (
   `copilot_oauth_attempt_id` CHAR(36) COLLATE ascii_bin,
   `created_at` DATETIME(3) NOT NULL,
   `updated_at` DATETIME(3) NOT NULL,
+  `enterprise_id` VARCHAR(32) COLLATE ascii_bin NOT NULL,
   PRIMARY KEY (`identity`),
+  UNIQUE uq_proxy_accounts_identity_enterprise (identity, enterprise_id),
+  CONSTRAINT fk_proxy_accounts_enterprise FOREIGN KEY (enterprise_id) REFERENCES proxy_enterprises(id) ON DELETE RESTRICT,
   INDEX idx_proxy_accounts_sso_user (sso_user),
-  INDEX idx_proxy_accounts_updated_at (updated_at)
+  INDEX idx_proxy_accounts_updated_at (updated_at),
+  INDEX idx_proxy_accounts_enterprise_updated (enterprise_id, updated_at)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS `proxy_request_stats` (
@@ -51,9 +73,11 @@ CREATE TABLE IF NOT EXISTS `proxy_request_stats` (
   `cache_write_tokens` BIGINT,
   `caller_id` VARCHAR(71) COLLATE ascii_bin,
   `lease_id` CHAR(36) COLLATE ascii_bin,
+  `enterprise_id` VARCHAR(32) COLLATE ascii_bin NOT NULL,
   PRIMARY KEY (`id`),
   INDEX idx_proxy_request_stats_identity_time (identity, requested_at DESC, id DESC),
-  INDEX idx_proxy_request_stats_time (requested_at DESC, id DESC)
+  INDEX idx_proxy_request_stats_time (requested_at DESC, id DESC),
+  INDEX idx_proxy_request_stats_enterprise_time (enterprise_id, requested_at DESC, id DESC)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS `proxy_identity_initializations` (
@@ -62,12 +86,18 @@ CREATE TABLE IF NOT EXISTS `proxy_identity_initializations` (
   `lease_expires_at` DATETIME(3) NOT NULL,
   `created_at` DATETIME(3) NOT NULL,
   `updated_at` DATETIME(3) NOT NULL,
+  `enterprise_id` VARCHAR(32) COLLATE ascii_bin NOT NULL,
   PRIMARY KEY (`identity`),
-  INDEX idx_proxy_identity_initializations_lease (lease_expires_at)
+  INDEX idx_proxy_identity_initializations_lease (lease_expires_at),
+  INDEX idx_proxy_identity_initializations_enterprise (enterprise_id)
 ) ENGINE=InnoDB;
 
 INSERT IGNORE INTO schema_migrations (id, applied_at) VALUES ('2026-08-27-proxy-mysql-initial', UTC_TIMESTAMP(3));
 INSERT IGNORE INTO schema_migrations (id, applied_at) VALUES ('2026-08-27-proxy-token-binary-collation', UTC_TIMESTAMP(3));
+INSERT IGNORE INTO schema_migrations (id, applied_at) VALUES ('enterprise-v1/01-create-proxy-enterprises', UTC_TIMESTAMP(3));
+INSERT IGNORE INTO schema_migrations (id, applied_at) VALUES ('enterprise-v1/03-accounts-enterprise', UTC_TIMESTAMP(3));
+INSERT IGNORE INTO schema_migrations (id, applied_at) VALUES ('enterprise-v1/04-accounts-guards', UTC_TIMESTAMP(3));
+INSERT IGNORE INTO schema_migrations (id, applied_at) VALUES ('enterprise-v1/05-initializations-and-stats', UTC_TIMESTAMP(3));
 
 -- User pool (caller-lease mode). Safe to apply even when the pool is disabled.
 CREATE TABLE IF NOT EXISTS `user_pool_settings` (
@@ -105,13 +135,17 @@ CREATE TABLE IF NOT EXISTS `user_pool_accounts` (
   `generation` BIGINT NOT NULL DEFAULT 0,
   `reauth_count` INT NOT NULL DEFAULT 0,
   `reauth_window_at` BIGINT NOT NULL DEFAULT 0,
+  `enterprise_id` VARCHAR(32) COLLATE ascii_bin NOT NULL,
   PRIMARY KEY (`identity`),
   UNIQUE (`ordinal`),
   CONSTRAINT fk_user_pool_account FOREIGN KEY (identity) REFERENCES proxy_accounts(identity) ON DELETE RESTRICT,
+  CONSTRAINT fk_user_pool_account_enterprise FOREIGN KEY (identity, enterprise_id) REFERENCES proxy_accounts(identity, enterprise_id) ON DELETE RESTRICT,
   INDEX idx_user_pool_pending (state, retry_at, ordinal),
   INDEX idx_user_pool_available (state, updated_at, ordinal),
   INDEX idx_user_pool_cooling (state, cooldown_until),
   INDEX idx_user_pool_verification (state, verified_at),
+  INDEX idx_user_pool_accounts_enterprise_state (enterprise_id, state),
+  INDEX idx_user_pool_accounts_member_enterprise (identity, enterprise_id),
   CHECK (state IN ('provisioning', 'ready', 'cooling', 'failed', 'disabled'))
 ) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
 
@@ -178,9 +212,11 @@ CREATE TABLE IF NOT EXISTS `user_pool_events` (
   `caller_id` VARCHAR(71) COLLATE ascii_bin,
   `lease_id` VARCHAR(36) COLLATE ascii_bin,
   `detail` TEXT,
+  `enterprise_id` VARCHAR(32) COLLATE ascii_bin,
   PRIMARY KEY (`id`),
   INDEX idx_user_pool_event_time (at),
-  INDEX idx_user_pool_event_member (identity, id)
+  INDEX idx_user_pool_event_member (identity, id),
+  INDEX idx_user_pool_events_enterprise (enterprise_id, at, id)
 ) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
 
 DELIMITER //
@@ -197,3 +233,5 @@ END//
 DELIMITER ;
 
 INSERT IGNORE INTO schema_migrations (id, applied_at) VALUES ('2026-09-12-user-pool-mysql-v1', UTC_TIMESTAMP(3));
+INSERT IGNORE INTO schema_migrations (id, applied_at) VALUES ('enterprise-v1/06-pool-accounts', UTC_TIMESTAMP(3));
+INSERT IGNORE INTO schema_migrations (id, applied_at) VALUES ('enterprise-v1/07-pool-events', UTC_TIMESTAMP(3));

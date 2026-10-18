@@ -9,6 +9,7 @@ import { UserPoolStore } from './store.js';
 import { MysqlPoolStore } from './mysqlStore.js';
 import { readPoolConfig } from './config.js';
 import type { PoolStore } from './storage.js';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 
 const options = readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease', STORAGE_DRIVER: 'mysql',
   POOL_ACCOUNT_EMAIL_DOMAIN: 'scheduler.test', POOL_WARMUP_MODEL: 'synthetic', READY_IDLE_TARGET: '0',
@@ -21,14 +22,22 @@ async function contract(store: PoolStore, query: Query) {
     const accounts: unknown[][] = [], members: unknown[][] = [];
     for (let i = start; i < Math.min(start + 100, 2011); i++) {
       const identity = `synthetic-scheduler-${String(i).padStart(4, '0')}`;
-      accounts.push([identity, identity, 'synthetic-token', 'valid', '2026-01-01 00:00:00', '2026-01-01 00:00:00']);
+      accounts.push([identity, 'default', identity, 'synthetic-token', 'valid', '2026-01-01 00:00:00',
+        '2026-01-01 00:00:00']);
       const stage = i < 2000 ? 'oauth-starting' : i < 2005 ? 'oauth-wait' : i < 2010 ? 'warmup' : 'new';
-      members.push([identity, i, 'provisioning', stage, randomUUID(), i === 2010 ? 0 : i < 2000 ? 1 : 2, now]);
+      const retryAt = i === 2010 ? 0 : i < 2000 ? 1 : 2;
+      members.push([identity, 'default', i, 'provisioning', stage, randomUUID(), retryAt, now]);
     }
-    await query(`INSERT INTO proxy_accounts(identity,sso_user,copilot_oauth_token,copilot_oauth_status,created_at,updated_at)
-      VALUES ${accounts.map(() => '(?,?,?,?,?,?)').join(',')}`, accounts.flat());
-    await query(`INSERT INTO user_pool_accounts(identity,ordinal,state,stage,attempt_id,retry_at,updated_at)
-      VALUES ${members.map(() => '(?,?,?,?,?,?,?)').join(',')}`, members.flat());
+    await query(`
+      INSERT INTO proxy_accounts(
+        identity, enterprise_id, sso_user, copilot_oauth_token, copilot_oauth_status, created_at, updated_at
+      )
+      VALUES ${accounts.map(() => '(?,?,?,?,?,?,?)').join(',')}
+    `, accounts.flat());
+    await query(`
+      INSERT INTO user_pool_accounts(identity, enterprise_id, ordinal, state, stage, attempt_id, retry_at, updated_at)
+      VALUES ${members.map(() => '(?,?,?,?,?,?,?,?)').join(',')}
+    `, members.flat());
   }
   const excluded: string[] = [], stages: string[] = [];
   for (let i = 0; i < 14; i++) {
@@ -69,7 +78,9 @@ async function contract(store: PoolStore, query: Query) {
 }
 
 test('SQLite capacity-aware fair scheduling advances downstream work past 2000 starters', async () => {
-  const db = new Database(':memory:'); db.pragma('foreign_keys=ON'); runMigrations(db);
+  const db = new Database(':memory:');
+  db.pragma('foreign_keys=ON');
+  runMigrations(db, defaultEnterpriseSeed({}));
   try {
     const store = new UserPoolStore(db, options);
     await contract(store, async (sql, values = []) => db.prepare(sql).run(...values));
@@ -88,7 +99,9 @@ test('MySQL capacity-aware fair scheduling preserves holds and final claim under
   url.pathname = '/' + name;
   const db = createPool({ uri: url.toString(), connectionLimit: 3, dateStrings: true, timezone: 'Z' });
   try {
-    await runMysqlMigrations(db); const store = new MysqlPoolStore(db, options); await store.initialize();
+    await runMysqlMigrations(db, defaultEnterpriseSeed({}));
+    const store = new MysqlPoolStore(db, options);
+    await store.initialize();
     await contract(store, async (sql, values = []) => db.query(sql, values));
   } finally { await db.end(); await admin.query(`DROP DATABASE \`${name}\``); await admin.end(); }
 });

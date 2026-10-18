@@ -4,11 +4,12 @@ import Database from 'better-sqlite3';
 import { runMigrations } from '../db/migrations.js';
 import { readPoolConfig } from './config.js';
 import { UserPoolStore } from './store.js';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 
 function fixture(t: TestContext) {
   const db = new Database(':memory:');
   db.pragma('foreign_keys=ON');
-  runMigrations(db);
+  runMigrations(db, defaultEnterpriseSeed({}));
   const store = new UserPoolStore(db, readPoolConfig({ ACCOUNT_ROUTING_MODE: 'caller-lease',
     POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.example.test', POOL_WARMUP_MODEL: 'test-model', READY_IDLE_TARGET: '1', POOL_MAX_ACCOUNTS: '1' }));
   let now = 1800000000000;

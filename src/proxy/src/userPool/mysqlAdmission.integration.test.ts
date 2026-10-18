@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import { runMysqlMigrations } from '../db/mysqlMigrations.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import { type PoolConfig, UserPoolError } from './config.js';
 import { MysqlPoolStore } from './mysqlStore.js';
 
@@ -11,6 +12,7 @@ const options: PoolConfig = {
   leaseSeconds: 172800, provisionalSeconds: 300, pollMs: 5000, prewarmConcurrency: 2,
   retryAfterSeconds: 30, warmupModel: 'synthetic-no-http', requestTimeoutMs: 120000,
 };
+const seed = { id: DEFAULT_ENTERPRISE_ID, fingerprint: 'f'.repeat(64), maxAccounts: options.maxAccounts };
 const caller = (n: number) => `sha256:${n.toString(16).padStart(64, '0')}`;
 const lockName = (database: string, id: string) => createHash('sha256').update(JSON.stringify([database, id])).digest('hex');
 const mysqlUrl = process.env.MYSQL_TEST_URL;
@@ -39,7 +41,7 @@ test('MySQL admission: caller locks and member-first allocation across replicas'
       timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true }));
     const [db, other] = pools;
     const first = new MysqlPoolStore(db, options), second = new MysqlPoolStore(other, options);
-    await runMysqlMigrations(db);
+    await runMysqlMigrations(db, seed);
     await Promise.all([first.initialize(), second.initialize()]);
     const reset = async (count = 2) => {
       for (const table of ['user_pool_holds', 'user_pool_catalog_holds', 'user_pool_catalog_cooldowns',

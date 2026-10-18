@@ -51,8 +51,9 @@ async function mysqlDriverCall<T>(start: () => Promise<T>, destroy: () => void =
 export class MysqlDeadline {
   private readonly expiresAt: number;
 
-  constructor(timeoutMs = MYSQL_POOL_DEADLINE_MS, maxMs = MYSQL_POOL_DEADLINE_MS) {
-    const cap = Number.isFinite(maxMs) ? Math.min(60000, Math.max(0, maxMs)) : MYSQL_POOL_DEADLINE_MS;
+  /** `capMs` lifts the 60 s ceiling only for schema migrations, whose lock wait is configurable. */
+  constructor(timeoutMs = MYSQL_POOL_DEADLINE_MS, maxMs = MYSQL_POOL_DEADLINE_MS, capMs = 60000) {
+    const cap = Number.isFinite(maxMs) ? Math.min(capMs, Math.max(0, maxMs)) : MYSQL_POOL_DEADLINE_MS;
     this.expiresAt = performance.now() + Math.max(0, Math.min(
       Number.isFinite(timeoutMs) ? timeoutMs : MYSQL_POOL_DEADLINE_MS, cap));
   }

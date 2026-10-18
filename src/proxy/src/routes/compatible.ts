@@ -1,8 +1,9 @@
 import { TextDecoder } from 'node:util';
 import { once } from 'node:events';
 import { Router, type NextFunction, type Request, type Response } from 'express';
-import { apiError } from '@ghcp/shared';
+import { apiError, DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import { recordRequestStat as persistRequestStat } from '../db/requestStatsRepo.js';
+import type { RecordRequestStatInput } from '../db/storageTypes.js';
 import { Logger } from '../logger.js';
 import {
   DiagnosticBodyCapture,
@@ -912,9 +913,10 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-async function recordRequestStat(input: Parameters<typeof persistRequestStat>[0]): Promise<void> {
+/** Request statistics stay with the `default` enterprise until routing becomes enterprise-aware (M5). */
+async function recordRequestStat(input: Omit<RecordRequestStatInput, 'enterpriseId'>): Promise<void> {
   try {
-    await persistRequestStat(input);
+    await persistRequestStat({ ...input, enterpriseId: DEFAULT_ENTERPRISE_ID });
   } catch (err) {
     requestStatsLogger.error('write-failed', 'Failed to persist Proxy request statistics', {
       identity: input.identity,

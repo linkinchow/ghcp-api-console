@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import type { EnterpriseSeed } from '../../src/proxy/src/db/enterpriseSeed.js';
 import type { PoolConfig } from '../../src/proxy/src/userPool/config.js';
 
 export const FROZEN_COMMIT = '2bc12b363e62923ca6c1db0185e42f9ed5c78bf9';
@@ -12,6 +13,20 @@ export const options: PoolConfig = {
   leaseSeconds: 600, provisionalSeconds: 30, pollMs: 250, prewarmConcurrency: 1,
   loginMaxPending: 1, retryAfterSeconds: 1, warmupModel: 'worker-synthetic-model', requestTimeoutMs: 15000,
 };
+/** The pool options as a caller-lease Proxy environment; it defines this suite's `default` enterprise. */
+export const ENTERPRISE_ENV: NodeJS.ProcessEnv = {
+  ACCOUNT_ROUTING_MODE: 'caller-lease', POOL_ACCOUNT_EMAIL_DOMAIN: options.accountDomain,
+  POOL_MAX_ACCOUNTS: String(options.maxAccounts),
+};
+
+/**
+ * Parent and children must migrate with one seed: a changed fingerprint fails once the pool has members.
+ * Imported lazily, because callers isolate their environment before any production import.
+ */
+export async function enterpriseSeed(env: NodeJS.ProcessEnv = ENTERPRISE_ENV): Promise<EnterpriseSeed> {
+  const { defaultEnterpriseSeed } = await import('../../src/proxy/src/db/enterpriseSeed.js');
+  return defaultEnterpriseSeed(env);
+}
 
 /** Only an explicit root/loopback disposable marker is accepted. Never print the URL. */
 export function validateMysqlUrl(raw: string): URL {

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import { runMysqlMigrations } from '../db/mysqlMigrations.js';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
 import { UserPoolError, type PoolConfig } from './config.js';
 import { MysqlPoolStore } from './mysqlStore.js';
 import type { Inventory } from './store.js';
@@ -49,7 +50,8 @@ async function withDatabase(config: PoolConfig, run: (fixture: Fixture) => Promi
     for (let i = 0; i < 2; i++) pools.push(createPool({ uri: url.toString(), connectionLimit: 4,
       connectTimeout: 5000, timezone: 'Z', dateStrings: true, supportBigNumbers: true, bigNumberStrings: true }));
     const [db, otherDb] = pools;
-    await runMysqlMigrations(db);
+    const seed = { id: DEFAULT_ENTERPRISE_ID, fingerprint: 'f'.repeat(64), maxAccounts: config.maxAccounts };
+    await runMysqlMigrations(db, seed);
     const first = new MysqlPoolStore(db, config), second = new MysqlPoolStore(otherDb, config);
     await Promise.all([first.initialize(), second.initialize()]);
     await run({ database, db, otherDb, first, second });

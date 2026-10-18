@@ -8,6 +8,7 @@ import { runMigrations } from '../db/migrations.js';
 import { readPoolConfig, UserPoolError } from './config.js';
 import { inferenceHoldTimeoutMs, readInferenceTimeoutMs } from './inferenceTimeout.js';
 import { UserPoolStore } from './store.js';
+import { defaultEnterpriseSeed } from '../db/enterpriseSeed.js';
 
 const env = {
   ACCOUNT_ROUTING_MODE: 'caller-lease', POOL_ACCOUNT_EMAIL_DOMAIN: 'accounts.example.test',
@@ -29,7 +30,7 @@ function fixture(t: TestContext) {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
     db.pragma('busy_timeout = 5000');
-    runMigrations(db);
+    runMigrations(db, defaultEnterpriseSeed({}));
     const store = new UserPoolStore(db, { ...options });
     store.now = () => clock.now;
     return { db, store };

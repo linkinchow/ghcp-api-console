@@ -1,11 +1,15 @@
 import Database from 'better-sqlite3';
 import { closeSync, existsSync, openSync, readFileSync, readSync } from 'node:fs';
 import { createPool, type Pool, type PoolConnection, type RowDataPacket } from 'mysql2/promise';
+import { DEFAULT_ENTERPRISE_ID } from '@ghcp/shared';
+import { ENTERPRISE_MIGRATION_IDS } from '../../src/proxy/src/db/enterpriseMigrationIds.js';
+import { defaultEnterpriseSeed, type EnterpriseSeed } from '../../src/proxy/src/db/enterpriseSeed.js';
 import { runMysqlMigrations, TOKEN_COLLATION_MIGRATION } from '../../src/proxy/src/db/mysqlMigrations.js';
 import { canonicalSql, SQLITE_CREDENTIAL_FENCE_DDL, MysqlSchemaError,
   MYSQL_SCHEMA, validateMysqlSchema, validateMysqlCredentialFence } from '../../src/proxy/src/db/mysqlSchema.js';
 import { normalizePoolConfig, readPoolConfig, type PoolConfig } from '../../src/proxy/src/userPool/config.js';
 import { accountName, NAME_CAPACITY } from '../../src/proxy/src/userPool/names.js';
+import { referenceTriggers, type SourceShape } from './sqlite-schema.js';
 
 type Value = string | number | null;
 type Row = Record<string, Value>;
@@ -21,11 +25,31 @@ const SCHEMA = {
   user_pool_holds: { request_id: 't36', lease_id: 't36', expires_at: 'i', deadline_at: 'i', generation: 'i' },
   user_pool_catalog_holds: { request_id: 't36', lease_id: 't36', caller_id: 't71', member_identity: 't255', assigned_at: 'i', expires_at: 'i', deadline_at: 'i', generation: 'i' },
   proxy_identity_initializations: { identity: 't255', claim_id: 't36', lease_expires_at: 'iso', created_at: 'iso', updated_at: 'iso' },
+  // Multi-enterprise sources only; the target row always exists (schema creation seeds `default`).
+  proxy_enterprises: { id: 't32', state: 't16', max_accounts: 'i32', inventory_count: 'i32', policy_version: 'i32',
+    profile_fingerprint: 't64', created_at: 'i', updated_at: 'i' },
 } satisfies Record<string, Record<string, string>>;
 type Table = keyof typeof SCHEMA;
 type Snapshot = Record<Table, Row[]>;
+interface Source { shape: SourceShape; snapshot: Snapshot }
 const TABLES = Object.keys(SCHEMA) as Table[];
 const TRANSIENT: Table[] = ['user_pool_holds', 'user_pool_catalog_holds', 'proxy_identity_initializations'];
+/** Multi-enterprise columns (design §4.2); a single-enterprise source has none and maps every row to `default`. */
+const ENTERPRISE_FIELDS: Partial<Record<Table, Record<string, string>>> = {
+  proxy_accounts: { enterprise_id: 't32' },
+  proxy_request_stats: { enterprise_id: 't32' },
+  proxy_identity_initializations: { enterprise_id: 't32' },
+  user_pool_accounts: { enterprise_id: 't32' },
+  // Global events (settings, owner) have none; every single-enterprise event belongs to `default`.
+  user_pool_events: { enterprise_id: 't32?' },
+};
+const ENTERPRISE_TABLES = Object.keys(ENTERPRISE_FIELDS) as Table[];
+/** One row each; the import updates the target's initialization row instead of inserting. */
+const SINGLETON_TABLES: Table[] = ['user_pool_settings', 'proxy_enterprises'];
+const ENTERPRISE_STATES = ['draft', 'active', 'draining'];
+const POOL_MIGRATION = '2026-09-12-user-pool-mysql-v1';
+const KNOWN_MIGRATIONS: string[] = ['2026-08-27-proxy-mysql-initial', TOKEN_COLLATION_MIGRATION, POOL_MIGRATION,
+  ...Object.values(ENTERPRISE_MIGRATION_IDS)];
 export const MIGRATION_LOCK = 'ghcp_user_pool_offline_import';
 export class MigrationError extends Error {}
 function requireSafe(condition: unknown, message: string): asserts condition {
@@ -36,7 +60,11 @@ export function safeError(error: unknown): string {
 }
 function integerSpec(spec: string): boolean { return /^i(?:32)?\??$/.test(spec); }
 function fields(table: Table, mysql = false): Record<string, string> {
-  return mysql && table === 'user_pool_settings' ? { ...SCHEMA[table], config_fingerprint: 't64' } : SCHEMA[table];
+  const columns = { ...SCHEMA[table], ...ENTERPRISE_FIELDS[table] };
+  return mysql && table === 'user_pool_settings' ? { ...columns, config_fingerprint: 't64' } : columns;
+}
+function sourceFields(table: Table, shape: SourceShape): Record<string, string> {
+  return shape === 'multi-enterprise' ? fields(table) : SCHEMA[table];
 }
 function exactColumns(actual: string[], expected: string[]): boolean {
   return actual.length === expected.length && expected.every((name) => actual.includes(name));
@@ -48,8 +76,8 @@ function iso(value: string): string {
   'Source contains an unsupported ISO timestamp.');
   return value.slice(0, 23).replace('T', ' ');
 }
-function validateRow(table: Table, row: Row): void {
-  for (const [key, spec] of Object.entries(fields(table))) {
+function validateRow(table: Table, row: Row, columns: Record<string, string>): void {
+  for (const [key, spec] of Object.entries(columns)) {
     const value = row[key];
     if (value === null && spec.endsWith('?')) continue;
     const valid = integerSpec(spec)
@@ -70,7 +98,7 @@ function unique(rows: Row[], key: string): void {
   requireSafe(new Set(rows.map((row) => row[key])).size === rows.length, 'Source uniqueness validation failed.');
 }
 
-function readSnapshot(path: string, now: number): Snapshot {
+function readSnapshot(path: string, now: number): Source {
   // A standalone rollback-journal backup avoids SQLite creating/updating WAL shared-memory sidecars even on a readonly connection.
   requireSafe(!['-wal', '-shm', '-journal'].some((suffix) => existsSync(path + suffix)), 'Source must be a standalone backup without SQLite sidecars.');
   const fd = openSync(path, 'r');
@@ -83,31 +111,84 @@ function readSnapshot(path: string, now: number): Snapshot {
     db.pragma('query_only = ON');
     db.pragma('foreign_keys = ON');
     db.exec('BEGIN'); // One read transaction pins schema, integrity checks and every table to one snapshot.
-    const objects = db.prepare("SELECT name, type FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'").all() as { name: string; type: string }[];
+    const objects = db.prepare(`
+      SELECT name, type, sql
+      FROM sqlite_schema
+      WHERE name NOT LIKE 'sqlite_%'
+    `).all() as SourceObject[];
+    const shape = sourceShape(objects);
+    const triggers = referenceTriggers(shape);
     requireSafe(objects.every(({ name, type }) => type === 'index'
-      || (type === 'trigger' && name === 'user_pool_credential_fence')
+      || (type === 'trigger' && triggers.has(name))
       || (type === 'table' && (TABLES.includes(name as Table) || name === 'schema_migrations'))), 'Unsupported source schema objects.');
     const fence = db.prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='user_pool_credential_fence'").get() as { sql: string } | undefined;
     requireSafe(fence && canonicalSql(fence.sql) === canonicalSql(SQLITE_CREDENTIAL_FENCE_DDL),
       'Source credential fence definition is unsupported; credentials require separate reconciliation.');
+    requireSafe(guardsMatch(objects, triggers),
+      'Source enterprise guard triggers are unsupported; use a separately reviewed schema upgrade.');
     requireSafe((db.pragma('integrity_check') as { integrity_check: string }[]).every((row) => row.integrity_check === 'ok'), 'Source integrity check failed.');
     requireSafe((db.pragma('foreign_key_check') as unknown[]).length === 0, 'Source foreign key check failed.');
     const snapshot = {} as Snapshot;
-    for (const table of TABLES) {
-      const columns = db.pragma(`table_xinfo(${table})`) as { name: string; type: string; hidden: number }[];
-      requireSafe(exactColumns(columns.map((column) => column.name), Object.keys(fields(table)))
-        && columns.every((column) => column.hidden === 0 && column.type.toUpperCase() === (integerSpec(fields(table)[column.name]) ? 'INTEGER' : 'TEXT')),
-      `Unsupported source schema in ${table}; use a separately reviewed schema upgrade, never modify the backup with this tool.`);
-      snapshot[table] = db.prepare(`SELECT * FROM ${table}`).all() as Row[];
-      for (const row of snapshot[table]) validateRow(table, row);
-      unique(snapshot[table], Object.keys(fields(table))[0]);
-    }
+    for (const table of TABLES) snapshot[table] = readTable(db, table, shape);
+    validateEnterprises(snapshot, shape);
     validateSnapshot(snapshot, now);
-    return snapshot;
+    return { shape, snapshot: withEnterprises(snapshot, shape) };
   } finally {
     if (db.inTransaction) db.exec('ROLLBACK');
     db.close();
   }
+}
+interface SourceObject { name: string; type: string; sql: string | null }
+/** A completed multi-enterprise migration created `proxy_enterprises`; r4 never had it. */
+function sourceShape(objects: SourceObject[]): SourceShape {
+  const migrated = objects.some(({ name, type }) => type === 'table' && name === 'proxy_enterprises');
+  return migrated ? 'multi-enterprise' : 'single-enterprise';
+}
+/** Every guard trigger of the shape, with the exact (canonical) definition the Proxy migrations create. */
+function guardsMatch(objects: SourceObject[], triggers: Map<string, string>): boolean {
+  return [...triggers].every(([name, sql]) => objects.some((object) => object.type === 'trigger'
+    && object.name === name && object.sql !== null && canonicalSql(object.sql) === sql));
+}
+function readTable(db: Database.Database, table: Table, shape: SourceShape): Row[] {
+  if (table === 'proxy_enterprises' && shape === 'single-enterprise') return [];
+  const spec = sourceFields(table, shape);
+  const columns = db.pragma(`table_xinfo(${table})`) as { name: string; type: string; hidden: number }[];
+  requireSafe(exactColumns(columns.map((column) => column.name), Object.keys(spec))
+    && columns.every((column) => column.hidden === 0
+      && column.type.toUpperCase() === (integerSpec(spec[column.name]) ? 'INTEGER' : 'TEXT')),
+  `Unsupported source schema in ${table}; use a separately reviewed schema upgrade, `
+    + 'never modify the backup with this tool.');
+  const rows = db.prepare(`SELECT * FROM ${table}`).all() as Row[];
+  for (const row of rows) validateRow(table, row, spec);
+  unique(rows, Object.keys(spec)[0]);
+  return rows;
+}
+/** Only the single `default` enterprise can be copied faithfully; its counter must match its members. */
+function validateEnterprises(s: Snapshot, shape: SourceShape): void {
+  if (shape === 'single-enterprise') return;
+  const [enterprise] = s.proxy_enterprises;
+  requireSafe(s.proxy_enterprises.length === 1 && enterprise.id === DEFAULT_ENTERPRISE_ID,
+    'Source contains enterprises other than default; only a single-enterprise pool can be imported.');
+  requireSafe(ENTERPRISE_STATES.includes(String(enterprise.state)) && Number(enterprise.max_accounts) >= 1
+    && Number(enterprise.max_accounts) <= NAME_CAPACITY && Number(enterprise.policy_version) >= 1
+    && /^[0-9a-f]{64}$/.test(String(enterprise.profile_fingerprint)), 'Source default enterprise is invalid.');
+  requireSafe(Number(enterprise.inventory_count) === s.user_pool_accounts.length,
+    'Source enterprise inventory counter does not match its pool members.');
+  requireSafe(ENTERPRISE_TABLES.every((table) => s[table].every((row) => row.enterprise_id === DEFAULT_ENTERPRISE_ID
+    || (table === 'user_pool_events' && row.enterprise_id === null))),
+  'Source rows outside the default enterprise are not supported.');
+}
+/** Single-enterprise data belongs to `default` (design §4.1 rule 5), as the in-place upgrade backfills it. */
+function withEnterprises(s: Snapshot, shape: SourceShape): Snapshot {
+  if (shape === 'multi-enterprise') return s;
+  for (const table of ENTERPRISE_TABLES) {
+    s[table] = s[table].map((row) => ({ ...row, enterprise_id: DEFAULT_ENTERPRISE_ID }));
+  }
+  return s;
+}
+/** The pool cap: `proxy_enterprises` owns it after the upgrade; before, `user_pool_settings` did. */
+function sourceCap(s: Snapshot): number {
+  return Number(s.proxy_enterprises[0]?.max_accounts ?? s.user_pool_settings[0].max_accounts);
 }
 function validateSnapshot(s: Snapshot, now: number): void {
   requireSafe(s.user_pool_settings.length === 1, 'Source must have exactly one pool settings row.');
@@ -116,7 +197,7 @@ function validateSnapshot(s: Snapshot, now: number): void {
   requireSafe(Number(settings.owner_until) <= now, 'Source has a live scheduler owner.');
   requireSafe(TRANSIENT.every((table) => s[table].length === 0), 'Source has undrained holds or initialization claims, including expired rows.');
   requireSafe(Number(settings.version) >= 1 && Number(settings.max_accounts) >= 1 && Number(settings.max_accounts) <= NAME_CAPACITY
-    && Number(settings.idle_target) <= Number(settings.max_accounts) && Number(settings.next_ordinal) <= NAME_CAPACITY
+    && Number(settings.idle_target) <= sourceCap(s) && Number(settings.next_ordinal) <= NAME_CAPACITY
     && Number(settings.lease_seconds) >= 60 && Number(settings.lease_seconds) <= 2592000, 'Source pool settings are invalid.');
   const domain = settings.account_domain as string;
   requireSafe(domain === domain.toLowerCase() && domain.split('.').length >= 2
@@ -169,12 +250,13 @@ export interface MigrationOptions {
   poolConfig?: PoolConfig;
   /** Owned by the caller, never closed here. Use verified TLS for nonlocal injected pools. */
   pool?: Pool;
+  /** The Proxy environment; also the source of the `default` enterprise identity (registry or GitHub variables). */
   env?: NodeJS.ProcessEnv;
 }
 export interface MigrationResult { dryRun: boolean; counts: Record<Table, number> }
 /** Source-only validation; does not connect to MySQL or initialize either provider. */
 export function preflightSqlite(sqlitePath: string): MigrationResult {
-  try { return summarize(readSnapshot(sqlitePath, Date.now()), true); }
+  try { return summarize(readSnapshot(sqlitePath, Date.now()).snapshot, true); }
   catch (error) { throw new MigrationError(safeError(error)); }
 }
 function summarize(snapshot: Snapshot, dryRun: boolean): MigrationResult {
@@ -203,7 +285,8 @@ async function rows(c: PoolConnection, sql: string, values: Value[] = []): Promi
   const [result] = await c.query<RowDataPacket[]>(sql, values);
   return result as Row[];
 }
-async function inspectTarget(c: PoolConnection, locking: boolean, config: PoolConfig): Promise<void> {
+async function inspectTarget(c: PoolConnection, locking: boolean, config: PoolConfig,
+  enterprise: EnterpriseSeed): Promise<void> {
   const tables = await rows(c, 'SELECT TABLE_NAME AS name, ENGINE AS engine FROM information_schema.tables WHERE table_schema = DATABASE()');
   let history: Row[] = [];
   for (const { name, engine } of tables) {
@@ -211,8 +294,8 @@ async function inspectTarget(c: PoolConnection, locking: boolean, config: PoolCo
     requireSafe(engine === 'InnoDB', 'Target tables must use InnoDB.');
     if (name === 'schema_migrations') {
       history = await rows(c, 'SELECT id FROM schema_migrations');
-      requireSafe(history.every((row) => ['2026-08-27-proxy-mysql-initial', '2026-08-27-proxy-token-binary-collation',
-        '2026-09-12-user-pool-mysql-v1'].includes(String(row.id))), 'Target has unsupported migration history.');
+      requireSafe(history.every((row) => KNOWN_MIGRATIONS.includes(String(row.id))),
+        'Target has unsupported migration history.');
       continue;
     }
     const table = name as Table;
@@ -226,21 +309,34 @@ async function inspectTarget(c: PoolConnection, locking: boolean, config: PoolCo
         && Number(seed.lease_seconds) === config.leaseSeconds && seed.account_domain === config.accountDomain
         && typeof seed.config_fingerprint === 'string' && /^[0-9a-f]{64}$/.test(seed.config_fingerprint),
       'Target settings are not an unused matching initialization seed.');
+    } else if (table === 'proxy_enterprises') {
+      requireSafe(unusedDefault(existing, locking, enterprise), 'Target enterprises are not an unused default seed.');
     } else requireSafe(existing.length === 0, 'Target is not empty; migration will not merge or overwrite data.');
   }
   try {
     await validateMysqlSchema(c, Object.keys(MYSQL_SCHEMA), { allowMissingTables: !locking, allowLegacyStats: !locking,
-      allowLegacyTokenCollation: !locking && !history.some(row => row.id === TOKEN_COLLATION_MIGRATION) });
-    await validateMysqlCredentialFence(c, !locking && !history.some(row => row.id === '2026-09-12-user-pool-mysql-v1'));
+      allowLegacyTokenCollation: !locking && !history.some(row => row.id === TOKEN_COLLATION_MIGRATION),
+      allowPendingEnterprise: !locking && !enterpriseMigrated(history) });
+    await validateMysqlCredentialFence(c, !locking && !history.some(row => row.id === POOL_MIGRATION));
   } catch (error) {
     // Never print attacker-controlled schema/SQL or driver details from the dedicated target.
     if (error instanceof MysqlSchemaError) throw new MigrationError('Target schema or credential fence does not match the supported pool schema.');
     throw error;
   }
 }
-function deploymentConfig(settings: Row, options: MigrationOptions): PoolConfig {
+/** Schema creation seeds `default` without members; afterwards the row carries the deployment identity. */
+function unusedDefault(existing: Row[], locking: boolean, enterprise: EnterpriseSeed): boolean {
+  const [row] = existing;
+  if (!row) return !locking;
+  return existing.length === 1 && row.id === DEFAULT_ENTERPRISE_ID && Number(row.inventory_count) === 0
+    && (!locking || row.profile_fingerprint === enterprise.fingerprint);
+}
+function enterpriseMigrated(history: Row[]): boolean {
+  return Object.values(ENTERPRISE_MIGRATION_IDS).every((id) => history.some((row) => row.id === id));
+}
+function deploymentConfig(settings: Row, cap: number, options: MigrationOptions): PoolConfig {
   const seed = { enabled: true, accountDomain: settings.account_domain as string, idleTarget: Number(settings.idle_target),
-    maxAccounts: Number(settings.max_accounts), leaseSeconds: Number(settings.lease_seconds) };
+    maxAccounts: cap, leaseSeconds: Number(settings.lease_seconds) };
   try {
     if (options.poolConfig) {
       requireSafe(options.poolConfig.enabled === true && options.poolConfig.accountDomain === seed.accountDomain
@@ -260,6 +356,48 @@ function deploymentConfig(settings: Row, options: MigrationOptions): PoolConfig 
       POOL_ACCOUNT_EMAIL_DOMAIN: seed.accountDomain, READY_IDLE_TARGET: String(seed.idleTarget),
       POOL_MAX_ACCOUNTS: String(seed.maxAccounts), CALLER_LEASE_TTL_SECONDS: String(seed.leaseSeconds) });
   } catch { throw new MigrationError('Deployment pool configuration is missing or invalid; provide the intended runtime PoolConfig or environment.'); }
+}
+/** The `default` enterprise exactly as the Proxy computes it at startup, for the source's pool account domain. */
+function deploymentEnterprise(settings: Row, options: MigrationOptions): EnterpriseSeed {
+  const env = { ...(options.env ?? process.env), ACCOUNT_ROUTING_MODE: 'caller-lease',
+    POOL_ACCOUNT_EMAIL_DOMAIN: settings.account_domain as string };
+  try {
+    return defaultEnterpriseSeed(env);
+  } catch {
+    throw new MigrationError('Deployment enterprise configuration is invalid; provide the intended Proxy environment.');
+  }
+}
+/** The Proxy refuses to start when a pool's enterprise identity changed, so the import refuses it first. */
+function requireSourceIdentity(s: Snapshot, enterprise: EnterpriseSeed): void {
+  const source = s.proxy_enterprises[0];
+  requireSafe(!source || source.profile_fingerprint === enterprise.fingerprint,
+    'Source default enterprise identity (GitHub base URL, shortcode or pool account domain) differs from the '
+    + 'deployment configuration.');
+}
+/** The `default` row the import leaves: the deployment identity, the source cap and the copied member count. */
+async function importedEnterprise(c: PoolConnection, s: Snapshot, enterprise: EnterpriseSeed): Promise<Row> {
+  const [target] = await rows(c, `
+    SELECT *
+    FROM proxy_enterprises
+    WHERE id = ?
+    FOR UPDATE
+  `, [DEFAULT_ENTERPRISE_ID]);
+  requireSafe(target, 'Target initialization is incomplete.');
+  const base = s.proxy_enterprises[0] ?? numericRow('proxy_enterprises', target);
+  return { ...base, profile_fingerprint: enterprise.fingerprint, max_accounts: sourceCap(s),
+    inventory_count: s.user_pool_accounts.length };
+}
+function numericRow(table: Table, row: Row): Row {
+  return Object.fromEntries(Object.entries(fields(table)).map(([key, spec]) => [key,
+    integerSpec(spec) && row[key] !== null ? Number(row[key]) : row[key]]));
+}
+async function updateSingleton(c: PoolConnection, table: Table, row: Row): Promise<void> {
+  const [primary, ...keys] = Object.keys(fields(table, true));
+  await c.query(`
+    UPDATE ${table}
+    SET ${keys.map((key) => `\`${key}\` = ?`).join(', ')}
+    WHERE \`${primary}\` = ?
+  `, [...keys.map((key) => row[key]), row[primary]]);
 }
 function converted(table: Table, row: Row): Row {
   return Object.fromEntries(Object.entries(row).map(([key, value]) => [key,
@@ -293,9 +431,11 @@ export async function migrateSqlitePoolToMysql(options: MigrationOptions): Promi
   try {
     requireSafe(options.dryRun || (options.confirmOfflineSource === true && options.confirmEmptyTarget === true),
       'Import requires explicit offline-source and empty-target confirmations.');
-    const snapshot = readSnapshot(options.sqlitePath, Date.now());
+    const { snapshot } = readSnapshot(options.sqlitePath, Date.now());
     if (options.dryRun) return summarize(snapshot, true);
-    const config = deploymentConfig(snapshot.user_pool_settings[0], options);
+    const config = deploymentConfig(snapshot.user_pool_settings[0], sourceCap(snapshot), options);
+    const enterprise = deploymentEnterprise(snapshot.user_pool_settings[0], options);
+    requireSourceIdentity(snapshot, enterprise);
     pool = options.pool ?? mysqlPoolFromEnv(options.env ?? process.env);
     connection = await pool.getConnection();
     try {
@@ -307,8 +447,8 @@ export async function migrateSqlitePoolToMysql(options: MigrationOptions): Promi
     requireSafe(locked, 'Could not acquire the target migration lock.');
     const version = (await rows(connection, 'SELECT VERSION() AS version'))[0]?.version;
     requireSafe(typeof version === 'string' && /^8\./.test(version) && !/mariadb/i.test(version), 'Target must be MySQL 8.');
-    await inspectTarget(connection, false, config);
-    await runMysqlMigrations(pool);
+    await inspectTarget(connection, false, config, enterprise);
+    await runMysqlMigrations(pool, enterprise);
     // Lazy load: source-only preflight stays independent of MySQL schema/provider initialization.
     const { MysqlPoolStore } = await import('../../src/proxy/src/userPool/mysqlStore.js');
     await new MysqlPoolStore(pool, config).initialize();
@@ -320,15 +460,15 @@ export async function migrateSqlitePoolToMysql(options: MigrationOptions): Promi
     await connection.beginTransaction();
     transaction = true;
     const [seed] = await rows(connection, 'SELECT * FROM user_pool_settings WHERE id = 1 FOR UPDATE');
-    await inspectTarget(connection, true, config); // Range locks plus the pool mutex protect the copy.
+    await inspectTarget(connection, true, config, enterprise); // Range locks plus the pool mutex protect the copy.
     requireSafe(seed && typeof seed.config_fingerprint === 'string', 'Target initialization is incomplete.');
     snapshot.user_pool_settings[0] = { ...snapshot.user_pool_settings[0], paused: 1, owner: null, owner_until: 0,
       config_fingerprint: seed.config_fingerprint }; // Preserve initialize()'s fingerprint of deployment options.
+    snapshot.proxy_enterprises = [await importedEnterprise(connection, snapshot, enterprise)];
     for (const table of TABLES) {
       const keys = Object.keys(fields(table, true));
-      if (table === 'user_pool_settings') {
-        const settings = snapshot[table][0];
-        await connection.query(`UPDATE ${table} SET ${keys.map((key) => `\`${key}\` = ?`).join(',')} WHERE id = 1`, keys.map((key) => settings[key]));
+      if (SINGLETON_TABLES.includes(table)) {
+        await updateSingleton(connection, table, snapshot[table][0]);
         continue;
       }
       for (let offset = 0; offset < snapshot[table].length; offset += 100) {
