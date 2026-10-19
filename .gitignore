@@ -40,6 +40,7 @@ curl.http
 !docs/multi-enterprise-upgrade-guide.md
 !docs/repo-map.md
 !docs/user-pool-*.md
+!docs/admin-manual/
 **/__pycache__/
 **/*.pyc
 .local-sso/

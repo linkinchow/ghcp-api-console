@@ -7,6 +7,8 @@
 
 本文使用“4个账号、2个已租出、2个idle、cap5、target2”的通用示例，企业名使用 `default`、`contoso-ghe` 等占位值，不包含实际客户账号或key hash。只有一个企业（`default`）时，所有说明同样适用，只是企业表只有一行。
 
+按管理任务组织、带截图的操作手册见 [多企业版管理员手册](admin-manual/README.md)；本文是它的逐项参考附录。
+
 配套：[设计原理](user-pool-design.md) · [配置与API](user-pool-implementation.md) · [存量Docker升级](user-pool-upgrade-guide.md) · [真实测试过程](user-pool-real-e2e-validation.md) · [仅升级Console：完整hash复制](user-pool-console-upgrade-guide.md) · [HTTP错误详情与定位](user-pool-http-error-details.md) · [多企业registry配置](multi-enterprise-registry.md) · [多企业版升级](multi-enterprise-upgrade-guide.md)
 
 ## 1. 先看懂三个对象

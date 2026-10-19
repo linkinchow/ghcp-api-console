@@ -8,6 +8,8 @@
 > 获得 GitHub Copilot Token的部分参考了 OpenCode 项目
 
 > 管理员的通用配置手册：[guidance/guidance.md](./guidance/guidance.md) · 网络配置：[guidance/network-deployment.md](./guidance/network-deployment.md)
+>
+> 多企业版 Console 的任务式操作手册（带截图）：[docs/admin-manual](./docs/admin-manual/README.md)
 
 ## 多企业版：一套部署服务多个 GitHub 企业
 
@@ -24,7 +26,7 @@
 | 镜像 | Docker Hub 公开仓库 `linkinchow/ghcp-{proxy,sso,login,console}:multi-41ecffc-amd64-r1`（linux/amd64）。四个组件必须同一版本，部署时按[升级指南](./docs/multi-enterprise-upgrade-guide.md)中的 digest 引用。 |
 | 验证范围 | GHE.com 企业**只用 mock 验证**（网页、设备授权、SCIM、席位、Copilot 均为 mock），尚未在真实 GHE.com 环境验收；首次接入真实 GHE.com 企业前请先在预发布环境验证。 |
 
-多企业版是独立的发布线；不需要多个企业的客户可以继续使用单企业版（`single-slug-*`）。文档：[升级指南（r4 → 多企业版）](./docs/multi-enterprise-upgrade-guide.md) · [registry 配置参考](./docs/multi-enterprise-registry.md) · [设计文档](./docs/multi-enterprise-design.md) · [发布验证记录](./docs/multi-enterprise-release-validation.md)。
+多企业版是独立的发布线；不需要多个企业的客户可以继续使用单企业版（`single-slug-*`）。文档：[管理员手册（任务式，带截图）](./docs/admin-manual/README.md) · [升级指南（r4 → 多企业版）](./docs/multi-enterprise-upgrade-guide.md) · [registry 配置参考](./docs/multi-enterprise-registry.md) · [设计文档](./docs/multi-enterprise-design.md) · [发布验证记录](./docs/multi-enterprise-release-validation.md)。
 
 ## User Pool：多 Proxy＋MySQL
 
