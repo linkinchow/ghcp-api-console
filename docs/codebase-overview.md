@@ -2,6 +2,8 @@
 
 > 面向新加入项目的高级开发人员。本文所有结论均来自对实际源码与配置文件的阅读，并在每条结论后标注了 `文件路径:行号` 或关键符号。
 > 无法从代码中确证的内容统一标记为 **待确认**。
+>
+> **多企业版本线（`multi-*`，2026-10-19 补充）**：一套部署可同时服务多个 github.com / GHE.com 企业。第 1–8 节以单企业基线写成，主体结构仍然成立，但部分行号、路由路径和表结构已变化；多企业相关的架构、数据模型、路由和新文件集中在 [第 9 节](#9-多企业架构multi-版本线)。以代码为准。
 
 ---
 
@@ -124,11 +126,12 @@ graph TB
 app.use(logRequestHeaders);          // 脱敏后打印原始请求头
 app.use(captureRawRequestBody);      // 旁路收集 req.rawBody（转发时原样透传）
 app.use(express.json({ limit: '20mb' }));
-app.get('/healthz', ...);            // 存活
+app.get('/healthz', ...);            // 存活，返回 releaseLine
 app.get('/readyz', ...);             // 就绪：pingStorage() + 回显 storage 驱动名
-app.use('/api',      requireInternalToken, adminApiRouter);     // 给 Console 用
-app.use('/internal', requireInternalToken, internalApiRouter);  // 给 Login/SSO 用
-app.use(requireApiKey, requireIdentityHeader, compatibleRouter); // 对外公开 API
+mountManagementRouters(app);         // 多企业版：/api/enterprises、/api/enterprises/:enterpriseId/...、
+                                     // 全局 /api/user-pool/{overview,settings,...}、/internal/enterprises/:enterpriseId/...；
+                                     // 其余无作用域的 /api、/internal 返回 400 enterprise_scope_required（见 §9.4）
+app.use(requireApiKey, requireIdentityHeader, routeUserPool, compatibleRouter); // 对外公开 API
 ```
 
 子模块：
@@ -171,11 +174,12 @@ app.use('/api', requireInternalToken, tasksApiRouter, settingsApiRouter);
 
 React SPA + 极薄的 Express BFF。服务端只做三件事：管理员登录态、把 `/api/console/*` 转发到三个后端、托管静态资源与 SPA fallback（`src/console/src/server/index.ts:71-79`）。
 
-前端页面清单（`src/console/src/web/App.tsx:35`）：
+前端页面清单（`src/console/src/web/App.tsx` 的 `type Page`，多企业版）：
 ```ts
-type Page = 'dashboard' | 'users' | 'budgets' | 'stats' | 'accounts' | 'tasks' | 'settings' | 'error-diagnostics' | 'diagnostics';
+type Page = 'dashboard' | 'users' | 'budgets' | 'stats' | 'accounts' | 'models' | 'pool-overview' | 'user-pool'
+  | 'tasks' | 'settings' | 'error-diagnostics' | 'diagnostics';
 ```
-路由通过 URL hash 驱动（`readPageFromHash()`，:117-133），不是 React Router。
+路由通过 URL hash 驱动（`src/console/src/web/lib/hashState.ts`，格式 `#/<page>?e=<enterpriseId>`），不是 React Router。每个页面声明作用域（`enterprise` / `global` / `mixed`），见 §9.6。
 
 #### `src/packages/shared`（@ghcp/shared）
 
@@ -700,6 +704,85 @@ MySQL 模式需要叠加第二个 compose 文件：`docker-compose.mysql.yml`（
 
 ---
 
+## 9. 多企业架构（multi 版本线）
+
+一套部署（一个 SSO、一个 Login、一个 Console、N 个 Proxy 副本）管理多个 GitHub 企业，可混用 github.com 与 GHE.com。设计依据：[multi-enterprise-design.md](multi-enterprise-design.md)；运维配置：[multi-enterprise-registry.md](multi-enterprise-registry.md)；升级：[multi-enterprise-upgrade-guide.md](multi-enterprise-upgrade-guide.md)。核心原则：**所有作用域内的读写都显式带 `enterpriseId`，任何地方都不回落到 `default`。**
+
+### 9.1 registry 与运行时企业对象
+
+- **registry**：`ENTERPRISE_REGISTRY_FILE` 指向的 JSON（示例 `deploy/enterprise-registry.example.json`），Proxy、SSO、Login 启动时各自读取一次并严格校验，结果 deep-freeze，不热加载。Console 不读取，企业列表来自 Proxy 的 `GET /api/enterprises`。
+- **`default` 企业**：保留 ID，承载升级前的全部数据。没有 registry、或 registry 不写 `default` 时，由各服务现有环境变量合成（`defaultFromEnv`）；写了时与环境变量合并，冲突报 `enterprise_env_conflict`。
+- 共享实现在 `src/packages/shared/src/enterprise/`：
+
+| 文件 | 职责 |
+| --- | --- |
+| `registryFile.ts` | `loadRegistry()`：读文件、合成/合并 `default`、调用解析器 |
+| `registry.ts` / `registryFields.ts` | 结构校验（未知字段即失败）、字段类型与规范化、错误码 `enterprise_registry_invalid` |
+| `registryDefaults.ts` | 字段默认值（例如非 `default` 企业的 SSO 登录页与初始 cap 10）、按服务计算阻塞项（blockers） |
+| `defaultFromEnv.ts` | 环境变量 → `default` 字段映射、内置回退值、warning（如 `MODELS_ADMIN_COPILOT_TOKEN_FILE` 优先） |
+| `secrets.ts` | secret 引用 `{env}` / `{file}` 的惰性读取（file 缓存 60 秒），错误只含字段路径 |
+| `githubEndpoints.ts` | 由 `baseUrl` 推导 REST、Copilot、设备流、SCIM、SAML 等端点；GHE.com 子域一致性 |
+| `trustedUrl.ts` | URL 卫生（拒绝 userinfo、query、fragment、编码分隔符、点段） |
+| `fingerprint.ts` | 企业身份指纹（各服务用于 `enterprise_identity_changed` 检查） |
+| `scope.ts` | `requireEnterprise(lookup)` 中间件：校验 `:enterpriseId`，与 header/query/body 冲突返回 400 `enterprise_scope_conflict`，未知返回 404 `enterprise_not_found` |
+| `poolRanking.ts` | 池调度纯函数（§9.3），SQLite 与 MySQL 共用 |
+| `dto.ts` | 生命周期、readiness、企业摘要等跨服务 DTO |
+
+- 各服务的运行时企业对象（profile + 推导值）：`src/proxy/src/enterprises.ts`（`findProxyEnterprise`、`directModeEnterprise`、`modelsAdminToken`）、`src/sso/src/enterprises.ts`、`src/login/src/enterprises.ts`（含 `resolveSsoType`）。启动日志对每个企业打印一行端点，并列出阻塞项。
+
+### 9.2 数据模型与迁移
+
+| 服务 | 新表 | 新列 / 主键变化 | 代码 |
+| --- | --- | --- | --- |
+| Proxy | `proxy_enterprises`（`state`、`max_accounts`、`inventory_count`、`policy_version`、`profile_fingerprint`） | `proxy_accounts`、`proxy_identity_initializations`、`proxy_request_stats`、`user_pool_accounts`、`user_pool_events` 加 `enterprise_id`，旧行回填 `default`；`user_pool_settings.max_accounts` 停用（cap 移到 `proxy_enterprises`） | `src/proxy/src/db/enterpriseMigrations.ts`（SQLite，trigger 拒绝缺 `enterprise_id` 的写入）、`db/mysqlEnterpriseMigrations.ts`（MySQL，逐语句 `isApplied`，崩溃后可续跑）、`db/enterpriseMigrationIds.ts`、`db/enterpriseSeed.ts`、`db/enterpriseRepo.ts`（插入/校验企业行、指纹比对、库存校正） |
+| SSO | `sso_enterprises` | `sso_users` 等主键改为 `(enterprise_id, ...)`；运行时设置按企业 | `src/sso/src/db/migrations.ts`、`db/enterpriseRepo.ts` |
+| Login | `login_enterprises` | `login_tasks.enterprise_id`；运行时设置仍全局 | `src/login/src/db/migrations.ts`、`db/enterpriseRepo.ts` |
+
+- 迁移在启动时自动执行、幂等，记录在 `schema_migrations`（`enterprise-v1/*`）。MySQL 迁移在 `db/mysqlMigrationLock.ts` 的锁内执行，等待时间 `MYSQL_MIGRATION_LOCK_WAIT_SECONDS`（默认 30）；`MYSQL_AUTO_MIGRATE=false` 时由 DBA 执行 `scripts/proxy-mysql-enterprise-upgrade.sql`，全新库用 `scripts/proxy-mysql-initial.sql`。
+- **旧镜像 fail closed**：MySQL 上 r4 因严格 schema 校验和池配置指纹无法启动；SQLite 上 r4 的写入被 trigger 拒绝。回滚只能靠备份。
+- **企业身份不可变**：企业已有数据后，身份字段（Proxy：`id`、`github.baseUrl`、`shortcode`、`pool.accountDomain`；SSO：加 `slug`；Login：`id`、`baseUrl`、`slug`）变化会导致启动失败 `enterprise_identity_changed`；有数据的企业从 registry 删除报 `enterprise_missing_from_registry`。
+
+### 9.3 池调度与生命周期
+
+- 每个企业的生命周期 `draft → active → draining`（可恢复到 `active`），只有 `active` 企业参与补货和新 caller 分配。cap 按企业设置，所有 cap 之和 ≤ 10000（共用一个账号名目录）。接口：`GET /api/enterprises`、`PATCH /api/enterprises/:id/pool-policy`（CAS `policy_version`），见 `src/proxy/src/routes/enterprisesApi.ts`。
+- 全局补货量 `D = max(0, T − I − P)`（全局 `idle_target`，全局 pause 优先）；`planCreations` 逐个分给分数最高且未到 cap 的企业，分数 `S_e = N × C_e − C × N_e`；新 caller 在有合格 idle 的企业中按同一分数排名（`rankEnterprisesForAdmission`，平局按 `sha256(caller, id)`）。已有 lease 或 catalog hold 的 caller 保持原企业和原成员。
+- `N_e` 是 `proxy_enterprises.inventory_count` 增量计数，启动时和每小时按实际成员数校正，偏差记 `enterprise_inventory_drift` 事件（`src/proxy/src/userPool/worker.ts`）。
+- 调用点：`src/proxy/src/userPool/scheduling.ts`，由 `store.ts`（SQLite）和 `mysqlStore.ts`（MySQL）共用；`userPool/storeContract.ts` 用同一组场景约束两个后端的结果一致。
+- `draining` 企业：不新建 lease / catalog hold、不补货，已有 lease 保留；只有 catalog hold 的 caller 落在该企业时返回 503 `enterprise_draining`。
+
+### 9.4 作用域路由
+
+| 服务 | 作用域路径 | 全局路径 | 无作用域 |
+| --- | --- | --- | --- |
+| Proxy | `/api/enterprises/:enterpriseId/{accounts,accounts/operations,request-stats,user-pool/...,models}`（`routes/enterpriseRoutes.ts`）；`/internal/enterprises/:enterpriseId/accounts/...`（Login/SSO 回调） | `/api/enterprises`、`/api/user-pool/{overview,settings,diagnostics/local,reconcile}`、`/api/error-diagnostics...` | 400 `enterprise_scope_required`（`rejectUnscoped`）；旧直连 `/api/accounts*` 保留一个版本并带 `Deprecation: true` |
+| SSO | `/api/enterprises/:enterpriseId/{users,settings/runtime,ai-credits,...}`、`/internal/enterprises/:enterpriseId/...`（`routes/enterpriseRoutes.ts`） | `/internal/enterprises`（readiness，`routes/enterprisesInternal.ts`） | 400 |
+| Login | `/api/enterprises/:enterpriseId/tasks...`（`routes/enterpriseRoutes.ts`） | `/api/settings/runtime`、`/internal/enterprises`（readiness） | 400 |
+
+- 作用域路由先校验内部令牌，再挂 `requireEnterprise`，处理函数通过 `requestEnterprise(res)`（各服务 `routes/requestEnterprise.ts`）取企业对象；repository 函数的第一个参数是必填的 `enterpriseId`。另一企业的行一律按“未找到”处理。
+- 服务间客户端（`src/proxy/src/clients/ssoClient.ts`、`loginClient.ts`、`src/login/src/clients/proxyClient.ts`）都把 `enterpriseId` 作为必填参数。
+- 公共推理路径不变，客户端不带企业：caller-lease 模式由 lease → member 的 `enterprise_id` 决定企业；直连模式由账号行的 `enterprise_id` 决定，新 identity 归属 `DIRECT_MODE_ENTERPRISE_ID`（默认 `default`）。之后请求使用该企业的 `copilotApiBaseUrl`。
+- **Models**：`GET /api/enterprises/:id/models`（`routes/modelsApi.ts`）只使用该企业的 `modelsAdmin`，缓存键 `models-admin:<enterpriseId>:<githubUserId>`，不回落到池或直连账号。
+
+### 9.5 就绪检查、SAML 会话与 Login 白名单
+
+- **readiness**：`src/proxy/src/clients/enterpriseReadiness.ts` 调用 SSO、Login 的 `GET /internal/enterprises`，比对三方是否都有该企业、`githubBaseUrl`、`shortcode`（Proxy↔SSO）、`slug`（SSO↔Login）是否一致、是否有阻塞项。每个副本内存缓存（就绪 60 秒、未就绪 10 秒），激活和恢复时强制实时检查；不写数据库。
+- **SSO 按企业的 SAML**：`default` 保持根路径 `/metadata`、`/sso`、`/login`、`/logout`，其他企业为 `/enterprises/:id/...`（`src/sso/src/routes/samlRoutes.ts`），每个企业独立的证书与 IdP/SP 实例。会话由 `src/sso/src/saml/enterpriseSession.ts` 写成每个企业一个签名 cookie（`default` 为 `sso_session`，其他为 `sso_session_<id>`，path `/enterprises/<id>`），载荷带企业 ID 和用户创建时间，服务端无内存会话；`POST /login`、`/logout` 拒绝跨站请求。
+- **Login**：任务行绑定企业，运行配置由 `src/login/src/auth/enterpriseAuth.ts` 从企业 profile 构造（设备流端点、SSO 登录页、选择器、OAuth client ID）；任务请求不能覆盖 SSO 地址或选择器。`src/login/src/auth/loginUrlAllowlist.ts` 在填写 SSO 凭据前检查当前页面：origin 相同，且路径按整段前缀匹配（`/login` 不匹配 `/loginfoo`）。
+- **回调主体校验**：Login 回写 token 前，Proxy 用新 token 调该企业的 `<apiBaseUrl>/user`，登录名与账号的 `gh_login` 不一致返回 409 `authorization_subject_mismatch`（`src/proxy/src/routes/internalApi.ts`）。
+
+### 9.6 Console
+
+- 页头企业选择器（`src/console/src/web/pages/EnterpriseSelector.tsx`），所选企业保存在 hash 的 `e` 参数中（`lib/hashState.ts`）。选择器不是权限边界。
+- 页面作用域（`App.tsx` 的 `pages`）：全局 Dashboard（`pages/DashboardPage.tsx`，每企业一张卡片）、Pool overview（`pages/EnterprisePoolPage.tsx` + `EnterprisePolicyDialogs.tsx`：全局设置、企业表、cap CAS、Activate/Drain/Resume）、Error Diagnostics；企业作用域 SSO Users、AI Credits Usage、Request Stats、Proxy Accounts、Models（`pages/ModelsPage.tsx`）、Pool members（`pages/UserPoolPage.tsx`）、Login Tasks；混合 Settings（`pages/SettingsPage.tsx`，SSO 设置按企业、Login 设置全局）、Diagnostics。
+- 作用域页面以 `${enterpriseId}:${page}` 为 key 重新挂载，`lib/scope.ts` 的 `useScopeLifetime` 在切换企业时中止进行中的请求并丢弃迟到结果；API 路径只能由 `api/enterprises.ts` 的 `enterprisePath(service, id)` 构造。
+- 服务端：`src/console/src/server/sameOrigin.ts` 对 `/api/console/*` 的所有写请求校验 `Origin` / `Sec-Fetch-Site`（403 `cross_site_request_rejected`），`CONSOLE_PUBLIC_BASE_URL` 用于反向代理改写 Host 的场景；`server/apiProxy.ts` 转发前再次校验，并拒绝含 `.`、`..` 段的路径。
+
+### 9.7 版本线
+
+镜像由同一个 `deploy/images/Dockerfile.release` 构建，构建参数 `RELEASE_LINE=multi`；四个服务的 `/healthz` 返回 `releaseLine`（`src/packages/shared/src/releaseLine.ts`，读取镜像内的 `GHCP_RELEASE_LINE`，未设置时为 `single`）。GHE.com 企业目前只用 mock 验证（见 [multi-enterprise-release-validation.md](multi-enterprise-release-validation.md)）。
+
+---
+
 ## 附：本次分析中发现的待确认项与风险
 
 | 项 | 类型 | 位置 |
@@ -712,3 +795,6 @@ MySQL 模式需要叠加第二个 compose 文件：`docker-compose.mysql.yml`（
 | mock-github 默认端口 | **待确认** | 未读取 |
 | 无端到端测试；前端 `src/console/src/web` 无测试覆盖 | **待确认（可能是有意为之）** | — |
 | 三个进程内缓存在多 Proxy 实例下不共享，`clearModelsCache` 只对本实例生效 | 多实例语义 | `src/proxy/src/copilot/copilotClient.ts` |
+| 多企业版：第 1–8 节的行号、`/api/*` 路径与表结构以单企业基线为准，未逐条更新 | 文档时效 | 见第 9 节 |
+| 多企业版：readiness 结果、Models 目录缓存、secret 文件缓存都在每个 Proxy 副本内存中，副本之间可能短暂不一致 | 多实例语义 | `src/proxy/src/clients/enterpriseReadiness.ts`、`src/packages/shared/src/enterprise/secrets.ts` |
+| 多企业版：GHE.com 企业只用 mock 验证，未在真实 GHE.com 验收 | 验证范围 | `docs/multi-enterprise-release-validation.md` |

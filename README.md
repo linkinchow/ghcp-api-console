@@ -9,9 +9,26 @@
 
 > 管理员的通用配置手册：[guidance/guidance.md](./guidance/guidance.md) · 网络配置：[guidance/network-deployment.md](./guidance/network-deployment.md)
 
+## 多企业版：一套部署服务多个 GitHub 企业
+
+多企业版（镜像 tag 以 `multi-` 开头，当前发布 `multi-41ecffc-amd64-r1`）让**一套部署**——一个 SSO、一个 Login、一个 Console 加 N 个 Proxy 副本——同时管理多个 GitHub 企业。每个企业可以是 github.com 或 GHE.com（data residency），可在同一部署中混用；每个企业有自己的 slug、shortcode、SAML/SCIM、席位 PAT、SSO 登录页和 Models 管理员。
+
+| 要点 | 说明 |
+| --- | --- |
+| 不配置 registry 时 | 行为与单企业版相同：`default` 企业完全由现有环境变量合成，无需修改任何配置。已有数据在启动时自动迁移，全部归入 `default`。 |
+| 添加企业 | 编写 registry JSON（参考 [`deploy/enterprise-registry.example.json`](./deploy/enterprise-registry.example.json)，只写 secret 引用、不写 secret 值），用 `ENTERPRISE_REGISTRY_FILE` 只读挂载到 Proxy、SSO、Login（Compose 叠加 `docker-compose.enterprise-registry.yml`），然后重启这三个服务。不支持热加载。 |
+| 生命周期（账号池模式） | 新企业初始为 `draft`，不补货、不分配。在 Console **Pool overview** 的企业表查看三方 readiness（Blockers）、设置 cap 后 **Activate** → `active`；**Drain** → `draining`（不新建租约、不补货，已有租约保留）；**Resume** 恢复为 `active`。直连模式不使用生命周期，新 identity 归属 `DIRECT_MODE_ENTERPRISE_ID`（默认 `default`）。 |
+| SAML 地址 | `default` 保持根路径 `/sso`、`/metadata`，已有 GitHub IdP 配置不变；其他企业使用 `<SSO_PUBLIC_BASE_URL>/enterprises/<id>/sso` 和 `<SSO_PUBLIC_BASE_URL>/enterprises/<id>/metadata`。 |
+| 接口 | 公共推理接口（`/v1/*`、`/chat/completions`、`/responses`）不变，调用方不传企业；管理接口改为按企业作用域 `/api/enterprises/<id>/...`，见下文[调用 API](#调用-api)。 |
+| Console | 页头 **Enterprise** 选择器决定企业作用域页面显示哪个企业；它不是权限边界，所有 Console 管理员都能管理所有企业。 |
+| 镜像 | Docker Hub 公开仓库 `linkinchow/ghcp-{proxy,sso,login,console}:multi-41ecffc-amd64-r1`（linux/amd64）。四个组件必须同一版本，部署时按[升级指南](./docs/multi-enterprise-upgrade-guide.md)中的 digest 引用。 |
+| 验证范围 | GHE.com 企业**只用 mock 验证**（网页、设备授权、SCIM、席位、Copilot 均为 mock），尚未在真实 GHE.com 环境验收；首次接入真实 GHE.com 企业前请先在预发布环境验证。 |
+
+多企业版是独立的发布线；不需要多个企业的客户可以继续使用单企业版（`single-slug-*`）。文档：[升级指南（r4 → 多企业版）](./docs/multi-enterprise-upgrade-guide.md) · [registry 配置参考](./docs/multi-enterprise-registry.md) · [设计文档](./docs/multi-enterprise-design.md) · [发布验证记录](./docs/multi-enterprise-release-validation.md)。
+
 ## User Pool：多 Proxy＋MySQL
 
-当前 `ghcp-user-pool-ops-handoff` 分支支持 **MySQL 共享账号池和多个 Proxy 副本**，同时保留 SQLite 单 Proxy 和默认 `direct` 模式。已有 SQLite User Pool 升级时，请从下面的客户指南开始，不要直接照后文的新环境快速启动命令操作原数据。
+当前版本支持 **MySQL 共享账号池和多个 Proxy 副本**，同时保留 SQLite 单 Proxy 和默认 `direct` 模式。已有 SQLite User Pool 升级时，请从下面的客户指南开始，不要直接照后文的新环境快速启动命令操作原数据。
 
 ### 客户部署与迁移入口
 
@@ -45,6 +62,8 @@ SSO / Login / Console → 同一个 Proxy Service
 
 | 当前部署与升级目标 | 对应指南或工具 |
 | --- | --- |
+| 单企业部署，升级到单企业版 r4（`single-slug-164cade-amd64-r4`） | [单企业版 r4 升级指南](./docs/user-pool-release-upgrade-guide.md)；SQLite 与 MySQL 均适用 |
+| 单企业版 r4（SQLite 或 MySQL），升级到多企业版（`multi-41ecffc-amd64-r1`） | [多企业版升级指南](./docs/multi-enterprise-upgrade-guide.md)：只支持从 r4 升级；四个组件一次性替换，首次升级需短暂停机；回滚只能恢复备份。升级完成并稳定后，再按 [registry 配置参考](./docs/multi-enterprise-registry.md) 添加企业 |
 | 已使用 SQLite User Pool（`caller-lease`），升级到 MySQL 多副本 | [SQLite User Pool → MySQL 多副本升级指南](./docs/user-pool-mysql-upgrade-guide.md)，保留现有池成员和有效凭据，不重新开户 |
 | 使用普通 `direct` 模式，仅将账号数据库从 SQLite 迁到 MySQL | [direct 模式数据库迁移工具](./upgrade/sqlite-to-mysql/README.md)，不用于迁移 User Pool 表 |
 | 尚未启用 User Pool，希望在单 Proxy／SQLite 部署中启用账号池 | [单副本 User Pool 启用与升级指南](./docs/user-pool-upgrade-guide.md)；原 direct 账号不会自动成为池成员 |
@@ -92,8 +111,8 @@ Client
 
 | 模块 | 职责 |
 | --- | --- |
-| `src/proxy` | 对外 API 网关；鉴权、identity 映射、Copilot OAuth 管理、请求转发和统计。 |
-| `src/sso` | 自定义 SAML IdP；SSO 用户、EMU/SCIM、Copilot seat、AI Credits 用量。 |
+| `src/proxy` | 对外 API 网关；鉴权、identity 映射、Copilot OAuth 管理、请求转发和统计；多企业版中还负责企业列表、跨服务 readiness 和账号池的企业生命周期。 |
+| `src/sso` | 自定义 SAML IdP；SSO 用户、EMU/SCIM、Copilot seat、AI Credits 用量；多企业版中每个企业有独立的 SAML 地址、证书和会话 cookie。 |
 | `src/login` | OpenCode OAuth Device Flow + Playwright 自动登录；成功后回写 Copilot OAuth token。 |
 | `src/console` | Web 管理控制台；统一操作 proxy/sso/login 管理 API。 |
 | `src/packages/shared` | 跨服务共享 DTO、HTTP client、logger、错误结构和工具。 |
@@ -111,6 +130,8 @@ Client
 5. **SAML IdP 签名证书和私钥**。本项目提供 `scripts/gen-certs.sh` 生成开发证书；生产环境应使用你维护的证书。
 6. **Docker / Docker Compose** 用于容器化部署；本地开发还需要 Node.js 22 和 npm。
 
+多企业版中，每个新增企业都需要各自准备第 1–5 项：GitHub 侧 SAML 配置、SCIM token、席位 PAT，以及独立的签名证书、私钥和 session secret。
+
 ## 配置模型：`.env` 与 Settings
 
 配置按以下来源管理，已有运行时设置与启动参数的生效方式不同：
@@ -118,12 +139,13 @@ Client
 | 配置来源 | 保存位置 | 适合内容 | 生效方式 |
 | --- | --- | --- | --- |
 | 环境变量 / `.env` / K8s Secret与ConfigMap | 进程环境 | 端口、服务地址、密钥、数据库/日志/证书路径、认证 header、浏览器静态选项 | 启动时读取；更新后需重新创建容器或滚动更新Pod，单纯restart不会更新容器环境。 |
-| Console **Settings**（SSO/Login） | `sso.sqlite` 或 `login.sqlite` | 管理员需要在线调整的限额、并发、超时、重试和调试开关 | 保存后持久化并在当前服务实例立即应用，无需重启。 |
-| Console **User pool → Pool settings** | Proxy的SQLite或共享MySQL `user_pool_settings` | idle target、账号cap、正式租约TTL、暂停补池 | 通过版本化管理API保存，所有MySQL Proxy共享；已有设置不会被启动env覆盖。 |
+| Console **Settings**（SSO/Login） | `sso.sqlite` 或 `login.sqlite` | 管理员需要在线调整的限额、并发、超时、重试和调试开关；SSO 设置按企业保存，Login 设置全局 | 保存后持久化并在当前服务实例立即应用，无需重启。 |
+| Console **Pool overview** | Proxy的SQLite或共享MySQL `user_pool_settings`、`proxy_enterprises` | 全局 idle target、正式租约TTL、暂停补池；企业表中各企业的 cap 和生命周期 | 通过版本化管理API保存，所有MySQL Proxy共享；已有设置不会被启动env覆盖。 |
+| 企业 registry（可选） | `ENTERPRISE_REGISTRY_FILE` 指向的只读 JSON | 第二个及以后企业的 GitHub/SSO/Login/池/Models 配置和 secret 引用 | Proxy、SSO、Login 启动时读取一次；修改后需重启这三个服务。 |
 
 根目录 `.env` 只用于 Docker Compose 的变量插值；只有 `docker-compose.yml` 的 `environment`、`ports`、`volumes` 中明确引用的变量才会传入容器。`src/<service>/.env` 面向单独运行该 workspace 的场景。显式注入的进程环境变量优先于 `.env`，两者都没有时才使用代码默认值。
 
-敏感值和部署拓扑使用受保护的环境变量或K8s Secret，不放管理页面Settings，例如`API_KEY`、`INTERNAL_API_TOKEN`、`SESSION_SECRET`、GitHub/SCIM token、数据库连接串和服务URL。SSO/Login运行时Settings首次初始化使用代码默认值，不从旧环境变量自动导入。User Pool的target/cap/正式TTL仅首次由env提供种子，之后以数据库为准；MySQL还保存域名、模型、预热并发等不变量的配置指纹，所有Proxy与迁移进程必须一致，不能只改某一副本的env或手工改hash绕过检查。
+敏感值和部署拓扑使用受保护的环境变量或K8s Secret，不放管理页面Settings，例如`API_KEY`、`INTERNAL_API_TOKEN`、`SESSION_SECRET`、GitHub/SCIM token、数据库连接串和服务URL。SSO/Login运行时Settings首次初始化使用代码默认值，不从旧环境变量自动导入。User Pool的target/正式TTL仅首次由env提供种子，各企业cap只在Proxy首次登记该企业时取初值（`default`取`POOL_MAX_ACCOUNTS`，其他企业取registry的`pool.initialMaxAccounts`，默认10；从单企业版升级时`default`沿用升级前的cap），之后以数据库为准；MySQL还保存域名、模型、预热并发等不变量的配置指纹，所有Proxy与迁移进程必须一致，不能只改某一副本的env或手工改hash绕过检查。
 
 SSO runtime settings：
 
@@ -159,13 +181,13 @@ cp .env.example .env
 # GHE.com（data residency）使用：cp .env.example.data-residency .env
 ```
 
-至少需要替换：
+至少需要替换（GitHub、SAML、SCIM、席位相关变量定义的是 `default` 企业；多企业版中其他企业在 registry 中配置，见 [registry 配置参考](./docs/multi-enterprise-registry.md)）：
 
 | 变量 | 说明 |
 | --- | --- |
 | `API_KEY` | 调用 `proxy` 裸 API 时使用的 Bearer token。 |
 | `INTERNAL_API_TOKEN` | `proxy`、`sso`、`login`、`console` 内部通信共享密钥。 |
-| `SESSION_SECRET` | `sso` / `console` cookie session 签名密钥。 |
+| `SESSION_SECRET` | `console` cookie session 和 `sso` 中 `default` 企业 SAML 会话 cookie 的签名密钥；其他企业使用 registry 中各自的 `sso.sessionSecret`。 |
 | `SSO_PUBLIC_BASE_URL` | `sso` 服务对 GitHub 可访问的公网地址。 |
 | `SP_ENTITY_ID` / `SP_ACS_URL` | GitHub Enterprise SAML SP 配置。 |
 | `GITHUB_BASE_URL` | GitHub Web 地址，默认 `https://github.com`；GHE.com 填 `https://<subdomain>.ghe.com`。Login、SSO、Proxy 都据此判断是否为 GHE.com 模式。 |
@@ -182,6 +204,11 @@ cp .env.example .env
 | `DB_PATH` | `sqlite` 模式的数据库路径；该模式只支持一个 Proxy 实例。 |
 | `MYSQL_URL` | `mysql` 模式必填，指向所有 Proxy Pod 共享的外部 MySQL 8 数据库。 |
 | `MYSQL_CONNECTION_LIMIT` / `MYSQL_SSL_*` | 每个 Proxy Pod 的连接池上限与 MySQL TLS 配置。 |
+| `MYSQL_AUTO_MIGRATE` | 默认 `true`，Proxy 启动时自动迁移 MySQL；`false` 时只读校验 schema，由 DBA 执行 `scripts/proxy-mysql-initial.sql`（空库）或 `scripts/proxy-mysql-enterprise-upgrade.sql`（r4 → 多企业版）。 |
+| `MYSQL_MIGRATION_LOCK_WAIT_SECONDS` | 多企业版新增，默认 `30`（1–3600）。其他 Proxy 副本等待迁移锁的秒数；首次升级且请求统计表很大时调高。 |
+| `ENTERPRISE_REGISTRY_FILE` | 多企业版新增，可选。registry 文件的容器内绝对路径，只读挂载到 Proxy、SSO、Login；Compose 用 `docker-compose.enterprise-registry.yml`，宿主机路径由 `ENTERPRISE_REGISTRY_HOST_FILE`、`ENTERPRISE_SECRETS_DIR` 指定。未设置时只有 `default` 企业。registry 中写了 `default` 时，对应环境变量必须留空或与文件一致，否则启动报 `enterprise_env_conflict`。 |
+| `DIRECT_MODE_ENTERPRISE_ID` | 多企业版新增，仅直连模式。新 identity 归属的企业，留空为 `default`；必须是 registry 中的企业，否则 Proxy 启动失败。 |
+| `CONSOLE_PUBLIC_BASE_URL` | 多企业版新增，可选。Console 前有会改写 Host 头的反向代理时，设为用户访问的 Console 地址；Console 写操作只接受来自该地址或请求 Host 的同源请求。 |
 | `IDENTITY_HEADER` | 调用方身份 header 名称和是否必填；默认 `X-User-Identity` 必填。 |
 | `IDENTITY_HEADER_REQUIRED` | 调用方身份 header 是否必填；默认 `true`。如果设置为 false，则 Identity header 可选。identity header 为空时，默认使用匿名身份。当前匿名用户为 `default` |
 | `CLAUDE_CODE_OPTIMIZED` | Proxy 的默认 Claude Code 优化模式；代码默认 `false`，Compose 默认和根模板均为 `true`。 |
@@ -193,15 +220,15 @@ cp .env.example .env
 | `PROXY_ERROR_DIAGNOSTICS_SHARED` / `PROXY_INSTANCE_ID` | 多 Proxy Pod 使用 RWX 诊断卷时启用；每个 Pod 使用独立实例目录，管理接口聚合读取。 |
 | `GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_SCOPE` | Login 使用的 OpenCode OAuth client 和 Device Flow scope。 |
 | `OPENCODE_VERSION` / `OPENCODE_USER_AGENT` | Login 与 Proxy 请求使用的 OpenCode User-Agent；显式 User-Agent 优先。 |
-| `COPILOT_API_BASE_URL` | Copilot API 地址；GitHub.com 默认 `https://api.githubcopilot.com`，GHE.com 为 `https://copilot-api.<subdomain>.ghe.com`。 |
-| `GITHUB_API_BASE_URL` | SSO 调用 GitHub Copilot seat 和 AI Credits API 的根地址，默认 `https://api.github.com`；GHE.com 为 `https://api.<subdomain>.ghe.com`（`SCIM_BASE_URL` 同理）。 |
+| `COPILOT_API_BASE_URL` | `default` 企业的 Copilot API 地址；GitHub.com 默认 `https://api.githubcopilot.com`，GHE.com 为 `https://copilot-api.<subdomain>.ghe.com`。多企业版在 GHE.com 下未设置时按 `GITHUB_BASE_URL` 自动推导；显式设置时必须属于同一个 `<subdomain>.ghe.com`，否则启动失败。 |
+| `GITHUB_API_BASE_URL` | `default` 企业的 GitHub REST API 根地址（SSO 的 Copilot seat、AI Credits；Proxy 的 Models 和 Login 回传 token 的 `/user` 身份核对），默认 `https://api.github.com`；GHE.com 为 `https://api.<subdomain>.ghe.com`（`SCIM_BASE_URL` 同理），未设置时同样自动推导。 |
 | `GITHUB_API_VERSION` | Copilot 请求的 `X-GitHub-Api-Version`，默认 `2026-06-01`。 |
-| `LOGIN_SSO_URL` | Login 自动化使用的默认 SSO 登录 URL；任务的 `ssoUrl` 可覆盖。Provider 由任务的 `ssoType` 决定，不通过环境变量配置。 |
+| `LOGIN_SSO_URL` | `default` 企业的 SSO 登录 URL（Login 的 `SSO_URL`）；其他企业默认 `<该 URL 的 origin>/enterprises/<id>/login`。多企业版中任务请求不能再覆盖登录地址或 selector。Provider 由任务的 `ssoType` 或企业 registry 的 `login.ssoProvider` 决定，不通过环境变量配置。 |
 | `AUTH_HEADLESS` | Login Playwright 是否无头运行，默认 `true`。 |
 | `LOG_LEVEL` | 所有服务的结构化日志等级：`debug`、`info`、`warn`、`error`。 |
 | `PROXY_PORT` / `SSO_PORT` / `LOGIN_PORT` / `CONSOLE_PORT` | Compose 暴露到宿主机的端口，不会改变容器内服务端口。 |
 
-**GHE.com（data residency）**：复制 `.env.example.data-residency`，把 `sample-ent` 换成实际的子域名和 enterprise slug；无需配置 `ENTERPRISE_SHORTCODE`。GHE.com 上 Login 不输入 GitHub 用户名：它根据 `GITHUB_BASE_URL` 和 `ENTERPRISE_SLUG` 直接打开 `https://<subdomain>.ghe.com/enterprises/<slug>/sso`，点击 Continue，在 SSO 登录页输入 SSO 用户名和密码；回到 GHE 后再完成 Device Flow 填码和授权。GHE.com 的 shortcode 随机生成并隐藏，REST API 也拒绝带后缀的用户名，所以 SSO 和 Proxy 在 GHE.com 模式下忽略 `ENTERPRISE_SHORTCODE`，GH login 直接使用 `<ssoUser>`（GitHub 限制为 30 字符），Copilot 坐席分配和查询都使用这个值。其余只需把 SCIM、GitHub API、SAML 和 Copilot API 地址换成 GHE.com 地址。若之前已用带后缀的 GH login 同步过用户，需在 Console 对这些用户重新执行 Sync to GH，再分配坐席。
+**GHE.com（data residency）**：复制 `.env.example.data-residency`，把 `sample-ent` 换成实际的子域名和 enterprise slug；无需配置 `ENTERPRISE_SHORTCODE`。GHE.com 上 Login 不输入 GitHub 用户名：它根据 `GITHUB_BASE_URL` 和 `ENTERPRISE_SLUG` 直接打开 `https://<subdomain>.ghe.com/enterprises/<slug>/sso`，点击 Continue，在 SSO 登录页输入 SSO 用户名和密码；回到 GHE 后再完成 Device Flow 填码和授权。GHE.com 的 shortcode 随机生成并隐藏，REST API 也拒绝带后缀的用户名，所以 SSO 和 Proxy 在 GHE.com 模式下忽略 `ENTERPRISE_SHORTCODE`，GH login 直接使用 `<ssoUser>`（GitHub 限制为 30 字符），Copilot 坐席分配和查询都使用这个值。其余只需把 SCIM、GitHub API、SAML 和 Copilot API 地址换成 GHE.com 地址。若之前已用带后缀的 GH login 同步过用户，需在 Console 对这些用户重新执行 Sync to GH，再分配坐席。多企业版中，也可以在 registry 里把 GHE.com 企业作为额外企业加入（`github.shortcode` 留空或省略），与 github.com 的 `default` 共用一套部署；多企业版的 GHE.com 支持目前只经过 mock 验证。
 
 各服务完整环境变量表见 [`src/proxy/README.md`](./src/proxy/README.md)、[`src/sso/README.md`](./src/sso/README.md)、[`src/login/README.md`](./src/login/README.md) 和 [`src/console/README.md`](./src/console/README.md)。升级后请在 Console **Settings** 页面确认 SSO/Login 的持久化设置值。
 
@@ -272,7 +299,7 @@ docker compose -f docker-compose.yml -f docker-compose.mysql.yml up -d --build -
 
 多 Pod/Kubernetes 部署必须使用 `mysql`，并让每个 Proxy Pod 使用同一 `MYSQL_URL`。错误诊断如需在 Console 中全局可见，应给所有 Proxy Pod 挂载同一个 RWX PVC，设置 `PROXY_ERROR_DIAGNOSTICS_SHARED=true`，并通过 Downward API 把 Pod 名注入 `PROXY_INSTANCE_ID`。本次横向扩展仅覆盖 Proxy；仍使用 SQLite/文件状态的 SSO、Login 和 Console 必须保持单副本。
 
-首次访问会创建本地控制台管理员。之后可以在控制台管理 SSO 用户、EMU 同步、Proxy 账号、登录任务、Copilot OAuth 重授权/导入、请求统计和 Error Diagnostics；管理员可在 **Settings** 修改自己的 Console 密码。
+首次访问会创建本地控制台管理员。之后可以在控制台管理 SSO 用户、EMU 同步、Proxy 账号、登录任务、Copilot OAuth 重授权/导入、请求统计和 Error Diagnostics；管理员可在 **Settings** 修改自己的 Console 密码。多企业版在页头用 **Enterprise** 选择器切换企业，选择保存在 URL hash（`#/<page>?e=<id>`）中。
 
 > **SSO 改密与自动登录**：SSO 只保存密码哈希，不能把修改后的任意密码提供给 Login。若新密码不是当前 `SSO_DEFAULT_USER_PASSWORD` 或该用户的 `ssoUser`，后续自动初始化无法取得密码；请在 Console 的 **Reauthorize Copilot OAuth** 中手动输入新密码。Login 仅使用该次请求提供的密码执行任务，不会把密码保存到任务历史。
 
@@ -305,6 +332,8 @@ curl http://localhost:3000/v1/models \
 ```
 
 首次请求某个 identity 时，如果账号和 token 还没准备好，`proxy` 可能返回 `202 account_initializing`。等待后台 SSO/EMU 同步和登录任务完成后再重试。
+
+多企业版的公共接口与单企业版完全相同，请求中不带企业：direct 模式下已有 identity 按其账号所属企业路由，新 identity 归属 `DIRECT_MODE_ENTERPRISE_ID`（默认 `default`）；caller-lease 模式下由账号池按各企业 cap 比例分配成员，租约绑定的成员属于哪个企业，就使用该企业的 Copilot API 地址。落在 `draining` 企业、且只有模型列表占位（catalog hold）的调用方会收到 `503 enterprise_draining`，不会被换到其他企业。
 
 成功启动且 identity 对应账号可用后，可以调用 Anthropic Messages 系列接口：
 
@@ -376,6 +405,32 @@ Claude Code 可以通过 settings 文件接入本地 proxy，例如 `~/.claude/s
 **注意：** Copilot API的Claude系列模型默认是包含1M的上下文窗口的。但在Claude Code侧默认是使用200K上下文窗口，这个是CC在客户端默认的配置。如果需要更多的上下文窗口，需要在CC配置文件的模型名称后面增加`[1m]`的后缀，如上面的示例中的模型名称。
 
 如果使用项目内 `.claude/settings.local.json`，不要提交包含 `ANTHROPIC_AUTH_TOKEN` 的文件。
+
+### 管理接口（内部）
+
+Console 已全部改用新路径，通常不需要直接调用。自建脚本直接调用 Proxy、SSO、Login 的 `/api/*`、`/internal/*` 时，使用 `X-Internal-Token: <INTERNAL_API_TOKEN>`，并按多企业版的路径调用：
+
+```bash
+# 企业列表（含 readiness 与池状态），全局接口
+curl http://localhost:3000/api/enterprises -H "X-Internal-Token: $INTERNAL_API_TOKEN"
+
+# 企业作用域接口：/api/enterprises/<id>/...，单企业部署使用 default
+curl "http://localhost:3000/api/enterprises/default/accounts?page=1&pageSize=25" \
+  -H "X-Internal-Token: $INTERNAL_API_TOKEN"
+curl "http://localhost:7001/api/enterprises/default/users?page=1&pageSize=25" \
+  -H "X-Internal-Token: $INTERNAL_API_TOKEN"
+curl "http://localhost:7003/api/enterprises/default/tasks?limit=20" \
+  -H "X-Internal-Token: $INTERNAL_API_TOKEN"
+```
+
+| 路径 | 行为 |
+| --- | --- |
+| `/api/enterprises/<id>/...`（三个服务） | 企业作用域的账号、请求统计、池成员、Models、SSO 用户、AI Credits、SSO 设置、登录任务等。未知企业返回 `404 enterprise_not_found`。 |
+| Proxy 全局接口 | `GET /api/enterprises`、`PATCH /api/enterprises/<id>/pool-policy`、`/api/user-pool/overview`、`/api/user-pool/settings`、`/api/user-pool/diagnostics/local`、`/api/user-pool/reconcile`、`/api/error-diagnostics*`。`PATCH /api/user-pool/settings` 再传 `max_accounts` 返回 `409 use_enterprise_cap`（cap 改为按企业设置）。 |
+| Login 全局接口 | `/api/settings/runtime`（Login 设置是进程级）。 |
+| Proxy 旧 `/api/accounts*` | 保留一个版本，响应带 `Deprecation: true`；列表使用 `DIRECT_MODE_ENTERPRISE_ID` 企业，单个账号按全局 identity 查找。请改用 `/api/enterprises/<id>/accounts*`。 |
+| 其他无作用域的 `/api/*`、`/internal/*` | 返回 `400 enterprise_scope_required`，不会回落到 `default`（例如旧的 `/api/request-stats`、`/api/user-pool/accounts`、SSO 的 `/api/users`、Login 的 `/api/tasks`）。 |
+| 公共推理接口 | 不变，见上文。 |
 
 ## 本地开发
 

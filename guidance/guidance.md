@@ -133,6 +133,10 @@ GHE.com 是 GitHub Enterprise Cloud with data residency：企业数据存放在�
 - 由于 GH login 最长 30 字符，GHE.com 下 SSO 用户名应控制在 30 个字符以内。
 - 修改 `GITHUB_BASE_URL` 后需要重启 `sso`、`proxy`、`login`。
 
+### 2.6 一套部署管理多个企业（多企业版）
+
+本手册按一个 GitHub 企业编写。多企业版（镜像 tag `multi-*`）可以让同一套 SSO、Login、Console 和 Proxy 同时服务多个 GitHub.com 与 GHE.com 企业：按本手册配置的企业成为 `default`，`.env` 写法不变；其他企业写在一个 registry 文件中（每个企业单独的 slug、SCIM token、PAT、SAML 证书、SSO 地址 `<sso-base-url>/enterprises/<id>/sso`），在 Console 的 Pool overview 检查就绪并激活。只需要一个企业时不要配置 registry。详见 [多企业 registry 配置参考](../docs/multi-enterprise-registry.md) 和 [多企业版升级指南](../docs/multi-enterprise-upgrade-guide.md)。GHE.com 企业在多企业版中目前只用 mock 验证过，首次接入请先在预发布环境验收。
+
 ## 3. 准备工作清单
 
 开始前请确认你具备以下条件：

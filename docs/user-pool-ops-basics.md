@@ -2,13 +2,57 @@
 
 更新于 2026-09-16。本交接仅涵盖基线 `5ea75af` 上现有 MySQL 用户池的有限范围工作。此次新增的是面向**现有监控平台**的可选只读适配器，而不是另一个监控服务、生产部署、自动恢复机制或 SLA（服务等级协议）。适配器不更改任何生产源码、数据库结构或运行时配置。另行获批的本地迁移和功能检查已使用真实数据、三个 MySQL Proxy 实例及 Console 执行；下文明确区分其实际结果与客户集成验收。100k 扩容涉及的全部八个文件均已回退至 HEAD，运行时上限仍为 10000，本次不交付 100k 版本，也不交付生产源码变更。新增的离线 SQL 维护工具、测试和交接文档仍未提交；最终交付源码的 SHA 尚未确定。本文档不授权任何进一步的端点调用或服务/配置变更。
 
+> **多企业版本线（镜像 tag `multi-*`）说明（2026-10-19 补充）**：一套部署可以管理多个 GitHub 企业，所有企业共用同一个用户池调度器、同一行 `user_pool_settings` 和同一个 MySQL 库，因此本文的 owner 观测、SQL 适配器和告警方法不变。变化的是管理 API：成员、租约、事件、账号和请求统计改为企业作用域路径，见第 1.1 节。企业的 cap、生命周期和就绪检查见 [registry 配置参考](multi-enterprise-registry.md) 和 [User Pool 页面手册](user-pool-console-guide.md)。
+
 ## 1. 采集三类相互独立的信号
 
-1. **每个实际 Proxy 实例：**调用经过身份验证的 `GET /api/user-pool/diagnostics/local`，不带查询参数。使用实例直连地址或固定到实例的路由，绝不能用负载均衡 URL 冒充每个副本的观测。分配取值范围受限且不敏感的标签，例如 `proxy-a`；指标标签中不得包含令牌、URL、调用方/成员 ID 或 owner（调度所有者）UUID。此端点只读取本地内存，不执行 SQL，并返回 `Cache-Control: no-store`。本地 `owner` 只表示本地租期尚未到期，不代表数据库已验证其所有权。`standby`（备用状态）、`stopped`、`localScheduler: null`、401 或实例不可达，都不能证明集群中没有 owner。
+1. **每个实际 Proxy 实例：**调用经过身份验证的 `GET /api/user-pool/diagnostics/local`，不带查询参数。该端点在多企业版中仍是全局路径（调度器是进程级的，不属于某个企业），不需要也不接受企业 ID。使用实例直连地址或固定到实例的路由，绝不能用负载均衡 URL 冒充每个副本的观测。分配取值范围受限且不敏感的标签，例如 `proxy-a`；指标标签中不得包含令牌、URL、调用方/成员 ID 或 owner（调度所有者）UUID。此端点只读取本地内存，不执行 SQL，并返回 `Cache-Control: no-store`。本地 `owner` 只表示本地租期尚未到期，不代表数据库已验证其所有权。`standby`（备用状态）、`stopped`、`localScheduler: null`、401 或实例不可达，都不能证明集群中没有 owner。
 2. **具有权威性的共享 MySQL 写入端：**通过客户现有且已获授权的 SQL 采集器运行随附的[只执行 SELECT 的查询](../ops/user-pool-monitor/owner-observation.sql)。它使用与应用相同的数据库时钟表达式和 `owner_until > DB_NOW` 边界。必须使用正确的共享数据库及写入端点，而不是只读副本或持有旧快照的事务。查询只输出行数、数据库时间、owner 存在标志位、到期时间和暂停标志位，不输出 owner 身份。单例记录缺失或无效、查询失败、观测过期或 SQL 不可达，均表示**所有权未知**，绝不表示“没有 owner”。仅有 ping 成功既不能证明调度所有权正常，也不能证明准入健康。
-3. **现有流量与库存观测：**从现有网关/访问日志中保留安全的 HTTP 状态码与精确用户池错误码计数。若现有平台已经轮询经过身份验证的 `GET /api/user-pool/summary`，只使用 `observedAt`、`settings.paused`、`settings.idle_target`、`settings.max_accounts` 和汇总值 `counts.ready_idle/leased/provisional/provisioning/cooling/failed/disabled/total`。不要改用完整的账号/租约/事件列表。汇总中没有权威的全局 owner 字段；任何字段缺失都不代表 owner 不存在。`ready_idle` 衡量的是可供新调用方使用的余量，而不是每个已绑定调用方是否都能获得服务。
+3. **现有流量与库存观测：**从现有网关/访问日志中保留安全的 HTTP 状态码与精确用户池错误码计数。多企业版中，单企业版的 `GET /api/user-pool/summary` 已不再是全局接口（无企业时返回 400 `enterprise_scope_required`），现有轮询需改为：
+   - 全局：`GET /api/user-pool/overview`，只使用 `observedAt`、`settings.paused`、`settings.idle_target` 和所有企业合计的 `counts.ready_idle/leased/provisional/provisioning/cooling/failed/disabled/total`。`settings` 中已没有 `max_accounts`。
+   - 每个企业的 cap 与状态：`GET /api/enterprises`，只使用 `items[].id`、`items[].pool.state`、`items[].pool.maxAccounts`、`items[].pool.inventory`、`items[].poolSummary` 和 `items[].readiness.ready`。该接口会对 SSO、Login 做就绪探测（每个副本缓存：就绪60秒、未就绪10秒；单个企业最多等待约8秒），轮询间隔不要短于1分钟。
+   - 单个企业的计数：`GET /api/enterprises/<enterpriseId>/user-pool/summary`（只有 `enterpriseId`、`observedAt`、`counts`）。
+
+   不要改用完整的账号/租约/事件列表。这些汇总中都没有权威的全局 owner 字段；任何字段缺失都不代表 owner 不存在。`ready_idle` 衡量的是可供新调用方使用的余量，而不是每个已绑定调用方是否都能获得服务；某个企业为 `draining` 或未就绪时，它的 idle 成员不会分给新调用方。
 
 健康的 MySQL standby（备用实例）可以通过共享的准入、hold（占用保护）和凭据保护机制，为现有 Ready（就绪）成员提供服务。它们不需要成为 owner 才能就绪。调度器缺失主要会停止补充和修复；应根据库存与请求受影响的程度判断紧急性。SQL 故障是独立的服务依赖故障，可能导致安全地返回 503，或中断已经开始的流式响应。
+
+<a id="multi-enterprise-management-api"></a>
+
+### 1.1 多企业版的管理 API 路径
+
+所有管理接口都要求 `X-Internal-Token`。`<enterpriseId>` 是部署内部的企业 ID（例如 `default`、`contoso-ghe`），不是 GitHub slug。升级后已有数据全部属于 `default`。
+
+| 用途 | 路径 | 说明 |
+| --- | --- | --- |
+| 企业列表 | `GET /api/enterprises` | 每个企业的 GitHub 主机、slug、池策略、库存计数、调度分数和三方就绪结果 |
+| 修改企业 cap / 生命周期 | `PATCH /api/enterprises/<enterpriseId>/pool-policy` | body `{"expectedVersion": <policyVersion>, "maxAccounts"?: n, "state"?: "active" \| "draining"}`；CAS 冲突 409 `policy_version_conflict`；所有 cap 之和超过 10000 时 409 `name_capacity_exceeded`；激活/恢复时三方未就绪 409 `enterprise_not_ready`（`details.blockers` 列出阻塞项）；不允许的状态转换 409 `invalid_state_transition` |
+| 全局设置 | `GET /api/user-pool/settings`、`PATCH /api/user-pool/settings` | PATCH body `{"expectedVersion": n, "changes": {"idle_target"?, "lease_seconds"?, "paused"?}}`；传 `max_accounts` 返回 409 `use_enterprise_cap` |
+| 全局概览 | `GET /api/user-pool/overview` | 全局设置和所有企业合计计数 |
+| 本地调度诊断 | `GET /api/user-pool/diagnostics/local` | 见第 1 节 |
+| 唤醒协调 | `POST /api/user-pool/reconcile` | 空 body，返回 202 |
+| 企业的成员 / 租约 / 事件 | `GET /api/enterprises/<enterpriseId>/user-pool/{summary,accounts,leases,events}`、`GET .../user-pool/page/{accounts,leases,events}?page=&pageSize=&q=&state=` | 只返回该企业的数据 |
+| 企业的成员操作 | `POST /api/enterprises/<enterpriseId>/user-pool/accounts/<identity>/{disable,resume,retry}`、`POST .../user-pool/leases/<leaseId>/release`（body `{"confirm": true}`） | 成员或租约不属于该企业时返回 404，不会作用到其他企业 |
+| 企业的账号、统计、Models | `/api/enterprises/<enterpriseId>/accounts...`、`/request-stats...`、`/models` | 与单企业版的子路径相同 |
+
+规则：
+
+- 无企业的旧路径（例如 `/api/user-pool/summary`、`/api/user-pool/accounts`、`/api/request-stats`、`/api/models`）返回 **400 `enterprise_scope_required`**，不会默认使用 `default`。只有旧的直连 `/api/accounts*` 保留一个版本，响应带 `Deprecation: true`。
+- 未知企业返回 404 `enterprise_not_found`；路径、请求头、query 或 body 中的企业 ID 不一致返回 400 `enterprise_scope_conflict`。
+- 服务间回调同样改为 `/internal/enterprises/<enterpriseId>/...`；新旧版本混跑时旧路径返回 400，所以首次升级必须一次替换全部镜像（见[多企业版升级指南](multi-enterprise-upgrade-guide.md)第 3 节）。
+- SSO、Login 的管理接口也按企业：`/api/enterprises/<enterpriseId>/users...`（SSO）、`/api/enterprises/<enterpriseId>/tasks...`（Login）；Login 运行时设置 `/api/settings/runtime` 仍是全局的。
+
+示例（占位地址；与第 2 节相同，令牌不能出现在命令参数或 shell 历史中，这里由现有密钥管理器写入受保护的请求头文件 `/protected/internal-token.header`，内容为一行 `X-Internal-Token: <令牌>`，用 curl 的 `-H @文件` 读取）：
+
+```sh
+curl -sS -H @/protected/internal-token.header https://proxy-a.example.invalid/api/enterprises
+curl -sS -H @/protected/internal-token.header https://proxy-a.example.invalid/api/enterprises/default/user-pool/summary
+curl -sS -X PATCH -H @/protected/internal-token.header -H "Content-Type: application/json" \
+  -d '{"expectedVersion": 3, "state": "draining"}' \
+  https://proxy-a.example.invalid/api/enterprises/contoso-ghe/pool-policy
+```
+
+`PATCH` 前先从 `GET /api/enterprises` 读取该企业当前的 `pool.policyVersion`。修改 cap 或生命周期属于生产变更，需按变更流程获批；本文不授权执行。
 
 ## 2. 可选的单次运行适配器：不引入新依赖
 
@@ -95,7 +139,7 @@ node ops/user-pool-monitor/monitor.mjs /protected/monitor-config.json --db-obser
 - `503 member_unavailable` → 成员准入/hold（占用保护）/凭据可用性。
 - `429 pool_exhausted` → 用户池库存耗尽。
 - `429 member_cooling` → 冷却。
-- 其他一切 → 其他类别。通用 503、上游 429 或 SSE 中断不会自动归入上述任何类别。一旦响应头/SSE 已开始发送，安全中止也无法把原来的 200 改为新的 HTTP 503；还须使用现有的流失败证据。
+- 其他一切 → 其他类别。通用 503、上游 429 或 SSE 中断不会自动归入上述任何类别。多企业版新增的 `503 enterprise_draining`（只有 catalog hold 的调用方落在已排空的企业，带 `Retry-After: 30`）同样归入其他类别：它表示运维人员排空了该企业，不是存储或 owner 故障。一旦响应头/SSE 已开始发送，安全中止也无法把原来的 200 改为新的 HTTP 503；还须使用现有的流失败证据。
 
 CLI 不读取流量日志或汇总端点。这些采集应保留在现有采集器中；辅助函数/规则仅记录精确映射，不另建日志采集体系。
 
@@ -106,7 +150,7 @@ CLI 不读取流量日志或汇总端点。这些采集应保留在现有采集�
 1. **先保留范围受限且安全的时间线。** 记录 UTC 时间窗口、实例标签、部署版本、重启/进程运行周期、本地诊断状态、新鲜写入端观测状态、就绪检查结果和精确安全错误码的计数。使用现有 `ownership-lost` 事件及白名单内的原因/子类别。不要将原始响应头或请求头、请求体、账号凭据、完整调用方/成员值或任意 SQL/驱动错误复制到事件或监控报告中。如果现有详细日志包含这些信息，访问仍须受限；只提取所需的安全字段。
 2. **区分进程、调度器和存储。** `/healthz` 检查进程的 HTTP 存活性，不检查数据库健康。`/readyz` 会 ping 存储，并包含现有的 SQLite owner 保护；正常的 MySQL standby（备用实例）不会仅因处于 standby 状态而就绪检查失败。SQL 不可用时诊断端点仍显示绿色是预期现象。数据库 ping 成功不是端到端准入/hold/凭据可用的证明。应验证每个实际实例和共用写入端；不要根据经负载均衡路由取得的快照启动多实例重启。
 3. **存储不可用：**通过现有数据库运维流程排查实际写入端/网络/TLS/连接/队列/锁/资源问题。在有效查询成功之前，所有权一律视为未知。不要清除 owner、手动延长租约、禁用 fence（栅栏保护）、重放结果不明的推理请求，或因共享数据库短暂故障而重启所有 Proxy。存储恢复后，MySQL 工作进程通常会重新参与选举；应观测实际结果，而不是承诺在名义上的 30 秒租期内恢复。
-4. **数据库健康，但反复观测不到有效调度器：**检查停止/缺失的进程、事件循环/资源阻塞、生效的共享配置、维护暂停和安全的 owner 丢失事件。Ready 库存可能继续服务，但补充/修复可能停滞。如果进程干预确有必要且已获批，在确认其他就绪后端和容量充足的同时，排空**一个受影响实例**。健康的 standby 不会仅因处于备用状态就成为受影响实例。使用正常关闭/租约到期和选举流程；不要通过 SQL 强制写入 owner。干预后确认新鲜的写入端所有权观测，在处理另一实例前始终维持容量。
+4. **数据库健康，但反复观测不到有效调度器：**检查停止/缺失的进程、事件循环/资源阻塞、生效的共享配置、维护暂停和安全的 owner 丢失事件。Ready 库存可能继续服务，但补充/修复可能停滞。如果进程干预确有必要且已获批，在确认其他就绪后端和容量充足的同时，排空**一个受影响实例**。健康的 standby 不会仅因处于备用状态就成为受影响实例。使用正常关闭/租约到期和选举流程；不要通过 SQL 强制写入 owner。干预后确认新鲜的写入端所有权观测，在处理另一实例前始终维持容量。**不要混淆两种“排空”**：这里的“排空实例”指从负载均衡中移除一个 Proxy 进程；Console 企业表中的 **Drain**（`PATCH /api/enterprises/<id>/pool-policy`，`state: "draining"`）是停止为某个企业补货和分配新调用方，与进程重启无关，也不能用来恢复调度器。
 5. **外部副作用未知：**SSO/SCIM/席位/Login 超时、派发结果不明、取消结果不确定或回调不匹配，都需要使用现有受限操作/任务证据进行人工核对。超时、404 或已取消的响应不能证明外部动作没有发生。保留任务/nonce（一次性随机值）/generation（代次）/fence（栅栏）状态；不要重复 POST、清空槽位、重置尝试次数、伪造 Ready 成员或创建替代用户/席位。`manual_reconciliation_required` 仍是必须停止的条件。在现有保护机制允许的情况下，运维人员只有在核对原始结果后才能显式重试/恢复。调度所有权恢复并不授权重放结果未知的外部动作。
 6. **就绪、存活和重启策略始终分开。** 使用 `/readyz` 决定后端加入/移出流量，使用 `/healthz` 作为具有适当容忍度的进程存活探针；两种探针都不应要求拥有 MySQL 调度所有权。共享故障期间，数据库引发的就绪失败可能移除所有后端；存活探针不应把同一短暂故障升级为整个实例群的重启风暴。仅有容器 `unhealthy` 状态不会触发 Docker `on-failure`；Kubernetes 就绪探针负责移除流量，存活探针负责重启，进程管理器的重启预算/退避策略则独立生效。本交接不更改其中任何机制。
 7. **计划终止：**先通过现有平台移除/排空新的负载均衡流量；考虑端点变更传播和长流式连接，再按获批的进程流程发送 SIGTERM。基线关闭流程会关闭 HTTP，并在约 25 秒时强制关闭连接，随后才完成工作进程/存储清理；这不保证每个流或外部操作都能优雅完成。终止宽限期应按实测的负载均衡排空时间 + 服务端关闭时间 + 清理余量配置，而不是象征性地承诺 30 秒。通过现有受限工具检查进行中的流量/hold，并预期崩溃进程通过有界 TTL 完成清理。绝不能仅为加快排空而强制释放活动 hold 或重放结果不确定的请求。先对一个实例试行重启，观测恢复后再决定是否需要处理其他实例。

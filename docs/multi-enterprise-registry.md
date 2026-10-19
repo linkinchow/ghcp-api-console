@@ -48,7 +48,7 @@
 | `sso.scimBaseUrl` | 否 | `<apiBaseUrl>/scim/v2/enterprises/<slug>` | SSO |
 | `sso.emailDomain` / `sso.userPrefix` | 否 | 只在首次创建该企业的 SSO 运行时设置时作为初值，之后在 Console 的 SSO 设置中修改 | SSO |
 | `sso.signingCert` / `sso.signingKey` / `sso.sessionSecret` | 是（阻塞项） | secret 引用；文件不存在或为空也是阻塞项 | SSO |
-| `sso.scimToken` / `sso.seatPat` / `sso.defaultUserPassword` | 否 | secret 引用。缺失时相关操作对该企业返回 503 `enterprise_secret_unconfigured` | SSO |
+| `sso.scimToken` / `sso.seatPat` / `sso.defaultUserPassword` | 否 | secret 引用。缺失时：`scimToken` 相关的 SCIM 操作返回 503 `enterprise_secret_unconfigured`；`seatPat` 相关的席位操作同样返回 503，AI Credits 刷新返回 400 `ai_credits_refresh_failed`；`defaultUserPassword` 缺失时默认密码回退为用户名（与 r4 相同） | SSO |
 | `login.ssoProvider` | 否 | `custom` 或 `azure`。不设置：每个登录任务自行选择（与单企业版相同）；设置后任务必须一致 | Login |
 | `login.ssoLoginUrl` | 否 | `default` 取 `SSO_URL`；其他企业取 `<SSO_URL 的 origin>/enterprises/<id>/login`。`custom` 类型缺失时为阻塞项；query 和 fragment 会被去掉 | Login |
 | `login.allowedLoginUrls` | 否 | `[ssoLoginUrl]`；1–16 项，必须包含 `ssoLoginUrl`。浏览器只在 origin 相同、路径按整段前缀匹配的页面填写 SSO 凭据（`/login` 不匹配 `/loginfoo`） | Login |
@@ -69,7 +69,7 @@
 | 格式 | 说明 |
 | --- | --- |
 | `{ "env": "NAME" }` | 读取该服务的环境变量。`NAME` 匹配 `^[A-Z][A-Z0-9_]{0,127}$`。修改需重启。 |
-| `{ "file": "/abs/path" }` | 读取容器内的绝对路径。使用时读取并缓存 60 秒，**轮换挂载的 Secret 不需要重启**。 |
+| `{ "file": "/abs/path" }` | 读取容器内的绝对路径。使用时读取并缓存 60 秒，**轮换挂载的 Secret 不需要重启**。例外：Models 管理员 token（`modelsAdmin.copilotToken`）每次查询都重新读取，与 r4 一致；SSO 的 SAML 签名证书和私钥（`sso.signingCert`、`sso.signingKey`）在进程内缓存，轮换后需要重启 SSO。 |
 
 - 内容最大 128 KiB，不允许 NUL 字节，只去掉一个结尾换行；空文件视为未配置。
 - 只在需要它的服务中、需要时才读取。某个企业缺少 secret 只影响该企业，不影响其他企业和服务启动。
@@ -102,7 +102,7 @@
 
 ## 6. 就绪检查（readiness）
 
-Proxy 比对三个服务对同一企业的配置：三方都有该 `id`；`githubBaseUrl` 相同；`shortcode` 在 Proxy 与 SSO 之间相同；`slug` 在 SSO 与 Login 之间相同；三方都没有阻塞项。结果显示在 Console **User pool → Pool overview** 的企业表（Blockers 列）。
+Proxy 比对三个服务对同一企业的配置：三方都有该 `id`；`githubBaseUrl` 相同；`shortcode` 在 Proxy 与 SSO 之间相同；`slug` 在 SSO 与 Login 之间相同；三方都没有阻塞项。结果显示在 Console **Pool overview** 页的企业表（Blockers 列）。
 
 | 阻塞项（示例） | 含义 |
 | --- | --- |
@@ -125,7 +125,7 @@ Proxy 比对三个服务对同一企业的配置：三方都有该 `id`；`githu
 
 允许的转换：`draft → active`（激活）、`active → draining`（排空）、`draining → active`（恢复）。不能回到 `draft`，`draft` 不能直接排空。
 
-Console **User pool → Pool overview → Enterprises** 表中的操作：
+Console **Pool overview** 页企业表中的操作：
 
 - **Edit cap**：修改该企业的 cap（`max_accounts`）。带版本号（CAS），别人先改过时提示重新加载；所有 cap 之和不能超过 10,000。
 - **Activate** / **Resume**：先显示三方 readiness 明细，Proxy 实时检查通过才会执行；未就绪返回 409 `enterprise_not_ready` 并列出阻塞项。
