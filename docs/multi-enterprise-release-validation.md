@@ -101,7 +101,7 @@ Docker Hub：**待发布**（发布需另行确认；发布后在此补充按 di
 | 全仓 typecheck（含 upgrade 工具） | 通过 |
 | shared | 145/145 |
 | Proxy | 680 条：639 通过、40 跳过（需 MySQL，另行运行）、1 失败。失败项为 `mysqlMigrationLock.test.ts` 的 “migration CREATE TABLE timeout destroys without recycling”，单独重跑 3 次均 18/18 通过。另有一轮与镜像构建同时运行的全量测试出现 2 失败、1 取消（`loginPollingRecovery`、`mysqlAdmission.integration`、`mysqlCallerIsolation` 中的超时类用例），这几个文件单独重跑全部通过。 |
-| Proxy MySQL 集成（MySQL 8.4，逐个文件） | 13 个文件中 11 个第一次就通过；`mysqlStore.integration` 和 `loginPollingRecovery` 在普通磁盘的 MySQL 上失败，在 tmpfs 的 MySQL 上通过，见下文 |
+| Proxy MySQL 集成（MySQL 8.4，逐个文件） | 13 个文件全部通过。其中 `mysqlStore.integration` 和 `loginPollingRecovery` 在主机负载高时于普通磁盘 MySQL 上超时失败，主机空闲后在同一普通磁盘 MySQL 上复跑通过（34/34、6/6），见下文 |
 | SSO / Login / Console | 95/95、61/61、35/35 |
 | Console 浏览器测试（本机 Edge headless，串行） | 71 条：70 通过、1 失败（“SSO sync submits directly once …”，服务端计数尚未记录请求时就断言）。单独重跑该文件时这条通过，另一条（“logout and session expiry clear action snapshots …”）因 8 秒点击超时失败；两条再单独重跑都通过。每条测试都至少通过一次，失败都是计时类。 |
 | 离线迁移工具（`upgrade/user-pool-mysql` 三个测试文件 + `upgrade/sqlite-to-mysql` 集成测试，MySQL 用例在 MySQL 上） | 133/133 |
@@ -121,8 +121,9 @@ Docker Hub：**待发布**（发布需另行确认；发布后在此补充按 di
     - 错误一律是 `MysqlDeadlineError: User pool MySQL deadline exceeded during query`（`POOL_SQL_TIMEOUT`，即每条语句 5 秒的时限）。
   - `loginPollingRecovery`（6 条，含 MySQL 场景）：第一次 4 通过、2 取消（`disabled-read-rejection`、`success-callback-race` 超过 45 秒的测试时限）；单独重跑时 3 通过、1 失败（`failed-read-503`，连接 MySQL 时 `connect ETIMEDOUT`）、2 取消（同上两条超时）。
 - 同一 MySQL 8.4 镜像、数据目录放在 tmpfs 的一次性容器：`mysqlStore.integration` **34/34 通过**，`loginPollingRecovery` **6/6 通过**。
+- 次日主机空闲时（容器内 `SELECT 1` 往返约 0.7 秒，此前约 3 秒），在**同一个普通磁盘 MySQL 容器**上逐个复跑：`mysqlStore.integration` **34/34 通过**，`loginPollingRecovery` **6/6 通过**。
 
-结论：这两个文件在普通磁盘 MySQL 上的失败都是超时类（语句时限、测试时限、连接超时），与本次代码改动无关（改动只涉及启动配置校验和 Console 列名）；功能断言在 tmpfs MySQL 上全部通过。但它们在本机普通磁盘 MySQL 上**没有**通过，不能记为“全部通过”。建议在磁盘性能正常的环境中复跑这两个文件。
+结论：这两个文件此前的失败都是超时类（语句时限、测试时限、连接超时），出现在主机负载高、Docker Desktop 磁盘明显变慢的时段；主机空闲后在同一普通磁盘 MySQL 上复跑全部通过。与本次代码改动无关（改动只涉及启动配置校验和 Console 列名）。
 
 ### 4. 镜像扫描（Docker Scout）
 
@@ -149,7 +150,6 @@ Docker Hub：**待发布**（发布需另行确认；发布后在此补充按 di
 - OpenCode OAuth client id 能否用于 `*.ghe.com`（设计 §13 第 4 项）。
 - 资格测试中没有真实 Login 浏览器任务；Login 浏览器流程由 Login 自带的浏览器测试覆盖。
 - `MYSQL_AUTO_MIGRATE=false` + DBA 升级脚本的路径只在集成测试中覆盖。
-- `mysqlStore.integration`、`loginPollingRecovery` 未在普通磁盘 MySQL 上通过（见第 3 节）。
 - 第 2.3 节在无网络环境下进行，不覆盖空闲目标大于上限时的实际补货行为。
 - Docker Hub 推送与按 digest 拉取核对（待发布）。
 - 性能、容量与长时间稳定性。
