@@ -8,7 +8,8 @@ Console 解决“运维/开发人员如何集中管理各服务状态和手动�
 
 职责：
 
-- 提供 Web UI：仪表盘、SSO 用户、AI Credits、请求统计、Proxy 账号、Login 任务、上游错误诊断和服务连通性诊断。
+- 提供 Web UI：仪表盘、SSO 用户、AI Credits、请求统计、Proxy 账号、Models、账号池（Pool overview / Pool members）、Login 任务、上游错误诊断和服务连通性诊断。
+- 多企业版：页头 **Enterprise** 选择器切换企业作用域页面；Pool overview 管理各企业的 cap 和生命周期。企业列表来自 Proxy 的 `GET /api/enterprises`，Console 不读取 registry 文件。
 - 提供控制台登录鉴权：首次初始化管理员，后续使用 cookie session 登录。
 - 作为浏览器到内部服务的 API 网关：浏览器只访问 `/api/console/**`，Console 服务端再转发到 proxy/sso/login 的 `/api/**`。
 - 给上游服务补充内部认证头 `X-Internal-Token`，避免前端直接持有内部 token。
@@ -16,7 +17,7 @@ Console 解决“运维/开发人员如何集中管理各服务状态和手动�
 非职责/当前未提供：
 
 - 当前未提供 Console 自己的数据数据库；只通过 `admins.json` 保存控制台管理员。
-- 当前未提供外部 SSO/OAuth 登录 Console、细粒度 RBAC、多管理员管理界面。
+- 当前未提供外部 SSO/OAuth 登录 Console、细粒度 RBAC、多管理员管理界面。企业选择器**不是权限边界**：所有 Console 管理员都能管理所有企业。
 - 当前未提供专门的 Vite dev/HMR npm script；服务端 API proxy 已提供 Node test runner 测试。
 
 ## 2. 核心功能
@@ -31,17 +32,43 @@ Console 解决“运维/开发人员如何集中管理各服务状态和手动�
 
 ### 管理页面
 
-| 页面 | 代码入口 | 实际能力 |
-| --- | --- | --- |
-| Dashboard | `DashboardPage` | 汇总 proxy accounts、SSO users、login tasks、request stats；展示近期失败任务/失败请求。 |
-| SSO Users | `UsersPage` | 查询/分页、创建、编辑、CSV 导入、批量创建、从 GH/SCIM 预览并应用导入、批量同步/挂起/删除 GH login、分配/移除 Copilot seat。 |
-| AI Credits Usage | `AiCreditsUsagePage` | 读取/刷新企业 AI Credits 用量、展示预计本月用量和 Copilot seat 成本。 |
-| Request Stats | `RequestStatsPage` | 查看 proxy 请求统计，按 identity/GH login、model、成功状态过滤。 |
-| Proxy Accounts | `ProxyAccountsPage` | 查看 identity 映射和 Copilot OAuth 状态、详情、验证后导入 token、发起重新授权、批量删除选中 Proxy account 及其 request stats。 |
-| Login Tasks | `LoginTasksPage` | 完整筛选、可调分页、跨页批量重试/取消/清理、实际队列、阶段时长、独立尝试及脱敏日志。 |
-| Settings | `SettingsPage` | 修改当前 Console 管理员密码；在线读取/更新 SSO 与 Login runtime settings。 |
-| Error Diagnostics | `ErrorDiagnosticsPage` | 分页查看 Copilot 上游失败摘要，预览含 headers/body/curl 的人类可读日志，下载完整 `.log`，清空诊断文件。 |
-| Diagnostics | `DiagnosticsPage` | 调用 proxy/sso/login-service 代理路由检查服务连通性和内部 token 是否匹配。 |
+“作用域”一列：**企业**表示页面只显示页头所选企业的数据；**全局**表示与企业选择无关；**混合**表示页面同时含全局部分和所选企业的部分。
+
+| 页面 | 代码入口 | 作用域 | 实际能力 |
+| --- | --- | --- | --- |
+| Dashboard | `DashboardPage` | 全局 | 每个企业一张卡片：账号、SSO 用户、失败任务汇总，池状态和 readiness。 |
+| SSO Users | `UsersPage` | 企业 | 查询/分页、创建、编辑、CSV 导入、批量创建、从 GH/SCIM 预览并应用导入、批量同步/挂起/删除 GH login、分配/移除 Copilot seat。 |
+| AI Credits Usage | `AiCreditsUsagePage` | 企业 | 读取/刷新该企业 AI Credits 用量、展示预计本月用量和 Copilot seat 成本。 |
+| Request Stats | `RequestStatsPage` | 企业 | 查看该企业的 proxy 请求统计，按 identity/GH login、model、成功状态过滤。 |
+| Proxy Accounts | `ProxyAccountsPage` | 企业 | 查看 identity 映射和 Copilot OAuth 状态、详情、验证后导入 token、发起重新授权、批量删除选中 Proxy account 及其 request stats。 |
+| Models | `ModelsPage` | 企业 | 用该企业配置的 Models 管理员查看 Copilot 模型目录（见 [Models 使用指南](../../docs/models-admin-guide.md)）；不回落到池账号。未配置时显示 `models_admin_not_configured`。 |
+| Pool overview | `EnterprisePoolPage` | 全局 | 账号池全局设置（idle target、租约 TTL、暂停补池）和企业表（见下文）。 |
+| Pool members | `UserPoolPage` | 企业 | 该企业的池成员、调用方租约和事件；对成员执行 disable / resume / retry，释放租约。 |
+| Login Tasks | `LoginTasksPage` | 企业 | 完整筛选、可调分页、跨页批量重试/取消/清理、实际队列、阶段时长、独立尝试及脱敏日志。 |
+| Settings | `SettingsPage` | 混合 | 修改当前 Console 管理员密码、在线读取/更新 Login runtime settings（全局）；SSO runtime settings 按所选企业读取/更新。 |
+| Error Diagnostics | `ErrorDiagnosticsPage` | 全局 | 分页查看 Copilot 上游失败摘要，预览含 headers/body/curl 的人类可读日志，下载完整 `.log`，清空诊断文件。 |
+| Diagnostics | `DiagnosticsPage` | 混合 | 调用企业列表和所选企业的 proxy/sso/login-service 代理路由，检查服务连通性和内部 token 是否匹配。 |
+
+### 企业选择器
+
+- 选项来自 `GET /api/console/proxy/enterprises`，每项显示 `displayName · GitHub 主机（github.com 或 <sub>.ghe.com）· 状态`（`draft`、`active`、`draining`，直连模式显示 `direct`）。
+- 选择保存在 URL hash：`#/<page>?e=<enterpriseId>&<页面查询参数>`，刷新、收藏和分享链接都保留所选企业；旧的 `#<page>?...` 形式仍可读取。没有 `e` 时界面默认选 `default`，这只是界面初值，每个 API 请求都显式带企业 ID。
+- hash 中的企业不合法或不在 Proxy 的企业列表中时，企业作用域页面显示错误并要求重新选择，**不会**自动换成其他企业；企业列表读取失败时显示警告。
+- 企业作用域页面以 `<enterpriseId>:<page>` 为 key 重新挂载：切换企业会中止进行中的请求并丢弃迟到的响应，清空列表选择和未提交的草稿，避免把操作提交到另一个企业。
+- 前端只通过 `enterprisePath(service, enterpriseId)`（`src/web/api/enterprises.ts`）拼接作用域路径；企业 ID 不合法时直接报错，不回落到 `default`。
+
+### Pool overview 企业表
+
+账号池（caller-lease）模式下，企业表列出每个企业的 Enterprise、State、Inventory / cap、Target share、Actual share、Score、Ready idle、Leased、In flight、Failed / disabled、Blockers 和操作。库存是该企业已登记的池账号数，不是账单数字；目标/实际占比只决定新账号补给哪个企业，不是流量配额。
+
+| 操作 | 说明 |
+| --- | --- |
+| **Edit cap** | 修改该企业的 cap（1–10000，所有企业 cap 之和不能超过共享名字目录容量 10000）。请求带 `expectedVersion`（CAS）；别人先改过时返回 `409 policy_version_conflict`，需重新加载。 |
+| **Activate** | `draft → active`。确认框先显示 Proxy、SSO、Login 三方 readiness 明细；Proxy 实时检查通过才执行，未就绪返回 `409 enterprise_not_ready` 并列出阻塞项。 |
+| **Drain** | `active → draining`：不新建租约、不补货，已有租约保留。 |
+| **Resume** | `draining → active`，与 Activate 一样实时检查 readiness。 |
+
+对应接口为 `PATCH /api/console/proxy/enterprises/<id>/pool-policy`，body `{ expectedVersion, maxAccounts?, state? }`。全局设置通过 `/api/console/proxy/user-pool/settings` 保存，不再包含 cap。直连模式下没有池策略，企业表不提供这些操作。
 
 ### Copilot 直接席位状态
 
@@ -59,13 +86,28 @@ Console 前端不直接访问这些服务；所有请求先到 Console：
 - `/api/console/sso/**` → `SSO_BASE_URL/api/**`
 - `/api/console/login-service/**` → `LOGIN_BASE_URL/api/**`
 
+企业作用域的请求使用 `/api/console/<service>/enterprises/<enterpriseId>/...`，转发后即为上游的 `/api/enterprises/<enterpriseId>/...`；只转发上游 `/api/**`，包含 `.`、`..` 路径段的请求返回 `400 invalid_proxy_path`，因此浏览器无法经 Console 访问上游的 `/internal/**`。
+
 转发时 Console 会：
 
 - 要求已登录管理员；
+- 对非 GET/HEAD/OPTIONS 请求做同源检查（见下文“同源保护”）；
 - 设置 `Accept: application/json`、`Content-Type: application/json`；
 - 设置 `X-Internal-Token: <INTERNAL_API_TOKEN>`；
 - GET/HEAD 不带 body，其他方法把前端 JSON body 重新序列化；
 - 原样透传上游 HTTP status、content-type、`content-disposition` 和响应 bytes，支持诊断 `.log` 附件下载；转发失败返回 `502 { error: { code: 'service_proxy_failed', message } }`。
+- Models 查询（`GET .../models`）最长等待 40 秒；超时返回 `504`、其他转发失败返回 `502`，错误码均为 `models_service_unavailable`，不透传底层错误文本。
+
+### 同源保护
+
+Console 对 `/api/console/**` 下**所有**写请求（非 GET/HEAD/OPTIONS）校验来源，包括 setup、login、logout、改密码和全部转发到 proxy/sso/login 的写操作（`src/server/sameOrigin.ts`）：
+
+- `Sec-Fetch-Site: cross-site` 拒绝；
+- `Origin: null` 或无法解析的 `Origin` 拒绝；
+- `Origin` 的 host 必须等于请求的 Host 头，或 `CONSOLE_PUBLIC_BASE_URL` 的 host；
+- 没有 `Origin` 头时放行（非浏览器客户端）。
+
+拒绝时返回 `403 cross_site_request_rejected`。Console 前有会改写 Host 头的反向代理时，把 `CONSOLE_PUBLIC_BASE_URL` 设为用户在浏览器中打开的 Console 地址，否则浏览器发起的写操作会被拒绝。
 
 ## 3. 启动方式
 
@@ -131,6 +173,7 @@ Console 使用 `dotenv/config` 读取当前进程工作目录下的 `.env`，建
 | `SSO_BASE_URL` | `http://localhost:7001` | `http://sso:7001` | 否 | sso 服务地址；Console 转发 `/api/console/sso/**` 到这里。 |
 | `LOGIN_BASE_URL` | `http://localhost:7003` | `http://login:7003` | 否 | login 服务地址；Console 转发 `/api/console/login-service/**` 到这里。 |
 | `LOG_LEVEL` | `info`（shared logger） | `info` | 否 | `apiProxy` 使用 `loggerFor('console', 'api-proxy')` 输出转发日志；支持 `debug/info/warn/error`。 |
+| `CONSOLE_PUBLIC_BASE_URL` | 未设置 | 未列出 | 否 | 多企业版新增。用户在浏览器中打开的 Console 地址（http/https，例如 `https://console.example.com`）；Console 前有会改写 Host 头的反向代理时设置。其 host 被视为同源，见“同源保护”。值不是合法 http/https URL 时启动失败。 |
 
 根目录 `.env.example` 中也出现了 `SESSION_SECRET`、`INTERNAL_API_TOKEN` 等共享变量；Console 代码实际只直接读取上表变量。
 
@@ -138,10 +181,10 @@ Console 使用 `dotenv/config` 读取当前进程工作目录下的 `.env`，建
 
 Console 自身没有 runtime settings 表。上表环境变量只在 Console 启动时读取，修改后需要重启；它们不会被 Settings 页面覆盖。Settings 页面只是经过 Console 的认证代理调用：
 
-- `GET/PATCH /api/console/sso/settings/runtime` → SSO 的 `/api/settings/runtime`
-- `GET/PATCH /api/console/login-service/settings/runtime` → Login 的 `/api/settings/runtime`
+- `GET/PATCH /api/console/sso/enterprises/<id>/settings/runtime` → SSO 的 `/api/enterprises/<id>/settings/runtime`（按页头所选企业，每个企业单独保存）
+- `GET/PATCH /api/console/login-service/settings/runtime` → Login 的 `/api/settings/runtime`（全局）
 
-SSO settings 保存在 `sso.sqlite`：用户上限、用户名 fallback、默认 email 域、`sync_emu` 并发以及 SCIM delay/retry。Login settings 保存在 `login.sqlite`：Login 并发、认证超时、debug 日志和 debug artifacts。保存请求带 `expectedVersion`；发生 409 时页面重新加载最新值，避免覆盖另一管理员的修改。
+SSO settings 按企业保存在 `sso.sqlite`：用户上限、用户名 fallback、默认 email 域、`sync_emu` 并发以及 SCIM delay/retry。Login settings 保存在 `login.sqlite`：Login 并发、认证超时、debug 日志和 debug artifacts。保存请求带 `expectedVersion`；发生 409 时页面重新加载最新值，避免覆盖另一管理员的修改。
 
 Console 管理员密码不是 runtime setting。Settings 页面调用 Console 自身的 `PATCH /api/console/password`，先校验当前密码，再为当前登录用户名生成新的随机 salt 和 scrypt hash，写回 `ADMINS_FILE`。新密码立即用于后续登录；当前 cookie session 不会被注销。
 
@@ -161,7 +204,7 @@ Settings 按 SSO、Login、管理员安全排列为独立的全宽区块，不�
 | Login | `authDebugLogs` | `false` | boolean |
 | Login | `authDebugArtifacts` | `false` | boolean |
 
-Proxy 当前没有可由 Console 修改的 runtime settings。`REQUEST_STATS_PER_ACCOUNT_LIMIT` 和 `PROXY_ERROR_DIAGNOSTICS_*` 只能通过 Proxy 环境变量配置并重启生效；Error Diagnostics 页面只负责筛选、读取、下载和清空记录，不修改采集策略。Login 历史没有自动 retention，可按终态和结束时间预览批量清理。密钥、默认密码、服务 URL、文件路径、证书和 token 均不应进入 Settings。
+Proxy 没有 Settings 页中的 runtime settings；账号池全局设置（idle target、租约 TTL、暂停补池）和各企业的 cap / 生命周期在 **Pool overview** 中修改，保存在 Proxy 数据库。`REQUEST_STATS_PER_ACCOUNT_LIMIT` 和 `PROXY_ERROR_DIAGNOSTICS_*` 只能通过 Proxy 环境变量配置并重启生效；Error Diagnostics 页面只负责筛选、读取、下载和清空记录，不修改采集策略。Login 历史没有自动 retention，可按终态和结束时间预览批量清理。密钥、默认密码、服务 URL、文件路径、证书和 token 均不应进入 Settings。
 
 ## 5. 接口与 API 边界
 
@@ -169,16 +212,16 @@ Proxy 当前没有可由 Console 修改的 runtime settings。`REQUEST_STATS_PER
 
 | 方法/路径 | 认证 | 请求核心结构 | 响应核心结构 |
 | --- | --- | --- | --- |
-| `GET /healthz` | 无 | 无 | `{ status: 'ok', service: 'console' }` |
+| `GET /healthz` | 无 | 无 | `{ status: 'ok', service: 'console', releaseLine }`；多企业版镜像 `releaseLine` 为 `'multi'` |
 | `GET /api/console/setup` | 无 | 无 | `{ initialized: boolean }` |
-| `POST /api/console/setup` | 无；但已有 enabled admin 时失败 | `{ username?: string, password?: string }` | `201 { username, role: 'admin' }`；失败 `400 ApiErrorResponse` |
-| `POST /api/console/login` | 无 | `{ username?: string, password?: string }` | `{ username, role: 'admin' }`；失败 `401 ApiErrorResponse` |
-| `POST /api/console/logout` | 无 | 无 | `204` |
+| `POST /api/console/setup` | 无（同源检查）；已有 enabled admin 时失败 | `{ username?: string, password?: string }` | `201 { username, role: 'admin' }`；失败 `400 ApiErrorResponse` |
+| `POST /api/console/login` | 无（同源检查） | `{ username?: string, password?: string }` | `{ username, role: 'admin' }`；失败 `401 ApiErrorResponse` |
+| `POST /api/console/logout` | 无（同源检查） | 无 | `204` |
 | `GET /api/console/me` | Console admin | 无 | `{ username, role: 'admin' }` |
-| `PATCH /api/console/password` | Console admin | `{ currentPassword: string, newPassword: string }` | 成功 `204`；当前密码错误返回 `401 invalid_current_password`。 |
-| `/api/console/proxy/**` | Console admin | JSON；由前端 API client 决定 | 透传 proxy `/api/**` 响应 |
-| `/api/console/sso/**` | Console admin | JSON；由前端 API client 决定 | 透传 sso `/api/**` 响应 |
-| `/api/console/login-service/**` | Console admin | JSON；由前端 API client 决定 | 透传 login `/api/**` 响应 |
+| `PATCH /api/console/password` | Console admin（同源检查） | `{ currentPassword: string, newPassword: string }` | 成功 `204`；当前密码错误返回 `401 invalid_current_password`。 |
+| `/api/console/proxy/**` | Console admin；写请求同源检查 | JSON；由前端 API client 决定 | 透传 proxy `/api/**` 响应 |
+| `/api/console/sso/**` | Console admin；写请求同源检查 | JSON；由前端 API client 决定 | 透传 sso `/api/**` 响应 |
+| `/api/console/login-service/**` | Console admin；写请求同源检查 | JSON；由前端 API client 决定 | 透传 login `/api/**` 响应 |
 
 `ApiErrorResponse` 来自 shared：`{ error: { code, message, details?, requestId? } }`。
 
@@ -194,56 +237,70 @@ Proxy 当前没有可由 Console 修改的 runtime settings。`REQUEST_STATS_PER
 
 完整管理列表由 `ManagedList` 直接调用通用 `api<T>()`，使用服务端筛选、排序和分页，不再为每个列表维护单独的 API 包装函数，也不在前端把数组补成分页响应。
 
+下文中 `{p}`、`{s}`、`{l}` 分别表示 `/api/console/proxy/enterprises/<id>`、`/api/console/sso/enterprises/<id>`、`/api/console/login-service/enterprises/<id>`（由 `enterprisePath()` 生成，`<id>` 为页头所选企业）。
+
 | 列表 | Console GET 路径 | 响应 |
 | --- | --- | --- |
-| SSO Users | `/api/console/sso/users` | `PageResponse<SsoUserDto>` |
-| Proxy Accounts | `/api/console/proxy/accounts` | `PageResponse<ProxyAccountDto>` |
-| Login Tasks | `/api/console/login-service/tasks` | `PageResponse<LoginTaskDto>` |
-| Request Stats | `/api/console/proxy/request-stats` | `PageResponse<ProxyRequestStatDto>` |
-| Error Diagnostics | `/api/console/proxy/error-diagnostics` | `ProxyErrorDiagnosticsListResponse` |
+| SSO Users | `{s}/users` | `PageResponse<SsoUserDto>` |
+| Proxy Accounts | `{p}/accounts` | `PageResponse<ProxyAccountDto>` |
+| Login Tasks | `{l}/tasks` | `PageResponse<LoginTaskDto>` |
+| Request Stats | `{p}/request-stats` | `PageResponse<ProxyRequestStatDto>` |
+| Error Diagnostics | `/api/console/proxy/error-diagnostics`（全局） | `ProxyErrorDiagnosticsListResponse` |
 
-Users、Proxy Accounts 和 Login Tasks 的列表操作由 `useOperations` 统一访问对应资源下的 `/operations`：内部冻结目标 `POST /preview`，执行 `POST /:id/execute`，手动查询 `GET /:id`。普通操作直接串联冻结与执行，不弹出预览页面；危险操作仅显示简短确认框，重试/重新授权保留凭据确认。行内操作使用单个目标，复用同样的流程。
+Users、Proxy Accounts 和 Login Tasks 的列表操作由 `useOperations` 统一访问对应资源下的 `/operations`（例如 `{p}/accounts/operations`）：内部冻结目标 `POST /preview`，执行 `POST /:id/execute`，手动查询 `GET /:id`。普通操作直接串联冻结与执行，不弹出预览页面；危险操作仅显示简短确认框，确认框中显示企业 ID 与 slug；重试/重新授权保留凭据确认。行内操作使用单个目标，复用同样的流程。
 
-Proxy 单账号删除、Login 单任务取消/删除/重试的服务端 HTTP 接口仍保留兼容；只是当前列表不再通过旧的前端包装函数调用它们。接口语义见 [Proxy README](../proxy/README.md) 和 [Login README](../login/README.md)。下列 client 提供摘要读取、详情、设置、导入等专用调用，并保留已有的兼容导入入口。
+Proxy 单账号删除、Login 单任务取消/删除/重试的服务端 HTTP 接口仍保留兼容；只是当前列表不再通过旧的前端包装函数调用它们。接口语义见 [Proxy README](../proxy/README.md) 和 [Login README](../login/README.md)。下列 client 提供摘要读取、详情、设置、导入等专用调用；企业作用域的函数第一个参数都是 `enterpriseId`。
+
+#### 企业与账号池 client（`src/web/api/enterprises.ts`、`src/web/api/userPool.ts`、`src/web/api/models.ts`）
+
+| 函数 | Console 路径 | 核心结构 |
+| --- | --- | --- |
+| `listEnterprises()` | `GET /api/console/proxy/enterprises` | `{ items, nameCapacity }`；企业选择器、Dashboard 和 Pool overview 使用。 |
+| `updatePoolPolicy(id, body)` | `PATCH {p}/pool-policy` | `{ expectedVersion, maxAccounts?, state? }` → `EnterprisePoolPolicyDto`。 |
+| `getUserPoolOverview()` / `updateUserPoolSettings()` / `reconcileUserPool()` | `/api/console/proxy/user-pool/overview`、`/settings`、`/reconcile`（全局） | 全局池设置与计数；设置不含 cap。 |
+| `getEnterprisePoolSummary(id)`、`getUserPoolPage(id, kind, ...)` | `GET {p}/user-pool/summary`、`{p}/user-pool/page/:kind` | 该企业的池计数与分页列表。 |
+| `updateUserPoolAccount(id, identity, action)`、`releaseUserPoolLease(id, leaseId)` | `POST {p}/user-pool/accounts/:identity/:action`、`{p}/user-pool/leases/:id/release` | 成员 disable / resume / retry；释放租约。 |
+| `getAdminModels(id, refresh)` | `GET {p}/models?refresh=true\|false` | 该企业 Models 管理员看到的模型目录。 |
 
 #### proxy client（`src/web/api/proxy.ts`）
 
 | 函数 | Console 路径 | 核心结构 |
 | --- | --- | --- |
-| `getProxyAccount(identity)` | `GET /api/console/proxy/accounts/:identity` | `ProxyAccountDto` |
-| `listRequestStats({ identity?, limit? })` | `GET /api/console/proxy/request-stats` 或 `/accounts/:identity/request-stats` | `ProxyRequestStatDto[]`；供 Dashboard 和账号详情读取近期样本，不用于完整列表分页。 |
-| `reauthorizeCopilotOauth(identity, { credentialMode, ssoPassword?, ssoType? })` | `POST /api/console/proxy/accounts/:identity/copilot-oauth/reauthorize` | `ProxyAccountDto`；密码默认由服务端解析 |
-| `importCopilotOauthTokens(csvText)` | `POST /api/console/proxy/accounts/copilot-oauth-token/import` | `BatchResult<ImportCopilotOauthTokenRow>`；请求 `{ csvText }`。 |
-| `getErrorDiagnostic(id)` | `GET /api/console/proxy/error-diagnostics/:id` | `ProxyErrorDiagnosticDetailDto`。 |
-| `downloadErrorDiagnostic(id)` | `GET /api/console/proxy/error-diagnostics/:id/download` | 返回附件 `Blob` 和服务端文件名。 |
-| `clearErrorDiagnostics()` | `DELETE /api/console/proxy/error-diagnostics` | 发送 `{ confirm: true }` 清空全部记录。 |
+| `getProxyAccount(id, identity)` | `GET {p}/accounts/:identity` | `ProxyAccountDto` |
+| `getAccountsSummary(id)` | `GET {p}/accounts/summary` | `ManagementSummary`；Dashboard 使用。 |
+| `listRequestStats(id, { identity?, limit? })` | `GET {p}/request-stats` 或 `{p}/accounts/:identity/request-stats` | `ProxyRequestStatDto[]`；供账号详情读取近期样本，不用于完整列表分页。 |
+| `reauthorizeCopilotOauth(id, identity, { credentialMode, ssoPassword?, ssoType? })` | `POST {p}/accounts/:identity/copilot-oauth/reauthorize` | `ProxyAccountDto`；密码默认由服务端解析 |
+| `importCopilotOauthTokens(id, csvText)` | `POST {p}/accounts/copilot-oauth-token/import` | `BatchResult<ImportCopilotOauthTokenRow>`；请求 `{ csvText }`。 |
+| `getErrorDiagnostic(diagnosticId)` | `GET /api/console/proxy/error-diagnostics/:id`（全局） | `ProxyErrorDiagnosticDetailDto`。 |
+| `downloadErrorDiagnostic(diagnosticId)` | `GET /api/console/proxy/error-diagnostics/:id/download`（全局） | 返回附件 `Blob` 和服务端文件名。 |
+| `clearErrorDiagnostics()` | `DELETE /api/console/proxy/error-diagnostics`（全局） | 发送 `{ confirm: true }` 清空全部记录。 |
 
 #### sso client（`src/web/api/sso.ts`）
 
 | 函数 | Console 路径 | 核心结构 |
 | --- | --- | --- |
-| `getSsoUserCapacity()` | `GET /api/console/sso/users/capacity` | `SsoUserCapacityDto` |
-| `getSsoRuntimeSettings()` | `GET /api/console/sso/settings/runtime` | `SsoRuntimeSettingsDto` |
-| `updateSsoRuntimeSettings({ expectedVersion, changes })` | `PATCH /api/console/sso/settings/runtime` | `SsoRuntimeSettingsDto` |
-| `createSsoUser({ ssoUser,password?,email?,role? })` | `POST /api/console/sso/users` | `SsoUserDto` |
-| `patchSsoUser(ssoUser, { password?,email?,role? })` | `PATCH /api/console/sso/users/:ssoUser` | `SsoUserDto` |
-| `importSsoUsers(csvText)` | `POST /api/console/sso/users/import` | `BatchResult<{ line, ssoUser, status, detail }>` |
-| `importEmuUsers({ ssoUser?, dryRun? })` | `POST /api/console/sso/users/emu/import` | `BatchResult<ImportEmuUserRow>`；当前 App 主要使用 plan 流程。 |
-| `createEmuImportPlan({ ssoUser? })` | `POST /api/console/sso/users/emu/import/plans` | `ImportEmuPlanDto` |
-| `listEmuImportPlanRows(planId,{ page,pageSize,status })` | `GET /api/console/sso/users/emu/import/plans/:planId/rows` | `PageResponse<ImportEmuUserRow>` |
-| `applyEmuImportPlan(planId)` | `POST /api/console/sso/users/emu/import/plans/:planId/apply` | `ImportEmuPlanDto` |
-| `deleteEmuImportPlan(planId)` | `DELETE /api/console/sso/users/emu/import/plans/:planId` | `void` |
-| `runSsoUserBatch({ operation,ssoUsers,enterpriseRole?,assignCopilotSeat? })` | `POST /api/console/sso/users/batch` | `BatchResult<SsoUserBatchRow>`；`sync_emu` 默认只同步 login，显式传 `assignCopilotSeat=true` 时同时分配 seat。 |
-| `readAiCreditsUsage()` | `GET /api/console/sso/ai-credits/usage` | `AiCreditsUsageDto` |
-| `refreshAiCreditsUsage()` | `POST /api/console/sso/ai-credits/usage/refresh` | `AiCreditsUsageDto` |
+| `getSsoUserCapacity(id)` | `GET {s}/users/capacity` | `SsoUserCapacityDto` |
+| `getSsoRuntimeSettings(id)` | `GET {s}/settings/runtime` | `SsoRuntimeSettingsDto` |
+| `updateSsoRuntimeSettings(id, { expectedVersion, changes })` | `PATCH {s}/settings/runtime` | `SsoRuntimeSettingsDto` |
+| `createSsoUser(id, { ssoUser,password?,email?,role? })` | `POST {s}/users` | `SsoUserDto` |
+| `patchSsoUser(id, ssoUser, { password?,email?,role? })` | `PATCH {s}/users/:ssoUser` | `SsoUserDto` |
+| `importSsoUsers(id, csvText)` | `POST {s}/users/import` | `BatchResult<{ line, ssoUser, status, detail }>` |
+| `importEmuUsers(id, { ssoUser?, dryRun? })` | `POST {s}/users/emu/import` | `BatchResult<ImportEmuUserRow>`；当前 App 主要使用 plan 流程。 |
+| `createEmuImportPlan(id, { ssoUser? })` | `POST {s}/users/emu/import/plans` | `ImportEmuPlanDto` |
+| `listEmuImportPlanRows(id, planId, { page,pageSize,status })` | `GET {s}/users/emu/import/plans/:planId/rows` | `PageResponse<ImportEmuUserRow>` |
+| `applyEmuImportPlan(id, planId)` | `POST {s}/users/emu/import/plans/:planId/apply` | `ImportEmuPlanDto` |
+| `deleteEmuImportPlan(id, planId)` | `DELETE {s}/users/emu/import/plans/:planId` | `void` |
+| `runSsoUserBatch(id, { operation,ssoUsers,enterpriseRole?,assignCopilotSeat? })` | `POST {s}/users/batch` | `BatchResult<SsoUserBatchRow>`；`sync_emu` 默认只同步 login，显式传 `assignCopilotSeat=true` 时同时分配 seat。 |
+| `readAiCreditsUsage(id)` | `GET {s}/ai-credits/usage` | `AiCreditsUsageDto` |
+| `refreshAiCreditsUsage(id)` | `POST {s}/ai-credits/usage/refresh` | `AiCreditsUsageDto` |
 
 #### login client（`src/web/api/login.ts`）
 
 | 函数 | Console 路径 | 核心结构 |
 | --- | --- | --- |
-| `listLoginTasks(limit)` | `GET /api/console/login-service/tasks?limit=...` | `LoginTaskDto[]`；供 Dashboard 读取近期任务，不用于完整列表分页。 |
-| `getLoginRuntimeSettings()` | `GET /api/console/login-service/settings/runtime` | `LoginRuntimeSettingsDto` |
-| `updateLoginRuntimeSettings({ expectedVersion, changes })` | `PATCH /api/console/login-service/settings/runtime` | `LoginRuntimeSettingsDto` |
+| `loginPath(id)` | `{l}` | 任务、队列、汇总和任务批量操作的路径前缀；Dashboard 读取 `{l}/tasks/summary`。 |
+| `getLoginRuntimeSettings()` | `GET /api/console/login-service/settings/runtime`（全局） | `LoginRuntimeSettingsDto` |
+| `updateLoginRuntimeSettings({ expectedVersion, changes })` | `PATCH /api/console/login-service/settings/runtime`（全局） | `LoginRuntimeSettingsDto` |
 
 ## 6. 数据结构
 
@@ -285,11 +342,12 @@ interface ConsoleSession {
 
 主要模型来自 `@ghcp/shared/src/contracts.ts`：
 
-- `ProxyAccountDto`：`identity`、`ssoUser`、可选 `ghLogin`、Copilot OAuth 状态与更新时间。
+- `ProxyAccountDto`：`identity`、`ssoUser`、可选 `ghLogin`、Copilot OAuth 状态与更新时间，以及所属 `enterpriseId`。
+- `EnterpriseListItem`（`EnterpriseSummaryDto` 扩展）：`id`、`displayName`、`githubBaseUrl`、`slug`、`shortcode`、池策略 `pool`（`state`、`maxAccounts`、`inventory`、`policyVersion`）、`readiness`（`ready`、`blockers`、三方明细）、`poolSummary`、`shareScore`。
 - `ProxyRequestStatDto`：请求时间、identity、path、model、成功/失败原因、input/output/cache token 统计。
 - `ProxyErrorDiagnosticRecordDto`：失败类型、原始入站请求、实际 Copilot 请求、上游响应或 transport/stream 异常；可能包含未脱敏凭据和用户内容。
 - `SsoUserDto`：`ssoUser`、email、role、可选 `ghLogin/ghScimId`、EMU 状态、Copilot seat 状态与错误。
-- `LoginTaskDto`：任务 id、identity、ssoUser、可选 ghLogin、`ssoType`、状态、尝试次数、失败原因、时间戳。
+- `LoginTaskDto`：任务 id、所属 `enterpriseId`、identity、ssoUser、可选 ghLogin、`ssoType`、状态、尝试次数、失败原因、时间戳。
 - `SsoRuntimeSettingsDto` / `LoginRuntimeSettingsDto`：运行时设置值、乐观锁 `version` 和 `updatedAt`。
 - `AiCreditsUsageDto`：企业名、上月/本月用量、当前月预测、seat 数量与成本。
 - `ImportEmuPlanDto` / `ImportEmuUserRow`：GH/SCIM 导入预览、应用结果、行级状态与摘要。
@@ -350,16 +408,20 @@ src/console/
 ├── .env.example               # Console 运行所需环境变量示例
 └── src/
     ├── server/
-    │   ├── index.ts           # Express app、cookie session、auth/setup/login、静态资源、服务代理挂载
-    │   ├── config.ts          # 环境变量读取和 PORT 校验
+    │   ├── index.ts           # 进程入口：监听端口、优雅停机
+    │   ├── app.ts             # Express app、cookie session、auth/setup/login、静态资源、服务代理挂载
+    │   ├── config.ts          # 环境变量读取、PORT 与 CONSOLE_PUBLIC_BASE_URL 校验
     │   ├── auth.ts            # ConsoleSession 与 requireAdmin
     │   ├── adminsStore.ts     # admins.json 读写、scrypt hash、管理员验证
-    │   ├── apiProxy.ts        # proxy/sso/login 转发、附件透传与 X-Internal-Token 注入
-    │   └── apiProxy.test.ts   # 二进制附件和 Content-Disposition 透传测试
+    │   ├── sameOrigin.ts      # 写请求同源检查
+    │   ├── apiProxy.ts        # proxy/sso/login 转发、路径校验、附件透传与 X-Internal-Token 注入
+    │   └── *.test.ts          # 转发、同源、Models 超时、healthz 等测试
     └── web/
         ├── main.tsx           # React 挂载入口
-        ├── App.tsx            # 页面状态、路由 hash、所有管理页面与弹窗
-        ├── api/               # 前端 API client：client/proxy/sso/login
+        ├── App.tsx            # 页面列表与作用域、路由 hash、企业作用域挂载、部分管理页面与弹窗
+        ├── pages/             # Dashboard、EnterpriseSelector、EnterprisePoolPage（Pool overview）、UserPoolPage、
+        │                      # ModelsPage、SettingsPage、AiCreditsUsagePage、ErrorDiagnosticsPage 等
+        ├── api/               # 前端 API client：client/enterprises/proxy/sso/login/userPool/models
         ├── components/
         │   ├── ManagedList.tsx     # 统一列表、查询、选择、导出与行内操作
         │   ├── Operations.tsx     # useOperations、直接提交/必要确认与行内结果
@@ -367,15 +429,19 @@ src/console/
         │   └── ui/                # Button/Input/Select/Checkbox/Table/Dialog 等共享组件
         └── lib/
             ├── management.ts # 查询、选择和页面偏好
+            ├── hashState.ts  # `#/<page>?e=<id>` 读写
+            ├── scope.ts      # 企业作用域 context、确认框中的企业文本、切换企业时丢弃迟到响应
+            ├── enterprisePool.ts # 企业表的目标/实际占比计算
             └── format.ts     # 日期、数字、状态样式和 token 汇总格式化
 ```
 
 ## 8. 开发提示
 
-- 入口定位：后端从 `src/server/index.ts` 看路由和中间件；前端从 `src/web/App.tsx` 的 `pages` 数组和 `AdminApp` 看页面入口。
-- 新增管理页面：先在 `Page` union 和 `pages` 数组加页面，再在 `AdminApp` 中挂载组件；完整列表复用 `ManagedList`，批量及行内管理动作复用 `useOperations`。
+- 入口定位：后端从 `src/server/app.ts` 看路由和中间件；前端从 `src/web/App.tsx` 的 `pages` 数组（含每页的 `scope`）和 `AdminApp` 看页面入口。
+- 新增管理页面：先在 `Page` union 和 `pages` 数组加页面并标明作用域（`enterprise`、`global`、`mixed`），再在 `PAGE_VIEWS` 中挂载组件；新页面放在 `src/web/pages/`。企业作用域页面用 `useEnterpriseScope()` 取企业，用 `enterprisePath()` 拼路径，不要缓存或默认企业 ID。完整列表复用 `ManagedList`，批量及行内管理动作复用 `useOperations`。
 - 新增上游调用：列表查询沿用通用组件，专用调用放到对应 `src/web/api/*.ts` client，避免添加没有调用方的包装；如果是新服务，需要在 `apiProxy.ts`、`config.ts` 和 `.env.example` 增加 base URL 与转发挂载。
-- 调试认证：先看 `/api/console/setup`、`/api/console/me`；服务间 401/403 多半是 `INTERNAL_API_TOKEN` 与上游不一致。
+- 调试认证：先看 `/api/console/setup`、`/api/console/me`；服务间 401/403 多半是 `INTERNAL_API_TOKEN` 与上游不一致。浏览器写操作返回 `403 cross_site_request_rejected` 时，检查反向代理是否改写了 Host 头，并设置 `CONSOLE_PUBLIC_BASE_URL`。
+- 调试企业：页面提示企业不存在时，检查 URL hash 中的 `e=`，以及 Proxy `GET /api/enterprises` 是否列出该企业；Pool overview 的 Blockers 列显示三方 readiness 阻塞项。上游返回 `400 enterprise_scope_required` 说明调用了无作用域的旧路径。
 - 调试转发：设置 `LOG_LEVEL=debug` 或 `info`，查看 `[console:api-proxy]` 日志中的 target、method、suffix、status、durationMs。
 - 调试 Copilot 请求：在 proxy 日志中找到 `diagnosticId`，到 **Error Diagnostics** 查看逐行 headers、格式化 body 和 curl；大记录优先下载完整 `.log`，页面只做有限预览。
 - 调试前端：浏览器 Network 中应只看到 `/api/console/**`；如果直接访问 proxy/sso/login，说明调用边界被破坏。

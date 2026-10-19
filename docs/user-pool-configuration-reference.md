@@ -1,6 +1,8 @@
 # User Pool 生产配置完整清单与默认值
 
-核对日期：2026-09-17。依据当前源码配置解析器、运行时 Settings、Compose 和 LiteLLM 接入代码；**不是客户当前部署值**。没有读取客户 `.env`、Secret 或数据库。本文用于逐项评审，不代表推荐直接修改全部默认值。
+核对日期：2026-10-19（多企业版本线，镜像 tag `multi-*`）。依据当前源码配置解析器、运行时 Settings、Compose 和 LiteLLM 接入代码；**不是客户当前部署值**。没有读取客户 `.env`、Secret 或数据库。本文用于逐项评审，不代表推荐直接修改全部默认值。
+
+多企业版中，与某个 GitHub 企业相关的值（GitHub 地址、slug、shortcode、SCIM、席位 PAT、SAML 证书、池账号域名、Models 管理员等）属于**企业**：`default` 企业仍由本文列出的环境变量提供，其他企业写在 registry 文件中。registry 的字段、默认值和校验规则见 [registry 配置参考](multi-enterprise-registry.md)，本文只列环境变量及其与 `default` 的关系（第 3.1 节）。
 
 ## 1. 先区分默认值和生效方式
 
@@ -10,6 +12,8 @@
 - **MySQL 池不变量**：写入配置指纹。已有池不能只改环境变量重启，所有副本必须一致且与数据库指纹匹配。
 - **Compose 输入**：只控制 YAML 插值；只有被 environment/ports/volumes 引用的值才会生效。
 - **源码常量**：没有生产环境变量入口，修改需要代码变更和验证。
+- **企业 registry**：`ENTERPRISE_REGISTRY_FILE` 指向的 JSON，Proxy、SSO、Login 启动时读取一次并严格校验，不热加载，修改后需重启这三个服务。
+- **按企业的在线设置**：每个企业的池 cap 与生命周期（Console Pool overview）、SSO Settings（Console Settings，按所选企业）。
 
 布尔值通常接受大小写不敏感的 `1/true/yes/on`、`0/false/no/off`；前后空格或空值可能被拒绝。池数值要求十进制数字和安全整数，不能写单位、负数、小数或科学记数法。普通 Proxy 正整数解析没有显式业务上限，不等于任意大值都合理。
 
@@ -20,9 +24,9 @@
 | 变量 | 代码默认值 | 允许范围 | 含义 | 修改方式 |
 | --- | --- | --- | --- | --- |
 | `ACCOUNT_ROUTING_MODE` | `direct` | `direct` / `caller-lease`，精确小写 | direct 按原 identity 取账号；caller-lease 按可信 key hash 分配排他成员 | 启动配置；不是数据库迁移开关 |
-| `POOL_ACCOUNT_EMAIL_DOMAIN` | 无可用默认，启用池时必填 | 合法域名，最多253字符；小写标准化 | 新池成员邮箱域名，不是 caller 身份 | MySQL 不变量；SQLite 也校验已保存域名 |
-| `READY_IDLE_TARGET` | `10` | 0–10000，且不大于 cap | 希望维持的就绪空闲储备 | 首次种子；已有池改 UI 的 Ready idle target |
-| `POOL_MAX_ACCOUNTS` | `100` | 1–10000 | 全部池成员增长上限，包括非 Ready 状态；降低不删号 | 首次种子；已有池改 UI 的 Maximum accounts |
+| `POOL_ACCOUNT_EMAIL_DOMAIN` | 未设置 | 设置时必须是合法域名，最多253字符；小写标准化 | `default` 企业的池成员邮箱域名（映射为 `default.pool.accountDomain`），不是 caller 身份。**不再是启动必填**：registry 已为 `default` 设置 `pool.accountDomain` 时可不设；某企业没有域名时 Proxy 照常启动，但该企业未就绪（阻塞项 `proxy:enterprise_field_missing:pool.accountDomain`），不能激活或补货。其他企业用各自的 `pool.accountDomain`，企业之间不能重复 | 企业身份字段：该企业已有池成员后不能修改，否则 Proxy 启动失败 `enterprise_identity_changed`（SQLite 与 MySQL 相同） |
+| `READY_IDLE_TARGET` | `10` | 0–10000；启动时还要求不大于 `POOL_MAX_ACCOUNTS` | 全局（所有企业合计）希望维持的就绪空闲储备 | 首次种子；已有池改 Pool overview 的 Ready idle target |
+| `POOL_MAX_ACCOUNTS` | `100` | 1–10000 | **只作为 `default` 企业的初始 cap**（映射为 `default.pool.initialMaxAccounts`），只在 Proxy 首次登记 `default` 时使用；从单企业版升级时 `default` 的 cap 沿用升级前数据库中的值。cap 现在**按企业**设置，所有企业 cap 之和 ≤ 10000；降低不删号 | 首次种子；之后在 Pool overview 企业表的 Edit cap 修改。改这个变量不会改变已有企业的 cap |
 | `CALLER_LEASE_TTL_SECONDS` | `172800`秒，48小时 | 60–2592000秒，最多30天 | 完整成功推理后的正式租约 TTL | 首次种子；已有池改 UI 的租约 TTL |
 | `PROVISIONAL_LEASE_TTL_SECONDS` | `300`秒 | 10–3600秒 | 新 caller 尚未完整成功时的临时租约期限 | MySQL 不变量 |
 | `PREWARM_POLL_SECONDS` | `5`秒 | 1–3600秒 | 后台周期轮询间隔；另有事件唤醒 | MySQL 不变量 |
@@ -52,15 +56,28 @@
 
 | API/数据库字段 | 初始值 | 可修改范围 | 实际作用 |
 | --- | --- | --- | --- |
-| `idle_target` | 上面的种子，默认10 | 0–10000，≤max_accounts | 在线补池目标，不是保证立刻有这么多空闲 |
-| `max_accounts` | 默认100 | 1–10000，≥idle_target | 限制继续增长，不自动删号缩池 |
+全局设置（`GET/PATCH /api/user-pool/settings`，Console Pool overview → Global pool settings）：
+
+| API/数据库字段 | 初始值 | 可修改范围 | 实际作用 |
+| --- | --- | --- | --- |
+| `idle_target` | 上面的种子，默认10 | 0–10000 | 全局在线补池目标，缺口按企业 cap 比例分给 `active` 企业；不是保证立刻有这么多空闲 |
 | `lease_seconds` | 默认172800 | 60–2592000秒 | 用于后续成功请求续租，不立即统一改写旧到期时间 |
-| `paused` | `0` | 0/1 | 暂停新的补池/修复调度，不停止正常推理，不保证已开始的阶段立即终止 |
+| `paused` | `0` | 0/1 | 暂停所有企业新的补池/修复调度，不停止正常推理，不保证已开始的阶段立即终止 |
 | `version` | `1` | 非手工配置项 | 乐观并发版本；提交旧版本返回409 |
 
-这四个业务设置在 User pool 页面修改；不要以为改启动 env 会覆盖迁入的数据。域名、临时 TTL、轮询、两个并发、耗尽 Retry-After、预热模型、请求总时限属于 MySQL 指纹不变量。
+`PATCH /api/user-pool/settings` 再传 `max_accounts` 返回 409 `use_enterprise_cap`。
 
-依据：[池配置](../src/proxy/src/userPool/config.ts)、[请求总时限](../src/proxy/src/userPool/runtime.ts)、[MySQL 初始化/指纹](../src/proxy/src/userPool/mysqlStore.ts)、[现有并发维护工具](../upgrade/user-pool-mysql/reconfigure-concurrency.ts)。
+按企业的池策略（`GET /api/enterprises`、`PATCH /api/enterprises/<id>/pool-policy`，Console Pool overview → Enterprises）：
+
+| 字段 | 初始值 | 可修改范围 | 实际作用 |
+| --- | --- | --- | --- |
+| `maxAccounts`（cap） | `default`：`POOL_MAX_ACCOUNTS` 或升级前的值；其他企业：registry `pool.initialMaxAccounts`，默认10 | 1–10000，且所有企业之和 ≤ 10000（否则 409 `name_capacity_exceeded`） | 该企业池成员增长上限，包括非 Ready 状态；降低不删号 |
+| `state` | `default` 升级后为 `active`；新企业为 `draft` | `draft→active`、`active→draining`、`draining→active`；激活和恢复前实时检查三方就绪，未就绪返回 409 `enterprise_not_ready` | 只有 `active` 企业参与补货和分配 |
+| `policyVersion` | `1` | 非手工配置项 | 请求体 `expectedVersion`；不一致返回 409 `policy_version_conflict` |
+
+这些业务设置在 Console 修改；不要以为改启动 env 会覆盖迁入的数据。临时 TTL、轮询、两个并发、耗尽 Retry-After、预热模型、请求总时限属于 MySQL 指纹不变量；池账号域名改由企业身份指纹保护（见上表）。
+
+依据：[池配置](../src/proxy/src/userPool/config.ts)、[请求总时限](../src/proxy/src/userPool/runtime.ts)、[MySQL 初始化/指纹](../src/proxy/src/userPool/mysqlStore.ts)、[企业池策略接口](../src/proxy/src/routes/enterprisesApi.ts)、[现有并发维护工具](../upgrade/user-pool-mysql/reconfigure-concurrency.ts)。
 
 ## 3. Proxy 通用启动配置
 
@@ -77,21 +94,41 @@
 | `CLAUDE_CODE_OPTIMIZED` | `false` | 布尔 | Claude Code 兼容默认开关，可由对应请求头覆盖；影响模型目录/兼容处理及 count_tokens |
 | `SSO_BASE_URL` | `http://localhost:7001` | 实际内部服务根地址 | Proxy 调用 SSO，不带 `/api` |
 | `LOGIN_BASE_URL` | `http://localhost:7003` | 实际内部服务根地址 | Proxy 调用 Login，不带 `/api` |
-| `ENTERPRISE_SHORTCODE` | `octo` | 企业实际短码 | GitHub EMU 用户名关联后缀 |
+| `ENTERPRISE_SHORTCODE` | `octo`（github.com） | 企业实际短码，自动转小写；GHE.com 下被忽略（启动日志 warning） | `default` 企业的 GitHub EMU 用户名关联后缀（`default.github.shortcode`） |
 | **`REQUEST_STATS_PER_ACCOUNT_LIMIT`** | **`2`** | 正整数，0无效 | 每个账号保留最近请求统计条数；启动和写入都会删超额历史，不是页面显示条数 |
-| `COPILOT_API_BASE_URL` | `https://api.githubcopilot.com` | 上游 API 根地址 | 模型目录、验证、推理和预热 |
+| `GITHUB_BASE_URL` | `https://github.com` | `https://github.com` 或 `https://<子域>.ghe.com`，只能是 origin | `default` 企业的 GitHub 实例（`default.github.baseUrl`）；决定是否按 GHE.com 规则推导其他地址 |
+| `GITHUB_API_BASE_URL` | github.com：`https://api.github.com`；GHE.com：`https://api.<子域>.ghe.com` | GHE.com 下必须属于同一子域 | `default` 的 GitHub REST API；Proxy 用于 Models 管理员和 Login 回调的 `/user` 主体校验 |
+| `COPILOT_API_BASE_URL` | github.com：`https://api.githubcopilot.com`；GHE.com：`https://copilot-api.<子域>.ghe.com` | 上游 API 根地址；GHE.com 下必须属于同一子域 | `default` 的模型目录、验证、推理和预热 |
+| `MODELS_ADMIN_GITHUB_LOGIN` / `MODELS_ADMIN_GITHUB_USER_ID` / `MODELS_ADMIN_COPILOT_TOKEN_FILE` / `MODELS_ADMIN_COPILOT_TOKEN` | 未设置 | 见 [Models 使用指南](models-admin-guide.md)；两个 token 来源同时设置时 `_FILE` 优先，另一个被忽略并打印 warning | `default` 企业的 Models 页管理员（`default.modelsAdmin.*`）；未设置时 `default` 的 Models 页显示 `models_admin_not_configured` |
+| `DIRECT_MODE_ENTERPRISE_ID` | `default` | 合法企业 ID，且必须是 registry 中的企业，否则启动失败 | 仅直连模式：新 identity 初始化时归属的企业；已有账号按自身所属企业路由 |
+| `ENTERPRISE_REGISTRY_FILE` | 未设置 | 容器内绝对路径 | 见第 3.1 节 |
 | `OPENCODE_VERSION` | `1.0.0` | 非空版本字符串，无semver校验 | 构造默认 User-Agent，不控制本应用版本 |
 | `OPENCODE_USER_AGENT` | `opencode/<OPENCODE_VERSION>` | 非空字符串优先 | 显式覆盖整个上游 User-Agent |
 | `GITHUB_API_VERSION` | `2026-06-01` | API版本字符串 | 上游版本请求头，不保证任意日期受支持 |
 | `LOG_LEVEL` | `info` | debug/info/warn/error；无效回退info | 四组件共享的结构化日志等级 |
 
-caller-lease 启动要求 API_KEY、INTERNAL_API_TOKEN 非空。普通字符串多数不校验 URL；解析通过不等于可连接。相对路径按进程工作目录解析。
+caller-lease 启动要求 API_KEY、INTERNAL_API_TOKEN 非空。普通字符串多数不校验 URL；解析通过不等于可连接。相对路径按进程工作目录解析（registry 路径和 secret 文件路径除外，必须是绝对路径）。
+
+四个服务的 `/healthz` 都返回 `releaseLine` 字段（例如 `{"status":"ok","service":"proxy","releaseLine":"multi"}`）。它来自镜像内置的 `GHCP_RELEASE_LINE`（由 `deploy/images/Dockerfile.release` 的构建参数 `RELEASE_LINE` 写入）；未设置该变量的源码运行显示 `single`。它只用于识别版本线，不是功能开关，不要在部署中覆盖。
+
+## 3.1 企业 registry 与 `default` 企业
+
+| 变量 | 服务 | 代码默认值 | 要求/用途 |
+| --- | --- | --- | --- |
+| `ENTERPRISE_REGISTRY_FILE` | Proxy、SSO、Login | 未设置 | registry JSON 的**容器内绝对路径**，只读挂载；三个服务必须挂载同一份文件。未设置时只有由环境变量合成的 `default` 企业，行为与单企业版相同。Console 不读它（企业列表来自 Proxy 的 `GET /api/enterprises`） |
+
+- 文件格式、字段默认值、secret 引用（`{"env": ...}` / `{"file": ...}`）、就绪检查和企业身份不可变规则见 [registry 配置参考](multi-enterprise-registry.md)。
+- **环境变量 → `default` 的映射**：Proxy、SSO、Login 各自把本文列出的企业相关变量（例如 `GITHUB_BASE_URL`、`ENTERPRISE_SLUG`、`ENTERPRISE_SHORTCODE`、`SCIM_TOKEN`、`CERT_DIR`、`SSO_URL`、`POOL_ACCOUNT_EMAIL_DOMAIN`、`MODELS_ADMIN_*`）映射为 `default` 企业的字段，完整对照表见 registry 配置参考第 5 节。空字符串视为未设置。
+- registry 中**不写** `default`（推荐）时，`default` 完全由环境变量定义；写了 `default` 时，同一字段两边都有值且不相同会导致启动失败 `enterprise_env_conflict`，错误消息给出变量名和字段路径，例如 `ENTERPRISE_SHORTCODE conflicts with default.github.shortcode in ENTERPRISE_REGISTRY_FILE; unset one or make them equal.`
+- registry 校验失败时服务不启动，错误码 `enterprise_registry_invalid`；消息只含字段路径，不含 secret 值。
 
 ## 4. MySQL 连接配置
 
 | 变量 | 代码默认值 | 范围/要求 | 用途 |
 | --- | --- | --- | --- |
 | `MYSQL_URL` | 未设置 | mysql 模式必填 | 完整连接串，包含用户名、URL编码密码、主机、端口和数据库；用 Secret 管理 |
+| `MYSQL_AUTO_MIGRATE` | `true` | 布尔 | `true` 时第一个启动的 Proxy 副本取得迁移锁并执行 schema 迁移；`false` 时只校验 schema，由 DBA 预先执行脚本（多企业升级为 `scripts/proxy-mysql-enterprise-upgrade.sql`，见[多企业版升级指南](multi-enterprise-upgrade-guide.md)第 5 节） |
+| `MYSQL_MIGRATION_LOCK_WAIT_SECONDS` | `30` | 1–3600 的整数，否则启动失败 | 其他副本等待迁移锁的秒数，超时退出并由平台重启。大表首次升级时调大（例如 `600`），同时放宽 `startupProbe` |
 | `MYSQL_CONNECTION_LIMIT` | `10` | 正整数，没有额外数值上限 | 每个 Proxy 的连接池上限；不是并发用户数或流数量 |
 | `MYSQL_SSL_MODE` | `disabled` | disabled/required/verify-ca | disabled不加密；required加密但不验证证书；verify-ca使用CA验证证书 |
 | `MYSQL_SSL_CA_PATH` | 未设置 | verify-ca必填可读文件路径 | 容器内的MySQL CA文件，与SAML证书不同 |
@@ -123,15 +160,17 @@ caller-lease 启动要求 API_KEY、INTERNAL_API_TOKEN 非空。普通字符串�
 | --- | --- | --- |
 | `PORT` | `7001` | 1–65535，HTTP监听 |
 | `DB_PATH` | `./data/sso.sqlite` | SSO独立SQLite，需要持久卷 |
-| `BASE_URL` | `http://localhost:7001` | 公开IdP地址，生成metadata/SSO/logout地址；生产填实际HTTPS入口 |
+| `BASE_URL` | `http://localhost:7001` | 公开IdP地址，生成metadata/SSO/logout地址；生产填实际HTTPS入口。`default` 使用根路径（`/metadata`、`/sso`），其他企业使用 `/enterprises/<id>/metadata`、`/enterprises/<id>/sso`。为 https 时会话 cookie 带 Secure |
+| `ENTERPRISE_REGISTRY_FILE` | 未设置 | 见第 3.1 节 |
+| `GITHUB_BASE_URL` | `https://github.com` | `default` 的 GitHub 实例；GHE.com 时其他地址按子域推导 |
 | `PROXY_BASE_URL` | `http://localhost:3000` | 该套池自己的内部Proxy地址，不走按业务hash分流的网关 |
 | `INTERNAL_API_TOKEN` | 空 | 内部鉴权密钥，生产必配 |
 | `SESSION_SECRET` | `dev-secret-change-me` | Session签名密钥，生产必须替换 |
 | `SSO_DEFAULT_USER_PASSWORD` | 未设置 | 普通新用户缺省可能退回用户名；池用户要求配置值trim后至少16字符、不能等于用户名。密钥配置，不是Settings |
-| `SSO_USER_EVENTS_LOG` | `./data/sso-user-events.log` | 用户事件追加日志，需安排保留和轮转 |
-| `ENTERPRISE_SLUG` | `acme` | GitHub企业标识，生产不能沿用示例 |
-| `ENTERPRISE_SHORTCODE` | `octo` | 企业用户短码 |
-| `GITHUB_API_BASE_URL` | `https://api.github.com` | GitHub API根地址 |
+| `SSO_USER_EVENTS_LOG` | `./data/sso-user-events.log` | `default` 的用户事件追加日志；其他企业写 `<同目录>/<enterpriseId>/<文件名>`。需安排保留和轮转 |
+| `ENTERPRISE_SLUG` | `acme` | `default` 的 GitHub企业标识，生产不能沿用示例 |
+| `ENTERPRISE_SHORTCODE` | `octo`（github.com） | `default` 的企业用户短码；GHE.com 下被忽略 |
+| `GITHUB_API_BASE_URL` | github.com：`https://api.github.com`；GHE.com：`https://api.<子域>.ghe.com` | `default` 的 GitHub API根地址 |
 | `GITHUB_COPILOT_SEAT_PAT` | 未设置 | 席位及AI Credits接口凭据，相关操作必配 |
 | `SCIM_BASE_URL` | 空；下游回退到mock地址 | 实际企业SCIM地址，生产必须显式填写 |
 | `SCIM_TOKEN` | 空 | SCIM Bearer凭据，相关操作必配 |
@@ -141,9 +180,13 @@ caller-lease 启动要求 API_KEY、INTERNAL_API_TOKEN 非空。普通字符串�
 | `MOCK_GITHUB_BASE_URL` | `http://localhost:8002` | 开发mock回退地址，不是生产上游替代值 |
 | `LOG_LEVEL` | `info` | 共享日志等级 |
 
-依据：[SSO 配置](../src/sso/src/config.ts)。
+表中与企业相关的变量（`SESSION_SECRET`、`SSO_DEFAULT_USER_PASSWORD`、`ENTERPRISE_*`、`GITHUB_*`、`SCIM_*`、`CERT_DIR`、`SP_*`）只定义 `default` 企业；其他企业在 registry 的 `github.*` / `sso.*` 中配置，每个企业使用独立的签名证书和 session secret。企业缺少 `scimToken` 或 `seatPat` 时，该企业的相关操作返回 503 `enterprise_secret_unconfigured`，不影响其他企业。
+
+依据：[SSO 配置](../src/sso/src/config.ts)、[SSO 企业](../src/sso/src/enterprises.ts)、[env→default 映射](../src/packages/shared/src/enterprise/defaultFromEnv.ts)。
 
 ### 6.1 SSO Settings：首次默认，在线修改
+
+SSO Settings **按企业**保存（Console Settings → SSO runtime settings，作用于页头所选企业）。新企业首次创建设置时，`userPrefix` 和 `emailDomain` 的初值可来自 registry 的 `sso.userPrefix`、`sso.emailDomain`，之后以 Console 中的值为准。
 
 | API/UI字段 | 数据库字段 | 首次默认 | 范围 | 用途 |
 | --- | --- | --- | --- | --- |
@@ -168,20 +211,23 @@ caller-lease 启动要求 API_KEY、INTERNAL_API_TOKEN 非空。普通字符串�
 | `PROXY_BASE_URL` | `http://localhost:3000` | 该套池自己的OAuth回调根地址 |
 | `INTERNAL_API_TOKEN` | 空 | 内部鉴权/回调密钥 |
 | `LOG_DIR` | `./logs/login` | 按账号记录Login日志 |
-| `GITHUB_OAUTH_CLIENT_ID` | `Ov23li8tweQw6odWQebz` | Device Flow公开客户端标识，不是秘密 |
+| `ENTERPRISE_REGISTRY_FILE` | 未设置 | 见第 3.1 节 |
+| `GITHUB_BASE_URL` / `ENTERPRISE_SLUG` | `https://github.com` / 未设置 | `default` 的 GitHub 实例和企业 slug；GHE.com 下 slug 必填，缺少时该企业未就绪 |
+| `GITHUB_OAUTH_CLIENT_ID` | `Ov23li8tweQw6odWQebz` | Device Flow公开客户端标识，不是秘密；也是其他企业未设置 `github.oauthClientId` 时的默认值 |
 | `GITHUB_OAUTH_SCOPE` | `read:user` | 申请的OAuth scope |
 | `OPENCODE_VERSION` | `1.0.0` | 默认User-Agent版本 |
 | `OPENCODE_USER_AGENT` | `opencode/<version>` | 显式值覆盖默认User-Agent |
-| `SSO_URL` | 未设置 | 默认预期SSO登录地址，任务值可覆盖 |
-| `SSO_PROVIDER` | `custom` | custom/azure，大小写标准化；任务ssoType优先 |
+| `SSO_URL` | 未设置 | `default` 企业的SSO登录页（`default.login.ssoLoginUrl`）；其他企业未设置 `login.ssoLoginUrl` 时取 `<SSO_URL 的 origin>/enterprises/<id>/login`。query 和 fragment 被去掉。**任务请求不能再覆盖该地址**；浏览器只在白名单页面（默认即该地址，按整段路径前缀匹配，`/login` 不匹配 `/loginfoo`）填写 SSO 凭据 |
 | `AZURE_STAY_SIGNED_IN` | `false` | 是否选择Azure保持登录 |
 | `AUTH_HEADLESS` | `true` | Chromium无头运行 |
 | `AUTH_DEBUG_ARTIFACT_DIR` | `.auth-debug` | 调试产物目录；单独配置目录不等于启用产物 |
 | `LOG_LEVEL` | `info` | 共享日志等级 |
 
+**SSO 类型（custom / azure）**：Login 不读取 `SSO_PROVIDER` 环境变量。企业在 registry 设置了 `login.ssoProvider` 时，任务必须与之一致或省略；未设置时（包括由环境变量合成的 `default`）由每个任务的 `ssoType` 决定，省略时为 `custom`。
+
 ### 7.1 浏览器选择器覆盖
 
-以下15项均**默认未设置**。填写合法浏览器选择器后优先尝试，然后使用内置后备定位；任务 `selectorOverrides` 比环境变量优先。一般无需调整，仅页面变化时验证后覆盖。
+以下15项均**默认未设置**，作为所有企业的默认值；某企业在 registry 的 `login.selectors.<名称>` 中设置后以该企业的值为准。填写合法浏览器选择器后优先尝试，然后使用内置后备定位。任务请求不能覆盖选择器。一般无需调整，仅页面变化时验证后覆盖。
 
 | 环境变量 | 对应控件 |
 | --- | --- |
@@ -210,7 +256,7 @@ caller-lease 启动要求 API_KEY、INTERNAL_API_TOKEN 非空。普通字符串�
 | `authDebugLogs` | auth_debug_logs | `false` | 布尔 | 新启动任务的详细认证日志 |
 | `authDebugArtifacts` | auth_debug_artifacts | `false` | 布尔 | 新启动任务的trace/截图等，可能包含敏感内容 |
 
-正在执行的任务保留启动时快照，新任务使用最新Settings。GitHub device token轮询遵循上游expires_in/interval，不受authTimeoutMs统一封顶；浏览器启动也不是该参数控制。任务历史没有独立自动保留数量设置。
+Login Settings 是**全局**的：所有企业共用一个 Login 队列和并发上限（Console Settings → Login runtime settings）。正在执行的任务保留启动时快照，新任务使用最新Settings。GitHub device token轮询遵循上游expires_in/interval，不受authTimeoutMs统一封顶；浏览器启动也不是该参数控制。任务历史没有独立自动保留数量设置。
 
 SSO/Login Settings缓存和Login队列是进程内的，不因共用SQLite就成为多副本分布式服务，因此仍保持单实例。
 
@@ -227,9 +273,10 @@ SSO/Login Settings缓存和Login队列是进程内的，不因共用SQLite就成
 | `PROXY_BASE_URL` | `http://localhost:3000` | 本套池Proxy内部根地址 |
 | `SSO_BASE_URL` | `http://localhost:7001` | SSO内部根地址 |
 | `LOGIN_BASE_URL` | `http://localhost:7003` | Login内部根地址 |
+| `CONSOLE_PUBLIC_BASE_URL` | 未设置 | 可选，必须是 http/https 地址，否则启动失败。Console 前有会改写 `Host` 头的反向代理时，设为用户在浏览器中访问的 Console 地址。Console 的写操作只接受 `Origin` 为该地址或请求 Host 的同源请求，跨站请求返回 403 `cross_site_request_rejected` |
 | `LOG_LEVEL` | `info` | 共享日志等级 |
 
-没有通过环境变量配置初始管理员账号/密码的入口，初次由UI/API设置。Session有效期8小时是源码固定值，不是上述变量之一。
+Console 不读取 registry；企业列表来自 Proxy。页头企业选择器不是权限边界，所有管理员都能管理所有企业。没有通过环境变量配置初始管理员账号/密码的入口，初次由UI/API设置。Session有效期8小时是源码固定值，不是上述变量之一。
 
 依据：[Console配置](../src/console/src/server/config.ts)。
 
@@ -263,7 +310,9 @@ SSO/Login Settings缓存和Login队列是进程内的，不因共用SQLite就成
 | `SSO_PUBLIC_BASE_URL` | Compose必填 | 映射为SSO的BASE_URL |
 | `SSO_CERT_DIR` | ./certs | 宿主机证书目录，挂到容器/certs |
 | `LOGIN_SSO_URL` | http://sso:7001/login | 映射为Login SSO_URL |
-| `LOGIN_SSO_PROVIDER` | custom | 映射为Login SSO_PROVIDER |
+| `ENTERPRISE_REGISTRY_HOST_FILE` | `docker-compose.enterprise-registry.yml` 必填 | 宿主机上的 registry 文件，只读挂到 Proxy、SSO、Login 的 `/config/enterprise-registry.json` |
+| `ENTERPRISE_SECRETS_DIR` | `docker-compose.enterprise-registry.yml` 必填 | 宿主机 secret 目录，只读挂到 SSO、Proxy 的 `/run/secrets`；registry 中按 `/run/secrets/<enterpriseId>/<名称>` 引用 |
+| `RELEASE_LINE` | Dockerfile 构建参数，默认 `single` | 多企业版镜像用 `multi` 构建；写入镜像的 `GHCP_RELEASE_LINE` 和 label `com.ghcp.release-line` |
 | `PROXY_CLUSTER_BASE_URL` | MySQL overlay必填 | SSO/Login/Console使用的同一池内部负载均衡地址 |
 | `PROXY_REPLICAS` | MySQL overlay为2 | Compose副本数，不是池数量 |
 | `MYSQL_DATABASE` | 本地MySQL overlay为ghcp_proxy | 容器数据库首次初始化名；托管MySQL由DBA建库 |
@@ -311,7 +360,10 @@ SSO/Login Settings缓存和Login队列是进程内的，不因共用SQLite就成
 
 以下是当前源码常量，避免继续误认为都能通过env改：
 
-- 名字容量1000基础名×10后缀＝10000。
+- 名字容量1000基础名×10后缀＝10000，**所有企业共用**；所有企业 cap 之和不能超过它。
+- registry 最多32个企业；企业 ID 格式 `^[a-z][a-z0-9-]{0,30}[a-z0-9]$`，创建后不能修改。
+- 三方就绪检查结果在每个 Proxy 副本内存缓存：就绪60秒，未就绪或探测失败10秒；激活和恢复时强制实时检查。
+- registry 中 `{"file": ...}` secret 读取后缓存60秒（Models 管理员 token 每次查询重新读取）。
 - 账号池租约/hold心跳约5秒；hold绝对截止时间外10秒清理宽限。
 - MySQL普通操作共享5秒预算；DDL/迁移启动上限60秒；mysql2原生队列上限1024。
 - 本地同caller准入最多32个排队、进程保留票据最多1024。

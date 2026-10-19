@@ -1,5 +1,7 @@
 # GHCP API Learning — 项目地图
 
+> **多企业版本线（`multi-*`，2026-10-19 补充）**：一套部署可同时服务多个 github.com / GHE.com 企业。本文第 1–9 节写于早期单企业基线，部分文件名（例如 `tokenManager.ts`）和链路细节已过时；多企业新增的文件、链路和注意点集中在[第 10 节](#10-多企业multi-版本线地图)，并在目录树中以“（多企业）”标注。以代码为准。
+
 ## 1. 项目概览
 
 **核心目标**：把 GitHub Copilot 的后端能力包装成一套**集中化、多租户的“裸 API”服务**，对外暴露 OpenAI / Anthropic / Responses 兼容接口，对内自动管理一整条账号供应链：GitHub EMU 账号创建 → SSO 登录 → GitHub token → Copilot token。
@@ -39,9 +41,11 @@
 ghcp-api-learning/
 ├── package.json            # monorepo 根：workspaces 定义 + 所有 start/build 脚本
 ├── docker-compose.yml      # 5 服务编排：端口、环境变量、健康检查、依赖顺序
+├── docker-compose.enterprise-registry.yml  # （多企业）把 registry 与 secret 目录只读挂到 proxy/sso/login
+├── deploy/enterprise-registry.example.json # （多企业）registry 示例：github.com 的 default + 一个 GHE.com 企业（占位值）
 ├── tsconfig.base.json      # 所有服务共享的 TS 编译基线
 ├── .env / .env.example     # compose 顶层环境变量（密钥、header 配置）
-├── scripts/                # gen-certs.sh(SAML证书) / validate-health.sh
+├── scripts/                # gen-certs.sh(SAML证书) / validate-health.sh / proxy-mysql-enterprise-upgrade.sql（多企业，DBA 手动升级）
 ├── certs/                  # 开发用 SAML IdP 证书（idp-cert.pem / idp-key.pem）
 │
 ├── src/
@@ -50,12 +54,21 @@ ghcp-api-learning/
 │   │       ├── contracts.ts   # 所有 DTO + 枚举（单一事实来源）
 │   │       ├── api.ts         # ApiError、X-Internal-Token 头、分页、批处理结构
 │   │       ├── httpClient.ts  # JsonHttpClient（服务间调用统一客户端）
-│   │       └── logger/redact/ids/time.ts  # 结构化日志、脱敏、ID、时间工具
+│   │       ├── logger/redact/ids/time.ts  # 结构化日志、脱敏、ID、时间工具
+│   │       ├── releaseLine.ts # （多企业）/healthz 的 releaseLine（single / multi）
+│   │       └── enterprise/    # （多企业）registry 解析、env→default、secret 引用、GitHub/GHE 端点、
+│   │                          #   requireEnterprise 中间件、企业指纹、池调度排名（详见第 10 节）
 │   │
 │   ├── proxy/              # ★ 对外 API 网关 + 账号编排中枢（端口 3000）
 │   │   └── src/
 │   │       ├── server.ts          # Express 装配：/api /internal + 兼容路由
+│   │       ├── enterprises.ts     # （多企业）Proxy 的企业对象：profile + 端点、Models 管理员 token
 │   │       ├── routes/
+│   │       │   ├── enterprisesApi.ts      # （多企业）GET /api/enterprises、PATCH /api/enterprises/:id/pool-policy
+│   │       │   ├── enterpriseRoutes.ts    # （多企业）/api/enterprises/:id/...、/internal/enterprises/:id/...、无作用域 400
+│   │       │   ├── requestEnterprise.ts   # （多企业）从 res.locals 取当前企业
+│   │       │   ├── userPoolApi.ts         # 全局池接口 + 企业作用域的成员/租约/事件
+│   │       │   ├── modelsApi.ts           # 按企业的 Models 管理员目录
 │   │       │   ├── compatible.ts          # 公共 LLM 接口 + SSE 流式转发 + usage 统计
 │   │       │   ├── claudeCodeCompat.ts    # Anthropic Messages 请求体改写（核心兼容层）
 │   │       │   ├── anthropicModelProfiles.ts # 各 Claude 模型的 thinking/effort 能力画像
@@ -66,36 +79,47 @@ ghcp-api-learning/
 │   │       │   ├── copilotToken.ts        # GitHub token → Copilot token 兑换
 │   │       │   └── copilotClient.ts       # 转发请求 + 模型列表缓存 + 路径能力推断
 │   │       ├── accounts/githubTokenImport.ts # CSV 批量导入 GitHub token
-│   │       ├── clients/{ssoClient,loginClient}.ts # 调 sso / login 的出站客户端
+│   │       ├── clients/{ssoClient,loginClient}.ts # 调 sso / login 的出站客户端（多企业版：enterpriseId 必填）
+│   │       ├── clients/enterpriseReadiness.ts      # （多企业）比对 Proxy/SSO/Login 三方企业配置，按副本缓存
 │   │       ├── auth/                      # apiKey / identityHeader / internalAuth 三道中间件
-│   │       └── db/                        # proxy_accounts + proxy_request_stats
+│   │       ├── userPool/                  # 账号池：调度、准入、worker；scheduling.ts（多企业排名）、storeContract.ts（两后端一致性场景）
+│   │       └── db/                        # proxy_accounts + proxy_request_stats；（多企业）proxy_enterprises 表、
+│   │                                      #   enterpriseMigrations.ts / mysqlEnterpriseMigrations.ts / enterpriseRepo.ts / enterpriseSeed.ts
 │   │
 │   ├── sso/               # ★ 自建 SAML IdP + EMU/SCIM 同步 + Copilot 计费（端口 7001）
 │   │   └── src/
 │   │       ├── server.ts
+│   │       ├── enterprises.ts      # （多企业）SSO 的企业对象
 │   │       ├── routes/{usersApi,samlRoutes,budgetApi}.ts
+│   │       ├── routes/{enterpriseRoutes,enterprisesInternal}.ts # （多企业）作用域路由；readiness 用的 GET /internal/enterprises
 │   │       ├── saml/saml.ts        # IdP metadata、解析 AuthnRequest、签发 SAMLResponse
+│   │       ├── saml/enterpriseSession.ts # （多企业）每个企业一个签名会话 cookie
 │   │       ├── scim/               # 调 GitHub SCIM 批量造号/暂停/删号（含重试限流）
 │   │       ├── copilot/seats.ts    # 分配/回收 Copilot seat
 │   │       ├── budget/             # AI Credits 用量查询 + 预测缓存
 │   │       ├── users/              # SSO 用户 CRUD、批处理、EMU 反向导入计划
-│   │       └── db/                 # sso_users + budget_cache + emu_import_plans + 事件日志
+│   │       └── db/                 # sso_users + budget_cache + emu_import_plans + 事件日志；（多企业）sso_enterprises、enterpriseRepo.ts
 │   │
 │   ├── login/            # ★ GitHub device flow + Playwright 自动登录（端口 7003）
 │   │   └── src/
 │   │       ├── server.ts
+│   │       ├── enterprises.ts              # （多企业）Login 的企业对象、SSO 类型解析
 │   │       ├── routes/tasksApi.ts          # 登录任务 CRUD
+│   │       ├── routes/{enterpriseRoutes,enterprisesInternal}.ts # （多企业）作用域路由；readiness
 │   │       ├── tasks/{queue,runner,accountLogger}.ts # 内存队列 + 任务执行 + 按账号日志
 │   │       ├── auth/
 │   │       │   ├── deviceFlow.ts                    # GitHub OAuth device code 申请+轮询
-│   │       │   └── HeadlessPlaywrightAuthStrategy.ts # ★ 浏览器自动填表登录（690行，最脆弱）
+│   │       │   ├── HeadlessPlaywrightAuthStrategy.ts # ★ 浏览器自动填表登录（690行，最脆弱）
+│   │       │   ├── enterpriseAuth.ts                 # （多企业）按任务所属企业构造登录配置
+│   │       │   └── loginUrlAllowlist.ts              # （多企业）只在白名单页面填写 SSO 凭据（整段路径匹配）
 │   │       ├── clients/proxyClient.ts      # 成功/失败回写 proxy
-│   │       └── db/                         # login_tasks
+│   │       └── db/                         # login_tasks；（多企业）login_enterprises、enterpriseRepo.ts
 │   │
 │   ├── console/          # ★ React 管理后台 + API 转发中继（端口 7004）
 │   │   └── src/
-│   │       ├── server/      # Express：管理员鉴权 + 静态托管 + apiProxy(注入内部 token)
-│   │       └── web/         # React SPA：7 个管理页 + 前端 API client
+│   │       ├── server/      # Express：管理员鉴权 + 静态托管 + apiProxy(注入内部 token)；（多企业）sameOrigin.ts 写操作同源校验
+│   │       └── web/         # React SPA：管理页 + 前端 API client；（多企业）pages/（EnterpriseSelector、EnterprisePoolPage、
+│   │                        #   EnterprisePolicyDialogs、DashboardPage、ModelsPage、UserPoolPage、SettingsPage…）、lib/scope.ts、lib/hashState.ts
 │   │
 │   └── mock-github/      # 本地 SCIM mock（端口 8002，纯内存，开发期用）
 │
@@ -156,8 +180,8 @@ src/proxy/src/index.ts  →  startServer()  →  src/proxy/src/server.ts
 
 ### 5.4 console（管理后台）
 - **职责**：浏览器只访问 `/api/console/**`，服务端注入 `X-Internal-Token` 后**转发**给 proxy/sso/login；自己只存管理员账号。
-- **关键文件**：`server/apiProxy.ts`（转发中继）、`server/adminsStore.ts`（scrypt 哈希的 admins.json）、`web/App.tsx`（7 页）。
-- **7 个管理页**：Dashboard / SSO Users / AI Credits / Request Stats / Proxy Accounts / Login Tasks / Diagnostics。
+- **关键文件**：`server/apiProxy.ts`（转发中继）、`server/adminsStore.ts`（scrypt 哈希的 admins.json）、`web/App.tsx`（页面清单与路由）、`web/pages/*`。
+- **管理页（多企业版）**：全局 Dashboard / Pool overview / Error Diagnostics；企业作用域 SSO Users / AI Credits Usage / Request Stats / Proxy Accounts / Models / Pool members / Login Tasks；混合 Settings / Diagnostics。页头企业选择器决定作用域页面显示哪个企业（不是权限边界）。
 
 ### 5.5 packages/shared（契约层）
 - **职责**：所有 DTO、枚举、ApiError 结构、分页/批处理形状、`JsonHttpClient`、logger/redact 的**单一事实来源**。改 API 必从这里改。
@@ -210,10 +234,25 @@ POST /v1/messages
 
 ### 链路 C：管理后台转发
 ```
-Admin Browser → console /api/console/sso/users
-  → requireAdmin（cookie session）
-  → apiProxy 注入 X-Internal-Token，转发 → sso http://sso:7001/api/users
+Admin Browser → console /api/console/sso/enterprises/<enterpriseId>/users   （多企业版；旧的无作用域路径返回 400）
+  → requireSameOrigin（写操作）→ requireAdmin（cookie session）
+  → apiProxy 注入 X-Internal-Token，转发 → sso http://sso:7001/api/enterprises/<enterpriseId>/users
   ← 透传响应
+```
+
+### 链路 D：多企业下一个 caller 落到哪个企业（caller-lease 模式）
+```
+Client POST /v1/messages（不带企业信息）
+  → proxy routeUserPool：caller 已有 lease / catalog hold → 沿用原企业、原成员
+                         否则在 active 且有合格 idle 的企业中按 cap 比例分数排名（rankEnterprisesForAdmission）
+  → lease → member.enterprise_id → 该企业的 copilotApiBaseUrl
+  → 转发、记统计（统计行带 enterprise_id）
+
+[worker] 全局缺口 D = max(0, T − I − P) → planCreations 按分数逐个分给未到 cap 的 active 企业
+  → sso /api/enterprises/<id>/users/ensure → SCIM/席位（该企业的端点与凭据）
+  → login /api/enterprises/<id>/tasks → 浏览器只在该企业白名单 SSO 页填写凭据
+  → login 回调 /internal/enterprises/<id>/accounts/<identity>/copilot-oauth-token
+  → proxy 用新 token 调该企业 /user 核对 gh_login → ready
 ```
 
 ---
@@ -356,3 +395,34 @@ sequenceDiagram
 - **登录任务队列是纯内存**：`login` 的 queue 在进程内存，重启丢失（已用 `recoverInterruptedTasks` 把中断任务标 failed 兜底，但需重新触发）。
 - **mock-github 未经测试**：src/README 明确标注“只在项目初期用过，未做测试”。
 - **SCIM 全局串行限流**：`scimClient` 用单个 `nextScimRequestAt` 变量串行化所有 SCIM 请求，大批量操作会被这个瓶颈拖慢。
+
+---
+
+## 10. 多企业（multi 版本线）地图
+
+设计：[multi-enterprise-design.md](multi-enterprise-design.md) · 配置：[multi-enterprise-registry.md](multi-enterprise-registry.md) · 升级：[multi-enterprise-upgrade-guide.md](multi-enterprise-upgrade-guide.md) · 验证：[multi-enterprise-release-validation.md](multi-enterprise-release-validation.md)
+
+| 关注点 | 入口文件 | 一句话说明 |
+| --- | --- | --- |
+| registry 加载 | `src/packages/shared/src/enterprise/registryFile.ts`、`registry.ts`、`registryFields.ts`、`registryDefaults.ts` | `ENTERPRISE_REGISTRY_FILE` 启动时读一次、严格校验、deep-freeze；字段默认值和按服务的阻塞项 |
+| `default` 企业 | `src/packages/shared/src/enterprise/defaultFromEnv.ts` | 环境变量 → `default` 字段；与 registry 冲突报 `enterprise_env_conflict` |
+| secret 引用 | `src/packages/shared/src/enterprise/secrets.ts` | `{env}` / `{file}`，惰性读取，file 缓存 60 秒，错误只含字段路径 |
+| GitHub / GHE.com 端点 | `src/packages/shared/src/enterprise/githubEndpoints.ts` | 由 `baseUrl` 推导 API、Copilot、设备流、SCIM、SAML 地址 |
+| 作用域中间件 | `src/packages/shared/src/enterprise/scope.ts`；各服务 `routes/enterpriseRoutes.ts`、`routes/requestEnterprise.ts` | `requireEnterprise`；无作用域 400、未知 404、冲突 400 |
+| 各服务企业对象 | `src/proxy/src/enterprises.ts`、`src/sso/src/enterprises.ts`、`src/login/src/enterprises.ts` | profile + 推导值，启动时打印每个企业和阻塞项 |
+| 数据迁移 | `src/proxy/src/db/enterpriseMigrations.ts`、`db/mysqlEnterpriseMigrations.ts`、`db/mysqlMigrationLock.ts`、`db/enterpriseRepo.ts`；`src/sso/src/db/migrations.ts`、`src/login/src/db/migrations.ts` | 启动时幂等迁移，旧数据归 `default`；企业身份指纹不可变 |
+| 池调度 | `src/packages/shared/src/enterprise/poolRanking.ts`、`src/proxy/src/userPool/scheduling.ts`、`userPool/storeContract.ts` | 按 cap 比例补货与分配；SQLite/MySQL 共用同一组纯函数和场景 |
+| 企业 cap / 生命周期 | `src/proxy/src/routes/enterprisesApi.ts` | `GET /api/enterprises`；`PATCH /api/enterprises/:id/pool-policy`（CAS、激活前实时 readiness） |
+| readiness | `src/proxy/src/clients/enterpriseReadiness.ts`；SSO/Login `routes/enterprisesInternal.ts` | 三方配置比对，就绪 60 秒 / 未就绪 10 秒缓存 |
+| SAML 与会话 | `src/sso/src/routes/samlRoutes.ts`、`src/sso/src/saml/enterpriseSession.ts`、`src/sso/src/db/enterpriseRepo.ts` | `default` 根路径不变，其他企业 `/enterprises/<id>/...`；每企业一个签名 cookie |
+| Login 白名单 | `src/login/src/auth/loginUrlAllowlist.ts`、`auth/enterpriseAuth.ts`、`src/login/src/db/enterpriseRepo.ts` | 只在同 origin、整段路径前缀匹配的页面填写 SSO 凭据 |
+| Models | `src/proxy/src/routes/modelsApi.ts`、`src/proxy/src/copilot/modelsAdmin.ts` | 每企业一个管理员，不回落池账号，缓存键含企业 ID |
+| Console | `src/console/src/web/pages/*`、`web/lib/scope.ts`、`web/lib/hashState.ts`、`web/api/enterprises.ts`、`server/sameOrigin.ts` | 企业选择器、作用域页面重挂载、`enterprisePath()`、写操作同源校验 |
+
+**多企业注意点**
+
+- **不回落 `default`**：任何作用域内的读写都显式带 `enterpriseId`；无作用域的管理/内部路径返回 400。
+- **首次升级不能滚动**：内部接口改为按企业路径，旧镜像在迁移后的库上 fail closed；回滚只能靠备份。
+- **身份字段不可改**：企业有数据后改 `id`、`baseUrl`、`slug`、`shortcode`、`pool.accountDomain` 会启动失败；开通过账号的企业不能从 registry 删除，只能 Drain。
+- **按副本的内存状态**：readiness、Models 目录、secret 文件缓存都在每个 Proxy 副本内存中，副本间可能短暂不一致。
+- **GHE.com 只用 mock 验证**：首次接入真实 GHE.com 企业前需在预发布环境验收。

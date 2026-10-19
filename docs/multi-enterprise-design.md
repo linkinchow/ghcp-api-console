@@ -169,7 +169,7 @@
 | `sso.scimBaseUrl` | 否 | `<apiBaseUrl>/scim/v2/enterprises/<slug>` | SSO |
 | `sso.emailDomain` / `sso.userPrefix` | 否 | 只在首次创建该企业的 `sso_runtime_settings` 行时作为种子 | SSO |
 | `sso.signingCert` / `signingKey` / `sessionSecret` | 是 | — | SSO |
-| `sso.scimToken` / `seatPat` / `defaultUserPassword` | 否 | 缺失时，对应功能对该企业报 `enterprise_secret_unconfigured` | SSO |
+| `sso.scimToken` / `seatPat` / `defaultUserPassword` | 否 | secret 引用。缺失时：`scimToken` 相关的 SCIM 操作返回 503 `enterprise_secret_unconfigured`；`seatPat` 相关的席位操作同样返回 503，AI Credits 刷新返回 400 `ai_credits_refresh_failed`；`defaultUserPassword` 缺失时默认密码回退为用户名（与 r4 相同） | SSO |
 | `login.ssoProvider` | 否 | 不设：由每个任务选择（基线行为，未指定时为 `custom`）；设置后任务必须一致 | Login |
 | `login.ssoLoginUrl` | 否 | default 企业取 `SSO_URL`；其他企业取 `<SSO_URL origin>/enterprises/<id>/login` | Login |
 | `login.allowedLoginUrls` | 否 | `[ssoLoginUrl]`。最多 16 项；origin 相同且路径整段前缀匹配；query、fragment 被去掉 | Login |
@@ -501,7 +501,7 @@ SAML 会话**不建表**（§5.5）。
   - `service.ts` 的 `assertDestructiveOperationAllowed`，它会调用带作用域的 Proxy pool-membership；
   - 异步 scrypt 密码（`auth/password.ts`）和 `routes/loginCredentials.ts` 的并发上限。
 - 事件日志：default 仍写 `SSO_USER_EVENTS_LOG`；其他企业写 `<dir>/<enterpriseId>/<basename>`。
-- 企业缺少 `scimToken` 或 `seatPat` 时，相关操作返回 503 `enterprise_secret_unconfigured`（基线为 400 或发出空凭据）。
+- 企业缺少 `scimToken` 或 `seatPat` 时，SCIM 与席位操作返回 503 `enterprise_secret_unconfigured`（基线为 400 或发出空凭据）；AI Credits 刷新返回 400 `ai_credits_refresh_failed`；缺 `defaultUserPassword` 时默认密码回退为用户名。
 - 启动时，库中有用户、但 registry 中已不存在的企业，报 `enterprise_missing_from_registry`。
 - 外部写请求使用 `redirect: 'error'`。传输失败或 5xx 视为“结果不确定”（从旧分支 `clients/externalFetch.ts` 移植到 shared）。
 

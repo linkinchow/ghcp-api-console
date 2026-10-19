@@ -11,7 +11,7 @@
 | 多企业 | 一套部署（一个 SSO、一个 Login、一个 Console、N 个 Proxy 副本）管理多个 GitHub 企业，可混用 github.com 与 GHE.com。每个企业有自己的 slug、shortcode、SAML/SCIM、席位 PAT、登录页和 Models 管理员。配置见 [registry 配置参考](multi-enterprise-registry.md)。 |
 | 原地升级 | 启动时自动迁移数据库；已有数据全部归入 `default` 企业。**不配置 registry 时无需修改任何配置**，行为与单企业版相同。 |
 | 账号池 | 所有企业共享一个全局 idle 目标，按各企业 cap 的比例补货；企业有 `draft` → `active` → `draining` 生命周期。 |
-| Console | 页头企业选择器；User pool 页新增企业表（cap、激活、排空、恢复）；Models 页按企业查询。 |
+| Console | 页头企业选择器；新增 Pool overview 页（全局设置 + 企业表：cap、激活、排空、恢复）和按企业的 Pool members 页；Models 页按企业查询。 |
 | 安全加固 | Console 所有写操作校验同源；SSO 登录/登出拒绝跨站请求；Login 登录页白名单按整段路径匹配；Login 回传令牌前，Proxy 用 GitHub `/user` 核对账号身份。 |
 | 镜像 | 仍是同一个 `deploy/images/Dockerfile.release`，构建参数 `RELEASE_LINE=multi`。镜像带 label `com.ghcp.release-line=multi`，四个服务的 `/healthz` 返回 `"releaseLine": "multi"`。 |
 
@@ -111,8 +111,8 @@
 
 ## 8. 可能注意到的行为变化
 
-- **管理接口加上企业作用域**：Console 已全部改用新路径。自建脚本如果直接调用 Proxy、SSO、Login 的管理接口，需要改为 `/api/enterprises/default/...`。Proxy 中除 `/api/enterprises`、`/api/user-pool/overview`、`/api/user-pool/settings`、错误诊断等全局接口外，无作用域的旧路径返回 400 `enterprise_scope_required`；只有旧的 `/api/accounts*` 保留一个版本，响应带 `Deprecation: true`。
-- **账号池 cap 改为按企业设置**：在 User pool 页的企业表中修改；`PATCH /api/user-pool/settings` 再传 `max_accounts` 会返回 409 `use_enterprise_cap`。升级后 `default` 的 cap 等于升级前的值。
+- **管理接口加上企业作用域**：Console 已全部改用新路径。自建脚本如果直接调用 Proxy、SSO、Login 的管理接口，需要改为 `/api/enterprises/default/...`。Proxy 中除 `/api/enterprises`、`/api/user-pool/overview`、`/api/user-pool/settings`、错误诊断等全局接口外，无作用域的旧路径返回 400 `enterprise_scope_required`；只有旧的 `/api/accounts*` 保留一个版本，响应带 `Deprecation: true`。监控脚本如果轮询旧的全局 `/api/user-pool/summary`，升级后会收到 400：全局计数改用 `/api/user-pool/overview`，单个企业用 `/api/enterprises/<id>/user-pool/summary`。
+- **账号池 cap 改为按企业设置**：在 Pool overview 页的企业表中修改；`PATCH /api/user-pool/settings` 再传 `max_accounts` 会返回 409 `use_enterprise_cap`。升级后 `default` 的 cap 等于升级前的值。
 - **Console**：页头出现企业选择器（升级后只有 `default`）。选择器不是权限边界，所有管理员都能管理所有企业。
 - **GHE.com**：未设置 API 地址时自动推导（第 6 节）。
 - **SSO**：
@@ -127,7 +127,7 @@
 
 - 四个服务的 `/healthz` 返回 `"releaseLine": "multi"`；Proxy `/readyz` 正常。
 - 日志中没有 `enterprise_registry_invalid`、`enterprise_env_conflict`、`enterprise_identity_changed` 等启动错误。
-- Console 能登录；企业选择器显示 `default`；User pool 页企业表中 `default` 为 `active`，cap 与库存等于升级前，Blockers 为空。
+- Console 能登录；企业选择器显示 `default`；Pool overview 页企业表中 `default` 为 `active`，cap 与库存等于升级前，Blockers 为空。
 - 账号、SSO 用户、登录任务、请求统计与升级前一致。
 - 根路径 SAML 登录可用，已登录的会话仍有效。
 - MySQL：`SELECT id FROM schema_migrations WHERE id LIKE 'enterprise-v1/%'` 有记录。
@@ -152,7 +152,7 @@
 1. 在 GitHub 企业中配置 SAML（Sign on URL `<SSO_PUBLIC_BASE_URL>/enterprises/<id>/sso`，Issuer `<SSO_PUBLIC_BASE_URL>/enterprises/<id>/metadata`），准备 SCIM token、席位 PAT 和独立的签名证书。
 2. 编写 registry（参考 `deploy/enterprise-registry.example.json`），只读挂载到 Proxy、SSO、Login（Compose：`docker-compose.enterprise-registry.yml`；Kubernetes：ConfigMap + Secret 卷，模板中有注释示例）。推荐 registry 不写 `default`，`default` 继续由环境变量定义；若写，请按 registry 配置参考第 5 节处理环境变量，否则启动报 `enterprise_env_conflict`。
 3. 重启 Proxy、SSO、Login（可以逐个重启；新企业在三方就绪前一直是 `draft`，不会被调度）。
-4. 在 User pool 页查看新企业的 Blockers，设置 cap，然后 Activate。
+4. 在 Pool overview 页查看新企业的 Blockers，设置 cap，然后 Activate。
 
 ## 12. 验证范围说明
 
