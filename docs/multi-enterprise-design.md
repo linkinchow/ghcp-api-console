@@ -593,7 +593,7 @@ SAML 会话**不建表**（§5.5）。
    - 危险操作的确认框显示企业 ID 与 slug。
 3. **全局页面**：
    - Dashboard：每个企业一张卡片。
-   - Pool overview：全局设置（idle target、TTL、pause），加企业表。企业表列出：状态、库存/cap、目标占比、实际占比、分数、ready idle、leased、在途、failed/disabled、blocker、名字目录剩余容量。
+   - Pool overview：全局设置（idle target、TTL、pause），加企业表。企业表列出：状态、库存/cap、目标占比、实际占比、分数、ready idle、leased、开通中（provisioning）、failed/disabled、blocker、名字目录剩余容量。
      - 操作：改 cap（CAS `policy_version`）、Activate（显示三方 readiness 明细）、Drain、Resume。
      - 页面注明：库存不等于账单，占比不等于流量配额。
    - Settings：Login 运行时设置为全局；SSO 运行时设置按企业。
