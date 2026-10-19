@@ -20,6 +20,7 @@
 | `multi-sqlite-snapshot.mjs` | 在已发布镜像内用其自带 better-sqlite3 输出 SQLite 逻辑快照（按列哈希；迁移 ID、trigger 名明文）。 |
 | `multi-volume-copy.mjs` | 在无网络的一次性 helper 容器（已缓存的 node 镜像）内备份/恢复服务数据卷，保留属主、权限、时间并比对清单。 |
 | `multi-controller.mjs` | 本机回环 HTTP 控制器（端口 18821），通过 preview 工具启动，串行执行 prepare + run。 |
+| `idle-target-cap-check.mjs` | 独立检查：全局 `READY_IDLE_TARGET` 大于 `default` 企业上限（`POOL_MAX_ACCOUNTS`）时，候选 Proxy 能启动，设置 API 也接受更大的 `idle_target`（SQLite 无网络 + internal 网络上的一次性 MySQL）。可选 `RELEASE_QUALIFICATION_CONTROL_TAG` 指定旧的多企业标签作为对照（必须拒绝启动）。输入：`RELEASE_QUALIFICATION_PROJECT`、`RELEASE_QUALIFICATION_CANDIDATE_TAG`、`RELEASE_QUALIFICATION_MYSQL_IMAGE`、`RELEASE_QUALIFICATION_ISOLATED_SUBNET`；报告以 JSON 输出到 stdout；全部通过时只删除自己创建的容器、网络和卷，失败时停止并保留。 |
 
 `tests/docker-user-pool/mock-services.mjs` 按 `Host` 分发租户（设计 §9.5）：原有 `local-test`（github.com 形态）租户行为不变；`MOCK_GHE_TENANTS` 增加 GHE.com 租户（`contoso.ghe.com` 网页与设备流、`api.contoso.ghe.com` 的 SCIM/席位/`/user`、`copilot-api.contoso.ghe.com` 的 models/推理），每个租户独立的用户、席位、token、任务和计数，别的租户的凭据一律 401。GHE.com 句柄无后缀且不超过 30 字符；数字用户 ID 在每个租户都从 1001 开始（故意重复，覆盖 §6 的缓存键要求）。fake Login 同时支持 `/api/tasks`（单企业）和 `/api/enterprises/:id/tasks`（带作用域的回调 `/internal/enterprises/:id/...`）。设置 `MOCK_LOGIN_READINESS_URL=http://login:7003` 时，Proxy 经 `LOGIN_BASE_URL`（即 mock）读取的 `GET /internal/enterprises` 转发给真实 Login。`mysql-bridge.mjs` 的 mock 模式转发时保留原始 `Host`。`mock-services.tenants.test.mjs` 在本机子进程中验证这些行为（不需要 Docker）。
 
