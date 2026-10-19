@@ -59,7 +59,7 @@ Console 解决“运维/开发人员如何集中管理各服务状态和手动�
 
 ### Pool overview 企业表
 
-账号池（caller-lease）模式下，企业表列出每个企业的 Enterprise、State、Inventory / cap、Target share、Actual share、Score、Ready idle、Leased、In flight、Failed / disabled、Blockers 和操作。库存是该企业已登记的池账号数，不是账单数字；目标/实际占比只决定新账号补给哪个企业，不是流量配额。
+账号池（caller-lease）模式下，企业表列出每个企业的 Enterprise、State、Inventory / cap、Target share、Actual share、Score、Ready idle、Leased、Provisioning（开通中的成员数）、Failed / disabled、Blockers 和操作。库存是该企业已登记的池账号数，不是账单数字；目标/实际占比只决定新账号补给哪个企业，不是流量配额。
 
 | 操作 | 说明 |
 | --- | --- |

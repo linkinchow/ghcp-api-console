@@ -152,7 +152,7 @@ Refresh dashboard只重新读取，不触发补池或重新授权。
 | Actual share | 该企业库存占所有 `active` 企业库存之和的比例 | 请求量或计费占比 |
 | Score | 调度分数（第5.3节），只对 `active` 企业显示；越大越优先补货 | 健康评分 |
 | Ready idle / Leased | 该企业当前可分配成员数 / 正式租约数 | — |
-| In flight | 该企业正在开通（provisioning）的成员数 | 在途推理请求数 |
+| Provisioning | 该企业正在开通（provisioning）的成员数 | 在途推理请求数 |
 | Failed / disabled | 该企业失败 / 管理员禁用的成员数 | — |
 | Blockers | Proxy、SSO、Login三方对该企业配置的比对结果：`None` 表示就绪；列出阻塞项代码；`Readiness unknown` 表示本次未能在时限内完成比对 | 账号级错误 |
 | Actions | Edit cap，以及按状态出现的 Activate / Drain / Resume | 删除企业 |

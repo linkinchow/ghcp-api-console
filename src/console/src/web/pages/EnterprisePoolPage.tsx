@@ -21,7 +21,7 @@ type Editing = { kind: 'cap'; id: string } | { kind: 'lifecycle'; id: string; ac
 const ACTION_LABELS: Record<LifecycleAction, string> = { activate: 'Activate', drain: 'Drain', resume: 'Resume' };
 const HEADERS = [
   'Enterprise', 'State', 'Inventory / cap', 'Target share', 'Actual share', 'Score', 'Ready idle', 'Leased',
-  'In flight', 'Failed / disabled', 'Blockers', 'Actions',
+  'Provisioning', 'Failed / disabled', 'Blockers', 'Actions',
 ];
 
 function message(error: unknown): string {

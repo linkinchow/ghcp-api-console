@@ -25,7 +25,7 @@
 | --- | --- | --- | --- | --- |
 | `ACCOUNT_ROUTING_MODE` | `direct` | `direct` / `caller-lease`，精确小写 | direct 按原 identity 取账号；caller-lease 按可信 key hash 分配排他成员 | 启动配置；不是数据库迁移开关 |
 | `POOL_ACCOUNT_EMAIL_DOMAIN` | 未设置 | 设置时必须是合法域名，最多253字符；小写标准化 | `default` 企业的池成员邮箱域名（映射为 `default.pool.accountDomain`），不是 caller 身份。**不再是启动必填**：registry 已为 `default` 设置 `pool.accountDomain` 时可不设；某企业没有域名时 Proxy 照常启动，但该企业未就绪（阻塞项 `proxy:enterprise_field_missing:pool.accountDomain`），不能激活或补货。其他企业用各自的 `pool.accountDomain`，企业之间不能重复 | 企业身份字段：该企业已有池成员后不能修改，否则 Proxy 启动失败 `enterprise_identity_changed`（SQLite 与 MySQL 相同） |
-| `READY_IDLE_TARGET` | `10` | 0–10000；启动时还要求不大于 `POOL_MAX_ACCOUNTS` | 全局（所有企业合计）希望维持的就绪空闲储备 | 首次种子；已有池改 Pool overview 的 Ready idle target |
+| `READY_IDLE_TARGET` | `10` | 0–10000；可以大于 `POOL_MAX_ACCOUNTS`（后者只是 `default` 企业的初始 cap，cap 按企业设置） | 全局（所有企业合计）希望维持的就绪空闲储备 | 首次种子；已有池改 Pool overview 的 Ready idle target |
 | `POOL_MAX_ACCOUNTS` | `100` | 1–10000 | **只作为 `default` 企业的初始 cap**（映射为 `default.pool.initialMaxAccounts`），只在 Proxy 首次登记 `default` 时使用；从单企业版升级时 `default` 的 cap 沿用升级前数据库中的值。cap 现在**按企业**设置，所有企业 cap 之和 ≤ 10000；降低不删号 | 首次种子；之后在 Pool overview 企业表的 Edit cap 修改。改这个变量不会改变已有企业的 cap |
 | `CALLER_LEASE_TTL_SECONDS` | `172800`秒，48小时 | 60–2592000秒，最多30天 | 完整成功推理后的正式租约 TTL | 首次种子；已有池改 UI 的租约 TTL |
 | `PROVISIONAL_LEASE_TTL_SECONDS` | `300`秒 | 10–3600秒 | 新 caller 尚未完整成功时的临时租约期限 | MySQL 不变量 |
