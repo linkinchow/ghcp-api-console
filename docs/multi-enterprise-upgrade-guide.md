@@ -22,12 +22,16 @@
 
 | 组件 | 按 digest 引用（linux/amd64） |
 | --- | --- |
-| Proxy | `docker.io/linkinchow/ghcp-proxy@sha256:e2632d5120e333824c57436879fdff795b3d14ad57ca5f44e60747a719aba648` |
-| SSO | `docker.io/linkinchow/ghcp-sso@sha256:29e3e9adefc225c1325d93eab43bbadb6a114f6c5dd6a4f236889292d33cf1a9` |
-| Login | `docker.io/linkinchow/ghcp-login@sha256:7c71e1e85c703a580413f5776640ea656f8b0eebbef903ea24a8fb4ad412b0fd` |
-| Console | `docker.io/linkinchow/ghcp-console@sha256:52f6677539dd45ef70805f374c1d468bf17c32dfa632c03ed8779fffc9503c53` |
+| Proxy | `docker.io/linkinchow/ghcp-proxy@sha256:00453e3b81a3fea67ef05d4fce1e3def680dac96ae9ca288a85d1a77c74997b6` |
+| SSO | `docker.io/linkinchow/ghcp-sso@sha256:5b112760945fa5444d5720d48ddae5a4da9fa42ead08a8fa5715356395dcefe7` |
+| Login | `docker.io/linkinchow/ghcp-login@sha256:6a7e48f79a86a04a5343ad0e6c4ac9f294ddd87c772f36927f9bbb148ffe1d2e` |
+| Console | `docker.io/linkinchow/ghcp-console@sha256:a1605e6304597387e3e193223b01823d89b7a007d7e7bb5d8e44e236b97d3e2c` |
 
-对应 tag 均为 `multi-41ecffc-amd64-r1`（linux/amd64，2026-10-19 发布，仓库公开，无需登录即可拉取）。源码提交：`41ecffc`（已合入 main）。部署时请按 **digest** 引用，建议先同步到客户自己的镜像仓库。
+对应 tag 均为 `multi-4922a4a-amd64-r2`（linux/amd64，2026-10-20 发布，仓库公开，无需登录即可拉取）。源码提交：`4922a4a`（main）。
+
+r2 相对 r1（`multi-41ecffc-amd64-r1`）的变化：全局 `READY_IDLE_TARGET` 不再受单个企业 cap（`POOL_MAX_ACCOUNTS`）限制，r1 在 idle 目标大于该值时拒绝启动，r2 正常启动；Console Pool overview 企业表的列名改为 Provisioning。两者之间没有数据库或服务间接口变化，已部署 r1 的环境替换四个镜像即可（这条 r1→r2 路径没有单独做资格测试；r4→r2 原地升级已验证，见[发布验证记录](multi-enterprise-release-validation.md)）。新升级请直接使用 r2。
+
+部署时请按 **digest** 引用，建议先同步到客户自己的镜像仓库。
 
 ## 3. 首次升级需要短暂停机
 
