@@ -9,10 +9,12 @@ import { pathToFileURL } from 'node:url';
 
 // Optional third argument `scoped`: multi-enterprise images, whose SSO/Login management APIs are enterprise-scoped
 // (unscoped paths answer 400 enterprise_scope_required); the `default` enterprise is checked instead.
-const [service, phase, apiScope = 'unscoped'] = process.argv.slice(2);
+// Optional fourth argument: the number of SSO users the deployment holds (default 3, the MySQL smoke's inventory).
+const [service, phase, apiScope = 'unscoped', ssoUsers = '3'] = process.argv.slice(2);
 assert.ok(['proxy', 'proxy2', 'console', 'sso', 'login'].includes(service));
 assert.ok(['baseline', 'candidate', 'rollback'].includes(phase));
 assert.ok(['unscoped', 'scoped'].includes(apiScope));
+assert.match(ssoUsers, /^\d{1,3}$/);
 const scoped = apiScope === 'scoped';
 const managementPath = (path) => (scoped ? `/api/enterprises/default${path}` : `/api${path}`);
 const component = service === 'proxy2' ? 'proxy' : service;
@@ -177,7 +179,8 @@ try {
   }
 
   // HTTP checks against the service's own port inside the container.
-  const auth = { 'X-Internal-Token': 'mysql-fixture-internal-only' };
+  // The container's own synthetic token (the MySQL and SQLite qualification environments use different ones).
+  const auth = { 'X-Internal-Token': process.env.INTERNAL_API_TOKEN || 'mysql-fixture-internal-only' };
   async function get(path, headers = auth) {
     const port = { proxy: 3000, proxy2: 3000, console: 7004, sso: 7001, login: 7003 }[service];
     const response = await fetch(`http://127.0.0.1:${port}${path}`, {
@@ -231,7 +234,7 @@ try {
     result.metadataSha256 = hash(xml);
     result.certSha256 = hash(readFileSync('/certs/idp-cert.pem'));
     const users = await (await get(`${managementPath('/users')}?page=1&pageSize=100`)).json();
-    assert.equal(users.total, 3, 'sso_users_survive');
+    assert.equal(users.total, Number(ssoUsers), 'sso_users_survive');
     result.userCount = users.total;
     if (scoped) await expectScopeRequired('/api/users?page=1&pageSize=100');
     result.logicalTables = hashTables('/data/sso.sqlite');

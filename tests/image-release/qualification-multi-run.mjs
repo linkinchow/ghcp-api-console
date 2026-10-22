@@ -1,6 +1,9 @@
 // Multi-enterprise in-place upgrade qualification (docs/multi-enterprise-design.md §9.4, §9.5), dispatched from
 // qualification-run.mjs when RELEASE_QUALIFICATION_MODE is multi-upgrade (MySQL 8.4, two Proxy replicas; steps
-// 1–5 and 7) or multi-upgrade-sqlite (SQLite direct mode; step 6).
+// 1–5 and 7) or multi-upgrade-sqlite (SQLite direct mode; step 6). The fresh modes qualify a new single-enterprise
+// deployment on empty databases without a registry: multi-fresh (MySQL, Proxy auto-migrates), multi-fresh-dba (MySQL
+// prepared with scripts/proxy-mysql-initial.sql, MYSQL_AUTO_MIGRATE=false, DML-only runtime account) and
+// multi-fresh-sqlite (SQLite direct mode).
 //
 // Safety rules (unchanged from the single-slug qualification): a fresh Compose project and fresh subnets; only this
 // project's containers are started, stopped or killed; never `down`, `rm`, `prune` or volume removal; app
@@ -178,11 +181,12 @@ function phaseFiles(name) {
   if (name === 'legacy') return [files.base.path, files.legacy.path];
   if (name === 'registry') return [files.base.path, files.registry.path];
   if (name === 'sqlite') return [files.sqlite.path];
+  if (name === 'fresh') return [files.fresh.path];
   throw new Error(`unknown compose phase ${name}`);
 }
 
-const ALL = () => (h.mode === 'multi-upgrade' ? lib.MYSQL_ALL : lib.SQLITE_ALL);
-const APPS = () => (h.mode === 'multi-upgrade' ? lib.APPS : lib.SQLITE_APPS);
+const ALL = () => (lib.isSqliteMode(h.mode) ? lib.SQLITE_ALL : lib.MYSQL_ALL);
+const APPS = () => (lib.isSqliteMode(h.mode) ? lib.SQLITE_APPS : lib.APPS);
 const serviceName = (row) => row.Config.Labels['com.docker.compose.service'];
 const exitStatus = (row) => ({ service: serviceName(row), code: row.State.ExitCode, oom: row.State.OOMKilled,
   running: row.State.Running });
@@ -221,7 +225,7 @@ async function verifyOwnedContainers(phase = h.current, services = ALL()) {
 }
 
 async function infrastructureIds() {
-  const rows = await inspect(await containerIds(h.mode === 'multi-upgrade' ? INFRA : ['mock']));
+  const rows = await inspect(await containerIds(lib.isSqliteMode(h.mode) ? ['mock'] : INFRA));
   return Object.fromEntries(rows.map((row) => [serviceName(row), row.Id]));
 }
 
@@ -274,8 +278,11 @@ async function probe(requests) {
 const one = async (request) => (await probe([request]))[0];
 
 /** MySQL as root inside the MySQL container; SQL arrives on stdin so nothing is quoted through a shell. */
-function mysqlRoot(sql, { database = DATABASE, timeout = 120000, optional = false, logStdout = true } = {}) {
-  const command = `MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql --protocol=tcp -h127.0.0.1 -uroot -N -B ${database}`;
+function mysqlRoot(sql, { database = DATABASE, timeout = 120000, optional = false, logStdout = true,
+  clientCharset } = {}) {
+  if (clientCharset !== undefined && !/^[a-z0-9]+$/.test(clientCharset)) throw new Error('invalid client charset');
+  const charset = clientCharset ? `--default-character-set=${clientCharset} ` : '';
+  const command = `MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql ${charset}--protocol=tcp -h127.0.0.1 -uroot -N -B ${database}`;
   return compose(['exec', '-T', 'mysql', 'sh', '-c', command], { input: sql, timeout, optional, logStdout });
 }
 
@@ -294,7 +301,29 @@ async function ensureObserver() {
     await h.db.query('SELECT 1 FROM fixture_identity LIMIT 1');
   } catch {
     await h.db?.end().catch(() => {});
-    h.db = await h.smoke.connectDatabase('observer');
+    h.db = await connectFixtureDatabase('observer');
+  }
+}
+
+/** Connection-level failures of the loopback bridge path (Docker Desktop port forwarding), never SQL errors. */
+const TRANSPORT_ERRORS = new Set(['ER_NET_READ_INTERRUPTED', 'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED',
+  'PROTOCOL_CONNECTION_LOST', 'ER_HANDSHAKE_ERROR']);
+
+/**
+ * The smoke fixture's disposable-database connection, retried (3 attempts) when the handshake through the loopback
+ * bridge times out. Retries are counted in the report; the fixture still verifies the database identity.
+ */
+async function connectFixtureDatabase(role) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await h.smoke.connectDatabase(role);
+    } catch (error) {
+      if (attempt >= 3 || !TRANSPORT_ERRORS.has(error?.code)) throw error;
+      h.report.transport ??= { databaseConnectRetries: 0, codes: [] };
+      h.report.transport.databaseConnectRetries++;
+      h.report.transport.codes.push(error.code);
+      await new Promise((done) => setTimeout(done, 3000 * attempt));
+    }
   }
 }
 
@@ -430,12 +459,12 @@ async function scheduler(previousOwnerHash) {
   return renewed.owner_hash === first.owner_hash && Number(renewed.owner_until) > Number(first.owner_until);
 }
 
-async function runtime(phase, apiScope) {
+async function runtime(phase, apiScope, ssoUsers = 3) {
   const data = {};
   for (const service of APPS()) {
     const label = phase === 'rollback' ? 'rollback' : phase;
     const output = await compose(['exec', '-T', service, 'node', '/qualification/qualification-verify-runtime.mjs',
-      service, label, apiScope], { timeout: 120000, optional: true });
+      service, label, apiScope, String(ssoUsers)], { timeout: 120000, optional: true });
     const record = lib.lastJsonLine(output.stdout, (row) => row?.service === service);
     ensure(output.code === 0 && record?.pass === true, `runtime_${service}_failed`);
     data[service] = record;
@@ -515,9 +544,9 @@ async function saveSecrets() {
 // ---------------------------------------------------------------------------------------------------------------
 // Preflight
 
-async function inspectImages() {
+async function inspectImages(targets = [h.state.baseline, h.state.candidate]) {
   h.report.images = {};
-  for (const target of [h.state.baseline, h.state.candidate]) {
+  for (const target of targets) {
     for (const component of ['proxy', 'console', 'sso', 'login']) {
       const reference = `${target.prefix}-${component}:${target.tag}`;
       const [image] = JSON.parse((await execute(['image', 'inspect', reference], { timeout: 20000 })).stdout);
@@ -530,7 +559,7 @@ async function inspectImages() {
       };
     }
   }
-  if (h.mode === 'multi-upgrade') await execute(['image', 'inspect', h.state.mysqlImage], { timeout: 20000 });
+  if (!lib.isSqliteMode(h.mode)) await execute(['image', 'inspect', h.state.mysqlImage], { timeout: 20000 });
   await execute(['image', 'inspect', lib.NODE_IMAGE], { timeout: 20000 });
 }
 
@@ -645,7 +674,7 @@ async function step1() {
     await h.smoke.health();
     const smoke = await runBaselineSmoke();
     check(smoke.code === 0, 'baseline_smoke_passed', { passes: smoke.passes });
-    h.db = await h.smoke.connectDatabase('observer');
+    h.db = await connectFixtureDatabase('observer');
 
     // The run takes longer than the smoke's 600 s leases: lengthen them and renew both callers once.
     await patchSettings({ lease_seconds: 7200 });
@@ -790,7 +819,7 @@ async function enterpriseColumnsFailClosed() {
     + " WHERE TABLE_SCHEMA=DATABASE() AND COLUMN_NAME='enterprise_id' ORDER BY TABLE_NAME");
   const strict = ENTERPRISE_TABLES
     .every((table) => columns.some((row) => row.t === table && row.n === 'NO' && row.d === null));
-  const load = await h.smoke.connectDatabase('load');
+  const load = await connectFixtureDatabase('load');
   let refused = false;
   let code = null;
   try {
@@ -1111,7 +1140,7 @@ async function step5() {
     const dump = await readFile(h.dump.path, 'utf8');
     ensure(lib.sha(dump) === h.dump.sha256, 'backup_dump_changed');
     await mysqlRoot(lib.restorePreamble(DATABASE) + dump, { database: '', timeout: 300000 });
-    h.db = await h.smoke.connectDatabase('observer');
+    h.db = await connectFixtureDatabase('observer');
     const tables = (await query('SELECT TABLE_NAME AS t FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE()'))
       .map((row) => row.t);
     check(!tables.includes('proxy_enterprises') && tables.includes('proxy_accounts'), 'mysql_restored_from_dump');
@@ -1241,9 +1270,9 @@ function sqliteInference(stream = false) {
   } };
 }
 
-async function sqliteSnapshots() {
+async function sqliteSnapshots(services = ['proxy', 'sso', 'login']) {
   const result = {};
-  for (const service of ['proxy', 'sso', 'login']) {
+  for (const service of services) {
     const path = `/data/${service}.sqlite`;
     const script = '/qualification/multi-sqlite-snapshot.mjs';
     const output = await compose(['exec', '-T', service, 'node', script, service, path],
@@ -1442,19 +1471,558 @@ async function sqliteRestore() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// Fresh single-enterprise deployment (multi-fresh, multi-fresh-dba: MySQL + two replicas; multi-fresh-sqlite:
+// SQLite direct mode). Empty databases and volumes, no registry: `default` is synthesized from the environment.
+
+const PROTOCOLS = ['/v1/messages', '/chat/completions', '/responses'];
+const FRESH_CALLER = 'fresh-caller-a';
+const FRESH_OTHER_CALLER = 'fresh-caller-b';
+const FRESH_POOL_IDLE_TARGET = 3;
+const SQLITE_PASSWORD = 'release-fixture-password-only';
+const INITIAL_SQL = 'scripts/proxy-mysql-initial.sql';
+
+const freshSqlite = () => lib.isSqliteMode(h.mode);
+/** The internal token of the environment (MySQL and SQLite fixtures use different synthetic values). */
+const freshToken = () => (freshSqlite() ? SQLITE_TOKEN : probeToken());
+const errorCode = (row) => row.json?.error?.code ?? row.data?.error?.code;
+const cookiesOf = (response) => (response.headers?.['set-cookie'] ?? []).map((line) => line.split(';', 1)[0])
+  .join('; ');
+
+async function preflightFresh() {
+  check(await freshProject(), 'fresh_project_and_volumes');
+  const config = await renderConfig(h.files);
+  const registry = lib.registryReferences(config);
+  if (freshSqlite()) {
+    const problems = lib.composeViolations(config, { project: PROJECT, services: lib.SQLITE_ALL,
+      apps: lib.SQLITE_APPS });
+    check(problems.length === 0 && registry.length === 0, 'compose_isolated_sqlite', { problems, registry });
+  } else {
+    const problems = lib.composeViolations(config, { project: PROJECT, services: lib.MYSQL_ALL, apps: lib.APPS,
+      bridgePorts: 5 });
+    const autoMigrate = ['proxy', 'proxy2'].map((service) => config.services[service].environment.MYSQL_AUTO_MIGRATE
+      ?? null);
+    const expected = h.mode === 'multi-fresh-dba' ? 'false' : null;
+    check(problems.length === 0 && registry.length === 0 && autoMigrate.every((value) => value === expected),
+      'compose_isolated_fresh', { problems, registry, autoMigrate });
+  }
+  h.configs.fresh = config;
+  h.volumeNames = Object.fromEntries(Object.entries(config.volumes).map(([key, volume]) => [key, volume.name]));
+  await inspectImages([h.state.candidate]);
+  check(true, 'images_present_locally', { images: Object.keys(h.report.images) });
+  check(candidateDefaults(), 'candidate_shipped_defaults');
+  h.owned = true;
+  if (!freshSqlite()) check(await legacyCommandCheck(), 'candidate_legacy_command_starts_and_stops_cleanly');
+}
+
+/** Tables of the Proxy database, read as root inside the MySQL container (the bridge is not up yet). */
+async function rootTables() {
+  const result = await mysqlRoot(`SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='${DATABASE}'`
+    + ' ORDER BY TABLE_NAME;', { database: '' });
+  return result.stdout.split(/\r?\n/).filter(Boolean);
+}
+
+/** Columns, indexes, constraints and triggers of the Proxy database, hashed (root, inside the MySQL container). */
+async function rootSchemaFingerprint() {
+  const where = `WHERE TABLE_SCHEMA='${DATABASE}'`;
+  const result = await mysqlRoot([
+    'SELECT TABLE_NAME,COLUMN_NAME,ORDINAL_POSITION,COLUMN_TYPE,IS_NULLABLE,COALESCE(COLUMN_DEFAULT,\'<null>\'),'
+      + `COALESCE(COLLATION_NAME,''),EXTRA FROM information_schema.COLUMNS ${where} ORDER BY 1,3;`,
+    'SELECT TABLE_NAME,INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COALESCE(COLUMN_NAME,\'\') FROM information_schema.STATISTICS'
+      + ` ${where} ORDER BY 1,2,4;`,
+    `SELECT TABLE_NAME,CONSTRAINT_NAME,CONSTRAINT_TYPE FROM information_schema.TABLE_CONSTRAINTS ${where} ORDER BY 1,2;`,
+    'SELECT TRIGGER_NAME,EVENT_OBJECT_TABLE,ACTION_TIMING,EVENT_MANIPULATION FROM information_schema.TRIGGERS'
+      + ` WHERE TRIGGER_SCHEMA='${DATABASE}' ORDER BY 1;`,
+  ].join('\n'), { database: '' });
+  return lib.sha(result.stdout);
+}
+
+async function rootMigrationIds() {
+  const result = await mysqlRoot('SELECT id FROM schema_migrations ORDER BY id;');
+  return result.stdout.split(/\r?\n/).filter(Boolean).sort();
+}
+
+async function freshDbaSchema() {
+  await runStep('fresh-dba-schema', async () => {
+    h.current = 'candidate';
+    await compose(['up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '400', 'mysql', 'mock'],
+      { timeout: 430000 });
+    const empty = await rootTables();
+    check(empty.length === 1 && empty[0] === 'fixture_identity', 'mysql_database_empty', { tables: empty });
+
+    const script = await readFile(join(ROOT, INITIAL_SQL), 'utf8');
+    // The mysql client of the official image defaults to a latin1 session (POSIX locale); string literals of the
+    // CHECK constraints then carry `_latin1` introducers, which r2's MYSQL_AUTO_MIGRATE=false validator rejects
+    // ("proxy_enterprises check constraints"). A utf8mb4 session is what Proxy's own migrations and the
+    // integration test use (see docs/multi-enterprise-release-validation.md, fresh deployment findings).
+    await mysqlRoot(lib.initialSqlForDatabase(script, DATABASE),
+      { database: '', timeout: 180000, clientCharset: 'utf8mb4' });
+    const tables = await rootTables();
+    const recorded = await rootMigrationIds();
+    const scripted = lib.initialSqlMigrationIds(script);
+    const [enterpriseRows] = (await mysqlRoot('SELECT COUNT(*) FROM proxy_enterprises;')).stdout.trim().split(/\s+/);
+    const clauses = (await mysqlRoot('SELECT CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS'
+      + ` WHERE CONSTRAINT_SCHEMA='${DATABASE}';`)).stdout;
+    // Batch output escapes the clause's own `\'` once more, so any number of backslashes precedes the quote.
+    const introducers = [...new Set([...clauses.matchAll(/_([a-z0-9]+)\\*'/g)].map((match) => match[1]))].sort();
+    const expectedTables = ['proxy_accounts', 'proxy_enterprises', 'proxy_identity_initializations',
+      'proxy_request_stats', 'schema_migrations', 'user_pool_accounts', 'user_pool_catalog_cooldowns',
+      'user_pool_catalog_holds', 'user_pool_events', 'user_pool_holds', 'user_pool_leases', 'user_pool_settings'];
+    check(expectedTables.every((table) => tables.includes(table)) && JSON.stringify(recorded) === JSON.stringify(scripted)
+      && lib.missingMigrationIds(recorded, lib.expectedFreshMysqlMigrationIds()).length === 2
+      && Number(enterpriseRows) === 0 && JSON.stringify(introducers) === '["utf8mb4"]', 'initial_sql_applied',
+    { script: INITIAL_SQL, scriptSha256: lib.sha(script), clientCharset: 'utf8mb4', checkLiteralCharsets: introducers,
+      tables: tables.length, recorded, defaultRows: enterpriseRows });
+    h.report.findings.push({ kind: 'dba_initial_sql_client_charset', productChange: false,
+      detail: 'Applied through the image mysql client in its default latin1 session, the CHECK literals carry _latin1'
+        + ' introducers and Proxy with MYSQL_AUTO_MIGRATE=false refuses to start (proxy_enterprises check'
+        + ' constraints). This run applies the script with --default-character-set=utf8mb4.',
+      recommendation: 'Start the generated scripts with SET NAMES utf8mb4 (or document the client option), or let'
+        + ' the validator accept any charset introducer on ASCII literals.' });
+
+    await mysqlRoot(lib.dbaRuntimeGrantsSql(DATABASE, 'pool_fixture'), { database: '' });
+    const grants = (await mysqlRoot("SHOW GRANTS FOR 'pool_fixture'@'%';", { database: '' })).stdout
+      .split(/\r?\n/).filter(Boolean);
+    const ddl = lib.ddlPrivileges(grants);
+    const dml = grants.some((line) => /^GRANT SELECT, INSERT, UPDATE, DELETE ON `ghcp_pool_mysql_test`\.\*/.test(line));
+    const trigger = grants.some((line) => /^GRANT TRIGGER ON `ghcp_pool_mysql_test`\.`proxy_accounts`/.test(line));
+    check(ddl.length === 0 && dml && trigger, 'runtime_grants_dml_only', { grants, ddl });
+    h.dba = { schemaBefore: await rootSchemaFingerprint(), migrationsBefore: recorded };
+  });
+}
+
+/** `/healthz` of every application from inside the network: each must report releaseLine `multi`. */
+async function freshReleaseLines() {
+  const targets = freshSqlite() ? ['proxy', 'sso', 'login', 'console'] : ['proxy', 'proxy2', 'sso', 'login', 'console'];
+  const results = await probe(targets.map((target) => ({ target, path: '/healthz' })));
+  const lines = Object.fromEntries(targets.map((target, index) => [target, results[index].json?.releaseLine ?? null]));
+  check(results.every((row) => row.status === 200) && Object.values(lines).every((line) => line === 'multi'),
+    'release_line_multi', lines);
+}
+
+/** Exactly one row, `default`, in a snapshot's (value-hashed) enterprise table. */
+const onlyDefault = (snapshot, table) => snapshot.logicalTables[table]?.rows.length === 1
+  && snapshot.logicalTables[table].rows[0].id === lib.sha('default');
+
+async function freshStartMysql() {
+  await runStep('fresh-start', async () => {
+    h.current = 'candidate';
+    await compose(['up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '400'], { timeout: 430000 });
+    await verifyOwnedContainers('candidate');
+    h.infra = await infrastructureIds();
+    h.smoke = await import(pathToFileURL(join(h.state.directory, 'fixtures/mysql-smoke.mjs')).href);
+    await h.smoke.health();
+    h.db = await connectFixtureDatabase('observer');
+    check(true, 'fresh_services_healthy');
+    await freshReleaseLines();
+
+    const services = await sqliteSnapshots(['sso', 'login']);
+    const migrations = (await query('SELECT id FROM schema_migrations ORDER BY id')).map((row) => row.id).sort();
+    const expected = lib.expectedFreshMysqlMigrationIds();
+    const missing = {
+      proxy: lib.missingMigrationIds(migrations, expected),
+      unexpectedProxy: migrations.filter((id) => !expected.includes(id)),
+      sso: lib.missingMigrationIds(services.sso.migrations, lib.SSO_MIGRATION_IDS),
+      login: lib.missingMigrationIds(services.login.migrations, lib.LOGIN_MIGRATION_IDS),
+    };
+    check(Object.values(missing).every((ids) => ids.length === 0), 'fresh_migration_ids_complete',
+      { ...missing, proxyMigrations: migrations });
+    if (h.mode === 'multi-fresh-dba') {
+      const schemaAfter = await rootSchemaFingerprint();
+      const added = migrations.filter((id) => !h.dba.migrationsBefore.includes(id));
+      check(schemaAfter === h.dba.schemaBefore
+        && JSON.stringify(added) === JSON.stringify([lib.PROXY_MIGRATION_IDS[1], lib.PROXY_MIGRATION_IDS[7]]),
+      'dba_startup_no_ddl', { schemaUnchanged: schemaAfter === h.dba.schemaBefore, addedByProxy: added });
+    }
+    check(await enterpriseColumnsFailClosed(), 'fresh_enterprise_columns_fail_closed', h.failClosed);
+
+    const cap = Number(h.configs.fresh.services.proxy.environment.POOL_MAX_ACCOUNTS);
+    const rows = await query('SELECT id,state,max_accounts,inventory_count,policy_version,profile_fingerprint'
+      + ' FROM proxy_enterprises ORDER BY id');
+    const lists = [await enterprisesList('proxy'), await enterprisesList('proxy2')];
+    const listed = (items) => items.length === 1 && items[0].id === 'default' && items[0].pool?.state === 'active'
+      && items[0].pool.maxAccounts === cap && items[0].pool.inventory === 0;
+    check(rows.length === 1 && rows[0].id === 'default' && rows[0].state === 'active'
+      && Number(rows[0].max_accounts) === cap && Number(rows[0].inventory_count) === 0
+      && /^[a-f0-9]{64}$/.test(rows[0].profile_fingerprint ?? '') && lists.every(listed),
+    'single_default_enterprise_active', {
+      enterprises: rows.map(({ profile_fingerprint: _f, ...row }) => row),
+      listed: lists.map((items) => items.map((item) => ({ id: item.id, pool: item.pool }))),
+      readiness: lists[0][0]?.readiness ?? null,
+    });
+    check(onlyDefault(services.sso, 'sso_enterprises') && onlyDefault(services.login, 'login_enterprises'),
+      'sso_login_single_default_enterprise', { sso: services.sso.logicalTables.sso_enterprises?.rows.length ?? null,
+        login: services.login.logicalTables.login_enterprises?.rows.length ?? null });
+    check(await scheduler(null), 'single_scheduler_owner_renewing');
+  });
+}
+
+async function freshStartSqlite() {
+  await runStep('fresh-start', async () => {
+    h.current = 'candidate';
+    await compose(['up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300'], { timeout: 330000 });
+    await verifyOwnedContainers('candidate');
+    const ready = await probe([{ target: 'proxy', path: '/readyz' }, { target: 'mock', path: '/healthz' }]);
+    check(ready.every((row) => row.status === 200) && ready[0].json?.storage === 'sqlite', 'fresh_services_healthy');
+    await freshReleaseLines();
+    const snapshots = await sqliteSnapshots();
+    const missing = {
+      proxy: lib.missingMigrationIds(snapshots.proxy.migrations, lib.expectedProxyMigrationIds('sqlite-direct')),
+      sso: lib.missingMigrationIds(snapshots.sso.migrations, lib.SSO_MIGRATION_IDS),
+      login: lib.missingMigrationIds(snapshots.login.migrations, lib.LOGIN_MIGRATION_IDS),
+    };
+    check(Object.values(missing).every((ids) => ids.length === 0)
+      && Object.values(snapshots).every((row) => row.integrity === 'ok'), 'sqlite_fresh_migration_ids_complete',
+    { missing, proxyMigrations: snapshots.proxy.migrations });
+    const triggers = ['proxy_accounts_enterprise_required', 'proxy_accounts_enterprise_immutable',
+      'proxy_request_stats_enterprise_required'];
+    check(triggers.every((name) => snapshots.proxy.triggers.includes(name))
+      && snapshots.login.triggers.includes('login_tasks_enterprise_required'), 'sqlite_fail_closed_triggers_present',
+    { proxy: snapshots.proxy.triggers, login: snapshots.login.triggers });
+    const [list, pool] = await probe([
+      { target: 'proxy', path: '/api/enterprises', headers: SQLITE_TOKEN },
+      { target: 'proxy', path: '/api/enterprises/default/user-pool/summary', headers: SQLITE_TOKEN },
+    ]);
+    const items = list.json?.items ?? [];
+    check(onlyDefault(snapshots.proxy, 'proxy_enterprises') && onlyDefault(snapshots.sso, 'sso_enterprises')
+      && onlyDefault(snapshots.login, 'login_enterprises') && list.status === 200 && items.length === 1
+      && items[0].id === 'default' && items[0].pool === null && items[0].poolSummary === null,
+    'sqlite_single_default_enterprise', { listed: items.map((item) => ({ id: item.id, pool: item.pool })),
+      poolSummaryInDirectMode: { status: pool.status, code: errorCode(pool) ?? null },
+      proxyEnterpriseStateActive: snapshots.proxy.logicalTables.proxy_enterprises?.rows[0]?.state
+        === lib.sha('active') });
+  });
+}
+
+async function freshConsole() {
+  await runStep('fresh-console', async () => {
+    const [before, setup] = await probe([
+      { target: 'console', path: '/api/console/setup' },
+      { target: 'console', method: 'POST', path: '/api/console/setup', body: CONSOLE_ADMIN },
+    ]);
+    const setupCookie = cookiesOf(setup);
+    const [me, after, again] = await probe([
+      { target: 'console', path: '/api/console/me', headers: { cookie: setupCookie } },
+      { target: 'console', path: '/api/console/setup' },
+      { target: 'console', method: 'POST', path: '/api/console/setup',
+        body: { username: 'second-fixture-admin', password: 'second-fixture-console-only' } },
+    ]);
+    check(before.status === 200 && before.json?.initialized === false && setup.status === 201 && setupCookie
+      && me.status === 200 && me.json?.username === CONSOLE_ADMIN.username && after.json?.initialized === true
+      && again.status === 400, 'console_first_run_setup',
+    { statuses: [before.status, setup.status, me.status, after.status, again.status] });
+
+    const [login, wrong, anonymous] = await probe([
+      { target: 'console', method: 'POST', path: '/api/console/login', body: CONSOLE_ADMIN },
+      { target: 'console', method: 'POST', path: '/api/console/login',
+        body: { username: CONSOLE_ADMIN.username, password: 'wrong-fixture-password' } },
+      { target: 'console', path: '/api/console/me' },
+    ]);
+    h.secrets.consoleCookie = cookiesOf(login);
+    await saveSecrets();
+    const [session] = await probe([
+      { target: 'console', path: '/api/console/me', headers: { cookie: h.secrets.consoleCookie } },
+    ]);
+    check(login.status === 200 && h.secrets.consoleCookie && wrong.status === 401 && anonymous.status === 401
+      && session.status === 200 && session.json?.username === CONSOLE_ADMIN.username, 'console_login',
+    { statuses: [login.status, wrong.status, anonymous.status, session.status] });
+
+    const cookie = { cookie: h.secrets.consoleCookie };
+    const scopedProxy = freshSqlite() ? 'accounts?page=1&pageSize=100' : 'user-pool/summary';
+    const [list, overview, users, tasks, stats, unscoped, unauthenticated] = await probe([
+      { target: 'console', path: '/api/console/proxy/enterprises', headers: cookie },
+      { target: 'console', path: `/api/console/proxy/enterprises/default/${scopedProxy}`, headers: cookie },
+      { target: 'console', path: '/api/console/sso/enterprises/default/users?page=1&pageSize=100', headers: cookie },
+      { target: 'console', path: '/api/console/login-service/enterprises/default/tasks?page=1&pageSize=100',
+        headers: cookie },
+      { target: 'console', path: '/api/console/proxy/enterprises/default/request-stats', headers: cookie },
+      { target: 'console', path: '/api/console/proxy/request-stats', headers: cookie },
+      { target: 'console', path: '/api/console/proxy/enterprises' },
+    ]);
+    const items = list.json?.items ?? [];
+    check(list.status === 200 && items.length === 1 && items[0].id === 'default'
+      && [overview, users, tasks, stats].every((row) => row.status === 200)
+      && unscoped.status === 400 && errorCode(unscoped) === 'enterprise_scope_required'
+      && unauthenticated.status === 401, 'console_default_enterprise_overview',
+    { statuses: [list, overview, users, tasks, stats, unscoped, unauthenticated].map((row) => row.status),
+      enterprises: items.map((item) => item.id) });
+  });
+}
+
+async function defaultSummary(service = 'proxy') {
+  return h.smoke.status(await api(service, '/api/enterprises/default/user-pool/summary'), 200, 'default_summary')
+    .data;
+}
+
+async function freshPool() {
+  await runStep('fresh-pool', async () => {
+    const settings = await poolSettings('proxy', 'candidate');
+    const summary = await defaultSummary();
+    const initial = await h.smoke.mock();
+    check(Number(settings.idle_target) === 0 && summary.counts.total === 0 && initial.users.length === 0
+      && initial.tasks.length === 0 && initial.inference.length === 0, 'pool_fresh_settings',
+    { settings: { idle_target: settings.idle_target, paused: settings.paused, lease_seconds: settings.lease_seconds },
+      counts: summary.counts });
+
+    // Provisioning is requested through the second replica; the scheduler owner may be either one.
+    await patchSettings({ idle_target: FRESH_POOL_IDLE_TARGET, paused: 0 }, 'proxy2', 'candidate');
+    const started = Date.now();
+    const filled = await h.smoke.poll('fresh_replenishment', () => defaultSummary('proxy2'),
+      (value) => value.counts.total === FRESH_POOL_IDLE_TARGET && value.counts.ready_idle === FRESH_POOL_IDLE_TARGET
+        && value.counts.provisioning === 0, 300000);
+    const fillMs = Date.now() - started;
+    // Paused, so the SSO inventory stays at the idle target for the rest of the run (admission still works).
+    await patchSettings({ paused: 1 }, 'proxy', 'candidate');
+    const mock = await h.smoke.mock();
+    const accounts = await query('SELECT p.identity, p.enterprise_id AS account_enterprise,'
+      + ' p.copilot_oauth_status AS status, a.state, a.enterprise_id AS member_enterprise'
+      + ' FROM proxy_accounts p JOIN user_pool_accounts a ON a.identity=p.identity ORDER BY p.identity');
+    const [inventory] = await query("SELECT inventory_count FROM proxy_enterprises WHERE id='default'");
+    const counters = mock.counters;
+    check(filled.counts.ready_idle === FRESH_POOL_IDLE_TARGET && accounts.length === FRESH_POOL_IDLE_TARGET
+      && accounts.every((row) => row.status === 'valid' && row.state === 'ready')
+      && Number(inventory?.inventory_count) === FRESH_POOL_IDLE_TARGET
+      && counters.scimCreates === FRESH_POOL_IDLE_TARGET && counters.taskPosts === FRESH_POOL_IDLE_TARGET
+      && counters.callbacksSucceeded === FRESH_POOL_IDLE_TARGET && counters.callbacksFailed === 0
+      && counters.scimConflicts === 0 && mock.seats.length === FRESH_POOL_IDLE_TARGET, 'pool_reaches_idle_target',
+    { counts: filled.counts, fillMs, counters, inventory: Number(inventory?.inventory_count),
+      warmupInference: mock.inference.filter((row) => row.marker === null).length });
+
+    const [users] = await probe([{ target: 'sso', path: '/api/enterprises/default/users?page=1&pageSize=100',
+      headers: probeToken() }]);
+    h.freshSsoUser = mock.users[0]?.userName;
+    check(accounts.every((row) => row.account_enterprise === 'default' && row.member_enterprise === 'default')
+      && mock.tasks.length === FRESH_POOL_IDLE_TARGET && mock.tasks.every((task) => task.enterpriseId === 'default'
+        && task.status === 'success') && users.status === 200 && users.json?.total === FRESH_POOL_IDLE_TARGET
+      && h.freshSsoUser, 'pool_provisioning_scoped_to_default',
+    { tasks: mock.tasks.map((task) => task.enterpriseId ?? null), ssoUsers: users.json?.total ?? null });
+  });
+}
+
+async function freshCaller() {
+  await runStep('fresh-caller', async () => {
+    const caller = `sha256:${h.smoke.hash(FRESH_CALLER)}`;
+    const options = h.smoke.inferOptions(caller, '/responses', 'POOL_TEST:{"id":"fresh-hold","streamMode":"hold"}',
+      true);
+    const controller = new AbortController();
+    const held = await fetch(`${h.smoke.urls.proxy}/responses`, {
+      method: 'POST', headers: { ...options.headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify(options.body), redirect: 'error',
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(25000)]),
+    });
+    let provisional;
+    try {
+      ensure(held.status === 200, 'fresh_held_stream_not_started');
+      await h.smoke.poll('fresh_hold', () => h.smoke.databaseState(h.db), (row) => Number(row.holds) === 1, 10000);
+      provisional = (await defaultLeases('proxy2', 'candidate')).find((row) => row.callerKeyHash === caller);
+      const [row] = await query('SELECT lease_id, phase, member_identity, expires_at - assigned_at AS ttl'
+        + ' FROM user_pool_leases WHERE caller_id=?', [caller]);
+      const upstream = (await h.smoke.mock()).inference.find((record) => record.marker === 'fresh-hold');
+      check(provisional?.phase === 'provisional' && row?.phase === 'provisional' && row.lease_id === provisional.leaseId
+        && upstream?.identity === provisional.memberIdentity && upstream.outcome === 'pending',
+      'caller_provisional_lease', { ttlMs: Number(row?.ttl ?? 0), seenFrom: 'proxy2', requestOn: 'proxy' });
+    } finally {
+      controller.abort();
+      await held.body?.cancel().catch(() => {});
+    }
+    await h.smoke.poll('fresh_hold_cancelled', () => h.smoke.mock(),
+      (value) => value.inference.some((row) => row.marker === 'fresh-hold' && row.outcome === 'cancelled'), 15000);
+    await h.smoke.poll('fresh_hold_drain', () => h.smoke.databaseState(h.db), (row) => Number(row.holds) === 0, 15000);
+
+    const member = provisional.memberIdentity;
+    let n = 0;
+    for (const path of PROTOCOLS) {
+      for (const stream of [false, true]) {
+        const id = `fresh-protocol-${n}`;
+        const service = n++ % 2 ? 'proxy2' : 'proxy';
+        const request = h.smoke.inferOptions(caller, path, `POOL_TEST:${JSON.stringify({ id })}`, stream);
+        h.smoke.successful(await h.smoke.request(service, path, request), path, stream);
+      }
+    }
+    const records = (await h.smoke.mock()).inference.filter((row) => row.marker?.startsWith('fresh-protocol-'));
+    check(records.length === 6 && records.every((row) => row.identity === member && row.outcome === 'complete')
+      && PROTOCOLS.every((path) => records.filter((row) => row.path === path).length === 2),
+    'caller_protocol_json_sse_same_member', { requests: records.length, replicas: ['proxy', 'proxy2'] });
+
+    await pauseDrain('candidate');
+    const leases = [];
+    for (const service of ['proxy', 'proxy2']) {
+      leases.push((await defaultLeases(service, 'candidate')).find((row) => row.callerKeyHash === caller));
+    }
+    check(leases.every((lease) => lease?.phase === 'active' && lease.leaseId === provisional.leaseId
+      && lease.memberIdentity === member) && leases[0].expiresAt === leases[1].expiresAt,
+    'caller_active_lease_both_replicas', { phases: leases.map((lease) => lease?.phase ?? null) });
+
+    const stats = await query('SELECT identity, lease_id, path, success, enterprise_id FROM proxy_request_stats'
+      + ' WHERE caller_id=?', [caller]);
+    const succeeded = stats.filter((row) => Number(row.success) === 1);
+    const [all] = await query("SELECT COUNT(*) AS n, SUM(enterprise_id='default') AS d FROM proxy_request_stats");
+    check(succeeded.length === 6 && succeeded.every((row) => row.identity === member
+      && row.lease_id === provisional.leaseId) && stats.every((row) => row.enterprise_id === 'default')
+      && PROTOCOLS.every((path) => succeeded.filter((row) => row.path === path).length === 2)
+      && Number(all.n) === Number(all.d ?? 0), 'caller_stats_default_enterprise',
+    { callerRows: stats.length, succeeded: succeeded.length, allRows: Number(all.n) });
+
+    const other = `sha256:${h.smoke.hash(FRESH_OTHER_CALLER)}`;
+    const request = h.smoke.inferOptions(other, '/v1/messages', 'POOL_TEST:{"id":"fresh-other"}');
+    h.smoke.successful(await h.smoke.request('proxy2', '/v1/messages', request), '/v1/messages', false);
+    await pauseDrain('candidate');
+    const otherLease = (await defaultLeases('proxy', 'candidate')).find((row) => row.callerKeyHash === other);
+    const upstream = (await h.smoke.mock()).inference.find((row) => row.marker === 'fresh-other');
+    check(otherLease?.phase === 'active' && otherLease.memberIdentity !== member
+      && upstream?.identity === otherLease.memberIdentity, 'second_caller_exclusive_member');
+  });
+}
+
+async function freshDirect() {
+  await runStep('fresh-direct', async () => {
+    const [created, imported] = await probe([
+      { target: 'sso', method: 'POST', path: '/api/enterprises/default/users', headers: SQLITE_TOKEN,
+        body: { ssoUser: SQLITE_MEMBER, password: SQLITE_PASSWORD, email: 'release-member@example.test' } },
+      { target: 'proxy', method: 'POST', path: '/api/enterprises/default/accounts/copilot-oauth-token/import',
+        headers: SQLITE_TOKEN, body: { csvText: `name,copilotOauthToken\n${SQLITE_MEMBER},release-fixture-oauth\n` } },
+    ]);
+    check(created.status === 201 && imported.status === 200 && imported.json?.summary?.success === 1
+      && imported.json.summary.failed === 0, 'sqlite_scoped_user_and_token_import',
+    { statuses: [created.status, imported.status] });
+    const [json, sse, evidence] = await probe([sqliteInference(false), sqliteInference(true),
+      { target: 'mock', path: '/evidence' }]);
+    const requests = evidence.json?.requests ?? [];
+    check(json.status === 200 && json.json?.content?.[0]?.text === 'RELEASE_MOCK_OK' && sse.status === 200
+      && /text\/event-stream/.test(sse.headers['content-type'] ?? '') && /message_stop/.test(sse.text ?? '')
+      && requests.length === 2 && requests.every((row) => row.oauthMatches) && requests[1].stream === true,
+    'sqlite_direct_inference_json_sse', { statuses: [json.status, sse.status], upstreamRequests: requests.length });
+    const [snapshot] = Object.values(await sqliteSnapshots(['proxy']));
+    const stats = snapshot.enterprise.proxy_request_stats;
+    const accounts = snapshot.enterprise.proxy_accounts;
+    check(stats?.total === 2 && stats.default === 2 && stats.missing === 0 && accounts?.total === 1
+      && accounts.default === 1, 'sqlite_stats_default_enterprise', { stats, accounts });
+    const [legacy] = await probe([{ target: 'proxy', path: '/api/accounts?page=1&pageSize=100', headers: SQLITE_TOKEN }]);
+    check(legacy.status === 200 && legacy.headers.deprecation === 'true'
+      && JSON.stringify(legacy.json).includes(SQLITE_MEMBER), 'sqlite_legacy_accounts_deprecated');
+  });
+}
+
+async function freshScope() {
+  await runStep('fresh-scope', async () => {
+    const token = freshToken();
+    const scopedRequests = [
+      { target: 'proxy', path: '/api/enterprises/default/accounts?page=1&pageSize=100', headers: token },
+      { target: 'proxy', path: '/api/enterprises/default/request-stats', headers: token },
+      { target: 'sso', path: '/api/enterprises/default/users?page=1&pageSize=100', headers: token },
+      { target: 'login', path: '/api/enterprises/default/tasks?page=1&pageSize=100', headers: token },
+      ...(freshSqlite() ? [] : [
+        { target: 'proxy', path: '/api/enterprises/default/user-pool/summary', headers: token },
+        { target: 'proxy2', path: '/api/enterprises/default/user-pool/leases', headers: token },
+        { target: 'proxy2', path: '/api/enterprises/default/user-pool/events', headers: token },
+      ]),
+    ];
+    const scopedResults = await probe(scopedRequests);
+    const accounts = scopedResults[0].json?.total;
+    check(scopedResults.every((row) => row.status === 200)
+      && accounts === (freshSqlite() ? 1 : FRESH_POOL_IDLE_TARGET), 'scoped_management_200',
+    { paths: scopedRequests.map((row, index) => `${row.target} ${row.path.split('?')[0]} ${scopedResults[index].status}`),
+      accounts });
+    const tokenBody = { oauthAttemptId: randomUUID(), copilotOauthToken: 'synthetic-unscoped-token' };
+    const unscopedRequests = [
+      { target: 'proxy', path: '/api/request-stats', headers: token },
+      { target: 'proxy', method: 'PUT', path: '/internal/accounts/fixture-unscoped/copilot-oauth-token', headers: token,
+        body: tokenBody },
+      { target: 'sso', path: '/api/users', headers: token },
+      { target: 'sso', method: 'POST', path: '/internal/users/fixture-unscoped/login-credentials', headers: token,
+        body: {} },
+      { target: 'login', path: '/api/tasks', headers: token },
+      ...(freshSqlite() ? [] : [
+        { target: 'proxy', path: '/api/user-pool/summary', headers: token },
+        { target: 'proxy2', path: '/api/user-pool/leases', headers: token },
+      ]),
+    ];
+    const unscoped = await probe(unscopedRequests);
+    check(unscoped.every((row) => row.status === 400 && errorCode(row) === 'enterprise_scope_required'),
+      'unscoped_management_400',
+    { paths: unscopedRequests.map((row, index) => `${row.target} ${row.path} ${unscoped[index].status}`) });
+  });
+}
+
+async function freshSso(user, password) {
+  await runStep('fresh-sso', async () => {
+    const login = await ssoLogin('/login', user, password);
+    const wrong = await ssoLogin('/login', user, 'wrong-fixture-password');
+    const payload = lib.decodeSessionCookie(login.cookies.sso_session);
+    const cookie = lib.cookieHeader(login.cookies, 'sso_session');
+    check(login.status === 200 && cookie && payload?.e === 'default' && payload?.user?.ssoUser === user
+      && wrong.status === 401 && !wrong.cookies.sso_session, 'sso_root_login_default_cookie',
+    { statuses: [login.status, wrong.status], enterprise: payload?.e ?? null });
+    const saml = await samlWith('/sso', cookie, '/login');
+    const anonymous = await samlWith('/sso', '', '/login');
+    check(saml === 'saml_response' && anonymous === 'login_redirect', 'sso_root_saml_response', { saml, anonymous });
+    const metadata = await one({ target: 'sso', path: '/metadata' });
+    const identity = lib.metadataIdentity(metadata.text);
+    const pem = await readFile(join(h.state.directory, 'certs/idp-cert.pem'), 'utf8');
+    check(metadata.status === 200 && identity.entityId && identity.certificateSha256 === lib.pemCertificateSha256(pem),
+      'sso_root_metadata_identity', { entityId: identity.entityId });
+  });
+}
+
+async function freshRuntime() {
+  await runStep('fresh-runtime', async () => {
+    const records = await runtime('candidate', 'scoped', freshSqlite() ? 1 : FRESH_POOL_IDLE_TARGET);
+    h.runtime = { candidate: records };
+    const lines = releaseLines(records);
+    check(Object.values(records).every((record) => record.pass === true)
+      && Object.values(lines).every((line) => line === 'multi'), 'runtime_verified_scoped',
+    { releaseLines: lines, services: Object.keys(records) });
+  });
+}
+
+async function freshStop() {
+  await runStep('fresh-stop', async () => {
+    const exits = await stopApps();
+    check(exits.length === APPS().length && exits.every((row) => !row.running && !row.oom && row.code === 0),
+      'applications_exit_zero', { exits });
+  });
+}
+
+async function runFresh() {
+  await runStep('preflight', preflightFresh);
+  if (freshSqlite()) {
+    await freshStartSqlite();
+    await freshConsole();
+    await freshDirect();
+    await freshScope();
+    await freshSso(SQLITE_MEMBER, SQLITE_PASSWORD);
+  } else {
+    if (h.mode === 'multi-fresh-dba') await freshDbaSchema();
+    await freshStartMysql();
+    await freshConsole();
+    await freshPool();
+    await freshCaller();
+    await freshScope();
+    await freshSso(h.freshSsoUser, SSO_DEFAULT_PASSWORD);
+  }
+  await freshRuntime();
+  await freshStop();
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Entry point
 
 export function planText(mode) {
   const baselineTag = process.env.RELEASE_QUALIFICATION_BASELINE_TAG || lib.BASELINE_R4_TAG;
   const candidateTag = process.env.RELEASE_QUALIFICATION_CANDIDATE_TAG || 'multi-<sha7>-amd64-r<N>';
+  let composePhases = { sqlite: 'generated sibling of tests/image-release/compose.yaml' };
+  if (mode === 'multi-upgrade') {
+    composePhases = { legacy: 'base + legacy overlay (r4 environment, no registry)',
+      registry: 'base + registry overlay (step 4)' };
+  } else if (!lib.isSqliteMode(mode)) {
+    composePhases = { fresh: 'tests/image-release/qualification-compose.json, proxy2 flattened, no registry'
+      + (mode === 'multi-fresh-dba' ? ', MYSQL_AUTO_MIGRATE=false' : ', MYSQL_AUTO_MIGRATE unset (default true)') };
+  }
   return JSON.stringify({
     mode,
-    baseline: `${lib.RELEASE_PREFIX}-<component>:${baselineTag}`,
+    baseline: lib.isFreshMode(mode) ? null : `${lib.RELEASE_PREFIX}-<component>:${baselineTag}`,
     candidate: `${lib.RELEASE_PREFIX}-<component>:${candidateTag}`,
     budget: lib.runBudget(mode, process.env.RELEASE_QUALIFICATION_BUDGET_MINUTES),
-    composePhases: mode === 'multi-upgrade'
-      ? { legacy: 'base + legacy overlay (r4 environment, no registry)', registry: 'base + registry overlay (step 4)' }
-      : { sqlite: 'generated sibling of tests/image-release/compose.yaml' },
+    composePhases,
     registry: mode === 'multi-upgrade' ? lib.buildRegistry() : undefined,
     clearedInRegistryPhase: mode === 'multi-upgrade' ? lib.LEGACY_ENV_KEYS : undefined,
     steps: lib.qualificationPlan(mode),
@@ -1483,8 +2051,9 @@ export async function runMultiQualification(mode, argv) {
     limits: {
       activeSeconds: budget.activeMs / 1000, finalSeconds: budget.finalMs / 1000, dockerCommandSecondsDefault: 120,
     },
-    scope: { realMysql: mode === 'multi-upgrade', mocked: ['GitHub/GHE.com SCIM', 'seats', 'OAuth Login', '/user',
-      'Copilot models and inference'], realLoginTasks: 0, performanceOrStress: false },
+    scope: { realMysql: !lib.isSqliteMode(mode), freshDeployment: lib.isFreshMode(mode),
+      mocked: ['GitHub/GHE.com SCIM', 'seats', 'OAuth Login', '/user', 'Copilot models and inference'],
+      realLoginTasks: 0, performanceOrStress: false },
     plan: lib.qualificationPlan(mode).map(({ id, title }) => ({ id, title })),
     stepResults: [], findings: [], pass: false,
   };
@@ -1512,6 +2081,10 @@ export async function runMultiQualification(mode, argv) {
       await step4();
       await step5();
       await step7();
+    } else if (lib.isFreshMode(mode)) {
+      h.current = 'candidate';
+      h.files = phaseFiles(lib.isSqliteMode(mode) ? 'sqlite' : 'fresh');
+      await runFresh();
     } else {
       await runStep('preflight', preflightSqlite);
       await sqliteBaseline();

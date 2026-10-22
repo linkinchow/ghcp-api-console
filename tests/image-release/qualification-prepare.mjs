@@ -7,9 +7,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   BASELINE_R4_TAG,
   buildMultiCompose,
+  buildFreshCompose,
   buildRegistry,
   buildSqliteCompose,
   CONTOSO_SECRETS,
+  isFreshMode,
+  isSqliteMode,
   MULTI_MODES,
   MULTI_TAG,
   RELEASE_PREFIX,
@@ -47,7 +50,7 @@ export async function loadState(path) {
   } else {
     assert.equal(resolve(state.compose), COMPOSE);
   }
-  if (state.mode !== 'multi-upgrade-sqlite') assert.match(state.mysqlImage, MYSQL_IMAGE_REFERENCE);
+  if (!isSqliteMode(state.mode)) assert.match(state.mysqlImage, MYSQL_IMAGE_REFERENCE);
   return { ...state, directory };
 }
 
@@ -65,7 +68,7 @@ export async function prepare() {
   const certDir = process.env.RELEASE_QUALIFICATION_CERTS_DIR;
   const mysqlImage = process.env.RELEASE_QUALIFICATION_MYSQL_IMAGE;
   assert.ok(certDir, 'synthetic_certs_directory_required');
-  if (mode !== 'multi-upgrade-sqlite') {
+  if (!isSqliteMode(mode)) {
     assert.match(mysqlImage ?? '', MYSQL_IMAGE_REFERENCE, 'cached_mysql_8_4_reference_required');
   }
   const certificatePaths = ['idp-cert.pem', 'idp-key.pem'].map((name) => join(resolve(certDir), name));
@@ -148,22 +151,28 @@ GRANT SELECT, INSERT, UPDATE ON ghcp_pool_mysql_test.* TO 'pool_load'@'%';
 
 /**
  * Multi-enterprise modes (design §9.4): probe/snapshot/volume-copy fixtures, the step-4 registry with its synthetic
- * secret files, an empty registry directory, and the Compose files generated from the checked-in r4 one.
+ * secret files, an empty registry directory, and the Compose files generated from the checked-in r4 one. Fresh
+ * modes get no registry at all: `default` must come from the environment.
  */
 async function prepareMulti(directory, mode) {
   for (const name of ['multi-probe.mjs', 'multi-sqlite-snapshot.mjs', 'multi-volume-copy.mjs', 'mock.mjs']) {
     await copyFile(join(ROOT, 'tests/image-release', name), join(directory, 'fixtures', name));
   }
-  await mkdir(join(directory, 'registry/contoso'), { recursive: true, mode: 0o755 });
   await mkdir(join(directory, 'backups'), { mode: 0o700 });
-  const registry = JSON.stringify(buildRegistry(), null, 2);
-  await writeFile(join(directory, 'registry/registry.json'), registry, { flag: 'wx', mode: 0o644 });
-  for (const [path, value] of Object.entries(CONTOSO_SECRETS)) {
-    await writeFile(join(directory, 'registry', path), `${value}\n`, { flag: 'wx', mode: 0o644 });
+  let registry;
+  if (!isFreshMode(mode)) {
+    await mkdir(join(directory, 'registry/contoso'), { recursive: true, mode: 0o755 });
+    registry = JSON.stringify(buildRegistry(), null, 2);
+    await writeFile(join(directory, 'registry/registry.json'), registry, { flag: 'wx', mode: 0o644 });
+    for (const [path, value] of Object.entries(CONTOSO_SECRETS)) {
+      await writeFile(join(directory, 'registry', path), `${value}\n`, { flag: 'wx', mode: 0o644 });
+    }
   }
-  const files = mode === 'multi-upgrade'
-    ? buildMultiCompose(JSON.parse(await readFile(COMPOSE, 'utf8')))
-    : { sqlite: buildSqliteCompose() };
+  const source = () => readFile(COMPOSE, 'utf8').then(JSON.parse);
+  let files;
+  if (mode === 'multi-upgrade') files = buildMultiCompose(await source());
+  else if (isSqliteMode(mode)) files = { sqlite: buildSqliteCompose() };
+  else files = { fresh: buildFreshCompose(await source(), { autoMigrate: mode !== 'multi-fresh-dba' }) };
   const composeFiles = {};
   for (const [name, content] of Object.entries(files)) {
     const path = join(directory, `${name}.compose.json`);
@@ -171,7 +180,7 @@ async function prepareMulti(directory, mode) {
     await writeFile(path, text, { flag: 'wx', mode: 0o644 });
     composeFiles[name] = { path, sha256: sha(text) };
   }
-  return { mode, composeFiles, registrySha256: sha(registry) };
+  return { mode, composeFiles, registrySha256: registry === undefined ? null : sha(registry) };
 }
 
 // Run only when executed directly; qualification-run.mjs imports this module for its exports.

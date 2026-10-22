@@ -368,8 +368,121 @@ function checkCalls(source) {
   return calls;
 }
 
+test('fresh modes: classification and plans', () => {
+  assert.deepEqual(lib.MULTI_MODES.filter(lib.isFreshMode), ['multi-fresh', 'multi-fresh-dba', 'multi-fresh-sqlite']);
+  assert.deepEqual(lib.MULTI_MODES.filter(lib.isSqliteMode), ['multi-upgrade-sqlite', 'multi-fresh-sqlite']);
+  const ids = (mode) => lib.qualificationPlan(mode).map((step) => step.id);
+  assert.deepEqual(ids('multi-fresh-dba').filter((id) => !ids('multi-fresh').includes(id)), ['fresh-dba-schema']);
+  const start = (mode) => lib.qualificationPlan(mode).find((step) => step.id === 'fresh-start').assertions;
+  assert.deepEqual(start('multi-fresh-dba').filter((name) => !start('multi-fresh').includes(name)),
+    ['dba_startup_no_ddl']);
+  // No step may need a baseline image or a registry.
+  for (const mode of lib.FRESH_MODES) {
+    const names = lib.qualificationPlan(mode).flatMap((step) => step.assertions);
+    assert.ok(!names.some((name) => /baseline|r4|registry|rollback/.test(name)), mode);
+  }
+});
+
+test('fresh MySQL compose keeps the r4 qualification environment and adds no registry', () => {
+  const auto = lib.buildFreshCompose(SOURCE);
+  const dba = lib.buildFreshCompose(SOURCE, { autoMigrate: false });
+  for (const service of lib.APPS) {
+    const proxy = ['proxy', 'proxy2'].includes(service);
+    const expected = { ...lib.sourceEnvironment(SOURCE, service), ...(proxy ? lib.FRESH_PROXY_ENV : {}) };
+    assert.deepEqual(auto.services[service].environment, expected, service);
+    assert.deepEqual(dba.services[service].environment,
+      { ...expected, ...(proxy ? { MYSQL_AUTO_MIGRATE: 'false' } : {}) }, service);
+  }
+  assert.equal(auto.services.proxy.environment.GITHUB_API_BASE_URL, SOURCE.services.sso.environment.GITHUB_API_BASE_URL,
+    'Proxy and SSO share the default enterprise REST API');
+  for (const compose of [auto, dba]) {
+    assert.equal(compose.services.proxy2.extends, undefined);
+    assert.equal(compose.services.proxy2.image, SOURCE.services.proxy.image);
+    assert.deepEqual(compose.services.proxy2.volumes, SOURCE.services.proxy2.volumes);
+    assert.equal(compose.services.mock.environment.MOCK_LOGIN_READINESS_URL, 'http://login:7003');
+    assert.equal(compose.services.mock.environment.MOCK_GHE_TENANTS, undefined);
+    assert.deepEqual(Object.keys(compose.services).sort(), [...lib.MYSQL_ALL].sort());
+    assert.ok(!JSON.stringify(compose).includes('registry'), 'no registry file or mount');
+  }
+  assert.equal(SOURCE.services.proxy2.extends.service, 'proxy', 'source not mutated');
+  const withFlag = structuredClone(SOURCE);
+  withFlag.services.proxy.environment.MYSQL_AUTO_MIGRATE = 'true';
+  assert.throws(() => lib.buildFreshCompose(withFlag), /MYSQL_AUTO_MIGRATE/);
+});
+
+test('registry references of a rendered config', () => {
+  const rendered = { services: {
+    proxy: { environment: { PORT: '3000' }, volumes: [{ type: 'volume', target: '/data' }] },
+    sso: { environment: { ENTERPRISE_REGISTRY_FILE: '/registry/registry.json' } },
+    login: { environment: {}, volumes: [{ type: 'bind', target: '/registry', read_only: true }] },
+  } };
+  assert.deepEqual(lib.registryReferences(rendered), ['sso', 'login']);
+  assert.deepEqual(lib.registryReferences({ services: { proxy: {} } }), []);
+});
+
+test('base migration ids mirror the Proxy MySQL sources', () => {
+  const constant = (path, name) => new RegExp(`${name} = '([^']+)'`).exec(read(path))[1];
+  assert.deepEqual([...lib.PROXY_MYSQL_BASE_MIGRATION_IDS], [
+    constant('src/proxy/src/db/mysqlMigrations.ts', 'INITIAL_SCHEMA_MIGRATION'),
+    constant('src/proxy/src/db/mysqlMigrations.ts', 'TOKEN_COLLATION_MIGRATION'),
+    constant('src/proxy/src/userPool/mysqlMigrations.ts', 'POOL_SCHEMA_MIGRATION'),
+  ]);
+  const ids = lib.expectedFreshMysqlMigrationIds();
+  assert.equal(ids.length, 11);
+  assert.deepEqual(ids, [...ids].sort());
+});
+
+test('DBA initial SQL: retargeted database and the migration ids it records', () => {
+  const script = read('scripts/proxy-mysql-initial.sql');
+  const sql = lib.initialSqlForDatabase(script, 'ghcp_pool_mysql_test');
+  assert.match(sql, /^CREATE DATABASE IF NOT EXISTS ghcp_pool_mysql_test$/m);
+  assert.match(sql, /^USE ghcp_pool_mysql_test;$/m);
+  assert.doesNotMatch(sql, /ghcp_proxy/);
+  assert.doesNotMatch(sql, /\r/);
+  assert.match(sql, /^DELIMITER \/\/$/m, 'the trigger needs the mysql client');
+  assert.doesNotMatch(sql, /INSERT (?:IGNORE )?INTO proxy_enterprises/, 'default comes from the Proxy, not the DBA');
+  assert.equal(lib.initialSqlForDatabase(script.replace(/\n/g, '\r\n'), 'ghcp_pool_mysql_test'), sql);
+  assert.throws(() => lib.initialSqlForDatabase(script, 'bad`name'), /invalid database name/);
+  assert.throws(() => lib.initialSqlForDatabase(script.replace('USE ghcp_proxy;', 'USE other;'), 'db'), /markers/);
+  assert.throws(() => lib.initialSqlForDatabase(`${script}\nUSE ghcp_proxy;\n`, 'db'), /markers/);
+  // The script records everything except the two rows Proxy writes with runtime privileges.
+  const missing = lib.missingMigrationIds(lib.initialSqlMigrationIds(script), lib.expectedFreshMysqlMigrationIds());
+  assert.deepEqual(missing, [lib.PROXY_MIGRATION_IDS[1], lib.PROXY_MIGRATION_IDS[7]]);
+  assert.ok(lib.initialSqlMigrationIds(script).every((id) => lib.expectedFreshMysqlMigrationIds().includes(id)));
+});
+
+test('DBA runtime grants and DDL privilege detection', () => {
+  const sql = lib.dbaRuntimeGrantsSql('ghcp_pool_mysql_test', 'pool_fixture').split('\n');
+  assert.deepEqual(sql, [
+    "REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'pool_fixture'@'%';",
+    "GRANT SELECT, INSERT, UPDATE, DELETE ON `ghcp_pool_mysql_test`.* TO 'pool_fixture'@'%';",
+    "GRANT TRIGGER ON `ghcp_pool_mysql_test`.`proxy_accounts` TO 'pool_fixture'@'%';",
+  ]);
+  assert.throws(() => lib.dbaRuntimeGrantsSql('db', "x'@'%"), /invalid grant target/);
+  assert.deepEqual(lib.ddlPrivileges([
+    "GRANT USAGE ON *.* TO `pool_fixture`@`%`",
+    'GRANT SELECT, INSERT, UPDATE, DELETE ON `ghcp_pool_mysql_test`.* TO `pool_fixture`@`%`',
+    'GRANT TRIGGER ON `ghcp_pool_mysql_test`.`proxy_accounts` TO `pool_fixture`@`%`',
+  ]), []);
+  assert.deepEqual(lib.ddlPrivileges(['GRANT ALL PRIVILEGES ON `db`.* TO `u`@`%`']), ['ALL PRIVILEGES']);
+  assert.deepEqual(lib.ddlPrivileges(['GRANT SELECT, CREATE, ALTER, INDEX ON `db`.* TO `u`@`%`', 'noise']),
+    ['ALTER', 'CREATE', 'INDEX']);
+});
+
+test('PEM certificate hash matches the metadata identity hash', () => {
+  const body = 'MIIBszCCAVmgAwIBAgIUQ0FGRQ==';
+  const pem = `-----BEGIN CERTIFICATE-----\n${body.slice(0, 12)}\r\n${body.slice(12)}\n-----END CERTIFICATE-----\n`;
+  const xml = `<md:EntityDescriptor entityID="http://sso:7001/metadata"><ds:X509Certificate>${body}`
+    + '</ds:X509Certificate>';
+  assert.equal(lib.pemCertificateSha256(pem), lib.metadataIdentity(xml).certificateSha256);
+  assert.throws(() => lib.pemCertificateSha256('-----BEGIN PRIVATE KEY-----\nAA\n-----END PRIVATE KEY-----'));
+});
+
 test('run budget bounds', () => {
   assert.deepEqual(lib.runBudget('multi-upgrade'), { activeMs: 3000000, finalMs: 3300000 });
+  assert.equal(lib.runBudget('multi-fresh').activeMs, 1800000);
+  assert.equal(lib.runBudget('multi-fresh-dba').activeMs, 1800000);
+  assert.equal(lib.runBudget('multi-fresh-sqlite').activeMs, 1200000);
   assert.equal(lib.runBudget('multi-upgrade-sqlite', '15').activeMs, 900000);
   assert.throws(() => lib.runBudget('multi-upgrade', '5'));
   assert.throws(() => lib.runBudget('multi-upgrade', 'abc'));
