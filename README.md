@@ -24,7 +24,7 @@
 | 镜像 | Docker Hub 公开仓库 `linkinchow/ghcp-{proxy,sso,login,console}:multi-4922a4a-amd64-r2`（linux/amd64）。四个组件必须同一版本，部署时按[升级指南](./docs/multi-enterprise-upgrade-guide.md)中的 digest 引用。 |
 | 验证范围 | GHE.com 企业**只用 mock 验证**（网页、设备授权、SCIM、席位、Copilot 均为 mock），尚未在真实 GHE.com 环境验收；首次接入真实 GHE.com 企业前请先在预发布环境验证。 |
 
-多企业版是独立的发布线；不需要多个企业的客户可以继续使用单企业版（`single-slug-*`）。文档：[升级指南（r4 → 多企业版）](./docs/multi-enterprise-upgrade-guide.md) · [registry 配置参考](./docs/multi-enterprise-registry.md) · [设计文档](./docs/multi-enterprise-design.md) · [发布验证记录](./docs/multi-enterprise-release-validation.md)。
+多企业版是独立的发布线；不需要多个企业的客户可以继续使用单企业版（`single-slug-*`）。**全新部署建议直接使用多企业版**：只有一个企业时不需要 registry，以后添加企业也不需要数据库迁移。文档：[新部署指南](./docs/multi-enterprise-new-deployment-guide.md) · [升级指南（r4 → 多企业版）](./docs/multi-enterprise-upgrade-guide.md) · [registry 配置参考](./docs/multi-enterprise-registry.md) · [设计文档](./docs/multi-enterprise-design.md) · [发布验证记录](./docs/multi-enterprise-release-validation.md)。
 
 ## User Pool：多 Proxy＋MySQL
 
@@ -62,6 +62,7 @@ SSO / Login / Console → 同一个 Proxy Service
 
 | 当前部署与升级目标 | 对应指南或工具 |
 | --- | --- |
+| 没有现有部署，全新安装（单个或多个企业） | [多企业版新部署指南](./docs/multi-enterprise-new-deployment-guide.md)：使用 `multi-4922a4a-amd64-r2`，从一个企业（`default`）开始，以后按 registry 添加企业 |
 | 单企业部署，升级到单企业版 r4（`single-slug-164cade-amd64-r4`） | [单企业版 r4 升级指南](./docs/user-pool-release-upgrade-guide.md)；SQLite 与 MySQL 均适用 |
 | 单企业版 r4（SQLite 或 MySQL），升级到多企业版（`multi-4922a4a-amd64-r2`） | [多企业版升级指南](./docs/multi-enterprise-upgrade-guide.md)：只支持从 r4 升级；四个组件一次性替换，首次升级需短暂停机；回滚只能恢复备份。升级完成并稳定后，再按 [registry 配置参考](./docs/multi-enterprise-registry.md) 添加企业 |
 | 已使用 SQLite User Pool（`caller-lease`），升级到 MySQL 多副本 | [SQLite User Pool → MySQL 多副本升级指南](./docs/user-pool-mysql-upgrade-guide.md)，保留现有池成员和有效凭据，不重新开户 |

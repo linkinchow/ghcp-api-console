@@ -35,6 +35,7 @@ curl.http
 !docs/codebase-overview.md
 !docs/models-admin-guide.md
 !docs/multi-enterprise-design.md
+!docs/multi-enterprise-new-deployment-guide.md
 !docs/multi-enterprise-registry.md
 !docs/multi-enterprise-release-validation.md
 !docs/multi-enterprise-upgrade-guide.md
