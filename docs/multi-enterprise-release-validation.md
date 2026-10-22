@@ -1,8 +1,8 @@
 # 多企业版发布验证记录
 
-本文记录多企业版（multi-enterprise / multi-slug SSO）候选镜像的发布前验证结果。设计见 [multi-enterprise-design.md](multi-enterprise-design.md)，升级步骤见 [multi-enterprise-upgrade-guide.md](multi-enterprise-upgrade-guide.md)。当前候选为 r2（`multi-4922a4a-amd64-r2`，待发布）；已发布的 r1（`multi-41ecffc-amd64-r1`）记录保留在后半部分。
+本文记录多企业版（multi-enterprise / multi-slug SSO）候选镜像的发布前验证结果。设计见 [multi-enterprise-design.md](multi-enterprise-design.md)，升级步骤见 [multi-enterprise-upgrade-guide.md](multi-enterprise-upgrade-guide.md)。当前发布为 r2（`multi-4922a4a-amd64-r2`）；此前发布的 r1（`multi-41ecffc-amd64-r1`）记录保留在后半部分。
 
-## r2：multi-4922a4a-amd64-r2（候选，待发布）
+## r2：multi-4922a4a-amd64-r2（已发布）
 
 全部验证只使用合成数据、mock 外部服务和本地 MySQL 容器；没有调用真实 GitHub、GitHub EMU、GHE.com、Copilot 或模型，没有创建真实用户或席位，没有接触真实 SSO 环境、云资源或集群。Docker Desktop 只验证功能，不评估性能。
 
@@ -29,7 +29,16 @@
 | Login | `ghcp-release-login:multi-4922a4a-amd64-r2` | `sha256:06deb18e77af634fa3f450f4401b6b595cd850fdb046bef51a5e4fae65f141fa` |
 | Console | `ghcp-release-console:multi-4922a4a-amd64-r2` | `sha256:bd289d234deeb711872afe44df4004505132d386c6fc8d7f23fad2f5f8b0f3b2` |
 
-Docker Hub：**待发布**（发布需另行确认；发布后在此补充按 digest 引用与不登录核对结果）。
+已发布到 Docker Hub（公开仓库，2026-10-20）：
+
+| 组件 | 按 digest 引用 |
+| --- | --- |
+| Proxy | `docker.io/linkinchow/ghcp-proxy@sha256:00453e3b81a3fea67ef05d4fce1e3def680dac96ae9ca288a85d1a77c74997b6` |
+| SSO | `docker.io/linkinchow/ghcp-sso@sha256:5b112760945fa5444d5720d48ddae5a4da9fa42ead08a8fa5715356395dcefe7` |
+| Login | `docker.io/linkinchow/ghcp-login@sha256:6a7e48f79a86a04a5343ad0e6c4ac9f294ddd87c772f36927f9bbb148ffe1d2e` |
+| Console | `docker.io/linkinchow/ghcp-console@sha256:a1605e6304597387e3e193223b01823d89b7a007d7e7bb5d8e44e236b97d3e2c` |
+
+发布后核对：每个 manifest 的 config digest 等于上表经资格测试的镜像 ID；按 digest 拉起 Proxy，`/healthz` 返回 `releaseLine: "multi"`，停止时退出码 0。
 
 四个镜像的 label：`org.opencontainers.image.revision=4922a4a`、`com.ghcp.release-line=multi`、`org.opencontainers.image.version=multi-4922a4a-amd64-r2`。ENTRYPOINT 为 Tini，CMD 与工作目录与 r1 相同。
 
@@ -151,7 +160,6 @@ Docker Hub：**待发布**（发布需另行确认；发布后在此补充按 di
 - 资格测试中没有真实 Login 浏览器任务；Login 浏览器流程由 Login 自带的浏览器测试覆盖。
 - `MYSQL_AUTO_MIGRATE=false` + DBA 升级脚本的路径只在集成测试中覆盖。
 - 第 2.3 节在无网络环境下进行，不覆盖空闲目标大于上限时的实际补货行为。
-- Docker Hub 推送与按 digest 拉取核对（待发布）。
 - 性能、容量与长时间稳定性。
 
 ---
