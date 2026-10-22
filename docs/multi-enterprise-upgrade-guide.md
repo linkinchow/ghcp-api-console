@@ -73,7 +73,7 @@ r2 相对 r1（`multi-41ecffc-amd64-r1`）的变化：全局 `READY_IDLE_TARGET`
 ### 5.2 DBA 手动迁移（`MYSQL_AUTO_MIGRATE=false`）
 
 1. 停止全部 Proxy 副本，备份数据库。
-2. DBA 用管理员账号对 Proxy 库执行**本版本源码**中的 `scripts/proxy-mysql-enterprise-upgrade.sql`，只执行一次，例如：`mysql <Proxy库名> < scripts/proxy-mysql-enterprise-upgrade.sql`。
+2. DBA 用管理员账号对 Proxy 库执行**本版本源码**中的 `scripts/proxy-mysql-enterprise-upgrade.sql`，只执行一次，例如：`mysql --default-character-set=utf8mb4 <Proxy库名> < scripts/proxy-mysql-enterprise-upgrade.sql`。**必须使用 utf8mb4 会话**：latin1 会话（部分客户端的默认值）建出的 CHECK 约束带 `_latin1` 前缀，`MYSQL_AUTO_MIGRATE=false` 时 Proxy 会拒绝启动。这一点在全新部署脚本 `proxy-mysql-initial.sql` 上实测确认；升级脚本含相同的 CHECK 约束，按同样要求执行。
 3. 启动 Proxy（保持 `MYSQL_AUTO_MIGRATE=false`）。Proxy 只读校验 schema，再用运行时权限（INSERT/UPDATE）补全 `default` 企业的指纹、cap 和库存计数，并更新账号池配置指纹。
 
 注意：
@@ -92,7 +92,7 @@ r2 相对 r1（`multi-41ecffc-amd64-r1`）的变化：全局 `READY_IDLE_TARGET`
 | `MYSQL_MIGRATION_LOCK_WAIT_SECONDS` | Proxy | 新增，默认 `30`。见第 5.1 节。 |
 | `DIRECT_MODE_ENTERPRISE_ID` | Proxy | 新增，仅直连模式。新 identity 归属的企业，默认 `default`。 |
 | `CONSOLE_PUBLIC_BASE_URL` | Console | 新增，可选。Console 前有反向代理且会改写 Host 头时，设为用户访问的 Console 地址；Console 的写操作只接受来自该地址或请求 Host 的同源请求。 |
-| `GITHUB_API_BASE_URL`、`COPILOT_API_BASE_URL` | Proxy、SSO | GHE.com 下未设置时自动推导为 `https://api.<子域>.ghe.com`、`https://copilot-api.<子域>.ghe.com`。显式设置时必须属于同一个 `<子域>.ghe.com`，否则启动失败。 |
+| `GITHUB_API_BASE_URL`、`COPILOT_API_BASE_URL` | Proxy、SSO | GHE.com 下未设置时自动推导为 `https://api.<子域>.ghe.com`、`https://copilot-api.<子域>.ghe.com`。显式设置时必须属于同一个 `<子域>.ghe.com`，否则启动失败。 r4 中如果只给 SSO 设置了 `GITHUB_API_BASE_URL`，升级后 **Proxy 也要设置同一个值**：多企业版 Proxy 在 Login 回传 token 时会调用 `GET <API 地址>/user` 核对账号身份，地址不可达时补货会全部以 `oauth_login_failed` 失败。 |
 | `ENTERPRISE_SHORTCODE` | Proxy、SSO | 自动转为小写（与 r4 生成登录名的方式一致）。 |
 | `docker-compose.yml` | — | `GITHUB_BASE_URL`、`GITHUB_API_BASE_URL`、`COPILOT_API_BASE_URL`、`ENTERPRISE_SHORTCODE`、`GITHUB_OAUTH_CLIENT_ID` 的默认值改为空，空值时服务使用与 r4 模板相同的内置值；新增 `docker-compose.enterprise-registry.yml` 用于挂载 registry。 |
 | Kubernetes / Rancher 模板 | Proxy | `strategy` 改为 `Recreate`（第 3 节）；新增上述变量和 registry 挂载示例（注释）。`terminationGracePeriodSeconds: 45` 与 Compose `stop_grace_period: 35s` 不变。 |

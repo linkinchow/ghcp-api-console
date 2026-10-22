@@ -117,6 +117,7 @@ GitHub 侧的完整操作（含截图）见 [配置手册](../guidance/guidance.
 1. DBA 用管理员账号执行**本版本源码**中的 `scripts/proxy-mysql-initial.sql`（全新空库用这个脚本；`scripts/proxy-mysql-enterprise-upgrade.sql` 只用于从 r4 升级）。注意：
    - 脚本开头是 `CREATE DATABASE IF NOT EXISTS ghcp_proxy;` 和 `USE ghcp_proxy;`。库名不同时，从注释 `-- If the database already exists, start here.` 之后开始、在自己的库上执行（例如私下复制一份并删除前面几行）。
    - 脚本用 `DELIMITER` 定义触发器，请用 `mysql` 命令行客户端执行。
+   - **必须使用 utf8mb4 会话执行**，例如 `mysql --default-character-set=utf8mb4 -h <主机> -u <管理员> -p < scripts/proxy-mysql-initial.sql`。部分客户端（包括官方 mysql 8.4 镜像自带的客户端）默认是 latin1 会话，这样建出的 CHECK 约束字面量带 `_latin1` 前缀，`MYSQL_AUTO_MIGRATE=false` 时 Proxy 会以 `Unsupported MySQL schema: proxy_enterprises check constraints` 拒绝启动。全新部署资格测试中，同一脚本用 utf8mb4 会话执行后通过。
 2. 运行账号只需要（与脚本头部注释一致）：
 
    ```sql
@@ -146,7 +147,7 @@ GitHub 侧的完整操作（含截图）见 [配置手册](../guidance/guidance.
 | `SESSION_SECRET` | SSO、Console | Compose | `<随机值>` | Console 会话和 `default` 企业 SSO 会话签名 |
 | `GITHUB_BASE_URL` | Proxy、SSO、Login | GHE.com 必填 | 空，或 `https://contoso.ghe.com` | 空表示 `https://github.com`。以 `.ghe.com` 结尾时三个服务进入 GHE.com 模式 |
 | `ENTERPRISE_SHORTCODE` | Proxy、SSO | github.com 必填 | `ctso` | 留空时使用内置值 `octo`，**不会报错**，所以 github.com 必须填实际值。GHE.com 留空（填了也被忽略，启动日志打印 warning） |
-| `GITHUB_API_BASE_URL`（Proxy、SSO）、`COPILOT_API_BASE_URL`（Proxy） | 见左 | 否 | 空 | 空时按 `GITHUB_BASE_URL` 推导：github.com 为 `https://api.github.com`、`https://api.githubcopilot.com`；GHE.com 为 `https://api.<子域>.ghe.com`、`https://copilot-api.<子域>.ghe.com`。GHE.com 下显式填写时必须属于同一个 `<子域>.ghe.com`，否则启动失败 |
+| `GITHUB_API_BASE_URL`（Proxy、SSO）、`COPILOT_API_BASE_URL`（Proxy） | 见左 | 否 | 空 | 空时按 `GITHUB_BASE_URL` 推导：github.com 为 `https://api.github.com`、`https://api.githubcopilot.com`；GHE.com 为 `https://api.<子域>.ghe.com`、`https://copilot-api.<子域>.ghe.com`。GHE.com 下显式填写时必须属于同一个 `<子域>.ghe.com`，否则启动失败。`GITHUB_API_BASE_URL` 若给 SSO 显式设置（例如经出口网关），**Proxy 也必须设置同一个值**：多企业版 Proxy 在 Login 回传 token 时会调用 `GET <API 地址>/user` 核对账号身份，地址不可达时补货会全部以 `oauth_login_failed` 失败 |
 | `LOG_LEVEL`、`SHUTDOWN_TIMEOUT_MS` | 全部 | 否 | `info`、`25000` | 关闭超时要小于容器的停止宽限期（第 5 节） |
 
 ### 4.3 Proxy
