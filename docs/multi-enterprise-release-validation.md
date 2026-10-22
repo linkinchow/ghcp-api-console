@@ -103,7 +103,71 @@
 
 证据：报告与日志保存在本机运行目录（`.claude/release-qualification-run-*`、`.claude/multi-r2/`，不入库）。
 
-### 3. 单元与集成测试（提交 `4922a4a`）
+### 3. 全新部署资格测试（发布后补充，2026-10-22）
+
+第 2 节只验证了 r4 → r2 的原地升级。本节用**同一批 r2 镜像**（第 1 节的镜像 ID，与 Docker Hub digest 字节相同；没有构建、拉取或推送）验证全新的单企业部署：空数据库、空卷、**没有** enterprise registry 文件，`default` 企业由各服务的环境变量合成。资格测试脚本新增三个模式（`tests/image-release/README.md` 的“多企业镜像的全新单企业部署资格验证”），每次运行都用全新的项目名和未使用的子网；只用 mock、本地 MySQL 8.4 容器、合成证书与合成凭据，应用容器只在 internal 网络上，没有访问真实 GitHub、GHE.com、Copilot 或模型。
+
+| 模式 | 环境 | 用时 | 断言 | 结果 |
+| --- | --- | --- | --- | --- |
+| `multi-fresh` | MySQL 8.4 空库 + 两个 Proxy 副本（caller-lease）+ SSO/Login/Console + mock + 回环 bridge；Proxy 自动迁移（不设 `MYSQL_AUTO_MIGRATE`，即默认 `true`） | 约 3.5 分钟 | 30 | 通过 |
+| `multi-fresh-dba` | 同上；DBA 先执行 `scripts/proxy-mysql-initial.sql`，运行账号只保留库级 `SELECT, INSERT, UPDATE, DELETE` 与 `proxy_accounts` 上的 `TRIGGER`，两个副本 `MYSQL_AUTO_MIGRATE=false` | 约 3.5 分钟 | 34 | 通过 |
+| `multi-fresh-sqlite` | SQLite 直连 + SSO/Login/Console + mock，空卷，无对外端口 | 约 1 分钟 | 23 | 通过 |
+
+三个模式的最终通过运行都基于提交后的脚本，`planCoverage.complete=true`；运行期间监测主机时钟，墙钟与单调时钟的偏差最大 7 ms，没有休眠。新增的纯函数（fresh Compose 生成、registry 引用检查、初始脚本改库名与迁移 ID 解析、DBA 授权 SQL 与 DDL 权限识别、PEM 证书哈希、计划与时限）都有单元测试：`qualification-multi-lib.test.mjs` 26 通过、1 跳过（需要已构建的 shared 包，与以前相同）。
+
+#### 3.1 MySQL（`multi-fresh` / `multi-fresh-dba`）
+
+| 步骤 | 内容 | `multi-fresh` | `multi-fresh-dba` |
+| --- | --- | --- | --- |
+| 预检 | 全新项目与卷；隔离渲染；没有任何服务引用 registry；`MYSQL_AUTO_MIGRATE` 与模式一致；只用本地候选镜像；Tini/CMD/WORKDIR 保持；旧模板命令覆盖可启动并干净退出 | 5 | 5 |
+| DBA 建库 | 库里只有 fixture 表；以 utf8mb4 会话执行初始脚本后 12 张业务表齐全，`schema_migrations` 恰为脚本写入的 9 个 ID（不含 `02-seed-default`、`08-pool-config-fingerprint`），`proxy_enterprises` 为空，CHECK 字面量只有 `_utf8mb4`；`SHOW GRANTS` 无任何 DDL 权限 | — | 3 |
+| 启动 | 全部服务健康；Proxy ×2、SSO、Login、Console 的 `/healthz` 都是 `releaseLine: "multi"`；`schema_migrations` 恰为 r4 的 3 个 ID + `enterprise-v1/01…08` 共 11 个，SSO 01–05、Login 01–03 齐全；（DBA）Proxy 启动前后 schema 指纹不变，Proxy 只用运行时权限补写了 02 与 08；`enterprise_id` NOT NULL 且无默认值，不带它的插入被拒（`ER_NO_DEFAULT_FOR_FIELD`）；`proxy_enterprises` 只有 `default`（active、cap 2000 = `POOL_MAX_ACCOUNTS`、库存 0），两个副本的 `GET /api/enterprises` 都只列出它，readiness 为 ready 且无 blocker；SSO、Login 的企业表也只有 `default`；单一调度 owner 并续期 | 7 | 8 |
+| Console | 初始为未初始化 → 创建管理员 201 → 再次创建 400；登录 200，错误密码与匿名 401；读企业列表（只有 `default`）、`default` 的池概览、SSO 用户、Login 任务和请求统计均 200，无作用域转发 400 `enterprise_scope_required`，未登录 401 | 3 | 3 |
+| 账号池 | 初始 `idle_target=0`、池与 mock 为空；经 `proxy2` 设 `idle_target=3`，5–11 秒内补到 3 个 ready idle（SCIM 创建、席位、Login 任务、回调各 3 次，失败 0，预热推理 3 次），库存计数 3；成员与账号都属于 `default`，Login 任务全部走 `/api/enterprises/default/tasks`；SSO 有 3 个用户 | 3 | 3 |
+| caller | 新 caller 的 SSE 请求在 `proxy` 上被 mock 挂住时，从 `proxy2` 看到 `provisional` 租约（TTL 60 秒）；取消后同一 caller 的 6 个请求（`/v1/messages`、`/chat/completions`、`/responses` × JSON/SSE，两副本交替）全部打到同一成员；租约在两副本上都是 `active` 且 `leaseId` 不变；统计 7 行（6 行成功 + 1 行被取消的挂起请求）全部为 `default`；第二个 caller 拿到另一个成员 | 5 | 5 |
+| 作用域 | `/api/enterprises/default/...` 7 个路径（Proxy 账号、统计、池概览/租约/事件，SSO 用户，Login 任务）都是 200；无作用域的 7 个路径（Proxy 统计、`/internal/accounts/...`、两副本的池接口，SSO 用户与 `/internal/users/...`，Login 任务）都是 400 `enterprise_scope_required` | 2 | 2 |
+| SSO | 根路径 `/login` 登录得到 `e: "default"` 的 `sso_session`，错误密码 401；`/sso` 用该会话返回 SAMLResponse，匿名时重定向到 `/login`；`/metadata` 的 entityID 存在、证书即合成证书 | 3 | 3 |
+| 运行时 | 五个应用容器内 `qualification-verify-runtime.mjs … candidate scoped 3` 全部通过（Tini、无 npm、依赖版本与行为、better-sqlite3、Login 内 Chromium、作用域管理 API 与无作用域 400） | 1 | 1 |
+| 停止 | 五个应用停止，退出码全部为 0 | 1 | 1 |
+| 合计 | | 30 | 34 |
+
+#### 3.2 SQLite 直连（`multi-fresh-sqlite`）
+
+| 步骤 | 内容 | 断言 |
+| --- | --- | --- |
+| 预检 | 全新项目与卷；隔离渲染、无 registry；只用本地候选镜像；Tini/CMD/WORKDIR 保持 | 4 |
+| 启动 | 健康（`/readyz` 的 storage 为 `sqlite`）；四个应用 `releaseLine: "multi"`；Proxy `enterprise-v1/01…05`、SSO 01–05、Login 01–03 齐全，三个库 `integrity_check` 为 ok；fail-closed trigger 存在；Proxy、SSO、Login 的企业表都只有 `default`（Proxy 中为 active），`GET /api/enterprises` 只列出 `default` 且 `pool: null`（直连模式下作用域池接口返回 409 `pool_mode_disabled`，记录为证据） | 5 |
+| Console | 同 3.1 | 3 |
+| 直连 | 经作用域接口建 SSO 用户、导入合成 OAuth token（成功 1）；`/v1/messages` JSON 与 SSE 都 200，mock 收到 2 次且 token 正确；统计 2 行、账号 1 行都是 `default`；旧 `/api/accounts` 200 且带 `Deprecation: true` | 4 |
+| 作用域 | 作用域 4 个路径 200；无作用域 5 个路径 400 `enterprise_scope_required` | 2 |
+| SSO | 同 3.1 | 3 |
+| 运行时 | 四个应用容器内运行时检查通过（`scoped`，SSO 用户数 1） | 1 |
+| 停止 | 四个应用退出码 0 | 1 |
+| 合计 | | 23 |
+
+#### 3.3 失败与重跑（如实记录）
+
+最终通过前共有 5 次未通过的运行，每次都换新的项目名和子网重跑，没有复用任何部分结果。
+
+| 运行 | 失败位置 | 原因 | 处理 |
+| --- | --- | --- | --- |
+| `multi-fresh` 第 1 次 | 启动：所有服务已健康，资格测试的只读 MySQL 观察连接经本机回环 bridge 握手超时（`ER_NET_READ_INTERRUPTED`） | Docker Desktop 端口转发的瞬时问题，与镜像无关 | 观察连接在连接级错误时最多重试 3 次，重试次数写入报告（`transport`）；最终运行未发生重试 |
+| `multi-fresh` 第 2 次 | 账号池：300 秒内未达空闲目标，9 个成员全部 `failed`（`oauth_login_failed`） | 多企业版 Proxy 在 Login 回传 token 时用 `default` 的 GitHub REST API 调 `GET /user` 核对身份（设计 §5.7，升级指南与 Proxy README 已写明）。r4 资格验证环境只给 SSO 设了 `GITHUB_API_BASE_URL`，Proxy 因而用默认的 `https://api.github.com`；internal 网络访问不到（没有请求离开隔离网络），回调 503，成员重试三次后失败 | 测试环境给两个 Proxy 加 `GITHUB_API_BASE_URL=http://mock:8002`。不是产品缺陷，但值得在部署说明中强调：GitHub API 走网关、只给 SSO 设了该变量的环境，换成多企业版后 Proxy 也必须设置，否则补货全部失败 |
+| `multi-fresh-dba` 第 1 次 | DBA 建库：收回运行账号权限的 `REVOKE … ON db.*` 报 1141 | 测试脚本问题：MySQL 镜像入口脚本按转义下划线的库名授权 | 改为 `REVOKE ALL PRIVILEGES, GRANT OPTION FROM <user>` |
+| `multi-fresh-dba` 第 2 次 | 启动：Proxy 拒绝启动 | **发现**，见下 | 改用 utf8mb4 会话执行脚本，并把“CHECK 字面量只有 `_utf8mb4`”加进断言 |
+| `multi-fresh-dba` 第 3 次 | DBA 建库：CHECK 字面量字符集解析为空 | 测试脚本问题：batch 输出对反斜杠再转义一次 | 修正解析 |
+
+**发现：DBA 用默认 latin1 会话执行初始脚本时，r2 Proxy 拒绝启动。** 官方 `mysql:8.4` 镜像里的 `mysql` 客户端在 POSIX locale 下默认 `character_set_client=latin1`。用它直接执行 `scripts/proxy-mysql-initial.sql` 时，CHECK 约束里的字符串字面量被保存为 `_latin1'draft'` 等；r2 Proxy 在 `MYSQL_AUTO_MIGRATE=false` 下只接受 `_utf8mb4`、`_ascii` 前缀，启动报 `Proxy MySQL schema is not ready for MYSQL_AUTO_MIGRATE=false: Unsupported MySQL schema: proxy_enterprises check constraints`（`user_pool_accounts`、`user_pool_leases` 的 CHECK 同样是 `_latin1`）。以 `--default-character-set=utf8mb4` 执行同一脚本则一切正常（上表 34 条）。集成测试用 mysql2 的 utf8mb4 连接执行脚本，所以没有发现。升级脚本 `scripts/proxy-mysql-enterprise-upgrade.sql` 含同样的 CHECK，预计有同样的问题（未在镜像级验证）。建议：生成的两个脚本开头加 `SET NAMES utf8mb4;`，或校验器接受任意字符集前缀的 ASCII 字面量；在此之前，在 README 与升级指南中写明 DBA 需用 utf8mb4 会话（例如 `mysql --default-character-set=utf8mb4`）。本分支只改资格测试脚本与文档，产品代码和脚本未改动。
+
+#### 3.4 本节未覆盖
+
+- SQLite 直连只验证 `/v1/messages`（`tests/image-release/mock.mjs` 只实现这一条）；`/chat/completions`、`/responses` 在 MySQL caller-lease 模式下覆盖。SQLite 下的 caller-lease（账号池）模式未覆盖。
+- 全新部署时由 registry 文件定义 `default`（或同时定义多个企业）的情形；r4 → 多企业的 DBA 升级脚本仍只在集成测试中覆盖。
+- `default` 补货以外的生命周期（cap 调整、draining、成员禁用与重新授权）；真实 Login 浏览器任务（Login 任务数仍为 0）；Kubernetes/Rancher 模板；性能与长时间稳定性。
+
+证据：报告与日志保存在本机运行目录（`.claude/release-qualification-run-*`，不入库）；各次运行的项目、容器、网络和卷都已停止并保留。
+
+### 4. 单元与集成测试（提交 `4922a4a`）
 
 | 范围 | 结果 |
 | --- | --- |
@@ -134,7 +198,7 @@
 
 结论：这两个文件此前的失败都是超时类（语句时限、测试时限、连接超时），出现在主机负载高、Docker Desktop 磁盘明显变慢的时段；主机空闲后在同一普通磁盘 MySQL 上复跑全部通过。与本次代码改动无关（改动只涉及启动配置校验和 Console 列名）。
 
-### 4. 镜像扫描（Docker Scout）
+### 5. 镜像扫描（Docker Scout）
 
 在同一时间、同一漏洞库下扫描了 r2 和 r1 的四个镜像（critical/high）：
 
@@ -153,13 +217,14 @@
 
 应用依赖（npm）没有 critical/high 告警。逐条可达性分析沿用 [单企业发布验证记录](user-pool-image-release-validation.md) 第 0.4 节；本次没有新增编号，结论不变。
 
-### 5. 未验证的范围
+### 6. 未验证的范围
 
 - 真实 GitHub、GHE.com、Copilot 与模型调用；GHE.com 只用 mock 验证。
 - OpenCode OAuth client id 能否用于 `*.ghe.com`（设计 §13 第 4 项）。
 - 资格测试中没有真实 Login 浏览器任务；Login 浏览器流程由 Login 自带的浏览器测试覆盖。
-- `MYSQL_AUTO_MIGRATE=false` + DBA 升级脚本的路径只在集成测试中覆盖。
+- `MYSQL_AUTO_MIGRATE=false` + r4 → 多企业 DBA 升级脚本的路径只在集成测试中覆盖。全新库的初始脚本已在第 3 节做了镜像级验证（需 utf8mb4 会话，见 3.3）。
 - 第 2.3 节在无网络环境下进行，不覆盖空闲目标大于上限时的实际补货行为。
+- 全新部署的其余未覆盖项见 3.4。
 - 性能、容量与长时间稳定性。
 
 ---
