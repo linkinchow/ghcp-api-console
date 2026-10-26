@@ -17,6 +17,9 @@ CREATE DATABASE IF NOT EXISTS ghcp_proxy
 USE ghcp_proxy;
 
 -- If the database already exists, start here.
+-- CHECK constraint literals take the session character set; Proxy accepts only utf8mb4.
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
 CREATE TABLE IF NOT EXISTS `schema_migrations` (
   `id` VARCHAR(191) COLLATE utf8mb4_bin,
   `applied_at` DATETIME(3) NOT NULL,

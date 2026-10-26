@@ -159,6 +159,15 @@
 
 **发现：DBA 用默认 latin1 会话执行初始脚本时，r2 Proxy 拒绝启动。** 官方 `mysql:8.4` 镜像里的 `mysql` 客户端在 POSIX locale 下默认 `character_set_client=latin1`。用它直接执行 `scripts/proxy-mysql-initial.sql` 时，CHECK 约束里的字符串字面量被保存为 `_latin1'draft'` 等；r2 Proxy 在 `MYSQL_AUTO_MIGRATE=false` 下只接受 `_utf8mb4`、`_ascii` 前缀，启动报 `Proxy MySQL schema is not ready for MYSQL_AUTO_MIGRATE=false: Unsupported MySQL schema: proxy_enterprises check constraints`（`user_pool_accounts`、`user_pool_leases` 的 CHECK 同样是 `_latin1`）。以 `--default-character-set=utf8mb4` 执行同一脚本则一切正常（上表 34 条）。集成测试用 mysql2 的 utf8mb4 连接执行脚本，所以没有发现。升级脚本 `scripts/proxy-mysql-enterprise-upgrade.sql` 含同样的 CHECK，预计有同样的问题（未在镜像级验证）。建议：生成的两个脚本开头加 `SET NAMES utf8mb4;`，或校验器接受任意字符集前缀的 ASCII 字面量；在此之前，在 README 与升级指南中写明 DBA 需用 utf8mb4 会话（例如 `mysql --default-character-set=utf8mb4`）。本分支只改资格测试脚本与文档，产品代码和脚本未改动。
 
+**修复（脚本层，镜像不变）：** 生成器在两个脚本的表结构语句之前加入 `SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;`（全新部署脚本放在“库已存在时从这里开始”标记之后），并有单元测试约束位置。修复后的复核：用官方 `mysql:8.4` 镜像的客户端、**不加任何字符集参数**（默认 latin1 会话）执行脚本，r2 Proxy 以 `MYSQL_AUTO_MIGRATE=false` 启动，隔离网络、合成凭据：
+
+| 场景 | 新脚本 | 修复前脚本（对照） |
+| --- | --- | --- |
+| 全新空库执行 `proxy-mysql-initial.sql` | 启动正常，CHECK 字面量为 `_utf8mb4`，停止退出码 0 | 拒绝启动（`proxy_enterprises check constraints`，`_latin1`） |
+| r4 库（以 utf8mb4 会话建表，与 r4 自动迁移一致）执行 `proxy-mysql-enterprise-upgrade.sql` | 启动正常，停止退出码 0 | 拒绝启动（`proxy_enterprises check constraints`） |
+
+另外确认：r4 的表结构如果当初是用 latin1 会话按 r4 脚本建的，r4 Proxy 自己就拒绝启动（`user_pool_accounts check constraints`），这样的库不会出现在正在运行的 r4 环境中，所以不构成 r4 → 多企业升级的新障碍。`multi-fresh-dba` 模式此后改为用客户端默认会话执行初始脚本，直接覆盖这项修复。
+
 #### 3.4 本节未覆盖
 
 - SQLite 直连只验证 `/v1/messages`（`tests/image-release/mock.mjs` 只实现这一条）；`/chat/completions`、`/responses` 在 MySQL caller-lease 模式下覆盖。SQLite 下的 caller-lease（账号池）模式未覆盖。

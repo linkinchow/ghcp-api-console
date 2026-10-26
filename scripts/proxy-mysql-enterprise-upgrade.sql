@@ -13,6 +13,9 @@
 -- (step 08). Both need only the runtime privileges; replicas of the previous release then fail to start.
 -- No new triggers and no new privileges are required.
 
+-- CHECK constraint literals take the session character set; Proxy accepts only utf8mb4.
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
 -- enterprise-v1/01-create-proxy-enterprises
 CREATE TABLE IF NOT EXISTS `proxy_enterprises` (
   `id` VARCHAR(32) COLLATE ascii_bin,

@@ -19,6 +19,17 @@ test('scripts/proxy-mysql-enterprise-upgrade.sql matches the steps Proxy runs', 
     'Run `npm --workspace @ghcp/proxy run mysql:enterprise-upgrade-sql` and commit the result.');
 });
 
+test('both scripts switch the session to utf8mb4 before any table DDL', () => {
+  for (const sql of [renderMysqlInitialSql(), renderMysqlEnterpriseUpgradeSql()]) {
+    const setNames = sql.indexOf('SET NAMES utf8mb4');
+    assert.ok(setNames > 0);
+    assert.ok(setNames < sql.search(/^(CREATE TABLE|ALTER TABLE)/m));
+  }
+  // Also on the documented entry point for an existing database.
+  const initial = renderMysqlInitialSql();
+  assert.ok(initial.indexOf('SET NAMES utf8mb4') > initial.indexOf('-- If the database already exists, start here.'));
+});
+
 test('initial SQL creates every table, the credential fence and the migration records', () => {
   const sql = renderMysqlInitialSql();
   for (const table of Object.keys(MYSQL_SCHEMA)) assert.match(sql, new RegExp(`CREATE TABLE IF NOT EXISTS \`${table}\``));
