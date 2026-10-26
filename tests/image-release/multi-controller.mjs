@@ -2,7 +2,7 @@
 // preview tools (see README). It runs qualification-prepare.mjs then qualification-run.mjs for one mode at a time
 // and exposes progress; it never touches Docker itself.
 //
-//   POST /run    {"mode":"multi-upgrade"|"multi-upgrade-sqlite","isolatedSubnet"?,"ingressSubnet"?}  -> 202
+//   POST /run    {"mode":<one of MULTI_MODES>,"isolatedSubnet"?,"ingressSubnet"?}  -> 202
 //   POST /stop   aborts the active run (the runner stops its own containers; nothing is removed)
 //   GET  /status the active/last runs, their recent step events and report summaries
 //   GET  /plan?mode=...  the dry-run step plan (no Docker)
@@ -19,7 +19,7 @@ import { appendFile, readFile, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { MULTI_MODES, PROJECT_PATTERN, SUBNET_PATTERN } from './qualification-multi-lib.mjs';
+import { isFreshMode, isSqliteMode, MULTI_MODES, PROJECT_PATTERN, SUBNET_PATTERN } from './qualification-multi-lib.mjs';
 
 const PORT = 18821;
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -128,7 +128,7 @@ function startRun(body) {
   const mode = body.mode;
   if (!MULTI_MODES.includes(mode)) return [400, { error: 'invalid_mode', modes: MULTI_MODES }];
   if (active) return [409, { error: 'run_active', id: active.id }];
-  const sqlite = mode === 'multi-upgrade-sqlite';
+  const sqlite = isSqliteMode(mode);
   const isolatedSubnet = body.isolatedSubnet ?? (sqlite
     ? process.env.RELEASE_QUALIFICATION_SQLITE_SUBNET
     : process.env.RELEASE_QUALIFICATION_ISOLATED_SUBNET);
@@ -141,7 +141,8 @@ function startRun(body) {
     return [409, { error: 'subnet_already_used_by_this_controller' }];
   }
   const prefix = process.env.RELEASE_QUALIFICATION_PROJECT_PREFIX || 'ghcp-release-qualification-multi';
-  const project = `${prefix}-${sqlite ? 's' : 'm'}-${Date.now().toString(36)}`;
+  const kind = `${isFreshMode(mode) ? 'f' : ''}${mode === 'multi-fresh-dba' ? 'd' : sqlite ? 's' : 'm'}`;
+  const project = `${prefix}-${kind}-${Date.now().toString(36)}`;
   if (!PROJECT_PATTERN.test(project)) return [400, { error: 'invalid_project_prefix' }];
   subnets.forEach((subnet) => usedSubnets.add(subnet));
   const id = randomUUID();

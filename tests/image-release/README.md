@@ -10,12 +10,12 @@
 | `ghe-compose.yaml`、`ghe-e2e.mjs` | GHE.com 模式全链路：真实 SSO（SAML IdP）+ 真实 Login（Chromium 设备授权）+ Proxy 账号池，mock（`tests/docker-user-pool/mock-ghe.mjs`）扮演 `*.ghe.com` 各主机。驱动容器的退出码即结果。 |
 | `qualification-compose.json` | MySQL 8.4 + 双 Proxy（caller-lease）+ SSO/Login/Console + mock + 本机回环 bridge 的完整环境。 |
 | `qualification-prepare.mjs` | 新建一次运行目录（`.claude/release-qualification-run-<uuid>/`）：复制并适配 `tests/docker-user-pool` 的 smoke 与 mock、写入合成证书和 MySQL 初始化脚本；多企业模式下另外生成 Compose 文件、registry 与合成 secret 文件。 |
-| `qualification-run.mjs` | 执行资格验证。默认模式：基线镜像 → 候选镜像 → 基线镜像（同一数据卷原地升级再回滚）；`RELEASE_QUALIFICATION_MODE=candidate-fresh`：候选镜像全新库；`multi-upgrade` / `multi-upgrade-sqlite`：多企业原地升级（见下文，委托给 `qualification-multi-run.mjs`）。 |
-| `qualification-verify-runtime.mjs` | 在每个运行中的容器里执行：Tini/npm/工作目录、依赖版本与行为、better-sqlite3、Login 内 Chromium、持久化数据摘要（SSO、Login 表按列哈希）等。第三个参数 `scoped` 用于多企业镜像（管理 API 走 `/api/enterprises/default/...`，并断言无作用域路径返回 400）。 |
+| `qualification-run.mjs` | 执行资格验证。默认模式：基线镜像 → 候选镜像 → 基线镜像（同一数据卷原地升级再回滚）；`RELEASE_QUALIFICATION_MODE=candidate-fresh`：候选镜像全新库；`multi-upgrade` / `multi-upgrade-sqlite`：多企业原地升级；`multi-fresh` / `multi-fresh-dba` / `multi-fresh-sqlite`：多企业镜像的全新单企业部署（见下文，都委托给 `qualification-multi-run.mjs`）。 |
+| `qualification-verify-runtime.mjs` | 在每个运行中的容器里执行：Tini/npm/工作目录、依赖版本与行为、better-sqlite3、Login 内 Chromium、持久化数据摘要（SSO、Login 表按列哈希）等。第三个参数 `scoped` 用于多企业镜像（管理 API 走 `/api/enterprises/default/...`，并断言无作用域路径返回 400）；可选第四个参数是 SSO 用户数（默认 3）。内部 token 取容器自己的 `INTERNAL_API_TOKEN`，所以 MySQL 与 SQLite 两套合成环境都能用。 |
 | `qualification-dependency.mjs` | 基线与候选的依赖补丁行为对照（独立、离线容器内执行）。 |
 | `qualification-multi-lib.mjs` | 多企业资格验证的纯函数：步骤计划与断言清单、registry、Compose 生成、隔离规则、cookie 签名、表对比等。没有 Docker/网络访问。 |
 | `qualification-multi-lib.test.mjs` | 上述纯函数的 `node --test`；若 `src/packages/shared/dist` 已构建，还会用产品自己的 `loadRegistry` 校验 step 4 的 registry（无 env 冲突、无 blocker、`default` 身份指纹不变）。 |
-| `qualification-multi-run.mjs` | 多企业资格验证执行器（§9.4 第 1–5、7 步：MySQL；第 6 步：SQLite）。 |
+| `qualification-multi-run.mjs` | 多企业资格验证执行器（§9.4 第 1–5、7 步：MySQL；第 6 步：SQLite；以及全新部署的三个模式）。 |
 | `multi-probe.mjs` | 在 mock 容器内执行的内网 HTTP 探针（SSO、Login 从不对外发布端口）。 |
 | `multi-sqlite-snapshot.mjs` | 在已发布镜像内用其自带 better-sqlite3 输出 SQLite 逻辑快照（按列哈希；迁移 ID、trigger 名明文）。 |
 | `multi-volume-copy.mjs` | 在无网络的一次性 helper 容器（已缓存的 node 镜像）内备份/恢复服务数据卷，保留属主、权限、时间并比对清单。 |
@@ -118,6 +118,43 @@ RELEASE_QUALIFICATION_MODE=multi-upgrade RELEASE_QUALIFICATION_CONFIRM=$RELEASE_
 - 第 7 步用 `LOCK TABLES proxy_request_stats READ` 让迁移确定地停在 05 内（01–04 已记录）。必须先结束被杀副本遗留的 MySQL 会话、再释放表锁，否则排队中的 `ALTER` 会在“崩溃”之后完成（这本身也是可恢复的“已生效未记录”状态，但不是本步要断言的那个）。
 - 项目名必须匹配 `ghcp-release-qualification-[a-z0-9-]+`（prepare 校验）。
 
+## 多企业镜像的全新单企业部署资格验证
+
+全新部署：空数据库、空卷、**没有** enterprise registry 文件，`default` 企业由各服务的环境变量合成。只用候选镜像（不需要 r4 基线镜像），输入变量、prepare/run 命令、证据和安全边界与上文相同（`RELEASE_QUALIFICATION_BASELINE_TAG` 不使用）。
+
+| 模式 | 环境 | 说明 |
+| --- | --- | --- |
+| `multi-fresh` | MySQL 8.4（空库）+ 两个 Proxy 副本（caller-lease）+ SSO/Login/Console + mock + 回环 bridge | Proxy 自动迁移（不设置 `MYSQL_AUTO_MIGRATE`，即默认 `true`）。 |
+| `multi-fresh-dba` | 同上 | DBA 路径：先只启动 MySQL 和 mock，用 root 以 `--default-character-set=utf8mb4` 执行 `scripts/proxy-mysql-initial.sql`（只把库名 `ghcp_proxy` 换成本环境的库名），把运行账号的 `GRANT ALL` 换成脚本头部写明的最小权限（库级 `SELECT, INSERT, UPDATE, DELETE` + `proxy_accounts` 上的 `TRIGGER`），两个副本都设 `MYSQL_AUTO_MIGRATE=false`。 |
+| `multi-fresh-sqlite` | SQLite 直连（与 `multi-upgrade-sqlite` 相同的生成 Compose）+ SSO/Login/Console + mock，无对外端口 | 直连模式只有 `/v1/messages`（mock 只实现这一条）。 |
+
+prepare 生成：MySQL 模式为 `fresh.compose.json`（即 `qualification-compose.json`，`proxy2` 展开，mock 增加 `MOCK_LOGIN_READINESS_URL`；两个 Proxy 增加 `GITHUB_API_BASE_URL=http://mock:8002`，DBA 模式另加 `MYSQL_AUTO_MIGRATE=false`；其余服务环境与 r4 资格验证逐项相同，单元测试比对）；SQLite 模式为 `sqlite.compose.json`。fresh 模式不生成 `registry/` 目录。
+
+为什么 Proxy 要加 `GITHUB_API_BASE_URL`：多企业版 Proxy 在 Login 回传 token 时用 `default` 的 GitHub REST API 调 `GET /user` 核对账号身份（设计 §5.7）。r4 资格验证环境只给 SSO 设了这个变量，Proxy 因而使用默认的 `https://api.github.com`；隔离网络访问不到它，回调一律 503，成员三次重试后以 `oauth_login_failed` 失败，补货达不到空闲目标。升级资格验证不会遇到，因为它的 `default` 没有新补货，第 4 步的 registry 也显式写了 `apiBaseUrl`。
+
+```bash
+RELEASE_QUALIFICATION_MODE=multi-fresh-dba node tests/image-release/qualification-run.mjs --plan
+```
+
+### 步骤与断言（MySQL：`multi-fresh` 30 条，`multi-fresh-dba` 34 条）
+
+1. **preflight**：项目、卷不存在；渲染结果满足隔离规则、没有任何服务引用 registry（`ENTERPRISE_REGISTRY_FILE` 或 `/registry` 挂载）、`MYSQL_AUTO_MIGRATE` 与模式一致；四个候选镜像、mysql、node 在本地；候选镜像保持 Tini/CMD/WORKDIR；旧模板命令覆盖下能启动并干净退出。
+2. **fresh-dba-schema**（仅 DBA）：库里只有 fixture 表；执行初始脚本后业务表齐全，`schema_migrations` 恰为脚本写入的 ID（缺 `02-seed-default`、`08-pool-config-fingerprint`，由 Proxy 用运行时权限补），`proxy_enterprises` 为空；`SHOW GRANTS` 没有任何 DDL 权限。
+3. **fresh-start**：全部服务健康；五个应用的 `/healthz` 都是 `releaseLine: "multi"`；`schema_migrations` 恰为 r4 的 3 个 ID + `enterprise-v1/01…08`，SSO 01–05、Login 01–03 齐全；（DBA）Proxy 启动前后 schema 指纹不变、Proxy 只补写了 02 和 08；`enterprise_id` NOT NULL 无默认值且不带它的插入被拒；`proxy_enterprises` 只有 `default`（active、cap = `POOL_MAX_ACCOUNTS`、库存 0），两个副本的 `GET /api/enterprises` 都只列出它；SSO、Login 的企业表也只有 `default`；单一调度 owner 并续期。
+4. **fresh-console**：`/api/console/setup` 初始为未初始化 → 创建管理员 201 → 再次创建 400；登录成功、错误密码与匿名 401；Console 读企业列表（只有 `default`）、`default` 的池概览、SSO 用户、Login 任务、请求统计，无作用域的 Console 转发返回 400，未登录 401。
+5. **fresh-pool**：初始 `idle_target=0`、池与 mock 为空；经 `proxy2` 把 `idle_target` 设为 3 后，经 mock SCIM/席位/Login/Copilot 补到 3 个 ready idle（SCIM 创建、任务、回调各 3 次，无失败），随后暂停补货；账号与成员都属于 `default`，Login 任务都走 `/api/enterprises/default/tasks`，SSO 有 3 个用户。
+6. **fresh-caller**：新 caller 的 SSE 请求被 mock 挂住时，从另一副本看到 `provisional` 租约；取消后同一 caller 的 6 个请求（3 协议 × JSON/SSE，两副本交替）全部打到同一成员；租约在两副本上都是 `active`、`leaseId` 不变；统计行 6 条成功、都是 `default`；第二个 caller 拿到另一个成员。
+7. **fresh-scope**：`/api/enterprises/default/...`（Proxy 账号、统计、池概览/租约/事件，SSO 用户，Login 任务）都是 200；无作用域的 Proxy 统计、池、`/internal/...`，SSO 用户与内部接口，Login 任务都返回 400 `enterprise_scope_required`。
+8. **fresh-sso**：根路径 `/login` 登录得到 `e: "default"` 的 `sso_session`，错误密码 401；`/sso` 用该会话返回 SAMLResponse、匿名重定向到 `/login`；`/metadata` 的证书就是运行目录里的合成证书。
+9. **fresh-runtime**：每个应用跑 `qualification-verify-runtime.mjs <service> candidate scoped <SSO 用户数>`。
+10. **fresh-stop**：停止全部应用，退出码都是 0。
+
+**发现（r2，DBA 路径）**：官方 mysql 镜像里的 `mysql` 客户端在 POSIX locale 下默认 latin1 会话。用它直接执行初始脚本时，CHECK 约束里的字符串字面量带 `_latin1` 前缀（例如 ``(`state` in (_latin1'draft',…))``），r2 Proxy 在 `MYSQL_AUTO_MIGRATE=false` 下只接受 `_utf8mb4`/`_ascii`，启动失败：`Unsupported MySQL schema: proxy_enterprises check constraints`。因此本模式显式用 utf8mb4 会话执行脚本，并断言 CHECK 字面量的字符集只有 `utf8mb4`。升级脚本 `proxy-mysql-enterprise-upgrade.sql` 含同样的 CHECK，预计有同样的问题（未在镜像级验证）。
+
+### 步骤与断言（SQLite：`multi-fresh-sqlite` 23 条）
+
+preflight（4）→ fresh-start（健康、`releaseLine`、Proxy 01–05 / SSO 01–05 / Login 01–03、fail-closed trigger、三个库的企业表都只有 `default`，`GET /api/enterprises` 只列出 `default` 且 `pool: null`）→ fresh-console（3，同上）→ fresh-direct（作用域 API 建 SSO 用户并导入合成 OAuth token；`/v1/messages` JSON 与 SSE；统计行都是 `default`；旧 `/api/accounts` 带 `Deprecation: true`）→ fresh-scope（2）→ fresh-sso（3）→ fresh-runtime（1）→ fresh-stop（1）。
+
 ## 控制器（preview 工具）
 
 协调者通过 `.claude/launch.json` 启动 `multi-controller.mjs`（端口 18821，只绑定 127.0.0.1，拒绝非回环 Host 和任何带 `Origin` 的请求）。示例配置：
@@ -144,7 +181,7 @@ RELEASE_QUALIFICATION_MODE=multi-upgrade RELEASE_QUALIFICATION_CONFIRM=$RELEASE_
 }
 ```
 
-- `POST /run`，body `{"mode":"multi-upgrade"}` 或 `{"mode":"multi-upgrade-sqlite"}`，可选 `isolatedSubnet`/`ingressSubnet` 覆盖子网（每次运行都要未用过的子网）。项目名自动生成：`ghcp-release-qualification-multi-{m|s}-<时间戳>`。同一时间只运行一个。
+- `POST /run`，body `{"mode":"<模式>"}`（上文五个多企业模式之一），可选 `isolatedSubnet`/`ingressSubnet` 覆盖子网（每次运行都要未用过的子网；SQLite 模式只用 `RELEASE_QUALIFICATION_SQLITE_SUBNET`）。项目名自动生成：`ghcp-release-qualification-multi-{m|s|fm|fd|fs}-<时间戳>`。同一时间只运行一个。
 - `GET /status`：每次运行的阶段、当前步骤、最近的步骤/断言事件、报告摘要（`pass`、`failure`、`failedStep`、`planCoverage`）。
 - `GET /plan?mode=…`：步骤计划（不碰 Docker）；`GET /report?id=…`：完整报告。
 - `POST /stop`：在运行目录写 `stop.request`，执行器在 2 秒内中止并照常停止本项目容器（Windows 上不依赖信号）。

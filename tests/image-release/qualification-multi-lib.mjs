@@ -2,7 +2,14 @@
 // No Docker, network, process or file-system access: everything here is covered by `node --test`.
 import { createHash, createHmac } from 'node:crypto';
 
-export const MULTI_MODES = Object.freeze(['multi-upgrade', 'multi-upgrade-sqlite']);
+export const MULTI_MODES = Object.freeze(['multi-upgrade', 'multi-upgrade-sqlite', 'multi-fresh', 'multi-fresh-dba',
+  'multi-fresh-sqlite']);
+/** Fresh single-enterprise deployments (empty databases, no registry): `default` is synthesized from env. */
+export const FRESH_MODES = Object.freeze(['multi-fresh', 'multi-fresh-dba', 'multi-fresh-sqlite']);
+/** Modes running SQLite direct mode instead of the MySQL + two-replica environment. */
+export const SQLITE_MODES = Object.freeze(['multi-upgrade-sqlite', 'multi-fresh-sqlite']);
+export const isFreshMode = (mode) => FRESH_MODES.includes(mode);
+export const isSqliteMode = (mode) => SQLITE_MODES.includes(mode);
 /** Single-slug r4, the baseline every multi candidate must upgrade from in place (design §11). */
 export const BASELINE_R4_TAG = 'single-slug-164cade-amd64-r4';
 export const RELEASE_PREFIX = 'ghcp-release';
@@ -65,6 +72,19 @@ export function expectedProxyMigrationIds(backend) {
   if (backend === 'sqlite-direct') return PROXY_MIGRATION_IDS.slice(0, 5);
   if (backend === 'sqlite-pool') return PROXY_MIGRATION_IDS.slice(0, 7);
   throw new Error(`unknown backend ${backend}`);
+}
+
+/** Single-enterprise Proxy MySQL migration ids (r4 schema and pool); src/proxy/src/db/mysqlMigrations.ts and
+ * src/proxy/src/userPool/mysqlMigrations.ts (the unit test guards drift). */
+export const PROXY_MYSQL_BASE_MIGRATION_IDS = Object.freeze([
+  '2026-08-27-proxy-mysql-initial',
+  '2026-08-27-proxy-token-binary-collation',
+  '2026-09-12-user-pool-mysql-v1',
+]);
+
+/** Every id a fresh caller-lease MySQL database records once Proxy has started (either migration path). */
+export function expectedFreshMysqlMigrationIds() {
+  return [...PROXY_MYSQL_BASE_MIGRATION_IDS, ...PROXY_MIGRATION_IDS].sort();
 }
 
 /** Every expected id present; returns the missing ones (empty when complete). */
@@ -248,6 +268,102 @@ export function sourceEnvironment(source, service) {
   const own = source.services[service];
   const inherited = own.extends ? source.services[own.extends.service].environment : {};
   return { ...inherited, ...(own.environment ?? {}) };
+}
+
+/**
+ * Proxy variables a fresh multi deployment adds to the r4 qualification environment: the multi Proxy checks every
+ * Login callback token with GitHub `GET /user` on `default`'s REST API (design §5.7), which defaults to
+ * https://api.github.com and is unreachable from the internal network; the mock answers `/user` instead.
+ */
+export const FRESH_PROXY_ENV = Object.freeze({ GITHUB_API_BASE_URL: 'http://mock:8002' });
+
+/**
+ * Compose file of a fresh single-enterprise MySQL deployment (`multi-fresh`, `multi-fresh-dba`): the r4 qualification
+ * services and environment (so `default` is synthesized from the same per-enterprise variables) plus
+ * FRESH_PROXY_ENV, no registry, `proxy2` flattened. Mock forwards Login readiness to the real Login. With
+ * `autoMigrate: false` both replicas get MYSQL_AUTO_MIGRATE=false (DBA path); otherwise the variable stays unset
+ * (the default, `true`).
+ */
+export function buildFreshCompose(source, { autoMigrate = true } = {}) {
+  const compose = clone(source);
+  const { extends: _extends, ...proxy2Own } = compose.services.proxy2;
+  compose.services.proxy2 = { ...clone(compose.services.proxy), ...proxy2Own };
+  compose.services.mock.environment = { ...compose.services.mock.environment,
+    MOCK_LOGIN_READINESS_URL: 'http://login:7003' };
+  for (const service of ['proxy', 'proxy2']) {
+    const environment = compose.services[service].environment;
+    for (const key of ['MYSQL_AUTO_MIGRATE', ...Object.keys(FRESH_PROXY_ENV)]) {
+      if (Object.hasOwn(environment, key)) throw new Error(`source sets ${key}`);
+    }
+    Object.assign(environment, FRESH_PROXY_ENV);
+    if (!autoMigrate) environment.MYSQL_AUTO_MIGRATE = 'false';
+  }
+  return compose;
+}
+
+/** Services of a rendered Compose config that would load an enterprise registry (must be none when fresh). */
+export function registryReferences(config) {
+  return Object.entries(config.services ?? {}).filter(([, item]) => {
+    const environment = item.environment ?? {};
+    return Object.hasOwn(environment, 'ENTERPRISE_REGISTRY_FILE')
+      || (item.volumes ?? []).some((volume) => volume.target === '/registry');
+  }).map(([service]) => service);
+}
+
+/** Database name the generated scripts/proxy-mysql-initial.sql creates and uses. */
+export const INITIAL_SQL_DATABASE = 'ghcp_proxy';
+
+/**
+ * The generated initial SQL retargeted to `database`, as a DBA running it for a differently named database would.
+ * Only the `CREATE DATABASE` and `USE` statements change; both must be present exactly once.
+ */
+export function initialSqlForDatabase(script, database) {
+  if (!/^[a-z0-9_]+$/.test(database)) throw new Error('invalid database name');
+  const create = `CREATE DATABASE IF NOT EXISTS ${INITIAL_SQL_DATABASE}\n`;
+  const use = `USE ${INITIAL_SQL_DATABASE};\n`;
+  const text = String(script).replace(/\r+\n/g, '\n');
+  for (const marker of [create, use]) {
+    if (text.split(marker).length !== 2) throw new Error('initial SQL database markers changed');
+  }
+  const retargeted = text.replace(create, `CREATE DATABASE IF NOT EXISTS ${database}\n`).replace(use, `USE ${database};\n`);
+  if (new RegExp(`\\b${INITIAL_SQL_DATABASE}\\b`).test(retargeted)) throw new Error('initial SQL names the database');
+  return retargeted;
+}
+
+/** `schema_migrations` ids the initial SQL records itself (Proxy adds the rest with runtime privileges). */
+export function initialSqlMigrationIds(script) {
+  return [...String(script).matchAll(/INSERT IGNORE INTO schema_migrations \(id, applied_at\) VALUES \('([^']+)'/g)]
+    .map((match) => match[1]).sort();
+}
+
+/**
+ * Least-privilege runtime grants of scripts/proxy-mysql-initial.sql's header: DML on the database plus TRIGGER on
+ * proxy_accounts (caller-lease mode reads the credential fence trigger's metadata). Replaces the image entrypoint's
+ * `GRANT ALL` for MYSQL_USER (granted on the underscore-escaped database name, so it is revoked in the global form).
+ */
+export function dbaRuntimeGrantsSql(database, user) {
+  if (!/^[a-z0-9_]+$/.test(database) || !/^[a-z0-9_]+$/.test(user)) throw new Error('invalid grant target');
+  return [
+    `REVOKE ALL PRIVILEGES, GRANT OPTION FROM '${user}'@'%';`,
+    `GRANT SELECT, INSERT, UPDATE, DELETE ON \`${database}\`.* TO '${user}'@'%';`,
+    `GRANT TRIGGER ON \`${database}\`.\`proxy_accounts\` TO '${user}'@'%';`,
+  ].join('\n');
+}
+
+const DDL_PRIVILEGES = ['ALL PRIVILEGES', 'CREATE', 'ALTER', 'DROP', 'INDEX', 'REFERENCES', 'CREATE VIEW',
+  'CREATE ROUTINE', 'ALTER ROUTINE', 'EVENT', 'LOCK TABLES', 'CREATE TEMPORARY TABLES'];
+
+/** Schema-changing privileges named in `SHOW GRANTS` lines (empty when the account can only read and write rows). */
+export function ddlPrivileges(grantLines) {
+  const found = new Set();
+  for (const line of grantLines) {
+    const match = /^GRANT (.+?) ON /.exec(String(line).trim());
+    if (!match) continue;
+    for (const privilege of match[1].split(',').map((value) => value.trim().toUpperCase())) {
+      if (DDL_PRIVILEGES.includes(privilege)) found.add(privilege);
+    }
+  }
+  return [...found].sort();
 }
 
 /**
@@ -444,6 +560,13 @@ export function metadataIdentity(xml) {
   return { entityId, certificateSha256: certificate ? sha(certificate) : null };
 }
 
+/** The `certificateSha256` metadataIdentity reports for an IdP whose signing certificate is this PEM. */
+export function pemCertificateSha256(pem) {
+  const match = /-----BEGIN CERTIFICATE-----([\s\S]+?)-----END CERTIFICATE-----/.exec(String(pem));
+  if (!match) throw new Error('not a PEM certificate');
+  return sha(match[1].replace(/\s+/g, ''));
+}
+
 export const sha = (value) => createHash('sha256')
   .update(typeof value === 'string' || Buffer.isBuffer(value) ? value : JSON.stringify(value))
   .digest('hex');
@@ -569,6 +692,9 @@ const step = (id, title, assertions) => Object.freeze({ id, title, assertions: O
 export function qualificationPlan(mode) {
   if (mode === 'multi-upgrade') return MYSQL_PLAN;
   if (mode === 'multi-upgrade-sqlite') return SQLITE_PLAN;
+  if (mode === 'multi-fresh') return FRESH_MYSQL_PLAN;
+  if (mode === 'multi-fresh-dba') return FRESH_DBA_PLAN;
+  if (mode === 'multi-fresh-sqlite') return FRESH_SQLITE_PLAN;
   throw new Error(`unknown multi mode ${mode}`);
 }
 
@@ -697,6 +823,101 @@ const SQLITE_PLAN = Object.freeze([
   ]),
 ]);
 
+// Fresh single-enterprise deployments: empty databases and volumes, no registry, candidate images only.
+const FRESH_COMMON_TAIL = Object.freeze([
+  step('fresh-scope', 'Scoped /api/enterprises/default/... answers; unscoped management paths are 400', [
+    'scoped_management_200',
+    'unscoped_management_400',
+  ]),
+  step('fresh-sso', 'SAML login of the default enterprise at the root paths /login, /sso and /metadata', [
+    'sso_root_login_default_cookie',
+    'sso_root_saml_response',
+    'sso_root_metadata_identity',
+  ]),
+  step('fresh-runtime', 'In-container runtime checks of every application (scoped management API)', [
+    'runtime_verified_scoped',
+  ]),
+  step('fresh-stop', 'Every application stops cleanly', [
+    'applications_exit_zero',
+  ]),
+]);
+
+const FRESH_CONSOLE = step('fresh-console', 'Console first-run admin setup, login and the default enterprise overview', [
+  'console_first_run_setup',
+  'console_login',
+  'console_default_enterprise_overview',
+]);
+
+function freshMysqlPlan(dba) {
+  return Object.freeze([
+    step('preflight', 'Fresh project, isolated Compose render without a registry, local candidate images only', [
+      'fresh_project_and_volumes',
+      'compose_isolated_fresh',
+      'images_present_locally',
+      'candidate_shipped_defaults',
+      'candidate_legacy_command_starts_and_stops_cleanly',
+    ]),
+    ...(dba ? [step('fresh-dba-schema', 'DBA path: empty database, generated initial SQL, DML-only runtime account', [
+      'mysql_database_empty',
+      'initial_sql_applied',
+      'runtime_grants_dml_only',
+    ])] : []),
+    step('fresh-start', dba
+      ? 'Both replicas start with MYSQL_AUTO_MIGRATE=false on the prepared schema; default synthesized from env'
+      : 'Both replicas start on an empty database (MYSQL_AUTO_MIGRATE default); default synthesized from env', [
+      'fresh_services_healthy',
+      'release_line_multi',
+      'fresh_migration_ids_complete',
+      ...(dba ? ['dba_startup_no_ddl'] : []),
+      'fresh_enterprise_columns_fail_closed',
+      'single_default_enterprise_active',
+      'sso_login_single_default_enterprise',
+      'single_scheduler_owner_renewing',
+    ]),
+    FRESH_CONSOLE,
+    step('fresh-pool', 'Pool provisions synthetic members through mock SCIM, Login and Copilot to the idle target', [
+      'pool_fresh_settings',
+      'pool_reaches_idle_target',
+      'pool_provisioning_scoped_to_default',
+    ]),
+    step('fresh-caller', 'Caller key: provisional then active lease, three protocols JSON + SSE, sticky across replicas', [
+      'caller_provisional_lease',
+      'caller_protocol_json_sse_same_member',
+      'caller_active_lease_both_replicas',
+      'caller_stats_default_enterprise',
+      'second_caller_exclusive_member',
+    ]),
+    ...FRESH_COMMON_TAIL,
+  ]);
+}
+
+const FRESH_MYSQL_PLAN = freshMysqlPlan(false);
+const FRESH_DBA_PLAN = freshMysqlPlan(true);
+
+const FRESH_SQLITE_PLAN = Object.freeze([
+  step('preflight', 'Fresh project, isolated SQLite Compose render, local candidate images only', [
+    'fresh_project_and_volumes',
+    'compose_isolated_sqlite',
+    'images_present_locally',
+    'candidate_shipped_defaults',
+  ]),
+  step('fresh-start', 'Direct mode on empty volumes; default synthesized from env', [
+    'fresh_services_healthy',
+    'release_line_multi',
+    'sqlite_fresh_migration_ids_complete',
+    'sqlite_fail_closed_triggers_present',
+    'sqlite_single_default_enterprise',
+  ]),
+  FRESH_CONSOLE,
+  step('fresh-direct', 'Direct mode: scoped SSO user and token import, inference JSON + SSE, statistics', [
+    'sqlite_scoped_user_and_token_import',
+    'sqlite_direct_inference_json_sse',
+    'sqlite_stats_default_enterprise',
+    'sqlite_legacy_accounts_deprecated',
+  ]),
+  ...FRESH_COMMON_TAIL,
+]);
+
 /** Which planned assertions never passed, and which recorded ones were not planned. */
 export function planCoverage(plan, results) {
   const missing = [];
@@ -714,7 +935,7 @@ export function planCoverage(plan, results) {
 
 /** Bounded run time (minutes) for the multi modes; Docker Desktop under load is slow. */
 export function runBudget(mode, raw) {
-  const fallback = mode === 'multi-upgrade' ? 50 : 20;
+  const fallback = { 'multi-upgrade': 50, 'multi-fresh': 30, 'multi-fresh-dba': 30 }[mode] ?? 20;
   const minutes = raw === undefined || raw === '' ? fallback : Number(raw);
   if (!Number.isInteger(minutes) || minutes < 10 || minutes > 120) throw new Error('invalid_run_budget');
   return { activeMs: minutes * 60000, finalMs: (minutes + 5) * 60000 };
