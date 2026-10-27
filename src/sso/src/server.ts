@@ -16,8 +16,9 @@ import { samlUrls } from './saml/saml.js';
 
 export function buildApp(): express.Express {
   const app = express();
-  app.use(express.json({ limit: '5mb' }));
-  app.use(express.urlencoded({ extended: false, limit: '1mb' }));
+  // CVE-2026-111181 (body-parser < 2.4.0): compressed bodies get 415. Remove once body-parser >= 2.4.0 is available.
+  app.use(express.json({ limit: '5mb', inflate: false }));
+  app.use(express.urlencoded({ extended: false, limit: '1mb', inflate: false }));
   app.get('/healthz', (_req, res) => {
     res.json({ status: 'ok', service: 'sso', releaseLine: releaseLine() });
   });

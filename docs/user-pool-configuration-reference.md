@@ -369,6 +369,7 @@ Console 不读取 registry；企业列表来自 Proxy。页头企业选择器不
 - 本地同caller准入最多32个排队、进程保留票据最多1024。
 - Proxy进程收到关闭信号后约25秒强制关闭剩余连接；仅增大K8s grace period不会自动延长它。
 - SSO和Login的SQLite/runtime缓存、Login进程内队列仍要求各单实例。
+- 四个服务都**不接受压缩的请求体**：带 `Content-Encoding: gzip`、`deflate`、`br` 等（`identity` 除外）的 JSON 请求体，以及 SSO 的表单（urlencoded）请求体，一律返回 415（SSO、Login 的响应体为 `unsupported_content_encoding`）。这是 body-parser 漏洞 CVE-2026-111181 的缓解措施（解析器设置 `inflate: false`），不可配置；批准的 npm 源提供 body-parser ≥ 2.4.0 后再取消。LiteLLM、浏览器和 Console 默认都发送未压缩的请求体；如果网关或客户端开启了请求体压缩，必须关闭。本修改只涉及请求体，不涉及响应。
 - Console Session约8小时；Login任务历史没有自动保留条数设置。
 
 ## 13. 建议优先审查的默认值

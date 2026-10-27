@@ -96,10 +96,21 @@ export function managementErrorHandler(service: string): ErrorRequestHandler {
   return (error: unknown, _req, res, next) => {
     if (res.headersSent) { next(error); return; }
     const message = error instanceof Error ? error.message : String(error);
+    if (isUnsupportedBodyEncoding(error)) {
+      res.status(415).json(apiError('unsupported_content_encoding', 'Compressed request bodies are not accepted.'));
+      return;
+    }
     logger.error('request-failed', 'API request failed', { error: message });
     res.status(error instanceof HttpApiError ? error.status : 500)
       .json(apiError(error instanceof HttpApiError ? error.code : 'internal_error', message));
   };
+}
+
+/** The body parsers run with `inflate: false` (CVE-2026-111181) and reject compressed bodies with this error. */
+function isUnsupportedBodyEncoding(error: unknown): boolean {
+  const candidate = error as { status?: unknown; type?: unknown } | null;
+  return typeof candidate === 'object' && candidate !== null && candidate.status === 415
+    && candidate.type === 'encoding.unsupported';
 }
 
 function objectBody(input: unknown): Record<string, unknown> {

@@ -92,14 +92,19 @@ try {
   const entry = `/app/src/${component}/dist/${component === 'console' ? 'server/index.js' : 'index.js'}`;
   assert.ok(existsSync(entry), 'shipped_absolute_entry_missing');
   result.absoluteCommandResolvable = true;
+  // multer was an unused dependency and is no longer shipped (CVE-2026-113872); older baselines still have it.
+  const installedVersion = (name) => {
+    const file = `/app/node_modules/${name}/package.json`;
+    return existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')).version : null;
+  };
   result.dependencyVersions = Object.fromEntries(['multer', 'proxy-addr', 'brace-expansion'].map((name) => [
     name,
-    JSON.parse(readFileSync(`/app/node_modules/${name}/package.json`, 'utf8')).version,
+    installedVersion(name),
   ]));
   if (phase === 'candidate') {
     assert.deepEqual(
       result.dependencyVersions,
-      { multer: '2.4.0', 'proxy-addr': '2.0.8', 'brace-expansion': '1.1.21' },
+      { multer: null, 'proxy-addr': '2.0.8', 'brace-expansion': '1.1.21' },
     );
   }
   if (service === 'proxy') {
@@ -121,6 +126,13 @@ try {
       ),
       '192.0.2.10',
     );
+    result.dependencyFunctionalChecks = {
+      braceExpansion: true,
+      proxyAddressTrustedAndUntrusted: true,
+      multipartValidMalformedAndSizeLimit: 'not_shipped',
+    };
+  }
+  if (service === 'proxy' && result.dependencyVersions.multer) {
     const express = requireImage('express');
     const multer = requireImage('multer');
     const app = express();
@@ -156,11 +168,7 @@ try {
       assert.equal(malformed.status, 400);
       await malformed.body?.cancel();
 
-      result.dependencyFunctionalChecks = {
-        braceExpansion: true,
-        proxyAddressTrustedAndUntrusted: true,
-        multipartValidMalformedAndSizeLimit: true,
-      };
+      result.dependencyFunctionalChecks.multipartValidMalformedAndSizeLimit = true;
     } finally {
       await new Promise((resolve) => {
         server.close(resolve);
