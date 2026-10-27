@@ -1,8 +1,8 @@
 # 多企业版发布验证记录
 
-本文记录多企业版（multi-enterprise / multi-slug SSO）候选镜像的发布前验证结果。设计见 [multi-enterprise-design.md](multi-enterprise-design.md)，升级步骤见 [multi-enterprise-upgrade-guide.md](multi-enterprise-upgrade-guide.md)。当前发布为 r2（`multi-4922a4a-amd64-r2`）；候选 r3（`multi-f43f27e-amd64-r3`，待发布）的验证记录在最前；此前发布的 r1（`multi-41ecffc-amd64-r1`）记录保留在后半部分。
+本文记录多企业版（multi-enterprise / multi-slug SSO）候选镜像的发布前验证结果。设计见 [multi-enterprise-design.md](multi-enterprise-design.md)，升级步骤见 [multi-enterprise-upgrade-guide.md](multi-enterprise-upgrade-guide.md)。当前发布为 r3（`multi-f43f27e-amd64-r3`），其验证记录在最前；r2（`multi-4922a4a-amd64-r2`）受 CVE-2026-111181 影响，已被 r3 取代；此前发布的 r1（`multi-41ecffc-amd64-r1`）记录保留在后半部分。
 
-## r3：multi-f43f27e-amd64-r3（候选，Docker Hub 待发布）
+## r3：multi-f43f27e-amd64-r3（已发布）
 
 全部验证只使用合成数据、mock 外部服务、本地 MySQL 容器和本机 kind 集群；没有调用真实 GitHub、GitHub EMU、GHE.com、Copilot 或模型，没有创建真实用户或席位，没有接触真实 SSO 环境、云资源或集群。Docker Desktop 只验证功能，不评估性能。
 
@@ -31,7 +31,16 @@
 | Login | `ghcp-release-login:multi-f43f27e-amd64-r3` | `sha256:05b60da5ed39df80c93f5a9889734cc23be4c5b1c2681c4d09a1965994c20e51` |
 | Console | `ghcp-release-console:multi-f43f27e-amd64-r3` | `sha256:b9e6f52faca7fa33cdde05d90c46ec286e54b6540ee683b12654a61cc8f91b60` |
 
-Docker Hub：**待发布**（未推送；发布需另行确认）。
+已发布到 Docker Hub（公开仓库，2026-10-27）：
+
+| 组件 | 按 digest 引用 |
+| --- | --- |
+| Proxy | `docker.io/linkinchow/ghcp-proxy@sha256:14ed9384f57a95c5cb4c1a5bd34d10d722d89d4e8ba9b3b49fcd6e32e41ad5f3` |
+| SSO | `docker.io/linkinchow/ghcp-sso@sha256:93e5be2c5fd8a9166cd67897c52466b833b9bbb12e2eede9dbe7700204b31214` |
+| Login | `docker.io/linkinchow/ghcp-login@sha256:96408b4fc3b0d0cd76083cc4bb8a1dcaf91ffa56152a8f7603caa1cc1a968338` |
+| Console | `docker.io/linkinchow/ghcp-console@sha256:6526394ff321ab15a4222423013689eb4959dc465dbec6262aa0a84ae267cc90` |
+
+发布后核对：每个 manifest 的 config digest 等于上表经资格测试的镜像 ID；按 digest 拉起 Proxy，`/healthz` 返回 `releaseLine: "multi"`，带 `Content-Encoding: gzip` 的请求体返回 415，停止时退出码 0。
 
 四个镜像的 label：`org.opencontainers.image.revision=f43f27e`、`com.ghcp.release-line=multi`、`org.opencontainers.image.version=multi-f43f27e-amd64-r3`。ENTRYPOINT 为 Tini（`/usr/bin/tini -g --`），CMD 与工作目录与 r2 相同。镜像内没有 `multer`、`busboy`，`body-parser` 仍为 2.3.0（express 5.2.1 的依赖）。
 
