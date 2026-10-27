@@ -15,10 +15,10 @@ const root = path.resolve(directory, '../..');
 const env = { ...process.env, KUBECONFIG: path.join(os.tmpdir(), `ghcp-no-kubeconfig-${randomUUID()}`) };
 
 const DIGESTS = {
-  proxy: 'docker.io/linkinchow/ghcp-proxy@sha256:00453e3b81a3fea67ef05d4fce1e3def680dac96ae9ca288a85d1a77c74997b6',
-  sso: 'docker.io/linkinchow/ghcp-sso@sha256:5b112760945fa5444d5720d48ddae5a4da9fa42ead08a8fa5715356395dcefe7',
-  login: 'docker.io/linkinchow/ghcp-login@sha256:6a7e48f79a86a04a5343ad0e6c4ac9f294ddd87c772f36927f9bbb148ffe1d2e',
-  console: 'docker.io/linkinchow/ghcp-console@sha256:a1605e6304597387e3e193223b01823d89b7a007d7e7bb5d8e44e236b97d3e2c',
+  proxy: 'docker.io/linkinchow/ghcp-proxy@sha256:14ed9384f57a95c5cb4c1a5bd34d10d722d89d4e8ba9b3b49fcd6e32e41ad5f3',
+  sso: 'docker.io/linkinchow/ghcp-sso@sha256:93e5be2c5fd8a9166cd67897c52466b833b9bbb12e2eede9dbe7700204b31214',
+  login: 'docker.io/linkinchow/ghcp-login@sha256:96408b4fc3b0d0cd76083cc4bb8a1dcaf91ffa56152a8f7603caa1cc1a968338',
+  console: 'docker.io/linkinchow/ghcp-console@sha256:6526394ff321ab15a4222423013689eb4959dc465dbec6262aa0a84ae267cc90',
 };
 const COMPONENTS = ['ingress-sso', 'ingress-console', 'mysql-dba-schema', 'network-policy'];
 const OVERLAYS = ['github-com', 'ghe-com'];

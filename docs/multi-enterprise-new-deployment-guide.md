@@ -1,6 +1,6 @@
 # GHCP 多企业版新部署指南：从一个企业开始
 
-本指南适用于**全新部署**多企业版 `multi-4922a4a-amd64-r2`，以最常见的情况为例：客户只有**一个** GitHub 企业（一个 slug）。第 10 节说明以后如何再添加企业。
+本指南适用于**全新部署**多企业版 `multi-f43f27e-amd64-r3`，以最常见的情况为例：客户只有**一个** GitHub 企业（一个 slug）。第 10 节说明以后如何再添加企业。
 
 - 已有单企业版 r4 部署要升级，请看 [多企业版升级指南](multi-enterprise-upgrade-guide.md)，不要按本文操作原数据。
 - 本文只写部署和首次开池。日常 Console 操作（每日巡检、调整 cap、Drain、处理异常成员、查用户租约等）见《管理员手册》。
@@ -21,7 +21,7 @@
 
 多企业版（镜像 tag 以 `multi-` 开头）让一套部署（一个 SSO、一个 Login、一个 Console 加 N 个 Proxy 副本）管理一个或多个 GitHub 企业。**不配置企业 registry 时只有一个企业 `default`，完全由环境变量合成，行为与单企业版相同。**
 
-| 对比项 | 多企业版 `multi-4922a4a-amd64-r2` | 单企业版 `single-slug-164cade-amd64-r4` |
+| 对比项 | 多企业版 `multi-f43f27e-amd64-r3` | 单企业版 `single-slug-164cade-amd64-r4` |
 | --- | --- | --- |
 | 只有一个企业时 | `default` 由环境变量定义，不需要 registry 文件 | 同样由环境变量定义 |
 | 以后添加企业 | 写 registry 文件，重启 Proxy、SSO、Login，新企业从 `draft` 激活即可；**不需要数据库迁移** | 先按 [升级指南](multi-enterprise-upgrade-guide.md) 原地升级到多企业版：四个镜像一次性替换、需要短暂停机、回滚只能靠备份 |
@@ -33,7 +33,7 @@
 验证范围：
 
 - 发布前资格测试只使用 mock 的 GitHub、GHE.com 和 Copilot，没有调用真实服务。**GHE.com 只用 mock 验证过**，首次接入真实 GHE.com 企业前请先在预发布环境验收。
-- 全新部署的镜像资格验证结果记录在 [多企业版发布验证记录](multi-enterprise-release-validation.md) 的 r2 部分。
+- 全新部署的镜像资格验证结果记录在 [多企业版发布验证记录](multi-enterprise-release-validation.md) 的 r3 部分（r2 部分有同样的全新部署验证）。
 - 本文的配置步骤另外用源码在本机核对过（SQLite，GitHub 与 Copilot 地址指向本机不可达端口，没有任何外部调用），核对内容见文末附录。这不等于镜像级或真实 GitHub 环境的验收。
 
 ## 2. 前提
@@ -44,12 +44,12 @@
 
 | 组件 | 按 digest 引用 |
 | --- | --- |
-| Proxy | `docker.io/linkinchow/ghcp-proxy@sha256:00453e3b81a3fea67ef05d4fce1e3def680dac96ae9ca288a85d1a77c74997b6` |
-| SSO | `docker.io/linkinchow/ghcp-sso@sha256:5b112760945fa5444d5720d48ddae5a4da9fa42ead08a8fa5715356395dcefe7` |
-| Login | `docker.io/linkinchow/ghcp-login@sha256:6a7e48f79a86a04a5343ad0e6c4ac9f294ddd87c772f36927f9bbb148ffe1d2e` |
-| Console | `docker.io/linkinchow/ghcp-console@sha256:a1605e6304597387e3e193223b01823d89b7a007d7e7bb5d8e44e236b97d3e2c` |
+| Proxy | `docker.io/linkinchow/ghcp-proxy@sha256:14ed9384f57a95c5cb4c1a5bd34d10d722d89d4e8ba9b3b49fcd6e32e41ad5f3` |
+| SSO | `docker.io/linkinchow/ghcp-sso@sha256:93e5be2c5fd8a9166cd67897c52466b833b9bbb12e2eede9dbe7700204b31214` |
+| Login | `docker.io/linkinchow/ghcp-login@sha256:96408b4fc3b0d0cd76083cc4bb8a1dcaf91ffa56152a8f7603caa1cc1a968338` |
+| Console | `docker.io/linkinchow/ghcp-console@sha256:6526394ff321ab15a4222423013689eb4959dc465dbec6262aa0a84ae267cc90` |
 
-对应 tag 均为 `multi-4922a4a-amd64-r2`（Docker Hub 公开仓库，无需登录即可拉取；没有 `latest`）。建议先同步到客户自己的镜像仓库，再按 digest 部署。镜像以 Tini 为 PID 1，**不要覆盖启动命令**（否则 SIGTERM 不会转发给 node）。
+对应 tag 均为 `multi-f43f27e-amd64-r3`（Docker Hub 公开仓库，无需登录即可拉取；没有 `latest`）。建议先同步到客户自己的镜像仓库，再按 digest 部署。镜像以 Tini 为 PID 1，**不要覆盖启动命令**（否则 SIGTERM 不会转发给 node）。
 
 ### 2.2 网络
 
@@ -117,7 +117,7 @@ GitHub 侧的完整操作（含截图）见 [配置手册](../guidance/guidance.
 1. DBA 用管理员账号执行**本版本源码**中的 `scripts/proxy-mysql-initial.sql`（全新空库用这个脚本；`scripts/proxy-mysql-enterprise-upgrade.sql` 只用于从 r4 升级）。注意：
    - 脚本开头是 `CREATE DATABASE IF NOT EXISTS ghcp_proxy;` 和 `USE ghcp_proxy;`。库名不同时，从注释 `-- If the database already exists, start here.` 之后开始、在自己的库上执行（例如私下复制一份并删除前面几行）。
    - 脚本用 `DELIMITER` 定义触发器，请用 `mysql` 命令行客户端执行。
-   - **会话字符集必须是 utf8mb4**。main 上的脚本开头已有 `SET NAMES utf8mb4`，会自动切换；r2 源码提交 `4922a4a` 中的脚本还没有这一行，用它时必须加客户端参数，例如 `mysql --default-character-set=utf8mb4 -h <主机> -u <管理员> -p < scripts/proxy-mysql-initial.sql`（对新脚本加上也无害）。部分客户端（包括官方 mysql 8.4 镜像自带的客户端）默认是 latin1 会话，这样建出的 CHECK 约束字面量带 `_latin1` 前缀，`MYSQL_AUTO_MIGRATE=false` 时 Proxy 会以 `Unsupported MySQL schema: proxy_enterprises check constraints` 拒绝启动。两个版本的脚本建出的表结构相同，都适用于 r2 镜像。
+   - **会话字符集必须是 utf8mb4**。r3 源码（`f43f27e`）和 main 上的脚本开头已有 `SET NAMES utf8mb4`，会自动切换；r2 源码提交 `4922a4a` 中的脚本还没有这一行，用它时必须加客户端参数，例如 `mysql --default-character-set=utf8mb4 -h <主机> -u <管理员> -p < scripts/proxy-mysql-initial.sql`（对新脚本加上也无害）。部分客户端（包括官方 mysql 8.4 镜像自带的客户端）默认是 latin1 会话，这样建出的 CHECK 约束字面量带 `_latin1` 前缀，`MYSQL_AUTO_MIGRATE=false` 时 Proxy 会以 `Unsupported MySQL schema: proxy_enterprises check constraints` 拒绝启动。两个版本的脚本建出的表结构相同，都适用于 r2 镜像。
 2. 运行账号只需要（与脚本头部注释一致）：
 
    ```sql
@@ -220,13 +220,13 @@ MySQL 下，`POOL_WARMUP_MODEL`、`PROVISIONAL_LEASE_TTL_SECONDS`、`PREWARM_POL
 ```yaml
 services:
   sso:
-    image: docker.io/linkinchow/ghcp-sso@sha256:5b112760945fa5444d5720d48ddae5a4da9fa42ead08a8fa5715356395dcefe7
+    image: docker.io/linkinchow/ghcp-sso@sha256:93e5be2c5fd8a9166cd67897c52466b833b9bbb12e2eede9dbe7700204b31214
   login:
-    image: docker.io/linkinchow/ghcp-login@sha256:6a7e48f79a86a04a5343ad0e6c4ac9f294ddd87c772f36927f9bbb148ffe1d2e
+    image: docker.io/linkinchow/ghcp-login@sha256:96408b4fc3b0d0cd76083cc4bb8a1dcaf91ffa56152a8f7603caa1cc1a968338
   proxy:
-    image: docker.io/linkinchow/ghcp-proxy@sha256:00453e3b81a3fea67ef05d4fce1e3def680dac96ae9ca288a85d1a77c74997b6
+    image: docker.io/linkinchow/ghcp-proxy@sha256:14ed9384f57a95c5cb4c1a5bd34d10d722d89d4e8ba9b3b49fcd6e32e41ad5f3
   console:
-    image: docker.io/linkinchow/ghcp-console@sha256:a1605e6304597387e3e193223b01823d89b7a007d7e7bb5d8e44e236b97d3e2c
+    image: docker.io/linkinchow/ghcp-console@sha256:6526394ff321ab15a4222423013689eb4959dc465dbec6262aa0a84ae267cc90
 ```
 
 先用 `docker pull <镜像@digest>` 拉取四个镜像（或从自己的仓库拉取），再用 `--no-build --pull never` 启动，确保运行的就是验收过的镜像。

@@ -11,7 +11,7 @@
 
 ## 多企业版：一套部署服务多个 GitHub 企业
 
-多企业版（镜像 tag 以 `multi-` 开头，当前发布 `multi-4922a4a-amd64-r2`）让**一套部署**——一个 SSO、一个 Login、一个 Console 加 N 个 Proxy 副本——同时管理多个 GitHub 企业。每个企业可以是 github.com 或 GHE.com（data residency），可在同一部署中混用；每个企业有自己的 slug、shortcode、SAML/SCIM、席位 PAT、SSO 登录页和 Models 管理员。
+多企业版（镜像 tag 以 `multi-` 开头，当前发布 `multi-f43f27e-amd64-r3`）让**一套部署**——一个 SSO、一个 Login、一个 Console 加 N 个 Proxy 副本——同时管理多个 GitHub 企业。每个企业可以是 github.com 或 GHE.com（data residency），可在同一部署中混用；每个企业有自己的 slug、shortcode、SAML/SCIM、席位 PAT、SSO 登录页和 Models 管理员。
 
 | 要点 | 说明 |
 | --- | --- |
@@ -21,7 +21,7 @@
 | SAML 地址 | `default` 保持根路径 `/sso`、`/metadata`，已有 GitHub IdP 配置不变；其他企业使用 `<SSO_PUBLIC_BASE_URL>/enterprises/<id>/sso` 和 `<SSO_PUBLIC_BASE_URL>/enterprises/<id>/metadata`。 |
 | 接口 | 公共推理接口（`/v1/*`、`/chat/completions`、`/responses`）不变，调用方不传企业；管理接口改为按企业作用域 `/api/enterprises/<id>/...`，见下文[调用 API](#调用-api)。 |
 | Console | 页头 **Enterprise** 选择器决定企业作用域页面显示哪个企业；它不是权限边界，所有 Console 管理员都能管理所有企业。 |
-| 镜像 | Docker Hub 公开仓库 `linkinchow/ghcp-{proxy,sso,login,console}:multi-4922a4a-amd64-r2`（linux/amd64）。四个组件必须同一版本，部署时按[升级指南](./docs/multi-enterprise-upgrade-guide.md)中的 digest 引用。 |
+| 镜像 | Docker Hub 公开仓库 `linkinchow/ghcp-{proxy,sso,login,console}:multi-f43f27e-amd64-r3`（linux/amd64）。四个组件必须同一版本，部署时按[升级指南](./docs/multi-enterprise-upgrade-guide.md)中的 digest 引用。 |
 | 验证范围 | GHE.com 企业**只用 mock 验证**（网页、设备授权、SCIM、席位、Copilot 均为 mock），尚未在真实 GHE.com 环境验收；首次接入真实 GHE.com 企业前请先在预发布环境验证。 |
 
 多企业版是独立的发布线；不需要多个企业的客户可以继续使用单企业版（`single-slug-*`）。**全新部署建议直接使用多企业版**：只有一个企业时不需要 registry，以后添加企业也不需要数据库迁移。文档：[新部署指南](./docs/multi-enterprise-new-deployment-guide.md) · [升级指南（r4 → 多企业版）](./docs/multi-enterprise-upgrade-guide.md) · [registry 配置参考](./docs/multi-enterprise-registry.md) · [设计文档](./docs/multi-enterprise-design.md) · [发布验证记录](./docs/multi-enterprise-release-validation.md)。
@@ -63,9 +63,9 @@ SSO / Login / Console → 同一个 Proxy Service
 
 | 当前部署与升级目标 | 对应指南或工具 |
 | --- | --- |
-| 没有现有部署，全新安装（单个或多个企业） | [多企业版新部署指南](./docs/multi-enterprise-new-deployment-guide.md)：使用 `multi-4922a4a-amd64-r2`，从一个企业（`default`）开始，以后按 registry 添加企业 |
+| 没有现有部署，全新安装（单个或多个企业） | [多企业版新部署指南](./docs/multi-enterprise-new-deployment-guide.md)：使用 `multi-f43f27e-amd64-r3`，从一个企业（`default`）开始，以后按 registry 添加企业 |
 | 单企业部署，升级到单企业版 r4（`single-slug-164cade-amd64-r4`） | [单企业版 r4 升级指南](./docs/user-pool-release-upgrade-guide.md)；SQLite 与 MySQL 均适用 |
-| 单企业版 r4（SQLite 或 MySQL），升级到多企业版（`multi-4922a4a-amd64-r2`） | [多企业版升级指南](./docs/multi-enterprise-upgrade-guide.md)：只支持从 r4 升级；四个组件一次性替换，首次升级需短暂停机；回滚只能恢复备份。升级完成并稳定后，再按 [registry 配置参考](./docs/multi-enterprise-registry.md) 添加企业 |
+| 单企业版 r4（SQLite 或 MySQL），升级到多企业版（`multi-f43f27e-amd64-r3`） | [多企业版升级指南](./docs/multi-enterprise-upgrade-guide.md)：只支持从 r4 升级；四个组件一次性替换，首次升级需短暂停机；回滚只能恢复备份。升级完成并稳定后，再按 [registry 配置参考](./docs/multi-enterprise-registry.md) 添加企业 |
 | 已使用 SQLite User Pool（`caller-lease`），升级到 MySQL 多副本 | [SQLite User Pool → MySQL 多副本升级指南](./docs/user-pool-mysql-upgrade-guide.md)，保留现有池成员和有效凭据，不重新开户 |
 | 使用普通 `direct` 模式，仅将账号数据库从 SQLite 迁到 MySQL | [direct 模式数据库迁移工具](./upgrade/sqlite-to-mysql/README.md)，不用于迁移 User Pool 表 |
 | 尚未启用 User Pool，希望在单 Proxy／SQLite 部署中启用账号池 | [单副本 User Pool 启用与升级指南](./docs/user-pool-upgrade-guide.md)；原 direct 账号不会自动成为池成员 |

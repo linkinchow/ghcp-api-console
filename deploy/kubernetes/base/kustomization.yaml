@@ -1,4 +1,4 @@
-# GHCP 多企业版 multi-4922a4a-amd64-r2 全新部署的 Kustomize base（四个服务 + 外部 MySQL）。
+# GHCP 多企业版 multi-f43f27e-amd64-r3 全新部署的 Kustomize base（四个服务 + 外部 MySQL）。
 # 不能单独 apply：企业变量（github.com / GHE.com）由 overlays/ 提供；所有 REPLACE_* 在私有副本中替换。
 # Secret 只按名称引用，值不在仓库里（见 ../secret.example.yaml 与 ../README.md）。
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -25,13 +25,13 @@ resources:
 images:
   - name: ghcp-proxy
     newName: docker.io/linkinchow/ghcp-proxy
-    digest: sha256:00453e3b81a3fea67ef05d4fce1e3def680dac96ae9ca288a85d1a77c74997b6
+    digest: sha256:14ed9384f57a95c5cb4c1a5bd34d10d722d89d4e8ba9b3b49fcd6e32e41ad5f3
   - name: ghcp-sso
     newName: docker.io/linkinchow/ghcp-sso
-    digest: sha256:5b112760945fa5444d5720d48ddae5a4da9fa42ead08a8fa5715356395dcefe7
+    digest: sha256:93e5be2c5fd8a9166cd67897c52466b833b9bbb12e2eede9dbe7700204b31214
   - name: ghcp-login
     newName: docker.io/linkinchow/ghcp-login
-    digest: sha256:6a7e48f79a86a04a5343ad0e6c4ac9f294ddd87c772f36927f9bbb148ffe1d2e
+    digest: sha256:96408b4fc3b0d0cd76083cc4bb8a1dcaf91ffa56152a8f7603caa1cc1a968338
   - name: ghcp-console
     newName: docker.io/linkinchow/ghcp-console
-    digest: sha256:a1605e6304597387e3e193223b01823d89b7a007d7e7bb5d8e44e236b97d3e2c
+    digest: sha256:6526394ff321ab15a4222423013689eb4959dc465dbec6262aa0a84ae267cc90
