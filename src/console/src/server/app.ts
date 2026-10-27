@@ -10,7 +10,8 @@ import { requireSameOrigin } from './sameOrigin.js';
 
 export function buildApp(): express.Express {
   const app = express();
-  app.use(express.json({ limit: '2mb' }));
+  // CVE-2026-111181 (body-parser < 2.4.0): compressed bodies get 415. Remove once body-parser >= 2.4.0 is available.
+  app.use(express.json({ limit: '2mb', inflate: false }));
   app.use(cookieSession({
     name: 'console_session',
     secret: config.sessionSecret,

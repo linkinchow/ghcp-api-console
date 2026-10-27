@@ -22,6 +22,8 @@
 | `multi-controller.mjs` | 本机回环 HTTP 控制器（端口 18821），通过 preview 工具启动，串行执行 prepare + run。 |
 | `idle-target-cap-check.mjs` | 独立检查：全局 `READY_IDLE_TARGET` 大于 `default` 企业上限（`POOL_MAX_ACCOUNTS`）时，候选 Proxy 能启动，设置 API 也接受更大的 `idle_target`（SQLite 无网络 + internal 网络上的一次性 MySQL）。可选 `RELEASE_QUALIFICATION_CONTROL_TAG` 指定旧的多企业标签作为对照（必须拒绝启动）。输入：`RELEASE_QUALIFICATION_PROJECT`、`RELEASE_QUALIFICATION_CANDIDATE_TAG`、`RELEASE_QUALIFICATION_MYSQL_IMAGE`、`RELEASE_QUALIFICATION_ISOLATED_SUBNET`；报告以 JSON 输出到 stdout；全部通过时只删除自己创建的容器、网络和卷，失败时停止并保留。 |
 
+| `shutdown-keepalive-check.mjs`、`shutdown-keepalive-fixture.mjs` | 独立检查：四个镜像在 `docker stop`（SIGTERM）时如何对待 keep-alive 连接（共享的 `src/packages/shared/src/shutdown.ts`），见下文“停止时的长连接检查”。 |
+
 `tests/docker-user-pool/mock-services.mjs` 按 `Host` 分发租户（设计 §9.5）：原有 `local-test`（github.com 形态）租户行为不变；`MOCK_GHE_TENANTS` 增加 GHE.com 租户（`contoso.ghe.com` 网页与设备流、`api.contoso.ghe.com` 的 SCIM/席位/`/user`、`copilot-api.contoso.ghe.com` 的 models/推理），每个租户独立的用户、席位、token、任务和计数，别的租户的凭据一律 401。GHE.com 句柄无后缀且不超过 30 字符；数字用户 ID 在每个租户都从 1001 开始（故意重复，覆盖 §6 的缓存键要求）。fake Login 同时支持 `/api/tasks`（单企业）和 `/api/enterprises/:id/tasks`（带作用域的回调 `/internal/enterprises/:id/...`）。设置 `MOCK_LOGIN_READINESS_URL=http://login:7003` 时，Proxy 经 `LOGIN_BASE_URL`（即 mock）读取的 `GET /internal/enterprises` 转发给真实 Login。`mysql-bridge.mjs` 的 mock 模式转发时保留原始 `Host`。`mock-services.tenants.test.mjs` 在本机子进程中验证这些行为（不需要 Docker）。
 
 ## 运行（单企业 single-slug）
@@ -154,6 +156,27 @@ RELEASE_QUALIFICATION_MODE=multi-fresh-dba node tests/image-release/qualificatio
 ### 步骤与断言（SQLite：`multi-fresh-sqlite` 23 条）
 
 preflight（4）→ fresh-start（健康、`releaseLine`、Proxy 01–05 / SSO 01–05 / Login 01–03、fail-closed trigger、三个库的企业表都只有 `default`，`GET /api/enterprises` 只列出 `default` 且 `pool: null`）→ fresh-console（3，同上）→ fresh-direct（作用域 API 建 SSO 用户并导入合成 OAuth token；`/v1/messages` JSON 与 SSE；统计行都是 `default`；旧 `/api/accounts` 带 `Deprecation: true`）→ fresh-scope（2）→ fresh-sso（3）→ fresh-runtime（1）→ fresh-stop（1）。
+
+## 停止时的长连接检查（`shutdown-keepalive-check.mjs`）
+
+验证共享的优雅停止在镜像里的实际行为（r3 修复的问题，背景见 `deploy/kubernetes/README.md` 第 10.1 节）。一个 internal 网络（显式子网）上运行候选的四个服务（SQLite 直连，环境与 `compose.yaml` 相同、凭据为合成值）、一个 mock（`shutdown-keepalive-fixture.mjs mock`：慢的 `/v1/messages` JSON；SSE 与 CSV 导出一直持续，直到客户端在 SIGTERM 之后调用 `/release`，再过 2 秒结束）和每个服务一个客户端容器（`shutdown-keepalive-fixture.mjs client`，原始 HTTP/1.1 套接字，能看到每个连接上的响应头、FIN 与 RST）。不发布端口，不构建、不拉取镜像，不访问任何外部地址。
+
+对每个服务，客户端先建立：A 一个空闲的 keep-alive 连接（约每秒发一个很短的请求，使它不会先触发服务的 5 秒 keep-alive 超时）；B 一个正在进行中的请求（JSON 请求体只上传了一半，响应头尚未发出：Proxy 为 `/v1/messages`，SSO 为作用域的建用户，Login 为取消不存在的任务（404），Console 为错误密码登录（401））；C 一个响应头已发出的流（Proxy 为 SSE，Console 为经 Console 转发的 CSV 导出；SSO、Login 没有流式接口，只检查 A、B）。然后执行 `docker stop -t 60`；编排脚本看到服务日志里的 `SIGTERM received, draining` 后在客户端容器里建一个标记文件，客户端随即新建连接 D、调用 mock 的 `/release`、补完 B 的请求体、等 C 结束。因此无论 Docker Desktop 多慢送达信号，SIGTERM 时 B 一定在进行中、C 一定在传输中。
+
+候选必须满足（每个服务分别断言）：A 立即被关闭（FIN 时间与服务日志中 draining 行的时间差在 -200 ms 到 1 秒之间，两者都取自 Docker Desktop VM 的时钟）；D 被拒绝（`ECONNREFUSED`）；B 的响应状态正确且带 `Connection: close`，响应结束后 1 秒内收到 FIN；C 在 SIGTERM 前已收到响应头、完整结束（SSE 的 `message_stop` / CSV 末行）且结束后 1 秒内收到 FIN；容器退出码 0、`docker stop` 用时小于 15 秒（排空时限 `SHUTDOWN_TIMEOUT_MS` 默认 25 秒），日志有 `shutdown complete`、没有 `closing their connections`。
+
+可选对照 `RELEASE_QUALIFICATION_CONTROL_TAG`（例如 `multi-4922a4a-amd64-r2`）必须表现出旧行为：B 的响应不带 `Connection: close`，连接保持打开并能在 SIGTERM 之后继续复用；C 结束后连接也能复用；直到 25 秒排空时限才以 `closing their connections` 强制关闭。这证明检查本身有区分能力。
+
+```bash
+export RELEASE_QUALIFICATION_PROJECT=ghcp-release-qualification-<唯一后缀>
+export RELEASE_QUALIFICATION_CANDIDATE_TAG=multi-<sha7>-amd64-r<N>
+export RELEASE_QUALIFICATION_CONTROL_TAG=multi-4922a4a-amd64-r2      # 可选
+export RELEASE_QUALIFICATION_ISOLATED_SUBNET=10.x.y.0/24             # 未使用的子网
+export RELEASE_QUALIFICATION_CERTS_DIR=<合成 IdP 证书目录>             # 只给 SSO 启动用
+node tests/image-release/shutdown-keepalive-check.mjs > report.json
+```
+
+报告（stdout 的 JSON）包含每个连接相对排空时刻的响应头时间、完成时间、FIN/错误时间，以及容器退出码、`docker stop` 用时和相关日志行。所有容器和网络都以 `<project>` 为前缀、带 `ghcp.qualification=<project>` 标签，结束后全部保持停止状态，不删除。
 
 ## 控制器（preview 工具）
 

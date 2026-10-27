@@ -12,7 +12,8 @@
 //
 // Every kubectl call passes --kubeconfig and --context explicitly. Only mocks and synthetic credentials are used:
 // GitHub, GHE.com, SCIM and Copilot are tests/docker-user-pool/mock-services.mjs inside the cluster; no request
-// leaves the machine. Images are the local r2 tags (byte-identical to the Docker Hub digests of the base).
+// leaves the machine. Images are local release tags loaded with `kind load docker-image` (never pulled); the
+// manifests' image names are replaced by the kind-shared overlay.
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes, X509Certificate } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -22,7 +23,7 @@ import { fileURLToPath } from 'node:url';
 import * as lib from '../image-release/qualification-multi-lib.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const TAG = 'multi-4922a4a-amd64-r2';
+const TAG = 'multi-f43f27e-amd64-r3'; // must match the newTag values in overlays/kind-shared
 const SERVICES = ['proxy', 'sso', 'login', 'console'];
 const PORTS = { proxy: 3000, sso: 7001, login: 7003, console: 7004 };
 const NODE_FIXTURE_SOURCE = lib.NODE_IMAGE;
@@ -35,6 +36,8 @@ const MOCK_URL = `http://ghcp-mock.${NS.mock}.svc.cluster.local:8002`;
 const MODEL = 'claude-opus-5-2';
 const PROTOCOLS = ['/v1/messages', '/chat/completions', '/responses'];
 const GHE_ENTITY = 'http://fixture.ghe.com:8002/enterprises/local-test';
+/** An old Proxy pod must go from SIGTERM to "shutdown complete" well within SHUTDOWN_TIMEOUT_MS (25 s). */
+const DRAIN_BOUND_MS = 5000;
 
 const cfg = {
   kubeconfig: process.env.KIND_E2E_KUBECONFIG ?? '',
@@ -728,13 +731,24 @@ async function proxyRollout(ns, connection) {
     const file = join(cfg.runDir, 'logs', `rollout-${connection}`, `${name}.log`);
     const text = existsSync(file) ? readFileSync(file, 'utf8') : '';
     // `kubectl logs --timestamps` prefixes each line with its RFC 3339 time.
-    const forcedCloseAt = text.split(/\r?\n/).filter((line) => line.includes('closing their connections'))
-      .map((line) => line.split(' ', 1)[0]);
+    const lines = text.split(/\r?\n/);
+    const at = (needle) => lines.filter((line) => line.includes(needle)).map((line) => line.split(' ', 1)[0]);
+    const forcedCloseAt = at('closing their connections');
+    const sigtermAt = at('received, draining in-flight requests')[0] ?? null;
+    const completeAt = at('shutdown complete')[0] ?? null;
     return { pod: name, old: names.includes(name), forcedClose: forcedCloseAt.length > 0, forcedCloseAt,
-      shutdownComplete: text.includes('shutdown complete'),
-      errors: text.split(/\r?\n/).filter((line) => /ERROR|WARN|failed/.test(line)).slice(0, 10) };
+      shutdownComplete: completeAt !== null, sigtermAt, completeAt,
+      drainMs: sigtermAt && completeAt ? Date.parse(completeAt) - Date.parse(sigtermAt) : null,
+      errors: lines.filter((line) => /ERROR|WARN|failed/.test(line)).slice(0, 10) };
   });
   return { names, rolloutMs, ...result, logs, lockWaitSamples };
+}
+
+/** A failed request's time relative to each old pod's SIGTERM, for the report if a client-side race ever shows up. */
+function failureTiming(run) {
+  const old = run.logs.filter((row) => row.old && row.sigtermAt);
+  return run.failures.map((failure) => ({ ...failure,
+    msAfterSigterm: Object.fromEntries(old.map((row) => [row.pod, Date.parse(failure.at) - Date.parse(row.sigtermAt)])) }));
 }
 
 async function restartChecks(P, ns) {
@@ -742,31 +756,29 @@ async function restartChecks(P, ns) {
   await sleep(2000);
   // A gateway-like client that reuses pooled connections (LiteLLM's HTTP client does).
   const pooled = await proxyRollout(ns, 'keep-alive');
-  const summary = (run) => ({ sent: run.sent, counts: run.counts, failures: run.failures, latencyMs: run.latencyMs,
+  const summary = (run) => ({ sent: run.sent, counts: run.counts, failures: failureTiming(run), latencyMs: run.latencyMs,
     rolloutMs: run.rolloutMs, oldPods: run.logs.filter((row) => row.old), lockWaitSamples: run.lockWaitSamples,
     buckets: run.buckets });
-  // Known product behavior (README section 10): the shared graceful shutdown never tells keep-alive clients to
-  // leave, so a busy pooled connection keeps a terminating Proxy serving until SHUTDOWN_TIMEOUT_MS, then the
-  // connection is force-closed and a request in flight on it fails at the TCP level. Such failures are accepted
-  // here only when they coincide (within 2 s) with an old pod's "closing their connections" log line; any other
-  // failure, or any HTTP error status, fails the assertion.
-  const forcedCloses = pooled.logs.filter((row) => row.old).flatMap((row) => row.forcedCloseAt ?? []);
-  const explained = (failure) => failure.status === 0
-    && forcedCloses.some((at) => Math.abs(Date.parse(failure.at) - Date.parse(at)) < 2000);
-  const unexplained = pooled.failures.filter((failure) => !explained(failure));
-  const knownResets = pooled.failures.length - unexplained.length;
-  if (knownResets) {
-    report.knownIssues = [...(report.knownIssues ?? []), { issue: 'keep-alive connection force-closed at the drain timeout',
-      resets: knownResets, sent: pooled.sent, forcedCloses }];
-  }
+  // Fixed in r3 (deploy/kubernetes/README.md section 10.1): while draining, the shared graceful shutdown closes each
+  // keep-alive connection after its current response (`Connection: close`, or FIN after a streamed response) and
+  // closes idle ones at once, so a pooled client moves to the new pods without errors. Zero failures are required for
+  // both clients, every old pod must finish its drain well before SHUTDOWN_TIMEOUT_MS (25 s) and none may log the
+  // force-close line. Failures are reported with their time relative to each old pod's SIGTERM; a request written
+  // exactly as the server closes an idle connection would show up here and must be investigated, not tolerated.
+  const drained = (run) => {
+    const old = run.logs.filter((row) => row.old);
+    return old.length === 2 && old.every((row) => row.shutdownComplete && !row.forcedClose
+      && row.drainMs !== null && row.drainMs < DRAIN_BOUND_MS);
+  };
   // Recorded without stopping the run, so the remaining checks still execute; any failure fails the report.
-  check(P, 'proxy_rollout_keepalive_client_only_known_drain_resets', (pooled.counts['200'] ?? 0) > 50
-    && pooled.failures.length === pooled.sent - (pooled.counts['200'] ?? 0) && unexplained.length === 0,
-  { ...summary(pooled), knownResets, unexplained }, { soft: true });
+  check(P, 'proxy_rollout_keepalive_client_zero_failures', (pooled.counts['200'] ?? 0) > 50
+    && pooled.counts['200'] === pooled.sent && pooled.failures.length === 0 && drained(pooled),
+  summary(pooled), { soft: true });
   // The same rollout with a new connection per request.
   const fresh = await proxyRollout(ns, 'close');
-  check(P, 'proxy_rollout_new_connections_all_succeed', (fresh.counts['200'] ?? 0) > 50 && fresh.counts['200'] === fresh.sent,
-    summary(fresh), { soft: true });
+  check(P, 'proxy_rollout_new_connections_zero_failures', (fresh.counts['200'] ?? 0) > 50
+    && fresh.counts['200'] === fresh.sent && fresh.failures.length === 0 && drained(fresh),
+  summary(fresh), { soft: true });
 
   const before = { proxy: [...pooled.names, ...fresh.names] };
   for (const service of ['sso', 'login', 'console']) {

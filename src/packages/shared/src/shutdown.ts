@@ -1,4 +1,4 @@
-import type { Server } from 'node:http';
+import type { Server, ServerResponse } from 'node:http';
 
 export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 25_000;
 /** Extra time for releasing storage after connections were force-closed, before a hard exit. */
@@ -38,7 +38,9 @@ export function readShutdownTimeoutMs(env: NodeJS.ProcessEnv = process.env): num
 
 /**
  * On SIGTERM/SIGINT: stop accepting connections, let in-flight requests finish, then release
- * resources and exit 0. Requests still running after `timeoutMs` have their connections closed.
+ * resources and exit 0. Keep-alive connections are closed as soon as their current response is done,
+ * so clients reconnect to another replica instead of reusing them until the drain timeout.
+ * Requests still running after `timeoutMs` have their connections closed.
  * A second signal, or a release that hangs, exits 1 immediately so the process never lingers
  * until the orchestrator sends SIGKILL.
  */
@@ -48,9 +50,25 @@ export function installGracefulShutdown(options: GracefulShutdownOptions): Grace
   const signals = options.signals ?? ['SIGTERM', 'SIGINT'];
   const exit = options.exit ?? ((code: number) => process.exit(code));
   let running: Promise<void> | undefined;
+  let draining = false;
+
+  // server.close() only closes connections that are idle at that moment. A client would keep reusing
+  // a busy one until the drain timeout force-closes it, so track responses to mark them at shutdown.
+  const inFlight = new Set<ServerResponse>();
+  server.prependListener('request', (_request, response) => {
+    if (draining) {
+      closeAfterResponse(response);
+      return;
+    }
+    inFlight.add(response);
+    response.once('close', () => inFlight.delete(response));
+  });
 
   const run = async (reason: string): Promise<void> => {
     console.log(`[${service}] ${reason} received, draining in-flight requests (up to ${timeoutMs} ms)`);
+    draining = true;
+    for (const response of inFlight) closeAfterResponse(response);
+    server.closeIdleConnections();
     try {
       onShutdownStart?.();
     } catch (error) {
@@ -109,6 +127,17 @@ export function installGracefulShutdown(options: GracefulShutdownOptions): Grace
       for (const [signal, handler] of handlers) process.removeListener(signal, handler);
     },
   };
+}
+
+/** Ends the connection once this response is complete, telling the client when headers are still unsent. */
+function closeAfterResponse(response: ServerResponse): void {
+  if (!response.headersSent) {
+    response.setHeader('Connection', 'close');
+    return;
+  }
+  // Captured now: the server detaches the socket from the response before later 'finish' listeners run.
+  const socket = response.socket;
+  response.once('finish', () => socket?.end());
 }
 
 function closeServer(server: Server): Promise<void> {

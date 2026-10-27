@@ -29,7 +29,8 @@ export function buildApp(): express.Express {
   const app = express();
   app.use(logRequestHeaders);
   app.use(captureRawRequestBody);
-  app.use(express.json({ limit: '20mb' }));
+  // CVE-2026-111181 (body-parser < 2.4.0): compressed bodies get 415. Remove once body-parser >= 2.4.0 is available.
+  app.use(express.json({ limit: '20mb', inflate: false }));
   app.get('/healthz', (_req, res) => {
     res.json({ status: 'ok', service: 'proxy', releaseLine: releaseLine() });
   });

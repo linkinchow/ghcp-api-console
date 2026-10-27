@@ -1,5 +1,6 @@
 # Test only (kind), shared by kind-ghe and kind-dba. Must come after components/network-policy.
-# - local r2 image tags instead of the Docker Hub digests (the cluster never pulls from Docker Hub);
+# - local candidate image tags (r3, not yet published) instead of the Docker Hub digests of the base
+#   (the cluster never pulls from Docker Hub; images are loaded with `kind load docker-image`);
 # - mock host names (hostAliases to the mock Service's fixed ClusterIP);
 # - network-policy placeholders: ghcp-e2e-caller plays LiteLLM and, without an Ingress controller in kind,
 #   the Ingress controller namespace; egress to the mock (port 8002) stands in for GitHub / Copilot on 443;
@@ -15,16 +16,16 @@ resources:
 images:
   - name: docker.io/linkinchow/ghcp-proxy
     newName: ghcp-release-proxy
-    newTag: multi-4922a4a-amd64-r2
+    newTag: multi-f43f27e-amd64-r3
   - name: docker.io/linkinchow/ghcp-sso
     newName: ghcp-release-sso
-    newTag: multi-4922a4a-amd64-r2
+    newTag: multi-f43f27e-amd64-r3
   - name: docker.io/linkinchow/ghcp-login
     newName: ghcp-release-login
-    newTag: multi-4922a4a-amd64-r2
+    newTag: multi-f43f27e-amd64-r3
   - name: docker.io/linkinchow/ghcp-console
     newName: ghcp-release-console
-    newTag: multi-4922a4a-amd64-r2
+    newTag: multi-f43f27e-amd64-r3
 
 patches:
   - path: mock-host-aliases.yaml

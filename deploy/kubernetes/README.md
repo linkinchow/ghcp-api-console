@@ -245,7 +245,7 @@ Proxy 只通过 ClusterIP Service 提供服务，不经 Ingress、不对最终�
 
 1. 读新版本的发布说明与升级指南：是否有数据库迁移、是否要求先停机（例如单企业 → 多企业那样的不兼容迁移必须 `Recreate` 并一次替换四个服务）。
 2. 备份：MySQL 做一致性备份（`mysqldump --single-transaction` 或托管服务的时间点还原）；SSO、Login、Console 的 PVC 做快照（CSI `VolumeSnapshot` / Azure Disk 快照）。一致的 SQLite 备份需要先把对应 Deployment 缩到 0（或用支持 SQLite 的备份方式）。同时保存当前的镜像 digest 和渲染出的清单。
-3. 在 base 或 overlay 的 `images:` 中换成新 digest，`kubectl apply -k`。Proxy 逐个替换，始终有就绪副本（kind 验证：每个新请求新建连接时全部成功；复用长连接的网关在旧 Pod 停止时可能有个别请求被断开，见第 10.1 节）；SSO、Login、Console 是 `Recreate`，各有几十秒不可用：期间新账号开户和 Console 暂停，已有调用方的推理不受影响。
+3. 在 base 或 overlay 的 `images:` 中换成新 digest，`kubectl apply -k`。Proxy 逐个替换，始终有就绪副本（kind 验证：每个新请求新建连接时全部成功；r2 上复用长连接的网关在旧 Pod 停止时可能有个别请求被断开，r3 已修复，见第 10.1 节）；SSO、Login、Console 是 `Recreate`，各有几十秒不可用：期间新账号开户和 Console 暂停，已有调用方的推理不受影响。
 4. `kubectl -n ghcp rollout status ...`，再按第 5 节第 4 步检查健康与日志。
 
 **回滚**：
@@ -274,7 +274,7 @@ Proxy 只通过 ClusterIP Service 提供服务，不经 Ingress、不对最终�
 | | 同一调用方 6 个请求（`/v1/messages`、`/chat/completions`、`/responses` × JSON / SSE）交替打到两个副本，全部落在同一成员；租约在两个副本上一致；第二个调用方拿到另一个成员；错误 `API_KEY` 401，非 hash 身份 403 | 通过 |
 | | SSO 根路径：`/metadata` 的 entityID 与证书正确，`/enterprises/default/metadata` 404；`/login` 错误密码 401、正确密码得到会话，`/sso` 返回 SAMLResponse，匿名重定向到 `/login` | 通过 |
 | | NetworkPolicy：其他 namespace 访问不到 Proxy（Pod IP 与 Service）、SSO、Console；LiteLLM 所在 namespace 访问不到 Login；Proxy 出站到其他 namespace 被拒；对照组（放行的路径）正常 | 通过 |
-| | Proxy 两次滚动更新期间持续经 Service 请求：复用长连接 755 个、每次新建连接 310 个，全部 200 | 通过（长连接见第 10.1 节：之前的运行中出现过 1/1271、1/669 的连接级失败） |
+| | Proxy 两次滚动更新期间持续经 Service 请求：复用长连接 755 个、每次新建连接 310 个，全部 200 | 通过（长连接见第 10.1 节：r2 之前的运行中出现过 1/1271、1/669 的连接级失败；r3 候选的重跑要求零失败并通过） |
 | | 7 个被替换的容器（4 个 Proxy、SSO、Login、Console）都以退出码 0（`Completed`）结束，删除请求后 9–12 秒退出 | 通过 |
 | | 重启后 Console 管理员仍可登录（`admins.json` 在 PVC 上），调用方仍落在原成员（租约在 MySQL） | 通过 |
 | | 删除 SSO、Login 的 Pod：新 Pod 绑定同一个 PV，SSO 用户、Login 任务数量不变，池用户仍能登录 SSO | 通过 |
@@ -289,7 +289,17 @@ Proxy 只通过 ClusterIP Service 提供服务，不经 Ingress、不对最终�
 
 ## 10. 已知限制
 
-### 10.1 Proxy 停止时不让长连接客户端离开（产品行为，未修改）
+### 10.1 Proxy 停止时不让长连接客户端离开（r2 的产品行为，r3 已修复）
+
+**r3（`multi-f43f27e-amd64-r3`，待发布）已修复**：`src/packages/shared/src/shutdown.ts`（提交 `3d6db1a`，四个服务共用）在排空期间让 SIGTERM 时正忙的 keep-alive 连接在当前响应结束后关闭（响应头尚未发出的加 `Connection: close`，已发出的如 SSE 在响应结束后关闭套接字），空闲连接立即关闭。验证方式：
+
+- kind（`tests/kubernetes/kind-e2e.mjs`，断言已收紧为零失败）：Proxy 滚动更新期间，复用长连接的客户端 739 个请求、每个请求新建连接的客户端 539 个请求全部 200；四个旧 Proxy Pod 从 SIGTERM 到 `shutdown complete` 用时 4–39 ms，没有 `closing their connections`。
+- 镜像级（`tests/image-release/shutdown-keepalive-check.mjs`，四个镜像各自 `docker stop`，r2 作对照，连续 3 次全部通过）：进行中的请求收到带 `Connection: close` 的完整响应后 0–3 ms 收到 FIN；已开始的 SSE / CSV 流完整结束后 1–16 ms 收到 FIN；空闲连接在 draining 日志后 1–13 ms 关闭；容器 1.2–4.1 秒以退出码 0 退出。r2 在同样条件下连接被继续复用约 24 秒，直到强制关闭。
+- 详细记录见 [多企业版发布验证记录](../../docs/multi-enterprise-release-validation.md) r3 第 4、5 节。
+
+仍有一个理论上的竞态：客户端恰好在服务器关闭空闲连接的瞬间写入新请求，会得到一个未收到任何响应的连接错误。上述验证中没有出现；稳妥起见，LiteLLM 可对这类错误重试（仓库示例配置为 `max_retries: 0`）。
+
+以下是 r2（当前清单中的 digest）的情况，升级到 r3 之前仍然适用。
 
 **现象**：Proxy 滚动更新（或节点排空）时，复用 keep-alive 长连接的网关（LiteLLM 的 HTTP 客户端就是这样）在旧 Pod 收到 SIGTERM 后仍持续通过原连接向它发送新请求，约 25 秒（`SHUTDOWN_TIMEOUT_MS`）后这些连接被强制关闭，此刻正在处理的请求以连接错误失败（客户端看到 `ECONNRESET` / socket closed）；如果是刚开始的 SSE 长流，会被截断。
 
@@ -301,9 +311,9 @@ Proxy 只通过 ClusterIP Service 提供服务，不经 Ingress、不对最终�
 
 **为什么清单改不了**：已建立的连接经 kube-proxy 的 conntrack 固定在旧 Pod 的 IP 上，与 Endpoint 摘除、readiness 无关；preStop 只推迟 SIGTERM，期间旧 Pod 照常服务这些连接；强制关闭由进程内的 `SHUTDOWN_TIMEOUT_MS` 计时决定，加大宽限期没有作用，加大 `SHUTDOWN_TIMEOUT_MS` 只是推迟。当前清单保证这一过程有界（10 + 25 + 5 < 45 秒）且进程以退出码 0 结束（kind 已验证）。
 
-**建议的产品修改（未实施，由产品负责人决定）**：在 `src/packages/shared/src/shutdown.ts` 开始停止时，让之后的每个响应带 `Connection: close`（例如 `server.prependListener('request', (_req, res) => res.setHeader('Connection', 'close'))`），并调用 `server.closeIdleConnections()`。这样每个连接在当前响应结束后就关闭，客户端经 Service 重连到其他就绪副本，排空在约一个请求的时间内完成。用上述 Node 实验验证：加上这两行后 `close()` 61 ms 后就排空完毕、没有强制关闭；不加时一直等到强制关闭。剩余一个很小的竞态（客户端恰好在连接被关闭的瞬间写入请求），需要客户端对“未收到任何响应的连接错误”重试；仓库的 LiteLLM 示例配置是 `max_retries: 0`，这一点需要一并评估。四个服务共用这段代码，SSO、Login、Console 同样受益。
+**当时建议的产品修改（已在 r3 以等价方式实施，见本节开头）**：在 `src/packages/shared/src/shutdown.ts` 开始停止时，让之后的每个响应带 `Connection: close`（例如 `server.prependListener('request', (_req, res) => res.setHeader('Connection', 'close'))`），并调用 `server.closeIdleConnections()`。这样每个连接在当前响应结束后就关闭，客户端经 Service 重连到其他就绪副本，排空在约一个请求的时间内完成。用上述 Node 实验验证：加上这两行后 `close()` 61 ms 后就排空完毕、没有强制关闭；不加时一直等到强制关闭。剩余一个很小的竞态（客户端恰好在连接被关闭的瞬间写入请求），需要客户端对“未收到任何响应的连接错误”重试；仓库的 LiteLLM 示例配置是 `max_retries: 0`，这一点需要一并评估。四个服务共用这段代码，SSO、Login、Console 同样受益。
 
-在修改之前：把 Proxy 的滚动更新放在低峰期；预期每次滚动有极少量请求失败。
+仍在 r2 上时：把 Proxy 的滚动更新放在低峰期；预期每次滚动有极少量请求失败。
 
 ### 10.2 其他
 

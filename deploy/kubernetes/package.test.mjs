@@ -369,7 +369,7 @@ test('test overlays render with local images and keep the customer invariants', 
     const { objects } = render(path.join(root, 'tests/kubernetes/overlays', overlay));
     for (const service of Object.keys(DIGESTS)) {
       for (const container of podSpec(objects, service).containers) {
-        assert.equal(container.image, `ghcp-release-${service}:multi-4922a4a-amd64-r2`);
+        assert.equal(container.image, `ghcp-release-${service}:multi-f43f27e-amd64-r3`);
       }
       assert.equal(podSpec(objects, service).terminationGracePeriodSeconds, 45);
     }
