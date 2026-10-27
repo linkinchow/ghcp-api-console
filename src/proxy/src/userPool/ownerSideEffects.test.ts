@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import type Database from 'better-sqlite3';
 import { createPool, type Pool, type PoolConnection, type RowDataPacket } from 'mysql2/promise';
 import type { LoginTaskDto, SsoUserDto } from '@ghcp/shared';
@@ -47,7 +48,9 @@ const { SqliteStorage, MysqlStorage, PrewarmWorker, realProvisioner } = applicat
 const options: PoolConfig = {
   enabled: true, accountDomain: ACCOUNT_DOMAIN, idleTarget: 1, maxAccounts: 1,
   leaseSeconds: 600, provisionalSeconds: 30, pollMs: 1000, prewarmConcurrency: 1,
-  loginMaxPending: 1, retryAfterSeconds: 1, warmupModel: 'synthetic-model', requestTimeoutMs: 5000,
+  // The production default. It is also the step deadline: a slow but successful step must
+  // not turn into provision_timeout and a 30-second backoff on a loaded host.
+  loginMaxPending: 1, retryAfterSeconds: 1, warmupModel: 'synthetic-model', requestTimeoutMs: 120000,
 };
 const createdAt = '2026-01-01T00:00:00.000Z';
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
@@ -59,6 +62,12 @@ const stages = {
   seat: { before: 'scim-synced', intent: 'seat-assigning', after: 'synced' },
   login: { before: 'oauth-starting', intent: 'oauth-dispatch', after: 'oauth-wait' },
 } as const;
+// Hang guards only: every wait below observes an event or a stored state, never elapsed time.
+const WAIT_MS = 60000;
+// The scheduler's clock is the database's, and it is not monotonic: Docker Desktop's VM
+// clock steps back by hundreds of milliseconds when it resynchronizes. Expire a lease
+// far enough in the past that such a step cannot make it current again.
+const EXPIRED_MS = 60000;
 
 function gate() {
   let enter!: () => void, release!: () => void;
@@ -70,7 +79,7 @@ async function bounded<T>(work: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([work, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Owner-side-effect barrier did not settle')), 8000);
+      timer = setTimeout(() => reject(new Error('Owner-side-effect barrier did not settle')), WAIT_MS);
     })]);
   } finally { clearTimeout(timer); }
 }
@@ -133,7 +142,7 @@ async function withDatabase(driver: 'SQLite' | 'MySQL', run: (f: Fixture) => Pro
         owner: async () => (db.prepare('SELECT owner FROM user_pool_settings WHERE id=1').get() as { owner: string | null }).owner,
         expire: async owner => {
           assert.equal(db.prepare('UPDATE user_pool_settings SET owner_until=? WHERE id=1 AND owner=?')
-            .run(first.now() - 1, owner).changes, 1);
+            .run(first.now() - EXPIRED_MS, owner).changes, 1);
         },
         snapshot: async () => ({
           accounts: db.prepare('SELECT * FROM user_pool_accounts ORDER BY identity').all(),
@@ -174,7 +183,7 @@ async function withDatabase(driver: 'SQLite' | 'MySQL', run: (f: Fixture) => Pro
       owner: async () => (await db.query<RowDataPacket[]>('SELECT owner FROM user_pool_settings WHERE id=1'))[0][0].owner,
       expire: async owner => {
         const [result] = await db.query<import('mysql2/promise').ResultSetHeader>(`UPDATE user_pool_settings
-          SET owner_until=(TIMESTAMPDIFF(MICROSECOND,'1970-01-01',UTC_TIMESTAMP(3)) DIV 1000)-1 WHERE id=1 AND owner=?`, [owner]);
+          SET owner_until=(TIMESTAMPDIFF(MICROSECOND,'1970-01-01',UTC_TIMESTAMP(3)) DIV 1000)-? WHERE id=1 AND owner=?`, [EXPIRED_MS, owner]);
         assert.equal(result.affectedRows, 1);
       },
       snapshot: async () => {
@@ -327,17 +336,45 @@ async function contract(f: Fixture, target: Stage, timing: Timing, observable = 
     await bounded(worker.tick()); await worker.waitForObservations();
     assert.deepEqual(service.errors, [], 'mock assertion/unexpected HTTP failures must not be swallowed by worker');
   };
+  // A tick runs only accounts already due by the DATABASE clock (retry_at <= now). After
+  // that clock steps back, a just-checkpointed account is briefly not due and a tick
+  // launches no step and changes no account. Repeat such ticks until the worker really
+  // runs a step, so each call is still exactly one adapter step, never "a tick happened".
+  const stepOnce = async (worker: InstanceType<typeof PrewarmWorker>) => {
+    const deadline = performance.now() + WAIT_MS;
+    for (const launched = service.steps.length; ; await delay(10)) {
+      await tick(worker);
+      if (service.steps.length !== launched) {
+        assert.equal(service.steps.length, launched + 1); return;
+      }
+      if (performance.now() >= deadline) {
+        const rows = (await f.storage.listAccounts(DEFAULT_ENTERPRISE_ID)).items;
+        const row = rows.length === 1 ? await f.first.inventory(rows[0].identity) : undefined;
+        assert.fail(`worker never ran a step for the account: ${JSON.stringify({ rows: rows.length, stage: row?.stage,
+          state: row?.state, attempts: row?.attempts, last_error: row?.last_error, retry_at: row?.retry_at, now: await f.first.now() })}`);
+      }
+    }
+  };
   try {
     assert.equal((await f.first.counts()).total, 0, 'start empty: no fixture Ready rows or direct stage seeding');
     if (target !== 'sso') {
       for (let i = 0; i < 6; i++) {
-        await tick(old);
+        await stepOnce(old);
         if ((await service.read()).stage === stages[target].before) break;
       }
       assert.equal((await service.read()).stage, stages[target].before);
     }
-    oldTick = old.tick();
-    await bounded(timing === 'http-response' ? service.barrier.entered : updateBarrier.entered);
+    // The withheld tick must be the one whose step reaches the barrier. Only a tick that
+    // launched no step (account not yet due) settles first and is repeated.
+    for (const deadline = performance.now() + WAIT_MS; ; await delay(10)) {
+      const launched = service.steps.length;
+      oldTick = old.tick();
+      const entered = timing === 'http-response' ? service.barrier.entered : updateBarrier.entered;
+      if (await bounded(Promise.race([entered.then(() => true), oldTick.then(() => false)]))) break;
+      assert.equal(service.steps.length, launched, 'old owner ran a step that bypassed the withheld effect');
+      assert.deepEqual(service.errors, []);
+      assert.ok(performance.now() < deadline, 'old owner never ran a step for the due account');
+    }
     const held = await service.read(), ownerA = await f.owner();
     assert.ok(ownerA); assert.equal(held.stage, stages[target].intent);
     assert.equal(held.state, 'provisioning'); assert.equal(held.attempts, 0); assert.equal(held.last_error, null);
@@ -354,7 +391,7 @@ async function contract(f: Fixture, target: Stage, timing: Timing, observable = 
     await f.expire(ownerA);
     assert.equal(await f.owner(), ownerA);
     assert.equal(await f.first.renewOwner(ownerA), false, 'expired UUID cannot resurrect its lease');
-    await tick(successor);
+    await stepOnce(successor);
     const ownerB = await f.owner(); assert.ok(ownerB); assert.notEqual(ownerB, ownerA);
     const recovered = await service.read();
     assert.deepEqual(service.posts, postsAtBarrier, 'successor recovery is read-only externally, with no replayed POST');
@@ -409,7 +446,7 @@ async function contract(f: Fixture, target: Stage, timing: Timing, observable = 
     if (observable && target !== 'sso') {
       // Finish normal real steps, then send the original Login callback through
       // the real storage nonce predicate (not an in-memory account fake).
-      for (let i = 0; i < 6 && (await service.read()).stage !== 'oauth-wait'; i++) await tick(successor);
+      for (let i = 0; i < 6 && (await service.read()).stage !== 'oauth-wait'; i++) await stepOnce(successor);
       const waiting = await service.read(); assert.equal(waiting.stage, 'oauth-wait');
       const task = service.tasks[0]; assert.ok(task.oauthAttemptId);
       assert.equal(task.oauthAttemptId, waiting.oauth_attempt_id);
@@ -418,8 +455,8 @@ async function contract(f: Fixture, target: Stage, timing: Timing, observable = 
       assert.deepEqual(await f.snapshot(), beforeCallback);
       assert.ok(await f.storage.saveCopilotOauthToken(waiting.identity, task.oauthAttemptId, 'synthetic-original-token', task.ghLogin));
       task.status = 'success';
-      await tick(successor); assert.equal((await service.read()).stage, 'warmup');
-      await tick(successor);
+      await stepOnce(successor); assert.equal((await service.read()).stage, 'warmup');
+      await stepOnce(successor);
       const ready = await service.read(), account = await f.storage.getAccount(ready.identity);
       assert.equal(ready.state, 'ready'); assert.equal(ready.stage, 'ready'); assert.equal(ready.attempts, 0);
       assert.ok(ready.verified_at); assert.equal(ready.attempt_id, held.attempt_id); assert.equal(ready.sso_created_at, createdAt);
@@ -458,11 +495,11 @@ for (const driver of ['SQLite', 'MySQL'] as const) {
   for (const target of ['sso', 'scim', 'seat', 'login'] as const) {
     for (const timing of ['http-response', 'store-update'] as const) {
       test(`${driver}: ${target} committed, ${timing} withheld, successor recovers before old owner drains`,
-        { skip, timeout: 30000 }, () => withDatabase(driver, f => contract(f, target, timing)));
+        { skip, timeout: 300000 }, () => withDatabase(driver, f => contract(f, target, timing)));
     }
   }
   for (const target of ['scim', 'seat', 'login'] as const) {
     test(`${driver}: ${target} effect not observable after owner loss stays unconfirmed without another POST`,
-      { skip, timeout: 30000 }, () => withDatabase(driver, f => contract(f, target, 'http-response', false)));
+      { skip, timeout: 300000 }, () => withDatabase(driver, f => contract(f, target, 'http-response', false)));
   }
 }
