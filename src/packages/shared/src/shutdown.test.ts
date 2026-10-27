@@ -18,12 +18,20 @@ function recorder() {
 test('lets an in-flight request finish before releasing resources and exiting 0', async () => {
   const { events, exitCodes, exit } = recorder();
   let finishRequest!: () => void;
+  let received!: () => void;
+  const requestReceived = new Promise<void>((resolve) => { received = resolve; });
   const server = createServer((_req, res) => {
+    // Server-side order: the response is closed with the connection right after it is written, so the client may
+    // read it only after `release` ran; what must hold is that the response was complete before resources go.
+    res.once('finish', () => { events.push('response:finished'); });
     finishRequest = () => res.end('done');
+    received();
   });
   const url = await listen(server);
-  const response = fetch(url).then(async (r) => { events.push(`response:${await r.text()}`); });
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  let body = '';
+  const response = fetch(url).then(async (r) => { body = await r.text(); });
+  // In flight means the server has the request; a fixed delay raced with connection setup under load.
+  await requestReceived;
 
   const shutdown = installGracefulShutdown({
     server, service: 'test', signals: [], timeoutMs: 5_000, exit,
@@ -33,7 +41,8 @@ test('lets an in-flight request finish before releasing resources and exiting 0'
   setTimeout(() => finishRequest(), 20);
   await Promise.all([shutdown, response]);
 
-  assert.deepEqual(events, ['start', 'response:done', 'release']);
+  assert.deepEqual(events, ['start', 'response:finished', 'release']);
+  assert.equal(body, 'done');
   assert.deepEqual(exitCodes, [0]);
 });
 
@@ -47,14 +56,17 @@ function keepAliveGet(url: string, agent: Agent): Promise<IncomingMessage> {
 test('a keep-alive connection busy at shutdown is closed after its response, not at the timeout', async () => {
   const { exitCodes, exit } = recorder();
   let finishRequest!: () => void;
+  let received!: () => void;
+  const requestReceived = new Promise<void>((resolve) => { received = resolve; });
   const server = createServer((_req, res) => {
     finishRequest = () => res.end('done');
+    received();
   });
   const url = await listen(server);
   const handle = installGracefulShutdown({ server, service: 'test', signals: [], timeoutMs: 5_000, exit });
   const agent = new Agent({ keepAlive: true });
   const pending = keepAliveGet(url, agent);
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await requestReceived;
 
   const started = Date.now();
   const shutdown = handle.shutdown('SIGTERM');
