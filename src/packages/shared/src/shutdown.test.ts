@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createServer, type Server } from 'node:http';
+import { Agent, createServer, request, type IncomingMessage, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import test from 'node:test';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, installGracefulShutdown, readShutdownTimeoutMs } from './shutdown.js';
@@ -35,6 +35,65 @@ test('lets an in-flight request finish before releasing resources and exiting 0'
 
   assert.deepEqual(events, ['start', 'response:done', 'release']);
   assert.deepEqual(exitCodes, [0]);
+});
+
+/** A keep-alive GET whose connection the test can observe; resolves once headers arrive. */
+function keepAliveGet(url: string, agent: Agent): Promise<IncomingMessage> {
+  return new Promise((resolve, reject) => {
+    request(url, { agent }, resolve).on('error', reject).end();
+  });
+}
+
+test('a keep-alive connection busy at shutdown is closed after its response, not at the timeout', async () => {
+  const { exitCodes, exit } = recorder();
+  let finishRequest!: () => void;
+  const server = createServer((_req, res) => {
+    finishRequest = () => res.end('done');
+  });
+  const url = await listen(server);
+  const handle = installGracefulShutdown({ server, service: 'test', signals: [], timeoutMs: 5_000, exit });
+  const agent = new Agent({ keepAlive: true });
+  const pending = keepAliveGet(url, agent);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const started = Date.now();
+  const shutdown = handle.shutdown('SIGTERM');
+  finishRequest();
+  const response = await pending;
+  const socketClosed = new Promise((resolve) => response.socket.once('close', resolve));
+  response.resume();
+  await Promise.all([shutdown, socketClosed]);
+
+  assert.equal(response.headers.connection, 'close');
+  assert.ok(Date.now() - started < 1_000, 'drained without waiting for the timeout');
+  assert.deepEqual(exitCodes, [0]);
+  agent.destroy();
+});
+
+test('a streaming response already sent at shutdown ends its connection when it finishes', async () => {
+  const { exitCodes, exit } = recorder();
+  let finishStream!: () => void;
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.write('event: ping\n\n');
+    finishStream = () => res.end('event: done\n\n');
+  });
+  const url = await listen(server);
+  const handle = installGracefulShutdown({ server, service: 'test', signals: [], timeoutMs: 5_000, exit });
+  const agent = new Agent({ keepAlive: true });
+  const response = await keepAliveGet(url, agent);
+  const socketClosed = new Promise((resolve) => response.socket.once('close', resolve));
+  response.resume();
+
+  const started = Date.now();
+  const shutdown = handle.shutdown('SIGTERM');
+  setTimeout(() => finishStream(), 20);
+  await Promise.all([shutdown, socketClosed]);
+
+  assert.notEqual(response.headers.connection, 'close', 'headers were sent before shutdown');
+  assert.ok(Date.now() - started < 1_000, 'drained without waiting for the timeout');
+  assert.deepEqual(exitCodes, [0]);
+  agent.destroy();
 });
 
 test('closes connections that outlive the timeout, such as an open SSE stream', async () => {
