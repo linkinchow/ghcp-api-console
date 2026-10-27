@@ -1,5 +1,5 @@
 # Test only (kind): the customer ghe-com overlay + network-policy component, pointed at the in-cluster mock.
-# Images are the local r2 tags loaded with `kind load` (byte-identical to the Docker Hub digests of the base).
+# Images are the local release tags of overlays/kind-shared (r3 candidate), loaded with `kind load docker-image`.
 # GHCP_CONFIG_APPROVED stays BLOCKED here on purpose: kind-e2e.mjs first checks the gate, then approves.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
