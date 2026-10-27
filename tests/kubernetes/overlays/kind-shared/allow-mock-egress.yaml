@@ -1,0 +1,21 @@
+# Test only: the mock (namespace ghcp-e2e-mock, port 8002) stands in for GitHub / Copilot, which the product
+# policies allow on public addresses, port 443. Additive to the component's policies; nothing else is opened.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ghcp-test-allow-mock-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: [ghcp-proxy, ghcp-sso, ghcp-login]
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ghcp-e2e-mock
+      ports:
+        - protocol: TCP
+          port: 8002

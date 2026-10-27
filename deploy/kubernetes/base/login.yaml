@@ -1,0 +1,191 @@
+# Login：无头 Chromium 完成 GitHub Device Flow 与企业 SSO 登录。任务在 SQLite（/data），只能单实例。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ghcp-login
+  labels:
+    app.kubernetes.io/name: ghcp-login
+    app.kubernetes.io/component: login
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ghcp-login
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ghcp-login
+        app.kubernetes.io/component: login
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      # SSO_PUBLIC_BASE_URL 是集群外的主机名（例如 Ingress）时，Login Pod 也必须能解析并访问它：
+      # 依赖集群 DNS，或在 overlay 中补 hostAliases 指向 Ingress 的内网地址。
+      initContainers:
+        - name: require-approved-config
+          image: ghcp-login
+          imagePullPolicy: IfNotPresent
+          command:
+            - node
+            - -e
+            - >-
+              const bad = Object.keys(process.env).filter((k) => String(process.env[k]).includes('REPLACE_')).sort();
+              if (bad.length) { console.error('[config-gate] placeholders not replaced: ' + bad.join(', ')); process.exit(1); }
+              if (process.env.GHCP_CONFIG_APPROVED !== 'true') {
+              console.error('[config-gate] GHCP_CONFIG_APPROVED is not "true": review the configuration first (deploy/kubernetes/README.md)');
+              process.exit(1); }
+              console.log('[config-gate] configuration approved');
+          envFrom: &loginEnvFrom
+            - configMapRef:
+                name: ghcp-common
+            - configMapRef:
+                name: ghcp-enterprise
+            - configMapRef:
+                name: ghcp-login-config
+          env: &loginEnv
+            # `default` 企业的 SSO 登录页：与 SSO 的 BASE_URL 同源，浏览器只在这里填写 SSO 密码。
+            - name: SSO_URL
+              value: $(SSO_PUBLIC_BASE_URL)/login
+            - name: INTERNAL_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ghcp-internal
+                  key: INTERNAL_API_TOKEN
+          terminationMessagePolicy: FallbackToLogsOnError
+          securityContext: &restricted
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      containers:
+        - name: login
+          image: ghcp-login
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 7003
+          envFrom: *loginEnvFrom
+          env: *loginEnv
+          securityContext: *restricted
+          # 默认 Login 并发 1（Console 的 Login Settings 可调到 20）。每个并发浏览器约需 300–500 MiB，
+          # 调高并发时同步调高 memory limit；/dev/shm（内存卷）也计入内存限额。
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            timeoutSeconds: 5
+            periodSeconds: 15
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              exec:
+                command: [node, -e, "setTimeout(() => {}, 10000)"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: logs
+              mountPath: /logs
+            - name: dshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: ghcp-login-data
+        - name: logs
+          persistentVolumeClaim:
+            claimName: ghcp-login-logs
+        # 容器默认 /dev/shm 只有 64 MiB，Chromium 渲染页面时会崩溃。
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Mi
+        # Chromium 的用户数据目录、HOME（见 ghcp-login-config）与临时文件。
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ghcp-login
+  labels:
+    app.kubernetes.io/name: ghcp-login
+    app.kubernetes.io/component: login
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ghcp-login
+  ports:
+    - name: http
+      port: 7003
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ghcp-login-data
+  labels:
+    app.kubernetes.io/name: ghcp-login
+    app.kubernetes.io/component: login
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+# 按账号的登录日志（LOG_DIR）与调试产物（AUTH_DEBUG_ARTIFACT_DIR，含敏感内容，默认关闭）。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ghcp-login-logs
+  labels:
+    app.kubernetes.io/name: ghcp-login
+    app.kubernetes.io/component: login
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi

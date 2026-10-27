@@ -1,0 +1,226 @@
+# 本应用所有 Pod：默认拒绝入站和出站。kubelet 的探测来自节点本身，常见 CNI 不受 NetworkPolicy 限制。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ghcp-default-deny
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: ghcp
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ghcp-allow-dns
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: ghcp
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Proxy：入站只来自 LiteLLM 和本应用的 SSO、Login、Console；出站到 SSO、Login、MySQL 和 GitHub / Copilot（443）。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ghcp-proxy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ghcp-proxy
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        # LiteLLM 所在的 namespace 与 Pod 标签（同一 namespace 时填本应用的 namespace）。
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: REPLACE_LITELLM_NAMESPACE
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: REPLACE_LITELLM_APP_LABEL
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: [ghcp-sso, ghcp-login, ghcp-console]
+      ports:
+        - protocol: TCP
+          port: 3000
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ghcp-sso
+      ports:
+        - protocol: TCP
+          port: 7001
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ghcp-login
+      ports:
+        - protocol: TCP
+          port: 7003
+    # 外部 MySQL 写主库：替换为实际地址段（示例 192.0.2.10/32 是文档保留地址，不可达）。
+    # Azure Database for MySQL 私有访问时为其所在子网或私有终结点地址。
+    - to:
+        - ipBlock:
+            cidr: 192.0.2.10/32
+      ports:
+        - protocol: TCP
+          port: 3306
+    # GitHub REST API、Copilot API：非私网地址的 443。也排除云元数据地址 169.254.0.0/16。
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16]
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# SSO：入站来自 Proxy、Login、Console，以及 Ingress 控制器（管理员浏览器、Login 的 Chromium 经 Ingress 访问时）。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ghcp-sso
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ghcp-sso
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: [ghcp-proxy, ghcp-login, ghcp-console]
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: REPLACE_INGRESS_NAMESPACE
+      ports:
+        - protocol: TCP
+          port: 7001
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ghcp-proxy
+      ports:
+        - protocol: TCP
+          port: 3000
+    # SCIM、Copilot 席位、AI Credits（GitHub REST API）。
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16]
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# Login：入站来自 Proxy、Console；出站到 Proxy（回传 token）、SSO（直接或经 Ingress）和 GitHub 网页（443）。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ghcp-login
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ghcp-login
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: [ghcp-proxy, ghcp-console]
+      ports:
+        - protocol: TCP
+          port: 7003
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ghcp-proxy
+      ports:
+        - protocol: TCP
+          port: 3000
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ghcp-sso
+      ports:
+        - protocol: TCP
+          port: 7001
+    # SSO_PUBLIC_BASE_URL 指向集群内 Ingress 控制器时，Chromium 经它访问 SSO。
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: REPLACE_INGRESS_NAMESPACE
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16]
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# Console：入站只来自内部 Ingress 控制器；出站到 Proxy、SSO、Login。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ghcp-console
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ghcp-console
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: REPLACE_INTERNAL_INGRESS_NAMESPACE
+      ports:
+        - protocol: TCP
+          port: 7004
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ghcp-proxy
+      ports:
+        - protocol: TCP
+          port: 3000
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ghcp-sso
+      ports:
+        - protocol: TCP
+          port: 7001
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ghcp-login
+      ports:
+        - protocol: TCP
+          port: 7003

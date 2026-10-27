@@ -1,0 +1,46 @@
+# github.com mode (GITHUB_BASE_URL is not *.ghe.com) with every GitHub / Copilot URL on the in-cluster mock.
+# This private-copy stand-in is already reviewed, so the start gate is approved.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-common
+data:
+  GHCP_CONFIG_APPROVED: "true"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-enterprise
+data:
+  ENTERPRISE_SLUG: local-test
+  ENTERPRISE_SHORTCODE: test
+  # Overrides the ingress-sso component: kind has no Ingress controller, so browsers use the Service directly.
+  SSO_PUBLIC_BASE_URL: http://ghcp-sso.ghcp-e2e-dba.svc.cluster.local:7001
+  GITHUB_BASE_URL: http://ghcp-mock.ghcp-e2e-mock.svc.cluster.local:8002
+  GITHUB_API_BASE_URL: http://ghcp-mock.ghcp-e2e-mock.svc.cluster.local:8002
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-proxy-config
+data:
+  POOL_ACCOUNT_EMAIL_DOMAIN: pool.kind.example.test
+  POOL_WARMUP_MODEL: claude-opus-5-2
+  COPILOT_API_BASE_URL: http://ghcp-mock.ghcp-e2e-mock.svc.cluster.local:8002
+  POOL_EXHAUSTED_RETRY_AFTER_SECONDS: "7"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-sso-config
+data:
+  SP_ENTITY_ID: http://ghcp-mock.ghcp-e2e-mock.svc.cluster.local:8002/enterprises/local-test
+  SP_ACS_URL: http://ghcp-mock.ghcp-e2e-mock.svc.cluster.local:8002/enterprises/local-test/saml/consume
+  SCIM_BASE_URL: http://ghcp-mock.ghcp-e2e-mock.svc.cluster.local:8002/scim/v2/enterprises/local-test
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-console-config
+data:
+  CONSOLE_PUBLIC_BASE_URL: https://console.kind.invalid

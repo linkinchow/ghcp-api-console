@@ -1,0 +1,24 @@
+# github.com 上的 EMU 企业。复制本目录到私有仓库，替换 REPLACE_*，按需启用下面的组件。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 应用所在的 namespace（需先创建）。
+namespace: ghcp
+
+resources:
+  - ../../base
+
+# 可选组件，按需取消注释（说明见 ../../README.md 第 6 节）：
+# components:
+#   - ../../components/ingress-sso       # SSO 经 Ingress 对浏览器开放（SAML 必需的可达性）
+#   - ../../components/ingress-console   # Console 只经内部 Ingress 开放
+#   - ../../components/mysql-dba-schema  # DBA 预建表，MYSQL_AUTO_MIGRATE=false
+#   - ../../components/network-policy    # 默认拒绝 + 最小放行
+
+patches:
+  - path: enterprise.yaml
+
+# 镜像已同步到自己的仓库时（digest 保持不变）：
+# images:
+#   - name: docker.io/linkinchow/ghcp-proxy
+#     newName: registry.example.com/ghcp/ghcp-proxy

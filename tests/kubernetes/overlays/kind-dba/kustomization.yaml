@@ -1,0 +1,35 @@
+# Test only (kind): the customer github-com overlay with every optional component (Ingress for SSO and Console,
+# DBA-managed schema with MYSQL_AUTO_MIGRATE=false, network policies). github.com mode, but every GitHub and
+# Copilot URL points at the in-cluster mock; the pool stays at Ready idle target 0, so nothing is provisioned.
+# kind has no Ingress controller: the Ingress objects are only accepted by the API server, not served.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ghcp-e2e-dba
+
+resources:
+  - ../../../../deploy/kubernetes/overlays/github-com
+
+components:
+  - ../../../../deploy/kubernetes/components/ingress-sso
+  - ../../../../deploy/kubernetes/components/ingress-console
+  - ../../../../deploy/kubernetes/components/mysql-dba-schema
+  - ../../../../deploy/kubernetes/components/network-policy
+  - ../kind-shared
+
+patches:
+  - path: config.yaml
+  - target:
+      kind: Ingress
+      name: ghcp-sso
+    patch: |-
+      - {op: replace, path: /spec/ingressClassName, value: ghcp-kind-none}
+      - {op: replace, path: /spec/tls/0/hosts/0, value: sso.kind.invalid}
+      - {op: replace, path: /spec/rules/0/host, value: sso.kind.invalid}
+  - target:
+      kind: Ingress
+      name: ghcp-console
+    patch: |-
+      - {op: replace, path: /spec/ingressClassName, value: ghcp-kind-none}
+      - {op: replace, path: /spec/tls/0/hosts/0, value: console.kind.invalid}
+      - {op: replace, path: /spec/rules/0/host, value: console.kind.invalid}

@@ -1,0 +1,79 @@
+# Test only. ghcp-e2e-caller stands in for LiteLLM in another namespace (the network-policy component admits it to
+# Proxy) and, with no Ingress controller in kind, for the Ingress controller namespace in front of SSO and Console.
+# ghcp-e2e-outsider is a namespace the policies do not admit. ConfigMap ghcp-driver is created by kind-e2e.mjs.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ghcp-e2e-caller
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: litellm-sim
+  namespace: ghcp-e2e-caller
+  labels:
+    app.kubernetes.io/name: litellm-sim
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+  containers:
+    - name: driver
+      image: ghcp-k8s-check/node-fixture:efd0ab5
+      imagePullPolicy: Never
+      command: [node, -e, "setInterval(() => {}, 1 << 30)"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      volumeMounts:
+        - name: driver
+          mountPath: /drv
+          readOnly: true
+  volumes:
+    - name: driver
+      configMap:
+        name: ghcp-driver
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ghcp-e2e-outsider
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: outsider
+  namespace: ghcp-e2e-outsider
+  labels:
+    app.kubernetes.io/name: litellm-sim
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+  containers:
+    - name: driver
+      image: ghcp-k8s-check/node-fixture:efd0ab5
+      imagePullPolicy: Never
+      # Also listens on 8080 so the egress check from Proxy has a reachable target outside the policy.
+      command: [node, -e, "require('node:http').createServer((q, r) => r.end('outsider')).listen(8080)"]
+      ports:
+        - containerPort: 8080
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      volumeMounts:
+        - name: driver
+          mountPath: /drv
+          readOnly: true
+  volumes:
+    - name: driver
+      configMap:
+        name: ghcp-driver

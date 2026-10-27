@@ -1,0 +1,18 @@
+# SSO 经 Ingress 开放：Login Pod 内的 Chromium 和管理员浏览器都要访问它（SAML 全部经浏览器中转，
+# GitHub 服务端从不主动连接 SSO，所以只需对这些浏览器可达，不需要公网）。
+# 同时把 SSO_PUBLIC_BASE_URL 改为 Ingress 地址：SSO 的 BASE_URL 与 Login 的 SSO_URL 随之改变。
+# GitHub SAML 设置：Sign on URL = https://<SSO 主机>/sso，Issuer = https://<SSO 主机>/metadata。
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - ingress.yaml
+
+patches:
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: ghcp-enterprise
+      data:
+        SSO_PUBLIC_BASE_URL: https://REPLACE_SSO_HOST

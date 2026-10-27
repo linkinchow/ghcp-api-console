@@ -1,0 +1,84 @@
+# Test only: tests/docker-user-pool/mock-services.mjs plays GitHub (GHE.com web + device flow, REST API, SCIM,
+# seats) and Copilot. The kind-ghe overlay maps fixture.ghe.com, api.fixture.ghe.com and copilot-api.fixture.ghe.com
+# to this Service's fixed ClusterIP with hostAliases. ConfigMap ghcp-mock-fixtures and Secret ghcp-mock-credentials
+# are created by kind-e2e.mjs (synthetic values generated per run).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ghcp-e2e-mock
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ghcp-mock
+  namespace: ghcp-e2e-mock
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ghcp-mock
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ghcp-mock
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: mock
+          image: ghcp-k8s-check/node-fixture:efd0ab5
+          imagePullPolicy: Never
+          command: [node, /fixtures/mock-services.mjs]
+          env:
+            - name: PORT
+              value: "8002"
+            # Required by the fixture's startup check; Login (not the fake Login) calls Proxy in this setup.
+            - name: PROXY_BASE_URL
+              value: http://proxy:3000
+            - name: MOCK_GHE_HOST
+              value: fixture.ghe.com
+            - name: MOCK_GHE_IDP_SSO_URL
+              value: http://ghcp-sso.ghcp-e2e-ghe.svc.cluster.local:7001/sso
+          envFrom:
+            - secretRef:
+                name: ghcp-mock-credentials
+          ports:
+            - name: http
+              containerPort: 8002
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: fixtures
+              mountPath: /fixtures
+              readOnly: true
+      volumes:
+        - name: fixtures
+          configMap:
+            name: ghcp-mock-fixtures
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ghcp-mock
+  namespace: ghcp-e2e-mock
+spec:
+  type: ClusterIP
+  clusterIP: 10.96.200.20
+  selector:
+    app.kubernetes.io/name: ghcp-mock
+  ports:
+    - name: http
+      port: 8002
+      targetPort: http

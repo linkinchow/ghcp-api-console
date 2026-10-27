@@ -1,0 +1,31 @@
+# GHE.com enterprise `local-test` on the mock host fixture.ghe.com (plain HTTP on port 8002, test only).
+# API and Copilot URLs are derived: http://api.fixture.ghe.com:8002, http://copilot-api.fixture.ghe.com:8002.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-enterprise
+data:
+  ENTERPRISE_SLUG: local-test
+  SSO_PUBLIC_BASE_URL: http://ghcp-sso.ghcp-e2e-ghe.svc.cluster.local:7001
+  GITHUB_BASE_URL: http://fixture.ghe.com:8002
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-proxy-config
+data:
+  POOL_ACCOUNT_EMAIL_DOMAIN: pool.kind.example.test
+  POOL_WARMUP_MODEL: claude-opus-5-2
+  POOL_MAX_ACCOUNTS: "5"
+  PREWARM_POLL_SECONDS: "1"
+  PREWARM_CONCURRENCY: "2"
+  POOL_REQUEST_TIMEOUT_SECONDS: "60"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-sso-config
+data:
+  SP_ENTITY_ID: http://fixture.ghe.com:8002/enterprises/local-test
+  SP_ACS_URL: http://fixture.ghe.com:8002/enterprises/local-test/saml/consume
+  SCIM_BASE_URL: http://api.fixture.ghe.com:8002/scim/v2/enterprises/local-test

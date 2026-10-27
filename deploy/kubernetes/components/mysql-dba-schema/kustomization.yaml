@@ -1,0 +1,16 @@
+# 方式 B：DBA 先用管理员账号执行本版本的 scripts/proxy-mysql-initial.sql，Proxy 运行账号只有
+# SELECT、INSERT、UPDATE、DELETE（库级）+ proxy_accounts 上的 TRIGGER。Proxy 启动时只读校验表结构，
+# 不符合时拒绝启动并提示应执行的脚本（Pod 处于 CrashLoopBackOff，日志中有原因）。
+# 脚本必须在 utf8mb4 会话中执行：main 上的脚本自带 SET NAMES utf8mb4；r2 源码（4922a4a）中的脚本没有，
+# 用它时加 mysql --default-character-set=utf8mb4（README 第 3 节）。
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: ghcp-proxy-config
+      data:
+        MYSQL_AUTO_MIGRATE: "false"

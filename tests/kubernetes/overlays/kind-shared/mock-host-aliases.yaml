@@ -1,0 +1,33 @@
+# The GHE.com mock host names resolve to the mock Service's fixed ClusterIP (tests/kubernetes/fixtures/mock.yaml).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ghcp-proxy
+spec:
+  template:
+    spec:
+      hostAliases:
+        - ip: 10.96.200.20
+          hostnames: [fixture.ghe.com, api.fixture.ghe.com, copilot-api.fixture.ghe.com]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ghcp-sso
+spec:
+  template:
+    spec:
+      hostAliases:
+        - ip: 10.96.200.20
+          hostnames: [fixture.ghe.com, api.fixture.ghe.com, copilot-api.fixture.ghe.com]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ghcp-login
+spec:
+  template:
+    spec:
+      hostAliases:
+        - ip: 10.96.200.20
+          hostnames: [fixture.ghe.com, api.fixture.ghe.com, copilot-api.fixture.ghe.com]
