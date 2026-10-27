@@ -38,6 +38,7 @@ export function renderMysqlInitialSql(): string {
     'USE ghcp_proxy;',
     '',
     '-- If the database already exists, start here.',
+    ...SESSION_CHARSET,
     ...MYSQL_BASE_TABLES.map((table) => `${mysqlCreateTable(table)};\n`),
     ...migrations.map(migrationRecord),
     '',
@@ -73,6 +74,7 @@ export function renderMysqlEnterpriseUpgradeSql(): string {
     '-- (step 08). Both need only the runtime privileges; replicas of the previous release then fail to start.',
     '-- No new triggers and no new privileges are required.',
     '',
+    ...SESSION_CHARSET,
     ...renderSteps(MYSQL_BASE_ENTERPRISE_STEPS),
     '-- User pool tables. Skip this section if the database has no user_pool_accounts table; the pool section',
     '-- of proxy-mysql-initial.sql creates the final tables if the pool is enabled later.',
@@ -80,6 +82,17 @@ export function renderMysqlEnterpriseUpgradeSql(): string {
     ...renderSteps(MYSQL_POOL_ENTERPRISE_STEPS),
   ].join('\n');
 }
+
+/**
+ * CHECK constraint literals keep the session character set as an introducer, and the startup schema check
+ * accepts only `_utf8mb4` / `_ascii`. Clients that default to latin1 (e.g. the official mysql image) would
+ * otherwise create `_latin1` literals and Proxy would refuse to start with MYSQL_AUTO_MIGRATE=false.
+ */
+const SESSION_CHARSET = [
+  '-- CHECK constraint literals take the session character set; Proxy accepts only utf8mb4.',
+  'SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;',
+  '',
+];
 
 function renderSteps(steps: readonly MysqlMigrationStep[]): string[] {
   return steps.flatMap((step) => [

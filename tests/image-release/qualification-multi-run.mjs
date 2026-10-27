@@ -278,11 +278,8 @@ async function probe(requests) {
 const one = async (request) => (await probe([request]))[0];
 
 /** MySQL as root inside the MySQL container; SQL arrives on stdin so nothing is quoted through a shell. */
-function mysqlRoot(sql, { database = DATABASE, timeout = 120000, optional = false, logStdout = true,
-  clientCharset } = {}) {
-  if (clientCharset !== undefined && !/^[a-z0-9]+$/.test(clientCharset)) throw new Error('invalid client charset');
-  const charset = clientCharset ? `--default-character-set=${clientCharset} ` : '';
-  const command = `MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql ${charset}--protocol=tcp -h127.0.0.1 -uroot -N -B ${database}`;
+function mysqlRoot(sql, { database = DATABASE, timeout = 120000, optional = false, logStdout = true } = {}) {
+  const command = `MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql --protocol=tcp -h127.0.0.1 -uroot -N -B ${database}`;
   return compose(['exec', '-T', 'mysql', 'sh', '-c', command], { input: sql, timeout, optional, logStdout });
 }
 
@@ -1550,12 +1547,10 @@ async function freshDbaSchema() {
     check(empty.length === 1 && empty[0] === 'fixture_identity', 'mysql_database_empty', { tables: empty });
 
     const script = await readFile(join(ROOT, INITIAL_SQL), 'utf8');
-    // The mysql client of the official image defaults to a latin1 session (POSIX locale); string literals of the
-    // CHECK constraints then carry `_latin1` introducers, which r2's MYSQL_AUTO_MIGRATE=false validator rejects
-    // ("proxy_enterprises check constraints"). A utf8mb4 session is what Proxy's own migrations and the
-    // integration test use (see docs/multi-enterprise-release-validation.md, fresh deployment findings).
-    await mysqlRoot(lib.initialSqlForDatabase(script, DATABASE),
-      { database: '', timeout: 180000, clientCharset: 'utf8mb4' });
+    // Applied in the image client's default session, which is latin1 (POSIX locale): the script's own
+    // `SET NAMES utf8mb4` must keep the CHECK literals utf8mb4, or Proxy with MYSQL_AUTO_MIGRATE=false refuses
+    // to start ("proxy_enterprises check constraints").
+    await mysqlRoot(lib.initialSqlForDatabase(script, DATABASE), { database: '', timeout: 180000 });
     const tables = await rootTables();
     const recorded = await rootMigrationIds();
     const scripted = lib.initialSqlMigrationIds(script);
@@ -1570,14 +1565,8 @@ async function freshDbaSchema() {
     check(expectedTables.every((table) => tables.includes(table)) && JSON.stringify(recorded) === JSON.stringify(scripted)
       && lib.missingMigrationIds(recorded, lib.expectedFreshMysqlMigrationIds()).length === 2
       && Number(enterpriseRows) === 0 && JSON.stringify(introducers) === '["utf8mb4"]', 'initial_sql_applied',
-    { script: INITIAL_SQL, scriptSha256: lib.sha(script), clientCharset: 'utf8mb4', checkLiteralCharsets: introducers,
+    { script: INITIAL_SQL, scriptSha256: lib.sha(script), clientCharset: 'default', checkLiteralCharsets: introducers,
       tables: tables.length, recorded, defaultRows: enterpriseRows });
-    h.report.findings.push({ kind: 'dba_initial_sql_client_charset', productChange: false,
-      detail: 'Applied through the image mysql client in its default latin1 session, the CHECK literals carry _latin1'
-        + ' introducers and Proxy with MYSQL_AUTO_MIGRATE=false refuses to start (proxy_enterprises check'
-        + ' constraints). This run applies the script with --default-character-set=utf8mb4.',
-      recommendation: 'Start the generated scripts with SET NAMES utf8mb4 (or document the client option), or let'
-        + ' the validator accept any charset introducer on ASCII literals.' });
 
     await mysqlRoot(lib.dbaRuntimeGrantsSql(DATABASE, 'pool_fixture'), { database: '' });
     const grants = (await mysqlRoot("SHOW GRANTS FOR 'pool_fixture'@'%';", { database: '' })).stdout

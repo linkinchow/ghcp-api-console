@@ -117,7 +117,7 @@ GitHub 侧的完整操作（含截图）见 [配置手册](../guidance/guidance.
 1. DBA 用管理员账号执行**本版本源码**中的 `scripts/proxy-mysql-initial.sql`（全新空库用这个脚本；`scripts/proxy-mysql-enterprise-upgrade.sql` 只用于从 r4 升级）。注意：
    - 脚本开头是 `CREATE DATABASE IF NOT EXISTS ghcp_proxy;` 和 `USE ghcp_proxy;`。库名不同时，从注释 `-- If the database already exists, start here.` 之后开始、在自己的库上执行（例如私下复制一份并删除前面几行）。
    - 脚本用 `DELIMITER` 定义触发器，请用 `mysql` 命令行客户端执行。
-   - **必须使用 utf8mb4 会话执行**，例如 `mysql --default-character-set=utf8mb4 -h <主机> -u <管理员> -p < scripts/proxy-mysql-initial.sql`。部分客户端（包括官方 mysql 8.4 镜像自带的客户端）默认是 latin1 会话，这样建出的 CHECK 约束字面量带 `_latin1` 前缀，`MYSQL_AUTO_MIGRATE=false` 时 Proxy 会以 `Unsupported MySQL schema: proxy_enterprises check constraints` 拒绝启动。全新部署资格测试中，同一脚本用 utf8mb4 会话执行后通过。
+   - **会话字符集必须是 utf8mb4**。main 上的脚本开头已有 `SET NAMES utf8mb4`，会自动切换；r2 源码提交 `4922a4a` 中的脚本还没有这一行，用它时必须加客户端参数，例如 `mysql --default-character-set=utf8mb4 -h <主机> -u <管理员> -p < scripts/proxy-mysql-initial.sql`（对新脚本加上也无害）。部分客户端（包括官方 mysql 8.4 镜像自带的客户端）默认是 latin1 会话，这样建出的 CHECK 约束字面量带 `_latin1` 前缀，`MYSQL_AUTO_MIGRATE=false` 时 Proxy 会以 `Unsupported MySQL schema: proxy_enterprises check constraints` 拒绝启动。两个版本的脚本建出的表结构相同，都适用于 r2 镜像。
 2. 运行账号只需要（与脚本头部注释一致）：
 
    ```sql

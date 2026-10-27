@@ -73,7 +73,7 @@ r2 相对 r1（`multi-41ecffc-amd64-r1`）的变化：全局 `READY_IDLE_TARGET`
 ### 5.2 DBA 手动迁移（`MYSQL_AUTO_MIGRATE=false`）
 
 1. 停止全部 Proxy 副本，备份数据库。
-2. DBA 用管理员账号对 Proxy 库执行**本版本源码**中的 `scripts/proxy-mysql-enterprise-upgrade.sql`，只执行一次，例如：`mysql --default-character-set=utf8mb4 <Proxy库名> < scripts/proxy-mysql-enterprise-upgrade.sql`。**必须使用 utf8mb4 会话**：latin1 会话（部分客户端的默认值）建出的 CHECK 约束带 `_latin1` 前缀，`MYSQL_AUTO_MIGRATE=false` 时 Proxy 会拒绝启动。这一点在全新部署脚本 `proxy-mysql-initial.sql` 上实测确认；升级脚本含相同的 CHECK 约束，按同样要求执行。
+2. DBA 用管理员账号对 Proxy 库执行**本版本源码**中的 `scripts/proxy-mysql-enterprise-upgrade.sql`，只执行一次，例如：`mysql --default-character-set=utf8mb4 <Proxy库名> < scripts/proxy-mysql-enterprise-upgrade.sql`。**会话字符集必须是 utf8mb4**：latin1 会话（部分客户端的默认值）建出的 CHECK 约束带 `_latin1` 前缀，`MYSQL_AUTO_MIGRATE=false` 时 Proxy 会拒绝启动。main 上的脚本开头已有 `SET NAMES utf8mb4`；r2 源码提交 `4922a4a` 中的脚本还没有这一行，用它时必须加 `--default-character-set=utf8mb4`。两个版本的脚本结构变更相同，都适用于 r2 镜像。
 3. 启动 Proxy（保持 `MYSQL_AUTO_MIGRATE=false`）。Proxy 只读校验 schema，再用运行时权限（INSERT/UPDATE）补全 `default` 企业的指纹、cap 和库存计数，并更新账号池配置指纹。
 
 注意：
