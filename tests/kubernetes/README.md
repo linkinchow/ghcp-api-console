@@ -1,6 +1,6 @@
 # deploy/kubernetes 的 kind 端到端验证
 
-在本机 kind 集群上按全新部署流程验证 [`deploy/kubernetes/`](../../deploy/kubernetes/README.md)。只用 mock 和合成凭据：GitHub、GHE.com、SCIM、Copilot 都是集群内的 `tests/docker-user-pool/mock-services.mjs`，MySQL 是 kind Docker 网络上的一个容器；不访问真实 GitHub、Copilot 或模型，不拉取应用镜像（使用本地候选镜像 `multi-3d6db1a-amd64-r3`，用 `kind load docker-image` 加载；r3 尚未发布，测试 overlay 用本地 tag 替换 base 中的 r2 digest）。Docker Desktop 上只验证功能，不评估性能。
+在本机 kind 集群上按全新部署流程验证 [`deploy/kubernetes/`](../../deploy/kubernetes/README.md)。只用 mock 和合成凭据：GitHub、GHE.com、SCIM、Copilot 都是集群内的 `tests/docker-user-pool/mock-services.mjs`，MySQL 是 kind Docker 网络上的一个容器；不访问真实 GitHub、Copilot 或模型，不拉取应用镜像（使用本地候选镜像 `multi-f43f27e-amd64-r3`，用 `kind load docker-image` 加载；r3 尚未发布，测试 overlay 用本地 tag 替换 base 中的 r2 digest）。Docker Desktop 上只验证功能，不评估性能。
 
 ## 文件
 
@@ -16,7 +16,7 @@
 
 ## 运行
 
-前提：Docker、kubectl、kind、openssl；本地已有 `ghcp-release-{proxy,sso,login,console}:multi-3d6db1a-amd64-r3`（与 `overlays/kind-shared` 和 `kind-e2e.mjs` 中的 `TAG` 一致）、`node:22-bookworm-slim@sha256:efd0ab57…`、`mysql:8.4`。
+前提：Docker、kubectl、kind、openssl；本地已有 `ghcp-release-{proxy,sso,login,console}:multi-f43f27e-amd64-r3`（与 `overlays/kind-shared` 和 `kind-e2e.mjs` 中的 `TAG` 一致）、`node:22-bookworm-slim@sha256:efd0ab57…`、`mysql:8.4`。
 
 ```bash
 export KIND_E2E_KUBECONFIG=<仓库>/.claude/kind/kubeconfig   # 只给这个集群用，绝不是 ~/.kube/config

@@ -23,7 +23,7 @@ import { fileURLToPath } from 'node:url';
 import * as lib from '../image-release/qualification-multi-lib.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const TAG = 'multi-3d6db1a-amd64-r3'; // must match the newTag values in overlays/kind-shared
+const TAG = 'multi-f43f27e-amd64-r3'; // must match the newTag values in overlays/kind-shared
 const SERVICES = ['proxy', 'sso', 'login', 'console'];
 const PORTS = { proxy: 3000, sso: 7001, login: 7003, console: 7004 };
 const NODE_FIXTURE_SOURCE = lib.NODE_IMAGE;

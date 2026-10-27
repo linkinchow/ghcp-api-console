@@ -1,6 +1,186 @@
 # 多企业版发布验证记录
 
-本文记录多企业版（multi-enterprise / multi-slug SSO）候选镜像的发布前验证结果。设计见 [multi-enterprise-design.md](multi-enterprise-design.md)，升级步骤见 [multi-enterprise-upgrade-guide.md](multi-enterprise-upgrade-guide.md)。当前发布为 r2（`multi-4922a4a-amd64-r2`）；此前发布的 r1（`multi-41ecffc-amd64-r1`）记录保留在后半部分。
+本文记录多企业版（multi-enterprise / multi-slug SSO）候选镜像的发布前验证结果。设计见 [multi-enterprise-design.md](multi-enterprise-design.md)，升级步骤见 [multi-enterprise-upgrade-guide.md](multi-enterprise-upgrade-guide.md)。当前发布为 r2（`multi-4922a4a-amd64-r2`）；候选 r3（`multi-f43f27e-amd64-r3`，待发布）的验证记录在最前；此前发布的 r1（`multi-41ecffc-amd64-r1`）记录保留在后半部分。
+
+## r3：multi-f43f27e-amd64-r3（候选，Docker Hub 待发布）
+
+全部验证只使用合成数据、mock 外部服务、本地 MySQL 容器和本机 kind 集群；没有调用真实 GitHub、GitHub EMU、GHE.com、Copilot 或模型，没有创建真实用户或席位，没有接触真实 SSO 环境、云资源或集群。Docker Desktop 只验证功能，不评估性能。
+
+### 0. 与 r2 相比的变更
+
+源码从 `4922a4a` 前进到 `f43f27e`（分支 `release/multi-r3`，基于 `main` 的 `8e58bc2`）。`4922a4a..8e58bc2` 之间是文档、DBA 脚本（`SET NAMES utf8mb4`）及其生成器 `src/proxy/src/db/mysqlInitialSql.ts`（只被脚本生成和测试使用，服务运行时不调用）、资格测试脚本和 Kubernetes 清单。运行时的改动：
+
+| 提交 | 改动 | 说明 |
+| --- | --- | --- |
+| `3d6db1a` | `src/packages/shared/src/shutdown.ts`（四个服务共用的优雅停止） | 排空期间，SIGTERM 时正忙的 keep-alive 连接在当前响应结束后关闭：响应头尚未发出的加 `Connection: close`；响应头已发出的（例如 SSE）在 `finish` 后结束套接字；空闲连接立即关闭。之前 LiteLLM 这类复用连接的客户端会一直使用忙碌的连接，直到 25 秒排空时限强制关闭（kind 中 669 个请求有 1 个 `ECONNRESET`，见 `deploy/kubernetes/README.md` 第 10.1 节）。 |
+| `f43f27e` | 四个服务的 body parser（Proxy、Login、Console 的 `express.json`，SSO 的 `express.json` 与 `express.urlencoded`）加 `inflate: false`；共享的 `managementErrorHandler` 把该解析错误映射为 415 | **CVE-2026-111181 的缓解**（body-parser 2.3.0，见第 6 节）：带 `Content-Encoding`（`identity` 除外）的请求体一律 415，不再创建解压流。SSO、Login 的响应为 `{"error":{"code":"unsupported_content_encoding"}}`，Proxy、Console 为 Express 默认的 415 页面。批准的 npm 源提供 body-parser ≥ 2.4.0 后取消。 |
+| `f43f27e` | 根 `package.json` / `package-lock.json` 删除 `multer` | CVE-2026-113872。multer 自初始提交起在依赖中，但产品代码从未引用；随之从锁文件删除的只有 multer、busboy、streamsearch、append-field 和 multer 内嵌的 type-is、mime-types、mime-db、media-typer，其他锁定版本不变。 |
+
+测试与脚本：`98ef32e` 新增镜像级停止检查、收紧 kind 断言；`e6112c9` 修正 `3d6db1a` 中的两个停止单元测试（见第 9 节）；`f43f27e` 增加四个服务的 415 测试，并让镜像运行时检查期望候选镜像中没有 multer（基线 r4 仍有，照旧检查其 multipart 行为）。
+
+`3d6db1a` 曾单独构建为 `multi-3d6db1a-amd64-r3` 并跑完一轮资格测试（第 10 节），扫描发现上述两个 npm 漏洞后按决定加入缓解并重新构建；`3d6db1a` 镜像从未发布，保留在本地。
+
+### 1. 候选镜像
+
+构建上下文为 `git -c core.autocrlf=false archive f43f27e`（LF 行尾，已检查上下文中没有 CRLF 文件；tar 的 SHA-256 为 `cf2c9d2e82b780e3a50ba73d9030e2d0e44e2fbe68090d2fc04cbec290570b13`），`deploy/images/Dockerfile.release`，`RELEASE_LINE=multi`，linux/amd64，基础镜像仍按 digest 固定为 `node:22-bookworm-slim@sha256:efd0ab57…`，npm 源为公司批准的源（没有绕过 npm 最短发布期管控）。镜像内 Node 为 v22.23.3。
+
+| 组件 | 本地标签 | 镜像 ID |
+| --- | --- | --- |
+| Proxy | `ghcp-release-proxy:multi-f43f27e-amd64-r3` | `sha256:95a15dc68faaa1d5f41f1b498ae6e35d890776cd1759df53b590e5127ad35fd1` |
+| SSO | `ghcp-release-sso:multi-f43f27e-amd64-r3` | `sha256:d0788d0a52ffbb2b69c3482bda29f8e5b0e5fc34e6594c1b6b8c01e70f1ea7ea` |
+| Login | `ghcp-release-login:multi-f43f27e-amd64-r3` | `sha256:05b60da5ed39df80c93f5a9889734cc23be4c5b1c2681c4d09a1965994c20e51` |
+| Console | `ghcp-release-console:multi-f43f27e-amd64-r3` | `sha256:b9e6f52faca7fa33cdde05d90c46ec286e54b6540ee683b12654a61cc8f91b60` |
+
+Docker Hub：**待发布**（未推送；发布需另行确认）。
+
+四个镜像的 label：`org.opencontainers.image.revision=f43f27e`、`com.ghcp.release-line=multi`、`org.opencontainers.image.version=multi-f43f27e-amd64-r3`。ENTRYPOINT 为 Tini（`/usr/bin/tini -g --`），CMD 与工作目录与 r2 相同。镜像内没有 `multer`、`busboy`，`body-parser` 仍为 2.3.0（express 5.2.1 的依赖）。
+
+构建说明：
+
+- 系统包：运行层的 `apt-get update && apt-get upgrade` 重新执行（`--no-cache-filter runtime`），相对固定的基础镜像升级了 `perl-base`（`5.36.0-7+deb12u3` → `deb12u4`，与 r2 相同）和 `tzdata`（`2026c-0+deb12u1` → `2026e-0+deb12u1`，本次新增），没有其他可用更新。
+- 行尾：构建上下文用 `git -c core.autocrlf=false archive` 生成，一次构建成功。验证用的工作区中 `tests/`、`scripts/`、`deploy/` 以 LF 重新检出（资格测试脚本的一个单元测试按 LF 解析 `compose.yaml`，在 CRLF 检出上会失败，与 r2 相同）。
+
+### 2. 原地升级资格测试（设计 §9.4）
+
+基线为已发布的单企业镜像 `single-slug-164cade-amd64-r4`。命令行方式与 r2 相同（`qualification-prepare.mjs` + `qualification-run.mjs`），全新项目名与未使用的子网（`10.231.21–29.0/24`），合成证书沿用 r1/r2 的合成 IdP 证书（有效期至 2026-11-17，公私钥配对已校验）。各报告都记录了上表的镜像 ID；`planCoverage.complete=true`；全部一次通过。
+
+| 模式 | 项目 | 用时 | 断言 | 结果 |
+| --- | --- | --- | --- | --- |
+| `multi-upgrade`（MySQL 8.4 + 双 Proxy） | `ghcp-release-qualification-multi-r3f-m1` | 约 7 分钟 | 76（预检 6、step1 9、step2 18、step3 4、step4 21、step5 10、step7 8） | 通过 |
+| `multi-upgrade-sqlite`（SQLite 直连，第 6 步） | `ghcp-release-qualification-multi-r3f-s1` | 约 1.5 分钟 | 19（预检 3、baseline 4、candidate 9、r4-on-migrated 1、restore 2） | 通过 |
+| `idle-target-cap-check.mjs`（对照 r1 必须拒绝启动） | `ghcp-release-qualification-multi-r3f-idlecap1` | 约 1 分钟 | 19（对照 1、SQLite 9、MySQL 9） | 通过 |
+
+各步骤内容与 r2 第 2 节相同。每个应用容器内的运行时检查（`qualification-verify-runtime.mjs`）确认候选镜像没有 multer、`proxy-addr` 2.0.8、`brace-expansion` 1.1.21。`idle-target-cap-check.mjs` 按设计在全部通过后只删除了自己创建的容器、网络和卷。
+
+### 3. 全新部署资格测试
+
+与 r2 第 3 节相同的三个模式，空库、空卷、没有 registry 文件，全部一次通过：
+
+| 模式 | 项目 | 用时 | 断言 | 结果 |
+| --- | --- | --- | --- | --- |
+| `multi-fresh` | `ghcp-release-qualification-multi-r3f-fm1` | 约 2.7 分钟 | 30（预检 5、启动 7、Console 3、账号池 3、caller 5、作用域 2、SSO 3、运行时 1、停止 1） | 通过 |
+| `multi-fresh-dba` | `ghcp-release-qualification-multi-r3f-fd1` | 约 2.8 分钟 | 34（预检 5、DBA 建库 3、启动 8、Console 3、账号池 3、caller 5、作用域 2、SSO 3、运行时 1、停止 1） | 通过 |
+| `multi-fresh-sqlite` | `ghcp-release-qualification-multi-r3f-fs1` | 约 1.7 分钟 | 23（预检 4、启动 5、Console 3、直连 4、作用域 2、SSO 3、运行时 1、停止 1） | 通过 |
+
+`multi-fresh-dba` 用客户端默认会话执行 `scripts/proxy-mysql-initial.sql`，CHECK 字面量只有 `_utf8mb4`。五个模式的“停止”断言（全部应用退出码 0）说明新的停止逻辑不影响正常停止；Login 回调 Proxy、SSO 调 Proxy、Console 转发等服务间请求都是未压缩的 JSON，在 `inflate: false` 下照常工作。主机时钟监测（每 5 秒比较墙钟与单调时钟）在这些运行期间偏差最大 12 ms，没有休眠或时间跳变（当天 10:26–10:35 UTC 有一次约 9 分钟的主机停顿，发生在资格测试开始之前，见第 9 节）。
+
+### 4. 停止时的长连接（本次新增，`tests/image-release/shutdown-keepalive-check.mjs`）
+
+独立、隔离的检查（说明见 `tests/image-release/README.md`“停止时的长连接检查”）：一个 internal 网络上运行四个服务（SQLite 直连，合成凭据）、mock 和每个服务一个原始 HTTP/1.1 客户端；对每个服务建立空闲连接 A、SIGTERM 时进行中的请求 B（请求体只上传了一半，响应头未发出）、响应头已发出的流 C（Proxy 为 SSE，Console 为经 Console 转发的 CSV 导出；SSO、Login 没有流式接口），然后 `docker stop -t 60`。r2 作为对照。在 `f43f27e` 镜像上连续运行 3 次（`r3f-shutdown-1/2/3`，子网 `10.231.31–33.0/24`），每次 50 条断言全部通过（r3 35 条、r2 对照 15 条）；在 `3d6db1a` 镜像上的最终版本检查也连续 3 次 50/50（第 10 节）。`f43f27e` 三次的范围：
+
+| 服务 | r3：B 的响应 | r3：B 之后的 FIN | r3：C | r3：`docker stop` 用时 / 退出码 | r2 对照 |
+| --- | --- | --- | --- | --- | --- |
+| Proxy | 200，`Connection: close` | 响应后 1–3 ms | SSE 完整（`message_stop`）后 1–2 ms FIN | 3.2–4.1 秒 / 0 | B 不带 `Connection: close`，SIGTERM 后又被复用 41 次；C 结束后仍可复用；约 24–26 秒时 `closing their connections` 强制关闭 |
+| SSO | 201，`Connection: close` | 0–1 ms | — | 1.3–1.5 秒 / 0 | 复用 42 次，强制关闭 |
+| Login | 404，`Connection: close` | 0–1 ms | — | 1.2 秒 / 0 | 复用 42 次，强制关闭 |
+| Console | 401，`Connection: close` | 0 ms | CSV 完整后 4–16 ms FIN | 3.4–3.5 秒 / 0 | 复用 42 次，C 结束后仍可复用，强制关闭 |
+
+r3 另外每次都满足：A 的 FIN 在服务日志 `SIGTERM received, draining` 之后 1–13 ms（空闲连接立即关闭）；SIGTERM 后的新连接 D 被拒绝（`ECONNREFUSED`）；日志有 `shutdown complete`，没有 `closing their connections`。r2 的四个服务每次都在排空时限处强制关闭，`docker stop` 用时（主机侧）24.4–25.5 秒，退出码仍为 0。
+
+**开发过程中的 4 次未通过运行（`3d6db1a` 镜像，`r3-shutdown-1..4`）都是检查脚本的问题，不是 r3 的缺陷**：
+
+| 运行 | 失败 | 原因 | 修改 |
+| --- | --- | --- | --- |
+| 1 | r3：只有“服务健康且 `releaseLine` 为 multi”一条（Proxy 的健康检查读了 `/readyz`，它不含 `releaseLine`），r3 其余 34 条行为断言全部通过；r2 对照：Proxy、Console 4 条 | 健康检查路径写错；对照中客户端等 C 结束后才开始复用 B，B 已空闲超过 5 秒，被服务的 keep-alive 超时关闭 | `releaseLine` 读 `/healthz`、就绪读 `/readyz`；复用循环与 C 并行 |
+| 3 | 只有 r2 对照的 Console 3 条（r3 35/35 通过） | 客户端把 A 收到 FIN 当作排空开始；Docker Desktop 送达 SIGTERM 慢，A 先被服务的 5 秒 keep-alive 超时关闭（A 的最后响应在“触发”前 6.0 秒，SIGTERM 日志在“触发”后 1.8 秒） | 见运行 4、5 |
+| 4 | r3 Console 4 条（B 的 `Connection: close`、B 的 FIN、C 完成、D 被拒） | 同一类误触发：客户端 05:29:25.3（UTC，容器时钟）停止刷新 A，A 在 05:29:30.9 被 5 秒 keep-alive 超时关闭，客户端误以为开始排空；Console 的 SIGTERM 日志在 05:29:33.557，晚 2.6 秒（`docker stop` 从调用到送达信号约 8 秒）。所以 D 能连上（服务还在监听）、B 在 SIGTERM 之前就正常返回（自然不带 `Connection: close`）、当时固定 6 秒的流 C 在 SIGTERM 之前 9.4 秒就已结束。B 在 05:29:33.558 收到 FIN，与 SIGTERM 日志相差 1 ms：此刻 B 空闲，被 r3 立即关闭，产品行为正确 | 运行 5 起：以服务自己的 `SIGTERM received, draining` 日志行为准（编排脚本看到后才通知客户端），A 每秒刷新、只有排空能关闭它，C 由 mock 持续到 SIGTERM 之后才结束，并断言 A 的 FIN 紧跟 draining 日志 |
+
+改动后的 9 次运行（`3d6db1a` 3 次、`f43f27e` 3 次，加上开发中的运行 2）中，Console 的 B（Console 自己处理的登录请求）和 C（经 Console 转发管道 `pipeline(...)` 流式返回的 CSV）都表现出修复后的行为，没有发现 Console 转发路径的缺口。同一时段测得 Docker Desktop 虚拟机的单调时钟比主机快约 4%（主机 31.9 秒内多出 1.2 秒），所以 r2 的 25 秒时限在主机上约 24 秒触发；对照组的用时下限因此设为 20 秒。
+
+### 5. Kubernetes（kind）
+
+`tests/kubernetes/kind-e2e.mjs` 用 r3 镜像重跑（kind v0.33，单节点，Kubernetes v1.37；独立 kubeconfig，每次 kubectl 调用都显式传 `--kubeconfig` 和 `--context kind-ghcp-k8s-check`；镜像用 `kind load docker-image` 加载）。滚动更新的断言收紧为：复用长连接的客户端与每个请求新建连接的客户端都必须**零失败**，两个旧 Proxy Pod 都必须在 SIGTERM 后 5 秒内 `shutdown complete` 且没有 `closing their connections`。
+
+**`f43f27e`：一次运行，35/35 全部通过**（阶段 A 26 条、阶段 B 9 条，内容同 `deploy/kubernetes/README.md` 第 9 节；池开到 2 个 Ready idle 用时约 46 秒）。滚动更新：
+
+| 客户端 | 请求 | 失败 | 延迟 p50 / p95 / 最大 | 旧 Pod：SIGTERM → `shutdown complete` | 强制关闭 |
+| --- | --- | --- | --- | --- | --- |
+| 复用长连接（`http.Agent({ keepAlive: true })`，2 并发、间隔 250 ms，模拟 LiteLLM） | 739 | 0 | 54 / 96 / 369 ms | 25 ms、39 ms | 无 |
+| 每个请求新建连接 | 539 | 0 | 70 / 668 / 1556 ms | 25 ms、4 ms | 无 |
+
+r2 时的对照：旧 Pod 有忙碌长连接时要等满 25 秒才强制关闭，669 个请求中 1 个 `ECONNRESET`。随后 SSO、Login、Console 依次重启，7 个旧容器都以退出码 0（`Completed`）在删除请求后 9–11 秒内结束。全部通过后按规则删除了 kind 集群、它的 kubeconfig、测试用 node 镜像 tag 和外部 MySQL 容器；默认 kubeconfig 的当前 context 仍为原值，文件哈希不变。
+
+**`3d6db1a` 的两次运行（如实记录）**：各 34/35，唯一的失败都是新收紧的零失败断言，原因都是 HTTP 503 `pool_storage_unavailable`（Proxy 的 MySQL 操作 5 秒时限），不是连接级错误，也与停止无关：
+
+- 第 1 次：复用长连接客户端 596 个请求中 1 个 503，发生在最后一个旧 Pod SIGTERM 之后 74 秒（滚动早已完成，在新 Pod 上）；两个旧 Pod 的排空分别为 38 ms、5 ms，没有强制关闭；同一 10 秒内的最慢请求 3.3 秒。新建连接客户端 642/642。
+- 第 2 次：复用长连接客户端 298/298（排空 1100 ms、385 ms，没有强制关闭）；新建连接客户端 542 个中 4 个 503，都在旧 Pod SIGTERM 之后 72–89 秒（新 Pod 上）。
+
+这与 `deploy/kubernetes/README.md` 第 10.2 节记录的 Docker Desktop 上 MySQL 偶发 503 是同一现象。两次运行合计 2078 个请求，没有任何连接级失败，旧 Pod 都没有强制关闭；断言没有放宽。`f43f27e` 的运行在 Docker Desktop 负载较低时进行，没有出现 503。
+
+### 6. CVE-2026-111181 / CVE-2026-113872 的处理
+
+`3d6db1a` 镜像的扫描（与 r2 同一时间、同一漏洞库）发现两条新公开、有修复版本的 High 级 npm 漏洞，r2 同样受影响：
+
+| 漏洞 | 包 | 修复版本 | 批准的 npm 源 | 可达性（r2 / `3d6db1a`） | r3（`f43f27e`）的处理 |
+| --- | --- | --- | --- | --- | --- |
+| CVE-2026-111181 | `body-parser@2.3.0`（express 5.2.1 的依赖，四个镜像） | 2.4.0 | 只到 2.3.0（推测受最短发布期管控限制） | **可达**：四个服务都在全局挂载 `express.json`（SSO 另有 `express.urlencoded`），在路由和鉴权之前解析请求体；公开说明为带 `Content-Encoding` 的请求体可导致进程退出 | 版本不变，加 `inflate: false` 缓解：压缩请求体在创建解压流之前就以 415 拒绝，漏洞路径不可达 |
+| CVE-2026-113872 | `multer@2.4.0`（根依赖，四个镜像） | 2.5.0 | 只到 2.4.0 | 不可达：产品代码从未引用 | 删除依赖，镜像中不再有 multer |
+
+缓解的范围与限制：
+
+- 四个服务都不再接受压缩的请求体（JSON，以及 SSO 的表单），一律 415；响应不受影响。LiteLLM、浏览器、Console 与服务之间的调用默认都发送未压缩的请求体（第 2、3、5 节的全部流程照常通过）；若网关或客户端开启了请求体压缩，必须关闭。已写入 `docs/user-pool-configuration-reference.md` 第 12 节。
+- 单元测试：四个服务对 gzip、deflate 的 JSON 请求体返回 415（SSO 的表单同样），未压缩的请求体仍被解析（Console 与 SSO 的登录、Login 的建任务都按请求体内容返回 401/400）。
+- SSO、Login 对**格式错误**的 JSON 仍返回 500 `internal_error`（r2 已有的行为，本次未改）。
+- body-parser 仍是 2.3.0，Scout 仍会按版本报告 CVE-2026-111181（第 8 节）。批准的源提供 2.4.0 后应升级并去掉 `inflate: false`。
+
+### 7. 单元与集成测试（提交 `f43f27e`）
+
+| 范围 | 结果 |
+| --- | --- |
+| 全仓 typecheck（含 upgrade 工具） | 通过 |
+| shared | 147/147（含 `e6112c9` 修正后的停止测试） |
+| Proxy | 682 条：642 通过、40 跳过（需 MySQL，另行运行）、0 失败（含新的 415 测试） |
+| Proxy MySQL 集成（MySQL 8.4 一次性容器，逐个文件） | 13 个文件：`mysqlStorage` 2/2、`mysqlEnterpriseMigrations` 10/10、`scheduling` 2/2、`mysqlStore` 34/34（单独重跑）、`mysqlRecovery` 5/5、`mysqlLifecycle` 2/2（单独重跑）、`mysqlCallerIsolation` 3/3、`mysqlAdmission` 16/16、`loginPollingRecovery` 6/6（单独重跑）、`inferenceTimeout.mysql` 3/3、`userPoolCredentialRace` 10/10、`userPoolCatalogPressure.mysql` 2/2；`ownerSideEffects` **未能在本机得到一次 22/22**（见下） |
+| SSO / Login / Console | 96/96、62/62、36/36（各含新的 415 测试） |
+| Console 浏览器测试（本机 Edge headless，`--test-concurrency=1` 串行） | 71/71，一次通过 |
+| 离线迁移工具（`upgrade/user-pool-mysql` 三个测试文件 + `upgrade/sqlite-to-mysql` 集成测试，MySQL 用例在 MySQL 上） | 133/133 |
+| 资格测试脚本与 mock（`qualification-multi-lib` 27、`mock-services.tenants` 5、`mock-login-queue` 3、`mysql-bridge` 2、`local-diagnostics-contract` 3） | 40/40 |
+| 部署脚本（`deploy/images/package-runtime` 2、`deploy/user-pool-mysql-customer/package` 9、`deploy/kubernetes/package` 13） | 24/24 |
+
+**MySQL 集成测试（如实记录）**：首轮逐文件运行时，kind 集群的节点容器仍在后台运行（空闲时约 37% CPU），`ownerSideEffects` 16/22（6 条 30 秒超时取消）、`mysqlStore` 28/34、`mysqlLifecycle` 1/2、`loginPollingRecovery` 5/6（1 条取消）。停掉 kind 节点后单独重跑：`mysqlStore` 34/34、`mysqlLifecycle` 2/2、`loginPollingRecovery` 6/6；`ownerSideEffects` 连续 5 次都是 21/22 或 20/22，每次失败的是不同的“owner 交接”用例（例如期望 `oauth-wait` 实际仍为 `oauth-starting`，期望 `ready` 实际仍为 `provisioning`），都是等待状态推进的计时断言。其中第 4、5 次期间主机出现过一次约 9 分钟的停顿（见第 9 节）。这个文件测试的 `src/proxy/src/userPool/` 代码在 `3d6db1a..f43f27e` 之间没有任何改动，也不引用本次改动的文件（`server.ts`、`operationRoutes.ts`）；在 `3d6db1a` 上同一文件首轮 21/22、随后单独重跑两次 22/22。结论：计时类不稳定、与本次改动无关，但本机在 `f43f27e` 上没有得到它的完整通过记录，发布前宜在负载较低的机器上补跑。
+
+### 8. 镜像扫描（Docker Scout）
+
+同一天、同一漏洞库扫描了 r3（`f43f27e`，全部级别）、`3d6db1a` 和 r2（critical/high；`3d6db1a` 另扫了全部级别）：
+
+| 镜像 | r3 `f43f27e`：Critical / High | `3d6db1a` | r2（今天的漏洞库） | 说明 |
+| --- | --- | --- | --- | --- |
+| Proxy / SSO / Console | 0 / 9 | 0 / 10 | 0 / 10 | r3 与 r2 相比：multer 的 CVE-2026-113872 消失（镜像中已无 multer）；其余与 r2 逐条相同 |
+| Login | 0 / 10 | 0 / 11 | 0 / 15 | 另外 r3 的 Login 层中 expat 为 `2.5.0-1+deb12u5`、openssl 为更新版本，r2 中 4 条有修复的 expat/openssl 漏洞（CVE-2025-59375、CVE-2026-102633、CVE-2026-77214、CVE-2026-84782）不再出现；新增 expat CVE-2026-115506（Debian 尚无修复） |
+
+- **r2 复扫结论**：已发布的 r2 四个镜像都受 CVE-2026-111181（body-parser 2.3.0，可达，见第 6 节）和 CVE-2026-113872（multer 2.4.0，不可达）影响，r2 的 Login 另有上述 4 条有修复的 Debian 漏洞（r2 构建之后 Debian 才发布修复）。r2 没有 `inflate: false` 缓解。
+- **r3 仍被报告的 npm 条目只有 CVE-2026-111181**：Scout 按版本判断，body-parser 仍为 2.3.0。已按第 6 节缓解：四个服务的全部 body parser 都设置 `inflate: false`，压缩请求体在创建解压流之前就以 415 拒绝，该漏洞所需的解压路径不可达；批准的源提供 2.4.0 后升级。
+- 全部级别中，除 body-parser 外没有其他有修复版本的条目（Proxy 共 51 条、Login 共 134 条，其余均为 `not fixed`）。
+- 其余 High 条目都来自 Debian Bookworm 基础系统包，Scout 标注 `fixed_version: not fixed`：util-linux CVE-2026-53613、53615、76642、78408、78409、78410，perl CVE-2026-82560，zlib CVE-2026-85091（全部镜像），expat CVE-2026-115506（Login）。逐条可达性分析沿用 [单企业发布验证记录](user-pool-image-release-validation.md) 第 0.4 节；新增的 expat CVE-2026-115506 只在 Login 镜像中（随 Chromium 的系统依赖安装），按包沿用该节对 expat 的分析，本次没有为这一条单独做可达性分析，发布前应补入该节。
+
+### 9. 失败与重跑汇总
+
+- **停止单元测试（`3d6db1a` 中的测试问题，已在 `e6112c9` 修正）**：`lets an in-flight request finish …` 与新的 `a keep-alive connection busy at shutdown …` 在发起请求后固定等待 20 ms 就开始停止。负载下请求还没到达服务器（连接仍在建立）监听就关闭了，客户端得到 `ECONNRESET`（Linux 上为 connect，Windows 上为 read）；另外修复后服务器在响应写完后立即关闭连接，`release` 可能先于客户端读完响应体执行，旧测试断言的是客户端读到响应的顺序。实测：`3d6db1a` 的测试在 Node 22.23.3（Linux 容器）上 40 次有 11 次失败，在 Node 24（Windows）上 15 次有 13 次失败；改为等待服务器确实收到请求、并断言服务器侧“响应写完 → release”的顺序和客户端拿到完整响应体后，新代码 60/60（Linux）、25/25（Windows）通过，两个 keep-alive 测试在旧 `shutdown.ts` 上仍 60/60 失败（测试仍有区分能力）。产品代码未改。第一次在 `3d6db1a` 上跑 shared 时 147/147 是碰巧通过。
+- **资格测试脚本单元测试**：首次在 CRLF 检出上 39/40（`SQLite compose mirrors …`），以 LF 重新检出后 40/40，与 r2 相同。
+- **Proxy 单元测试**：一次在 kind 节点运行期间的全量运行中 `userPoolDiagnostics` 1 条超时（`TimeoutError`），单独重跑通过；`f43f27e` 的全量运行 0 失败。
+- **Proxy MySQL 集成**：见第 7 节。
+- **停止时的长连接检查**：4 次开发中的运行未通过，均为检查脚本问题（第 4 节）。
+- **主机**：10:26–10:35 UTC 主机停顿约 9 分钟（时钟监测：一次 537 秒没有调度，墙钟与单调时钟偏差 7 ms，不是时间跳变），发生在 `ownerSideEffects` 重跑期间、资格测试开始之前；之后的资格测试、停止检查、kind 运行期间没有再出现。Docker Desktop 当天命令延迟偏高（一次 `docker stop` 约 8 秒才送达 SIGTERM，一次约 20 秒才读到日志）。
+- 第 2、3 节的资格测试和 idle-target 检查都一次通过，没有重跑。
+
+### 10. `3d6db1a` 候选（已被 `f43f27e` 取代，未发布）
+
+`multi-3d6db1a-amd64-r3`（Proxy `sha256:1b5c0312c2c4…`、SSO `sha256:87b8a5ab2702…`、Login `sha256:4e8a0a5570d8…`、Console `sha256:f2dbf517b734…`；tar SHA-256 `50139fa385a7…`）在加入 CVE 缓解之前跑完了一轮：typecheck；shared 147/147；Proxy 681 条（641 通过、40 跳过）；Proxy MySQL 集成 13 个文件（`ownerSideEffects` 首轮 21/22、`mysqlCallerIsolation` 首轮 1/3，各单独重跑两次全部通过）；SSO/Login/Console 95/95、61/61、35/35；Console 浏览器 71/71；离线迁移工具 133/133；资格测试脚本 40/40；部署脚本 24/24；`multi-upgrade` 76、`multi-upgrade-sqlite` 19、`multi-fresh` 30、`multi-fresh-dba` 34、`multi-fresh-sqlite` 23、idle-target 19 条断言全部一次通过（项目 `ghcp-release-qualification-multi-r3-*`）；停止检查最终版本 3 次 50/50（`r3-shutdown-5/6/7`）；kind 两次运行各 34/35（第 5 节）。这些镜像保留在本地，没有删除。
+
+### 11. 未验证的范围
+
+- 真实 GitHub、GHE.com、Copilot 与模型调用；GHE.com 只用 mock 验证。
+- 真实 LiteLLM：kind 和镜像级检查中的长连接客户端分别是 Node 的 `http.Agent({ keepAlive: true })` 和原始套接字，行为与 LiteLLM 的连接池相近，但没有用 LiteLLM 本身验证（包括它是否压缩请求体）；仓库的 LiteLLM 示例配置是 `max_retries: 0`。
+- CVE-2026-111181 的缓解只按设计和单元测试验证（压缩请求体在解压之前被 415 拒绝），没有在镜像上做攻击性复现。
+- SSO、Login 没有流式接口，“响应头已发出后在 `finish` 时结束套接字”只在 Proxy（SSE）、Console（CSV 转发）上做了镜像级验证，SSO、Login 由共享代码的单元测试覆盖。
+- `ownerSideEffects` 在 `f43f27e` 上没有完整通过记录（第 7 节）。
+- 资格测试中没有真实 Login 浏览器任务（kind 阶段 A 有真实 Login 的 Chromium 对 mock GHE.com）。
+- `MYSQL_AUTO_MIGRATE=false` + r4 → 多企业 DBA 升级脚本只在集成测试中覆盖；全新部署的其余未覆盖项同 r2 第 3.4 节。
+- 性能、容量与长时间稳定性。
+
+证据：构建日志、测试日志、各报告与 kind 运行目录保存在本机（`.claude/multi-r3/`、`.claude/release-qualification-run-*`、`.claude/kind/`，不入库）。
+
+---
 
 ## r2：multi-4922a4a-amd64-r2（已发布）
 

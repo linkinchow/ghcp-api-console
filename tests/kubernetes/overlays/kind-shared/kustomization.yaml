@@ -16,16 +16,16 @@ resources:
 images:
   - name: docker.io/linkinchow/ghcp-proxy
     newName: ghcp-release-proxy
-    newTag: multi-3d6db1a-amd64-r3
+    newTag: multi-f43f27e-amd64-r3
   - name: docker.io/linkinchow/ghcp-sso
     newName: ghcp-release-sso
-    newTag: multi-3d6db1a-amd64-r3
+    newTag: multi-f43f27e-amd64-r3
   - name: docker.io/linkinchow/ghcp-login
     newName: ghcp-release-login
-    newTag: multi-3d6db1a-amd64-r3
+    newTag: multi-f43f27e-amd64-r3
   - name: docker.io/linkinchow/ghcp-console
     newName: ghcp-release-console
-    newTag: multi-3d6db1a-amd64-r3
+    newTag: multi-f43f27e-amd64-r3
 
 patches:
   - path: mock-host-aliases.yaml
