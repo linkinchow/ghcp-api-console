@@ -86,6 +86,7 @@ Docker Scout（critical/high）：Proxy、Console、SSO 各 **8 条 high**，Log
 | perl | 2026-82560 | 全部 | 用 Pod::Text 格式化恶意 POD 文档 | 应用不运行 perl；perl-base 为 Debian 必需包。不可达。 |
 | zlib | 2026-85091 | 全部 | 非阻塞 `gzwrite` 停顿后调用 `gzprintf`（gzip 文件写入 API） | Node 不使用系统 zlib。Login 的 Chromium 加载系统 libz，但该缺陷位于 gzip 文件写入接口，并非网页内容解压路径。可达性低，记录为已知风险。 |
 | expat | 2026-77214 | Login | 调用方向 `XML_ParseBuffer` 传入未校验的长度（API 误用） | Chromium 加载系统 libexpat（主要经 fontconfig 读取本地字体配置）。触发需要调用方误用 API，不是由网页 XML 内容直接触发。记录为已知风险。 |
+| expat | 2026-115506 | Login（多企业版 r3 起出现） | 解析攻击者提供的、带大型 DTD 和嵌套实体展开的 XML，每次解析消耗数十秒 CPU（拒绝服务） | Node 不链接 libexpat。Chromium 加载的系统 libexpat 只经 fontconfig 解析镜像内的本地字体配置文件，不由攻击者控制；网页中的 XML 由 Blink 的 libxml2 处理，不经 libexpat；Login 只访问 GitHub / GHE.com 设备授权页面。不可达。Debian 标为 unfixed（trixie 为 no-dsa，Minor issue）。 |
 | openssl（libssl3） | 2026-84782 | Login | DTLS 重传路径 | Node 与 Chromium 都不链接系统 libssl；应用不使用 DTLS。不可达。 |
 
 以上为基于缺陷描述和实际链接关系的工程判断，不是形式化 VEX 证明。Login 的 Chromium 只访问 GitHub 与配置的 SSO 页面，并只在完成授权任务时运行。

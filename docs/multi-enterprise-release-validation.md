@@ -151,7 +151,7 @@ r2 时的对照：旧 Pod 有忙碌长连接时要等满 25 秒才强制关闭�
 - **r2 复扫结论**：已发布的 r2 四个镜像都受 CVE-2026-111181（body-parser 2.3.0，可达，见第 6 节）和 CVE-2026-113872（multer 2.4.0，不可达）影响，r2 的 Login 另有上述 4 条有修复的 Debian 漏洞（r2 构建之后 Debian 才发布修复）。r2 没有 `inflate: false` 缓解。
 - **r3 仍被报告的 npm 条目只有 CVE-2026-111181**：Scout 按版本判断，body-parser 仍为 2.3.0。已按第 6 节缓解：四个服务的全部 body parser 都设置 `inflate: false`，压缩请求体在创建解压流之前就以 415 拒绝，该漏洞所需的解压路径不可达；批准的源提供 2.4.0 后升级。
 - 全部级别中，除 body-parser 外没有其他有修复版本的条目（Proxy 共 51 条、Login 共 134 条，其余均为 `not fixed`）。
-- 其余 High 条目都来自 Debian Bookworm 基础系统包，Scout 标注 `fixed_version: not fixed`：util-linux CVE-2026-53613、53615、76642、78408、78409、78410，perl CVE-2026-82560，zlib CVE-2026-85091（全部镜像），expat CVE-2026-115506（Login）。逐条可达性分析沿用 [单企业发布验证记录](user-pool-image-release-validation.md) 第 0.4 节；新增的 expat CVE-2026-115506 只在 Login 镜像中（随 Chromium 的系统依赖安装），按包沿用该节对 expat 的分析，本次没有为这一条单独做可达性分析，发布前应补入该节。
+- 其余 High 条目都来自 Debian Bookworm 基础系统包，Scout 标注 `fixed_version: not fixed`：util-linux CVE-2026-53613、53615、76642、78408、78409、78410，perl CVE-2026-82560，zlib CVE-2026-85091（全部镜像），expat CVE-2026-115506（Login）。逐条可达性分析沿用 [单企业发布验证记录](user-pool-image-release-validation.md) 第 0.4 节；新增的 expat CVE-2026-115506 只在 Login 镜像中（随 Chromium 的系统依赖安装），可达性分析已补入该节：Node 不链接 libexpat，Chromium 只经 fontconfig 用它解析镜像内的本地字体配置，网页 XML 不经 libexpat，攻击者无法提供输入，不可达。
 
 ### 9. 失败与重跑汇总
 
