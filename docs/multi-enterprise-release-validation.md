@@ -137,7 +137,7 @@ r2 时的对照：旧 Pod 有忙碌长连接时要等满 25 秒才强制关闭�
 | 资格测试脚本与 mock（`qualification-multi-lib` 27、`mock-services.tenants` 5、`mock-login-queue` 3、`mysql-bridge` 2、`local-diagnostics-contract` 3） | 40/40 |
 | 部署脚本（`deploy/images/package-runtime` 2、`deploy/user-pool-mysql-customer/package` 9、`deploy/kubernetes/package` 13） | 24/24 |
 
-**MySQL 集成测试（如实记录）**：首轮逐文件运行时，kind 集群的节点容器仍在后台运行（空闲时约 37% CPU），`ownerSideEffects` 16/22（6 条 30 秒超时取消）、`mysqlStore` 28/34、`mysqlLifecycle` 1/2、`loginPollingRecovery` 5/6（1 条取消）。停掉 kind 节点后单独重跑：`mysqlStore` 34/34、`mysqlLifecycle` 2/2、`loginPollingRecovery` 6/6；`ownerSideEffects` 连续 5 次都是 21/22 或 20/22，每次失败的是不同的“owner 交接”用例（例如期望 `oauth-wait` 实际仍为 `oauth-starting`，期望 `ready` 实际仍为 `provisioning`），都是等待状态推进的计时断言。其中第 4、5 次期间主机出现过一次约 9 分钟的停顿（见第 9 节）。这个文件测试的 `src/proxy/src/userPool/` 代码在 `3d6db1a..f43f27e` 之间没有任何改动，也不引用本次改动的文件（`server.ts`、`operationRoutes.ts`）；在 `3d6db1a` 上同一文件首轮 21/22、随后单独重跑两次 22/22。结论：计时类不稳定、与本次改动无关，但本机在 `f43f27e` 上没有得到它的完整通过记录，发布前宜在负载较低的机器上补跑。
+**MySQL 集成测试（如实记录）**：首轮逐文件运行时，kind 集群的节点容器仍在后台运行（空闲时约 37% CPU），`ownerSideEffects` 16/22（6 条 30 秒超时取消）、`mysqlStore` 28/34、`mysqlLifecycle` 1/2、`loginPollingRecovery` 5/6（1 条取消）。停掉 kind 节点后单独重跑：`mysqlStore` 34/34、`mysqlLifecycle` 2/2、`loginPollingRecovery` 6/6；`ownerSideEffects` 连续 5 次都是 21/22 或 20/22，每次失败的是不同的“owner 交接”用例（例如期望 `oauth-wait` 实际仍为 `oauth-starting`，期望 `ready` 实际仍为 `provisioning`），都是等待状态推进的计时断言。其中第 4、5 次期间主机出现过一次约 9 分钟的停顿（见第 9 节）。这个文件测试的 `src/proxy/src/userPool/` 代码在 `3d6db1a..f43f27e` 之间没有任何改动，也不引用本次改动的文件（`server.ts`、`operationRoutes.ts`）；在 `3d6db1a` 上同一文件首轮 21/22、随后单独重跑两次 22/22。结论：计时类不稳定、与本次改动无关，之后在主机空闲时于 `f43f27e` 上再单独重跑 3 次：22/22、21/22、21/22，取得了完整通过记录；单条计时断言偶发失败仍然存在，属于这个测试文件已知的不稳定，与本次改动无关。
 
 ### 8. 镜像扫描（Docker Scout）
 
@@ -173,7 +173,7 @@ r2 时的对照：旧 Pod 有忙碌长连接时要等满 25 秒才强制关闭�
 - 真实 LiteLLM：kind 和镜像级检查中的长连接客户端分别是 Node 的 `http.Agent({ keepAlive: true })` 和原始套接字，行为与 LiteLLM 的连接池相近，但没有用 LiteLLM 本身验证（包括它是否压缩请求体）；仓库的 LiteLLM 示例配置是 `max_retries: 0`。
 - CVE-2026-111181 的缓解只按设计和单元测试验证（压缩请求体在解压之前被 415 拒绝），没有在镜像上做攻击性复现。
 - SSO、Login 没有流式接口，“响应头已发出后在 `finish` 时结束套接字”只在 Proxy（SSE）、Console（CSV 转发）上做了镜像级验证，SSO、Login 由共享代码的单元测试覆盖。
-- `ownerSideEffects` 在 `f43f27e` 上没有完整通过记录（第 7 节）。
+- `ownerSideEffects` 在 `f43f27e` 上 8 次运行中 1 次 22/22，其余各有 1–2 条计时断言失败（第 7 节）；测试本身的不稳定待单独修正。
 - 资格测试中没有真实 Login 浏览器任务（kind 阶段 A 有真实 Login 的 Chromium 对 mock GHE.com）。
 - `MYSQL_AUTO_MIGRATE=false` + r4 → 多企业 DBA 升级脚本只在集成测试中覆盖；全新部署的其余未覆盖项同 r2 第 3.4 节。
 - 性能、容量与长时间稳定性。
