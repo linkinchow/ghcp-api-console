@@ -1,0 +1,123 @@
+# 非机密配置。机密值（INTERNAL_API_TOKEN、SESSION_SECRET、API_KEY、MYSQL_URL、SCIM_TOKEN、席位 PAT、
+# 池用户 SSO 密码、SAML 签名证书与私钥）只放在 Secret 中，见 ../secret.example.yaml。
+# 修改 ConfigMap 不会自动重启 Pod：改完后 kubectl rollout restart 对应 Deployment。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-common
+data:
+  LOG_LEVEL: info
+  # 进程收到 SIGTERM 后排空请求的时限；之后强制关闭连接，再最多 5 秒释放资源后退出。
+  # terminationGracePeriodSeconds（45）= preStop 10 + 本值 25 + 释放 5 + 余量 5。改大本值时同步改大宽限期。
+  SHUTDOWN_TIMEOUT_MS: "25000"
+  # 首次启动门禁（init 容器 require-approved-config）：核对第 4.7 节“有数据后不能修改”的企业身份字段、
+  # 池配置指纹参数和 READY_IDLE_TARGET=0 后，在私有副本中改为 "true"。任何环境变量仍含 REPLACE_ 时同样拒绝启动。
+  GHCP_CONFIG_APPROVED: BLOCKED
+---
+# Proxy、SSO、Login 共用的 `default` 企业变量（不使用 enterprise registry）。overlays/ 补充
+# github.com 或 GHE.com 的差异（GITHUB_BASE_URL、ENTERPRISE_SHORTCODE）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-enterprise
+data:
+  # 企业 slug：SSO 与 Login 必须一致；有 SSO 用户后不能修改。
+  ENTERPRISE_SLUG: REPLACE_ENTERPRISE_SLUG
+  # SSO 的对外根地址（不带路径）：Login Pod 内的 Chromium 和管理员浏览器都必须能访问。
+  # SSO 的 BASE_URL 与 Login 的 SSO_URL（<本值>/login）都由它生成，保证同源。
+  SSO_PUBLIC_BASE_URL: REPLACE_SSO_PUBLIC_BASE_URL
+  # 空 = 按 GITHUB_BASE_URL 推导。经出口网关时显式填写；Proxy 与 SSO 读同一个值（Proxy 用它做 /user 主体校验）。
+  GITHUB_API_BASE_URL: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-proxy-config
+data:
+  PORT: "3000"
+  ACCOUNT_ROUTING_MODE: caller-lease
+  IDENTITY_HEADER: X-User-Identity
+  IDENTITY_HEADER_REQUIRED: "true"
+  CLAUDE_CODE_OPTIMIZED: "true"
+  STORAGE_DRIVER: mysql
+  # true：第一个取得迁移锁的副本建表，其他副本最多等待 MYSQL_MIGRATION_LOCK_WAIT_SECONDS。
+  # DBA 预建表、运行账号只有 DML 时使用 components/mysql-dba-schema（设为 false）。
+  MYSQL_AUTO_MIGRATE: "true"
+  MYSQL_MIGRATION_LOCK_WAIT_SECONDS: "30"
+  # 每个副本的连接池上限；总连接数约为 副本数 × 本值（滚动更新时多 1 个副本），须小于 max_connections。
+  MYSQL_CONNECTION_LIMIT: "10"
+  # 托管 MySQL（例如 Azure Database for MySQL）要求 TLS：verify-ca 校验证书链（不校验主机名）。
+  # CA 文件来自 ConfigMap ghcp-mysql-ca 的 ca.pem（README 第 3 节）。
+  MYSQL_SSL_MODE: verify-ca
+  MYSQL_SSL_CA_PATH: /run/mysql-ca/ca.pem
+  # 池账号邮箱域名（default.pool.accountDomain）：有池成员后不能修改。
+  POOL_ACCOUNT_EMAIL_DOMAIN: REPLACE_POOL_ACCOUNT_EMAIL_DOMAIN
+  # 新账号凭据验证使用的模型；与下面 6 项一起写入共享配置指纹，所有副本必须一致，首次启动前定下来。
+  POOL_WARMUP_MODEL: REPLACE_POOL_WARMUP_MODEL
+  PROVISIONAL_LEASE_TTL_SECONDS: "300"
+  PREWARM_POLL_SECONDS: "5"
+  PREWARM_CONCURRENCY: "5"
+  POOL_LOGIN_MAX_PENDING: "5"
+  POOL_EXHAUSTED_RETRY_AFTER_SECONDS: "30"
+  POOL_REQUEST_TIMEOUT_SECONDS: "120"
+  # 可选：只放宽推理请求时限（5–600 秒），不进入指纹。
+  # POOL_INFERENCE_TIMEOUT_SECONDS: "600"
+  # 以下三项只在首次创建池设置时生效，之后在 Console 修改。全新部署先保持 0，避免一启动就真实开户。
+  READY_IDLE_TARGET: "0"
+  POOL_MAX_ACCOUNTS: "100"
+  CALLER_LEASE_TTL_SECONDS: "172800"
+  REQUEST_STATS_PER_ACCOUNT_LIMIT: "2"
+  # 同一 namespace 内的 Service 根地址，不带 /api。
+  SSO_BASE_URL: http://ghcp-sso:7001
+  LOGIN_BASE_URL: http://ghcp-login:7003
+  # 空 = 按 GITHUB_BASE_URL 推导（github.com：https://api.githubcopilot.com）。
+  COPILOT_API_BASE_URL: ""
+  # 代码默认开启且不脱敏；生产关闭。需要时开启并保持脱敏，目录在 emptyDir（Pod 重建即清空）。
+  PROXY_ERROR_DIAGNOSTICS_ENABLED: "false"
+  PROXY_ERROR_DIAGNOSTICS_REDACT: "true"
+  PROXY_ERROR_DIAGNOSTICS_DIR: /data/error-diagnostics
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-sso-config
+data:
+  PORT: "7001"
+  DB_PATH: /data/sso.sqlite
+  SSO_USER_EVENTS_LOG: /data/sso-user-events.log
+  PROXY_BASE_URL: http://ghcp-proxy:3000
+  CERT_DIR: /certs
+  # GitHub 作为 SAML SP 的标识与 ACS 地址、SCIM 根地址；overlays/ 按 github.com 或 GHE.com 给出格式。
+  SP_ENTITY_ID: REPLACE_SP_ENTITY_ID
+  SP_ACS_URL: REPLACE_SP_ACS_URL
+  SCIM_BASE_URL: REPLACE_SCIM_BASE_URL
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-login-config
+data:
+  PORT: "7003"
+  DB_PATH: /data/login.sqlite
+  PROXY_BASE_URL: http://ghcp-proxy:3000
+  LOG_DIR: /logs/login
+  AUTH_DEBUG_ARTIFACT_DIR: /logs/auth-debug
+  AUTH_HEADLESS: "true"
+  # 空 = 内置 OpenCode client ID（不是机密）。
+  GITHUB_OAUTH_CLIENT_ID: ""
+  GITHUB_OAUTH_SCOPE: read:user
+  # 根文件系统只读：Chromium 的配置与临时目录写到 emptyDir /tmp。
+  HOME: /tmp
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-console-config
+data:
+  PORT: "7004"
+  ADMINS_FILE: /data/admins.json
+  PROXY_BASE_URL: http://ghcp-proxy:3000
+  SSO_BASE_URL: http://ghcp-sso:7001
+  LOGIN_BASE_URL: http://ghcp-login:7003
+  # Console 前有改写 Host 头的反向代理 / Ingress 时填写对外地址（components/ingress-console 会设置）。
+  CONSOLE_PUBLIC_BASE_URL: ""

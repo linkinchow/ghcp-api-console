@@ -1,0 +1,10 @@
+# 可选：本应用 Pod 默认拒绝所有入站和出站，只放行必需的路径。需要集群 CNI 支持 NetworkPolicy
+# （例如 AKS 的 Azure NPM / Calico / Cilium）。替换 policies.yaml 中的 REPLACE_* 与示例网段。
+# 标准 NetworkPolicy 不能按域名放行：GitHub / Copilot 出站按“非私网地址的 443 端口”放行。
+# 需要只放行 github.com、api.github.com、api.githubcopilot.com（或 *.ghe.com 对应主机）时，
+# 用出口防火墙的 FQDN 规则（例如 Azure Firewall）或 CNI 的 FQDN 策略（例如 Cilium）。
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - policies.yaml

@@ -247,30 +247,25 @@ docker compose -f docker-compose.yml -f docker-compose.user-pool.yml -f docker-c
 
 ### 5.2 Kubernetes / Rancher
 
-仓库提供的是 **Proxy** 的模板：[`kubernetes.template.yaml`](../deploy/user-pool-mysql-customer/kubernetes.template.yaml)、[`rancher.template.yaml`](../deploy/user-pool-mysql-customer/rancher.template.yaml)（ConfigMap、Deployment 和 Service），说明见 [模板 README](../deploy/user-pool-mysql-customer/README.md)。模板按“从已有部署迁移”编写，用于全新部署时注意：
+全新部署使用 [`deploy/kubernetes/`](../deploy/kubernetes/README.md)：Kustomize base 加 overlay，包含**全部四个服务**（Proxy、SSO、Login、Console），外部托管 MySQL（例如 Azure Database for MySQL）。操作步骤（建库、填写 Secret 与 ConfigMap、apply 顺序、首次启动门禁、初始化 Console、开池、LiteLLM 访问、升级与回滚）见其 README；该目录的清单已在本地 kind 集群上用 mock 端到端验证过（README 第 9 节）。
 
-- **镜像**：两处 `REPLACE_*_IMAGE`（init 容器和主容器）都填 `镜像@digest`。
-- **Secret**：`MYSQL_URL`、`API_KEY`、`INTERNAL_API_TOKEN` 从 Secret 引用，不写进 ConfigMap。
-- **企业变量**：模板 ConfigMap 有 `ENTERPRISE_SHORTCODE`、`COPILOT_API_BASE_URL`。github.com 填实际 shortcode，`COPILOT_API_BASE_URL` 可删掉（使用默认）；GHE.com 删掉 `ENTERPRISE_SHORTCODE`，并**补上** `GITHUB_BASE_URL=https://<子域>.ghe.com`（模板中没有这一项）。需要时补 `MODELS_ADMIN_*`。
-- **池参数**：`POOL_ACCOUNT_EMAIL_DOMAIN`、`POOL_WARMUP_MODEL`、`READY_IDLE_TARGET: "0"`、`POOL_MAX_ACCOUNTS`（Rancher 模板默认 `"2"`，按批准值填写）；`SSO_BASE_URL`、`LOGIN_BASE_URL` 填 SSO、Login 的 Service 根地址。
-- **启动门禁**：init 容器 `require-approved-paused-database` 在 `CUSTOMER_PAUSED_DATABASE_APPROVED` 不是 `"true"` 时阻止 Proxy 启动。它是为迁移设计的人工门禁，不检查数据库。全新空库按 [MySQL 实施文档](user-pool-mysql-implementation.md) 第 4 节做“单副本、target 0、业务入口关闭”的首次启动，由操作员确认后在私有副本中改为 `"true"`（模板 README 第 3 节）。
-- **副本与更新策略**：首次启动 `replicas: 1`，`/readyz` 正常、Console 能看到 `default` 后再扩到批准的副本数。模板使用 `strategy: Recreate`（为从单企业版首次升级而设）；全新部署稳定后，同一多企业版本线内的 Proxy 更新可以改为 `RollingUpdate`（`maxSurge: 1`、`maxUnavailable: 0`），见模板注释。
-- **探针与停止**：`readinessProbe` 用 `/readyz`，`livenessProbe` 和 `startupProbe` 用 `/healthz`（startupProbe 约 300 秒，Proxy 迁移完成后才监听）。`terminationGracePeriodSeconds: 45` = preStop 10 秒 + `SHUTDOWN_TIMEOUT_MS` 25 秒 + 余量；不要改回 `command:` 覆盖。
-- **TLS**：模板默认 `MYSQL_SSL_MODE: verify-ca`，CA 从 ConfigMap 挂到 `/run/mysql-ca/ca.pem`。
+| 目录 | 内容 |
+| --- | --- |
+| `base/` | 四个 Deployment、ClusterIP Service、ConfigMap、PVC 和 Proxy 的 PodDisruptionBudget；镜像按第 2.1 节的 digest 引用；Secret 只按名称引用，值不入库（格式见 `secret.example.yaml`） |
+| `overlays/github-com/`、`overlays/ghe-com/` | 两种 GitHub 形态的企业变量（GHE.com 不设 `ENTERPRISE_SHORTCODE`），复制到私有仓库后替换 `REPLACE_*` |
+| `components/` | 可选：`ingress-sso`（SSO 对浏览器开放，SAML 必需的可达性）、`ingress-console`（Console 只经内部 Ingress）、`mysql-dba-schema`（方式 B，`MYSQL_AUTO_MIGRATE=false`）、`network-policy`（默认拒绝 + 最小放行） |
 
-**SSO、Login、Console 没有仓库模板**，请参照 `docker-compose.yml` 中的环境变量和卷自行编写，要求：
+要点（与第 3、4 节一致）：
 
-| 要求 | SSO | Login | Console |
-| --- | --- | --- | --- |
-| 副本与策略 | 1，`Recreate` | 1，`Recreate` | 1，`Recreate` |
-| 持久卷（RWO） | `/data`（`sso.sqlite`、`sso-user-events.log`） | `/data`（`login.sqlite`）、`/logs` | `/data`（`admins.json`） |
-| Secret | `INTERNAL_API_TOKEN`、`SESSION_SECRET`、`SCIM_TOKEN`、`GITHUB_COPILOT_SEAT_PAT`、`SSO_DEFAULT_USER_PASSWORD`；签名证书和私钥作为 Secret 卷挂载，`CERT_DIR` 指向挂载目录 | `INTERNAL_API_TOKEN` | `INTERNAL_API_TOKEN`、`SESSION_SECRET` |
-| 服务地址 | `BASE_URL`=对外 SSO 地址；`PROXY_BASE_URL`=Proxy Service 根地址 | `SSO_URL`=`<SSO 对外地址>/login`（Pod 内可访问）；`PROXY_BASE_URL` | `PROXY_BASE_URL`、`SSO_BASE_URL`、`LOGIN_BASE_URL`；有改写 Host 的 Ingress 时设 `CONSOLE_PUBLIC_BASE_URL` |
-| 探针 | `/healthz`（端口 7001） | `/healthz`（7003） | `/healthz`（7004） |
+- **Proxy**：2 个副本、`caller-lease` + MySQL、`RollingUpdate`（`maxSurge: 1`、`maxUnavailable: 0`）、PDB `minAvailable: 1`；`readinessProbe` 用 `/readyz`，`livenessProbe` 与 `startupProbe`（约 300 秒）用 `/healthz`。
+- **SSO、Login、Console**：各 1 个副本、`strategy: Recreate`，`/data`（Login 另有 `/logs`）在 RWO 持久卷上；不要用 NFS / Azure Files 等共享文件系统。Login 的 `/dev/shm` 使用内存卷。
+- **停止**：四个服务都是 `terminationGracePeriodSeconds: 45` = preStop 10 秒 + `SHUTDOWN_TIMEOUT_MS` 25 秒 + 资源释放 5 秒 + 余量；不覆盖镜像的启动命令（Tini 转发 SIGTERM）。
+- **安全上下文**：以 UID 1000 运行（镜像内的 `node` 用户）、根文件系统只读、去掉全部 capability、不挂载 ServiceAccount token。
+- **首次启动门禁**：每个 Pod 的 init 容器在 `GHCP_CONFIG_APPROVED` 不是 `"true"`、或任何环境变量仍含 `REPLACE_` 时拒绝启动。核对第 4.7 节的身份字段和池配置指纹参数后再放行。
+- **SSO 地址**：只在 ConfigMap 写一次 `SSO_PUBLIC_BASE_URL`，SSO 的 `BASE_URL` 与 Login 的 `SSO_URL`（`<地址>/login`）都由它生成，保证同源。
+- **MySQL**：默认 `MYSQL_SSL_MODE=verify-ca`，CA 来自 ConfigMap `ghcp-mysql-ca`。
 
-- SQLite 不能被多个 Pod 共享：不要用 RollingUpdate（会短暂出现两个 Pod），不要放在多节点共享的 NFS/RWX 卷上。
-- `terminationGracePeriodSeconds` 不小于 35 秒（与 Compose 的停止宽限期一致）。
-- Proxy Service 用 ClusterIP，只让 LiteLLM 和这三个服务访问；Console 和 SSO 通过 Ingress 只对管理网段 / 需要的浏览器开放。
+[`deploy/user-pool-mysql-customer/`](../deploy/user-pool-mysql-customer/README.md) 中只有 Proxy 的模板，按“从已有单企业部署迁移”编写（`strategy: Recreate`、导入数据库门禁），用于升级，不用于全新部署。
 
 ## 6. GitHub 侧 SAML 配置（`default` 企业）
 
@@ -471,4 +466,4 @@ LiteLLM 侧的完整说明见 [LiteLLM 身份接入](user-pool-litellm.md) 和 [
 - GHE.com 下 `COPILOT_API_BASE_URL` 指向其他子域时 Proxy 拒绝启动；`ENTERPRISE_SHORTCODE` 被忽略并打印 warning。同一个 SQLite 库上启动第二个 Proxy 时启动失败（`Another Proxy owns the SQLite user pool`）。
 - 第 10 节：只写新 GHE.com 企业的 registry，重启三个服务后新企业为 `draft`，`default` 的 cap 和状态不变；缺签名私钥时 Blockers 为 `sso:enterprise_secret_unconfigured:sso.signingKey`，Activate 返回 409 `enterprise_not_ready`；补文件并只重启 SSO 后就绪，Activate 成功。registry 路径不存在时三个服务都无法启动。
 
-未在本机核对（只按代码和文档整理）：MySQL 的建库、权限和两种迁移方式，Compose 叠加文件与 digest 镜像的组合，Kubernetes / Rancher 清单，真实开户、浏览器登录与推理，LiteLLM Hook。
+未在本机核对（只按代码和文档整理）：Compose 叠加文件与 digest 镜像的组合，Rancher 清单，真实开户、浏览器登录与推理，LiteLLM Hook。MySQL 的两种迁移方式（含第 3.1 节方式 A 的权限清单）和 `deploy/kubernetes/` 清单另在本地 kind 集群上用 mock 验证过，见 [其 README 第 9 节](../deploy/kubernetes/README.md#9-在-kind-上验证了什么)。

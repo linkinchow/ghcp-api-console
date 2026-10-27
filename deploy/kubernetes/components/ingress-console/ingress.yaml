@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ghcp-console
+  labels:
+    app.kubernetes.io/name: ghcp-console
+    app.kubernetes.io/component: console
+  # 使用只在内网监听的 IngressClass（例如内部负载均衡 / 私有 Application Gateway），再按控制器限制来源，
+  # 例如 ingress-nginx：
+  # annotations:
+  #   nginx.ingress.kubernetes.io/whitelist-source-range: REPLACE_ADMIN_CIDRS
+spec:
+  ingressClassName: REPLACE_INTERNAL_INGRESS_CLASS
+  tls:
+    - hosts:
+        - REPLACE_CONSOLE_HOST
+      secretName: ghcp-console-tls
+  rules:
+    - host: REPLACE_CONSOLE_HOST
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ghcp-console
+                port:
+                  name: http

@@ -1,0 +1,30 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ghcp-sso
+  labels:
+    app.kubernetes.io/name: ghcp-sso
+    app.kubernetes.io/component: sso
+  # 只对需要的网段开放（Login 所在集群、管理员网段 / VPN）。不同 Ingress 控制器的写法不同，例如 ingress-nginx：
+  # annotations:
+  #   nginx.ingress.kubernetes.io/whitelist-source-range: REPLACE_ADMIN_CIDRS,REPLACE_CLUSTER_EGRESS_CIDRS
+spec:
+  ingressClassName: REPLACE_INGRESS_CLASS
+  tls:
+    - hosts:
+        - REPLACE_SSO_HOST
+      # TLS 证书 Secret 由证书流程（例如 cert-manager）维护，不在仓库中。
+      secretName: ghcp-sso-tls
+  rules:
+    - host: REPLACE_SSO_HOST
+      http:
+        paths:
+          # `default` 企业使用根路径（/sso、/metadata、/login）；以后添加的企业使用 /enterprises/<id>/...，
+          # 所以整个前缀都要转发。
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ghcp-sso
+                port:
+                  name: http

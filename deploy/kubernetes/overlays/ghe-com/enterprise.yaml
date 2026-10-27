@@ -1,0 +1,17 @@
+# GHE.com：GITHUB_BASE_URL=https://<子域>.ghe.com；不设置 ENTERPRISE_SHORTCODE（GHE.com 下被忽略）。
+# API 与 Copilot 地址按子域推导（api.<子域>.ghe.com、copilot-api.<子域>.ghe.com）；显式填写时必须属于同一子域。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-enterprise
+data:
+  GITHUB_BASE_URL: https://REPLACE_GHE_SUBDOMAIN.ghe.com
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ghcp-sso-config
+data:
+  SP_ENTITY_ID: https://REPLACE_GHE_SUBDOMAIN.ghe.com/enterprises/REPLACE_ENTERPRISE_SLUG
+  SP_ACS_URL: https://REPLACE_GHE_SUBDOMAIN.ghe.com/enterprises/REPLACE_ENTERPRISE_SLUG/saml/consume
+  SCIM_BASE_URL: https://api.REPLACE_GHE_SUBDOMAIN.ghe.com/scim/v2/enterprises/REPLACE_ENTERPRISE_SLUG

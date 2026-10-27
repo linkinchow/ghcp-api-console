@@ -35,6 +35,7 @@
 | 要做的事情 | 文档或配置 |
 | --- | --- |
 | **已有单 Proxy／SQLite User Pool 升级到多 Proxy／MySQL** | **[客户升级指南](./docs/user-pool-mysql-upgrade-guide.md)**：数据库迁移、四组件升级、Service切换、验证与回退 |
+| 多企业版全新部署到 Kubernetes | **[Kustomize 清单（四个服务 + 外部 MySQL）](./deploy/kubernetes/README.md)**：github.com / GHE.com overlay，可选 Ingress、DBA 预建表、NetworkPolicy |
 | Kubernetes 部署配置 | **[K8s YAML模板](./deploy/user-pool-mysql-customer/kubernetes.template.yaml)**：先启动1个Proxy验证，再扩为3个或所需数量 |
 | 数据库迁移参数与兼容处理 | [User Pool 专用迁移工具](./upgrade/user-pool-mysql/README.md) |
 | 自行构建四组件镜像 | [固定源码构建与部署包](./deploy/user-pool-mysql-customer/README.md) |

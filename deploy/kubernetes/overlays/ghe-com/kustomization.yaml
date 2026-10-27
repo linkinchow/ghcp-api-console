@@ -1,0 +1,19 @@
+# GHE.com（数据驻留的 GitHub Enterprise Cloud）上的企业。复制本目录到私有仓库，替换 REPLACE_*。
+# GHE.com 只用 mock 验证过：首次接入真实 GHE.com 企业前先在预发布环境验收。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ghcp
+
+resources:
+  - ../../base
+
+# 可选组件，按需取消注释（说明见 ../../README.md 第 6 节）：
+# components:
+#   - ../../components/ingress-sso
+#   - ../../components/ingress-console
+#   - ../../components/mysql-dba-schema
+#   - ../../components/network-policy
+
+patches:
+  - path: enterprise.yaml

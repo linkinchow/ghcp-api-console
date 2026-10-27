@@ -1,0 +1,17 @@
+# Console 只经内部 Ingress 开放（管理网段 / VPN）。初始化之前，第一个打开 Console 的人就能创建管理员，
+# 所以先限制可达范围，部署后立即初始化（README 第 5 节）。
+# 同时设置 CONSOLE_PUBLIC_BASE_URL：Console 的写操作只接受同源请求，Ingress 改写 Host 时需要它。
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - ingress.yaml
+
+patches:
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: ghcp-console-config
+      data:
+        CONSOLE_PUBLIC_BASE_URL: https://REPLACE_CONSOLE_HOST

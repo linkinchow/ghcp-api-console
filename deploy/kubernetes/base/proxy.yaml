@@ -1,0 +1,197 @@
+# Proxy：唯一的业务入口（LiteLLM → Proxy），无状态，多个副本共享同一个外部 MySQL 写主库。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ghcp-proxy
+  labels:
+    app.kubernetes.io/name: ghcp-proxy
+    app.kubernetes.io/component: proxy
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  # 全新部署、同一多企业版本线内的更新：逐个替换，始终保持全部副本可用。
+  # （从单企业版首次升级必须 Recreate，见 deploy/user-pool-mysql-customer/；不适用于本目录。）
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ghcp-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ghcp-proxy
+        app.kubernetes.io/component: proxy
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # preStop 10 秒 + SHUTDOWN_TIMEOUT_MS 25 秒 + 资源释放 5 秒 + 余量 5 秒。
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ghcp-proxy
+      # 私有镜像仓库需要时在此补 imagePullSecrets。
+      initContainers:
+        - name: require-approved-config
+          image: ghcp-proxy
+          imagePullPolicy: IfNotPresent
+          command: &gate
+            - node
+            - -e
+            - >-
+              const bad = Object.keys(process.env).filter((k) => String(process.env[k]).includes('REPLACE_')).sort();
+              if (bad.length) { console.error('[config-gate] placeholders not replaced: ' + bad.join(', ')); process.exit(1); }
+              if (process.env.GHCP_CONFIG_APPROVED !== 'true') {
+              console.error('[config-gate] GHCP_CONFIG_APPROVED is not "true": review the configuration first (deploy/kubernetes/README.md)');
+              process.exit(1); }
+              console.log('[config-gate] configuration approved');
+          envFrom: &proxyEnvFrom
+            - configMapRef:
+                name: ghcp-common
+            - configMapRef:
+                name: ghcp-enterprise
+            - configMapRef:
+                name: ghcp-proxy-config
+          env: &proxyEnv
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ghcp-proxy
+                  key: API_KEY
+            - name: MYSQL_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ghcp-proxy
+                  key: MYSQL_URL
+            - name: INTERNAL_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ghcp-internal
+                  key: INTERNAL_API_TOKEN
+          terminationMessagePolicy: FallbackToLogsOnError
+          securityContext: &restricted
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      containers:
+        - name: proxy
+          image: ghcp-proxy
+          imagePullPolicy: IfNotPresent
+          # 不覆盖 command/args：镜像以 Tini 为 PID 1，把 SIGTERM 转发给 node。
+          ports:
+            - name: http
+              containerPort: 3000
+          envFrom: *proxyEnvFrom
+          env: *proxyEnv
+          securityContext: *restricted
+          resources:
+            requests:
+              cpu: 250m
+              memory: 384Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          # Proxy 完成 MySQL 迁移后才监听端口；本探测共约 300 秒。大库或 DBA 脚本未执行完时调高 failureThreshold。
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 30
+          # /readyz 会 ping MySQL（5 秒预算）；失败时只摘流量，不重启。
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            timeoutSeconds: 6
+            periodSeconds: 10
+            failureThreshold: 2
+          # /healthz 不访问数据库，避免 MySQL 短暂故障时所有副本被一起重启。
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 6
+          lifecycle:
+            # 等 Endpoint 摘除传播到 kube-proxy / Ingress 后再收 SIGTERM。
+            preStop:
+              exec:
+                command: [node, -e, "setTimeout(() => {}, 10000)"]
+          volumeMounts:
+            - name: mysql-ca
+              mountPath: /run/mysql-ca
+              readOnly: true
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: mysql-ca
+          configMap:
+            name: ghcp-mysql-ca
+            items:
+              - key: ca.pem
+                path: ca.pem
+        # MySQL 模式不写本地数据库；只有开启错误诊断时写 /data/error-diagnostics。
+        - name: data
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ghcp-proxy
+  labels:
+    app.kubernetes.io/name: ghcp-proxy
+    app.kubernetes.io/component: proxy
+spec:
+  type: ClusterIP
+  # 不需要会话粘滞：调用方租约保存在 MySQL，任何副本都能服务同一个调用方。
+  sessionAffinity: None
+  selector:
+    app.kubernetes.io/name: ghcp-proxy
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ghcp-proxy
+  labels:
+    app.kubernetes.io/name: ghcp-proxy
+    app.kubernetes.io/component: proxy
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ghcp-proxy
