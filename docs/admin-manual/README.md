@@ -409,6 +409,24 @@ Ready idle target 是全局数，**可以大于任何一个企业的 cap**（截
 - 错误属于上面四种需人工核对的类型时返回 409 `manual_reconciliation_required`：先确认外部的 SSO 用户 / 登录任务到底有没有完成，不要反复 Retry。
 - 普通的首次 401 已有自动修复，一般不必手工 Retry；暂停时或 Attempts 已到 3 时才需要。
 
+#### 成员停在 `scim-syncing`，错误 `scim_sync_unconfirmed`
+
+开户时 SSO 要通过 SCIM 在 GitHub 企业中创建用户。这一步超时或结果不明确时，成员停在 `Stage: scim-syncing`，错误为 `scim_sync_unconfirmed`。为避免在 GitHub 侧重复创建用户，Proxy **不会自动重做这一步**；直接点 Retry 时，Proxy 只会重新查询该 SSO 用户，GitHub 侧仍未同步就以同一错误再次失败。
+
+处理步骤：
+
+1. 先排除原因：看 SSO 日志中该用户的 SCIM 请求结果（SCIM token、SCIM 地址连通性、GitHub 返回的错误）。
+2. 对这些用户做一次“只创建”的 EMU 同步。SSO Users 页面的 **Sync GH login** 对池成员返回 `pool_member_managed`，所以要在 SSO 容器内调用内部接口（替换 `<context>`、`<namespace>`、`<企业 ID>` 和账号名；账号名就是 Pool members 中该成员的名称，即 SSO 用户名，可以一次列多个）：
+
+   ```bash
+   kubectl --context <context> -n <namespace> exec deploy/ghcp-sso -- node -e "fetch('http://127.0.0.1:7001/api/enterprises/<企业 ID>/users/batch',{method:'POST',headers:{'content-type':'application/json','X-Internal-Token':process.env.INTERNAL_API_TOKEN},body:JSON.stringify({operation:'sync_emu',ssoUsers:['<账号名>'],assignCopilotSeat:false,createOnly:true})}).then(r=>r.text()).then(console.log)"
+   ```
+
+   `createOnly: true` 只为池成员补建 GitHub 用户，不改角色、不分配席位（席位由账号池在下一阶段分配）。
+3. 返回的每一行 `status` 都是 `success` 后，在 Pool members 中对这些成员点 **Retry**。成员确认 GitHub 用户已同步，继续分配席位、授权和预热，几分钟后变为 `Ready idle`。
+
+返回行中有失败时不要反复 Retry，按该行的错误信息处理（例如 SCIM 中已存在同名用户时会返回冲突，需在 GitHub 侧核对）。
+
 ### 6.3 Disable
 
 适用：某个账号需要人工调查、不应再接新请求。
@@ -688,6 +706,7 @@ LiteLLM 可能会重新包装错误正文，客户端看到的格式以所用 Li
 | Pool members 中成员 Failed、`upstream_unauthorized` | 该行 Recovery 列、Recent events | 正常会自动重新授权；暂停时不会，取消暂停或手工 Retry |
 | Retry 返回 `manual_reconciliation_required` | 该行错误代码 | 先核对外部 SSO 用户 / 登录任务的实际结果，不要反复 Retry |
 | Failed 成员 Attempts 已到 3 | Recovery 列 | 不再自动重试。查明原因后手工 Retry |
+| Failed 成员停在 `scim-syncing`，错误 `scim_sync_unconfirmed`，Retry 后仍失败 | 该行 Stage 与错误代码、SSO 日志 | 不会自动重做 SCIM 创建。先在 SSO 内做“只创建”的 EMU 同步，再 Retry（任务 6.2） |
 | Low idle capacity 一直不消失 | 企业表 Inventory/cap、Provisioning | 所有 `active` 企业到 cap 时不会再补货；提高 cap 或调低目标 |
 | 选择器中的企业状态和企业表不一致 | — | 浏览器刷新（选择器列表只在页面加载时读取） |
 | 按企业页面显示 `Enterprise "<id>" is not configured in Proxy` | 地址栏 `e=` | 选一个存在的企业 |
