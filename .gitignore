@@ -29,6 +29,8 @@ docs/*
 guidance/outline.md
 guidance-draft.md
 tmp.md
+# Scratch work (temporary clones, trial merges, generated artifacts)
+/tmp/
 curl.http
 
 .claude/*
