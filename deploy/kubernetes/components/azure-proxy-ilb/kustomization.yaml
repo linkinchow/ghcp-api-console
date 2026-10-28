@@ -1,0 +1,11 @@
+# 可选：Proxy 的 Azure 内部负载均衡，只用于 LiteLLM 运行在**另一个** AKS 集群（同一 VNet 或对等 VNet）的情况。
+# LiteLLM 与 GHCP 在同一个集群时不要启用：直接用 http://ghcp-proxy.<namespace>.svc.cluster.local:3000。
+#
+# 风险（deploy/azure/public-access-design.md 第 4.3 节）：Proxy 的业务接口和管理接口（/api、/internal，由
+# INTERNAL_API_TOKEN 保护）在同一个端口，四层负载均衡无法按路径过滤，而且 Proxy 信任 LiteLLM 注入的
+# X-User-Identity。所以 loadBalancerSourceRanges 只能填 LiteLLM 节点所在子网，不要填更大的网段，更不要公网。
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - proxy-ilb.yaml

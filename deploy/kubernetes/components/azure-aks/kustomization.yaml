@@ -1,0 +1,45 @@
+# AKS（Azure）适配组件：在 overlays/github-com 或 overlays/ghe-com 之上启用，不复制、不修改 base。
+# 内容（详见 deploy/azure/README.md）：
+# - 镜像改为从 ACR 拉取（只改 newName，digest 与 base 相同，由 az acr import 按 digest 复制）；
+# - 四个服务使用同一个 ServiceAccount ghcp-workload（Workload Identity），每个服务一个 SecretProviderClass，
+#   由 Secrets Store CSI 驱动从 Key Vault 读取机密，并同步出 base 按名称引用的 Secret
+#   （ghcp-internal、ghcp-proxy、ghcp-sso、ghcp-sso-saml），所以 base 的 secretKeyRef 不变；
+# - ghcp-mysql-ca 由本组件生成：Azure Database for MySQL 文档要求的两个根 CA（公开证书）；
+# - 四个 PVC 使用 StorageClass ghcp-azure-disk（Azure Disk CSI，默认 ZRS，回收策略 Retain）；
+# - SSO、Console 的内部负载均衡 Service（固定内网 IP，作为管理员访问入口和 Application Gateway 后端）。
+# 所有 REPLACE_* 由 deploy/azure/scripts/render-overlay.mjs 按 Bicep 输出替换；手工使用时自行替换。
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  # ServiceAccount ghcp-workload 与 ConfigMap ghcp-mysql-ca 是独立的子目录，MySQL 账号初始化 Job 也引用它们。
+  - workload-identity
+  # 公开证书，不是机密（README 第 3.2 节）。来源与指纹见 mysql-ca/README.md。
+  - mysql-ca
+  - secret-provider-classes.yaml
+  - storage-class.yaml
+  - internal-load-balancers.yaml
+
+# base 已把镜像解析为 docker.io/linkinchow/ghcp-*@sha256:...；这里只换仓库地址，digest 保持不变。
+images:
+  - name: docker.io/linkinchow/ghcp-proxy
+    newName: REPLACE_ACR_LOGIN_SERVER/ghcp/ghcp-proxy
+  - name: docker.io/linkinchow/ghcp-sso
+    newName: REPLACE_ACR_LOGIN_SERVER/ghcp/ghcp-sso
+  - name: docker.io/linkinchow/ghcp-login
+    newName: REPLACE_ACR_LOGIN_SERVER/ghcp/ghcp-login
+  - name: docker.io/linkinchow/ghcp-console
+    newName: REPLACE_ACR_LOGIN_SERVER/ghcp/ghcp-console
+
+patches:
+  - path: workload-patches.yaml
+  # 四个 RWO PVC 都用 Azure Disk。`test` 保证 base 没有自带 storageClassName（有了就说明 base 变了，需要复核）。
+  - target:
+      kind: PersistentVolumeClaim
+    patch: |-
+      - op: test
+        path: /spec/accessModes/0
+        value: ReadWriteOnce
+      - op: add
+        path: /spec/storageClassName
+        value: ghcp-azure-disk

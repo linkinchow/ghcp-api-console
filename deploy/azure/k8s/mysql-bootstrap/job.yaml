@@ -1,0 +1,106 @@
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: ghcp-mysql-bootstrap-kv
+  labels:
+    app.kubernetes.io/name: ghcp-mysql-bootstrap
+    app.kubernetes.io/part-of: ghcp
+spec:
+  provider: azure
+  parameters:
+    usePodIdentity: "false"
+    clientID: REPLACE_WORKLOAD_CLIENT_ID
+    keyvaultName: REPLACE_KEY_VAULT_NAME
+    tenantId: REPLACE_TENANT_ID
+    cloudName: ""
+    objects: |
+      array:
+        - |
+          objectName: mysql-admin-password
+          objectType: secret
+        - |
+          objectName: ghcp-mysql-proxy-password
+          objectType: secret
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ghcp-mysql-bootstrap
+  labels:
+    app.kubernetes.io/name: ghcp-mysql-bootstrap
+    app.kubernetes.io/part-of: ghcp
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ghcp-mysql-bootstrap
+        app.kubernetes.io/part-of: ghcp
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ghcp-workload
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bootstrap
+          image: ghcp-proxy
+          imagePullPolicy: IfNotPresent
+          # 只用 args：保留镜像的 Tini 入口。
+          args: [node, /opt/bootstrap/bootstrap.cjs]
+          envFrom:
+            - configMapRef:
+                name: ghcp-mysql-bootstrap-config
+          env:
+            - name: MYSQL_SSL_CA_PATH
+              value: /run/mysql-ca/ca.pem
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: script
+              mountPath: /opt/bootstrap
+              readOnly: true
+            - name: mysql-ca
+              mountPath: /run/mysql-ca
+              readOnly: true
+            - name: key-vault
+              mountPath: /mnt/secrets-store
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: script
+          configMap:
+            name: ghcp-mysql-bootstrap-script
+        - name: mysql-ca
+          configMap:
+            name: ghcp-mysql-ca
+            items:
+              - key: ca.pem
+                path: ca.pem
+        - name: key-vault
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: ghcp-mysql-bootstrap-kv
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi

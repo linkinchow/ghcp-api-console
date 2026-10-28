@@ -1,0 +1,21 @@
+# SSO、Login、Console 的 SQLite / JSON 数据卷（RWO 块存储，不用 Azure Files：SQLite 文件锁在 SMB/NFS 上不可靠）。
+#
+# - skuName：默认 Premium_ZRS（区域冗余磁盘，可以挂到同一地域任意可用区的节点上，节点或可用区故障后
+#   Pod 能在其他可用区重建并挂回同一块盘）。不支持 ZRS 的地域、或节点池不跨可用区时改为 Premium_LRS：
+#   LRS 盘固定在创建时的可用区，Pod 只能调度到该可用区的节点，该可用区没有可用节点时 Pod 会 Pending。
+#   deploy/azure 的渲染脚本按 Bicep 参数 diskSkuName 替换。
+# - reclaimPolicy: Retain：误删 PVC 或 namespace 时磁盘保留（需要手工清理或重新绑定），数据比磁盘费用更贵。
+# - WaitForFirstConsumer：按 Pod 实际调度的可用区创建磁盘（对 LRS 必需）。
+# - 无论 ZRS 还是 LRS，同一块盘同时只能挂到一个节点：这三个服务本来就是 1 副本 + Recreate。
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ghcp-azure-disk
+  labels:
+    app.kubernetes.io/part-of: ghcp
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: Premium_ZRS
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true

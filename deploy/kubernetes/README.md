@@ -19,15 +19,22 @@ deploy/kubernetes/
 │   └── console.yaml          Deployment（1 副本，Recreate）、Service、PVC
 ├── overlays/
 │   ├── github-com/           github.com 上的 EMU 企业
-│   └── ghe-com/              GHE.com（数据驻留）企业
+│   ├── ghe-com/              GHE.com（数据驻留）企业
+│   └── azure-aks/            AKS：github-com + components/azure-aks（GHE.com 时把 ../github-com 换成 ../ghe-com）
 ├── components/               可选组件，在 overlay 的 components: 中启用
 │   ├── ingress-sso/          SSO 的 Ingress（浏览器可达，SAML 必需）
 │   ├── ingress-console/      Console 的内部 Ingress
 │   ├── mysql-dba-schema/     DBA 预建表，MYSQL_AUTO_MIGRATE=false
-│   └── network-policy/       默认拒绝 + 最小放行
+│   ├── network-policy/       默认拒绝 + 最小放行
+│   ├── azure-aks/            AKS 适配：ACR 镜像、Key Vault（CSI + Workload Identity）同步出同名 Secret、
+│   │                         Azure MySQL 根 CA、Azure Disk StorageClass、SSO / Console 内部负载均衡
+│   └── azure-proxy-ilb/      Proxy 内部负载均衡（只用于 LiteLLM 在另一个 AKS 集群时）
 ├── secret.example.yaml       Secret 与 MySQL CA 的占位格式（不被任何 kustomization 引用）
-└── package.test.mjs          静态检查：渲染每个 overlay 并断言不变量
+├── package.test.mjs          静态检查：渲染每个 overlay 并断言不变量
+└── azure-aks.test.mjs        静态检查：AKS overlay / 组件（每个 Pod 引用的 Secret 都由它挂载的 SecretProviderClass 同步等）
 ```
+
+**部署到 Azure（AKS）**：用 [`deploy/azure/`](../azure/README.md)（azd + Bicep）。它创建 AKS、Azure Database for MySQL、ACR、Key Vault 等，并按 Bicep 输出渲染一个引用本目录 `overlays/<github-com|ghe-com>` 与 `components/azure-aks` 的私有 overlay；base 不需要修改。不用 azd 时以 `overlays/azure-aks` 为模板替换 `REPLACE_*`。
 
 | 资源 | 名称 | 说明 |
 | --- | --- | --- |
