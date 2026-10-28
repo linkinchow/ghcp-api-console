@@ -42,6 +42,10 @@ Connect-Aks
 $namespace = Get-RequiredEnv 'GHCP_NAMESPACE'
 Initialize-Namespace $namespace
 Invoke-Kubectl -Arguments @('apply', '-k', $appDir) | Out-Null
+# kubectl apply 不删除渲染结果中已去掉的对象：关闭 Proxy 对外（且没有 GHCP_PROXY_ILB）后，删除它的内部负载均衡与放行规则。
+if (-not ($rendered | Select-String -SimpleMatch 'name: ghcp-proxy-ilb')) {
+  Invoke-Kubectl -Arguments @('-n', $namespace, 'delete', 'service/ghcp-proxy-ilb', 'networkpolicy/ghcp-azure-proxy-ilb-ingress', '--ignore-not-found') | Out-Null
+}
 foreach ($name in @('sso', 'login', 'proxy', 'console')) {
   Invoke-Kubectl -Arguments @('-n', $namespace, 'rollout', 'status', "deployment/ghcp-$name", '--timeout=10m') -AllowFailure
 }

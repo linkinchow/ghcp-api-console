@@ -335,7 +335,7 @@ azd provision
 | `wafMode` | `Prevention`（默认）/ `Detection` |
 | `splitHorizonDns` | 默认 `true`：VNet 内把对外主机名解析到 App GW 私网前端 |
 
-**关闭**：把端点设为 `false` 后 `azd provision` 会移除对应监听器；三个都关闭后，增量部署**不会删除**已有的 App GW、公网 IP 与 WAF 策略，需要手工删除：
+**关闭**：把端点设为 `false` 后 `azd provision` 会移除对应监听器（关闭 Proxy 时 postprovision 同时删除 Proxy 的内部负载均衡及其 NetworkPolicy，除非设置了 `GHCP_PROXY_ILB`）；三个都关闭后，增量部署**不会删除**已有的 App GW、公网 IP 与 WAF 策略，需要手工删除：
 
 ```bash
 RG=<资源组>; ENV=<环境名>
@@ -494,7 +494,7 @@ az aks update --resource-group <rg> --name <集群> --enable-secret-rotation --s
 
 ## 12. 验证了什么、没有验证什么
 
-**已执行（离线，不连接任何订阅或租户）**：
+**离线检查（不连接任何订阅或租户）**：
 
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
@@ -509,17 +509,45 @@ az aks update --resource-group <rg> --name <集群> --enable-secret-rotation --s
 | 仓库卫生 | `azure.test.mjs` | 没有订阅 / 租户 / 对象 ID（只有内置角色定义 ID 和全零示例）、公网 IP、真实主机名、本机路径、私钥或令牌 |
 | 既有检查 | `node --test deploy/kubernetes/package.test.mjs` | 通过（13 项，未改动） |
 
+**已在 Azure 上执行（2026-10，测试订阅，australiaeast）**：`azd up` 从零部署，四个服务为 r3 镜像。GitHub / GHE.com / Copilot 由集群内 mock 代替（default 与 3 个 GHE.com 企业），不连接真实 GitHub、不调用模型；Login 是真实的 Chromium 登录（经 mock 的 GHE.com 页面与本部署的 SSO SAML）。
+
+| 检查 | 结果 |
+| --- | --- |
+| 部署 | `azd provision` + postprovision 完成：VNet 与 4 个子网（共一个 /24）、NAT Gateway、AKS（CNI Overlay + Cilium）、MySQL 灵活服务器（私有终结点）、ACR（按 digest 导入 r3）、私有 Key Vault、Log Analytics。部署中发现 7 个模板问题，均已修复（见下表） |
+| 机密 | Key Vault CSI + Workload Identity 同步四个服务的机密；每个企业的 6 个 SSO 机密只挂到 SSO 的 `/run/secrets/<id>`，Proxy / Login / Console 没有 |
+| MySQL | 私有终结点 + TLS 1.3 + utf8mb4；账号初始化 Job（方式 A）；`enterprise-v1/*` 迁移；8.0 → 8.4 原地升级期间应用自动恢复、租约保留（升级后 12 项检查通过） |
+| 多企业 | default + 两个企业：就绪、激活（cap 4）、跨企业开户。运行时按第 8.6 节新增第 4 个企业（写 Key Vault → registry → postprovision → Proxy / SSO / Login 滚动重启 → `draft` → 激活），43 秒内有 2 个 ready 账号 |
+| 推理 | 三个 API × JSON / SSE；同一调用方在两个 Proxy 副本上落到同一成员；错误 key 返回 401 |
+| 滚动更新 | 持续负载下滚动替换两个 Proxy：长连接 1389/1389、新连接 1364/1364，零失败 |
+| 配置变化 | 改 azd 值后只有读取该值的服务滚动更新（`ghcp.azure/config-hash`，第 6 节） |
+| 公网开关 | App GW WAF_v2（公网 + 私网前端），Key Vault 中的通配符证书（TLS 1.3，两个前端都通过系统信任链校验），split-horizon DNS（每个对外主机名一个私有区域）。Console 经 App GW 打开与登录，跨站写入 403。Proxy 只放行推理路径：`/healthz`、`/api/*`、`/internal/*` 在 WAF 层 403；推理 JSON / SSE 正常 |
+| 来源限制 | 允许列表之外的来源（AKS 的 NAT 出口、互联网扫描）对两个对外主机名均为 403；未配置的主机名 404 |
+| 长请求（经 App GW，`POOL_INFERENCE_TIMEOUT_SECONDS=600`） | SSE 300 秒与 550 秒：200，最大分块间隔 0.25 秒（响应不缓冲）。非流式 300 秒无输出：200（修复内部负载均衡空闲超时之后，见下表）。**非流式 550 秒无输出：Proxy 在 300 秒返回 502**——Proxy 用 Node 内置 fetch 调上游，其默认响应头超时为 300 秒，上游 300 秒内不发响应头时请求失败，与 App GW 无关（产品问题，见第 13 节） |
+
+**部署中发现并已修复的问题**：
+
+| 问题 | 现象 | 修复 |
+| --- | --- | --- |
+| 设置 API server 允许列表时没有包含 NAT 出口 IP | 节点连不上 API server，AKS 创建失败（`K8SAPIServerConnFail`） | 自动加入本模板 NAT 的出口 IP（第 3.3 节） |
+| postprovision 渲染成功却判为失败 | PowerShell 把渲染脚本的输出并入函数返回值 | `Invoke-Renderer` 输出改走 `Out-Host` |
+| MySQL 默认 8.0 | 8.0 标准支持 2027-01-31 结束，之后自动按 vCore 计 Extended Support 费用 | 默认 8.4（第 3.4 节） |
+| 订阅注册了 App GW 网络隔离（`EnableApplicationGatewayNetworkIsolation`） | App GW 创建失败，要求子网委派 | App GW 子网委派给 `Microsoft.Network/applicationGateways`（第 9 节） |
+| 应用部署后再运行 postprovision | MySQL 账号初始化 Job 被命名空间的默认拒绝策略阻断，超时失败（新增企业、打开公网开关都要重跑） | 为该 Job 渲染只放行 MySQL 3306 的 NetworkPolicy |
+| 改 azd 值后 ConfigMap 更新但 Pod 不重启 | 打开 Console 公网访问后 `CONSOLE_PUBLIC_BASE_URL` 不生效 | Pod 模板注解 `ghcp.azure/config-hash`（第 6 节） |
+| Proxy 内部负载均衡的 TCP 空闲超时为 Azure 默认 4 分钟 | 经 App GW 的 300 秒非流式请求在 268 秒被重置，App GW 返回 502 | 注解 `azure-load-balancer-tcp-idle-timeout: "15"`；LiteLLM 的内部负载均衡需要同样设置（第 7 节） |
+
+**观察到的其他情况**：运维机经 Global Secure Access 等代理访问时，App GW 与 API server 看到的来源是代理的出口地址，不是本机查询到的公网 IP，允许列表要按实际来源配置（WAF 日志 `ApplicationGatewayFirewallLog` 中可以看到被拒的来源）。App GW 公网 IP 开放后很快会有互联网扫描（日志中为 404 或 403）。Login 的 NetworkPolicy 保留了 base 中 `REPLACE_INGRESS_NAMESPACE` 的占位规则（不匹配任何 namespace，无副作用）。
+
 **没有验证**：
 
-- 没有部署到 Azure，没有运行 `what-if`、`az deployment ... validate` 或任何访问订阅的命令。因此 ARM 层面的校验（SKU / 版本在所选地域是否可用、配额、API 版本支持的属性值、`log_bin_trust_function_creators` 等参数的取值格式、MySQL 8.4 的可用性、ZRS 磁盘与 App GW 的可用区支持、角色分配的传播延迟）都要在客户订阅中首次部署时确认。
-- hooks 没有实际运行（它们调用 az / azd / kubectl 访问 Azure）；只做了语法与约定检查。
-- Key Vault CSI + Workload Identity 同步 Secret、`az acr import` 按 digest 复制、经 ARM 写入私有 Key Vault 的机密、App GW 从私有 Key Vault 读取证书、私有终结点 DNS、内部负载均衡固定 IP 与来源限制、Cilium 下的 NetworkPolicy、MySQL 账号初始化 Job 对真实 Azure MySQL 的连接，都只按官方文档设计，未在 Azure 上运行。
-- 多企业：Secrets Store CSI 把同一个 Pod 的多个 SecretProviderClass 卷挂到 `/run/secrets/<id>`（根文件系统只读）、registry 变化触发的滚动重启、新企业在真实 SSO / Login 上的就绪，都未在集群上运行。
-- WAF 托管规则对 SSO / Console 实际请求的误报情况未测（建议首次以 `Detection` 观察）；SSE 与 600 秒请求经 App GW 的端到端行为未测。
-- 应用本身的行为沿用 `deploy/kubernetes` 在 kind 上的验证（Kubernetes README 第 9 节），本目录没有新增运行时验证。
+- 公网前端上允许列表**之内**的来源：测试机的流量经代理出口，不在允许列表中；允许路径改从 VNet 内经 App GW 私网前端验证（同一组监听器、WAF 策略与后端设置）。因此公网 IP 的 15 分钟空闲超时没有用超过 4 分钟的请求实测。
+- 私有集群、复用 VNet / AKS、Proxy 的 mutual TLS、SSO 或 LiteLLM 端点对外、MySQL 高可用切换、DBA 方式（方式 B）、`azd down`。
+- WAF 托管规则对 SSO 的误报（Console 的页面、登录与推理请求在 `Prevention` 模式下没有误报）；建议首次对外时以 `Detection` 观察。
+- 真实 GitHub 企业（SAML、SCIM、席位、Copilot），按新部署指南在客户环境验证。
 
 ## 13. 已知限制与待确认
 
+- **非流式推理实际最长约 300 秒**（r3 及更早版本的产品行为，与部署方式无关）：Proxy 调上游使用 Node 内置 fetch，默认响应头超时 300 秒；上游超过 300 秒才返回响应头时请求以 502 失败，`POOL_INFERENCE_TIMEOUT_SECONDS` 设到 600 也不能延长。流式请求很快收到响应头，不受此限（实测 550 秒正常）。需要更长的非流式请求时请改用流式，或等待 Proxy 修复。
 - MySQL 管理员密码保存在运维机器的 azd 环境中（第 5.1 节），建议初始化后轮换。
 - 公网开关关闭后不会自动删除 App GW（第 7 节）。
 - `SSO_PUBLIC_BASE_URL` 改变需要同步 GitHub SAML 设置（public-access-design.md 第 8 节）。
