@@ -62,6 +62,8 @@ kubectl --context <原集群 context> -n <namespace> get pods -o custom-columns=
 | `ENTERPRISE_SLUG`、`ENTERPRISE_SHORTCODE`（GHE.com 则为 `GITHUB_BASE_URL`） | Proxy、SSO、Login | 企业身份；有数据后不能修改（新部署指南第 4 节） |
 | `POOL_ACCOUNT_EMAIL_DOMAIN` | Proxy | 企业身份的一部分 |
 | 账号池的其他 Proxy 参数（`POOL_WARMUP_MODEL`、`PROVISIONAL_LEASE_TTL_SECONDS`、`PREWARM_CONCURRENCY`、`PREWARM_POLL_SECONDS`、`POOL_LOGIN_MAX_PENDING`、`POOL_EXHAUSTED_RETRY_AFTER_SECONDS`、`POOL_REQUEST_TIMEOUT_SECONDS` 等） | Proxy | 它们写进 MySQL 中的账号池配置指纹；与原值不同时 Proxy 以 `Pool configuration differs between Proxy replicas` 拒绝启动。最稳妥：**原样复制原 Proxy 的全部非机密环境变量**。idle 目标、cap、租约时长不在指纹中，它们本来就保存在数据库里 |
+| `POOL_REQUEST_TIMEOUT_SECONDS`（默认 120） | Proxy | 账号池上游请求时限，**属于账号池配置指纹**：与原值不同时 Proxy 拒绝启动。即使已用下一行把推理时限调大，这个值也保持原样 |
+| `POOL_INFERENCE_TIMEOUT_SECONDS`（原环境设置过时，例如 600） | Proxy | 三条推理路径（`/v1/messages`、`/chat/completions`、`/responses`）的单独总时限（`bf38374` 起提供），**不在指纹中**。原环境设置过就必须带到新环境，否则长请求又会在 `POOL_REQUEST_TIMEOUT_SECONDS` 处被截断；原环境没有设置则不设 |
 | `SSO_DEFAULT_USER_PASSWORD` | SSO | 每个池账号的 SSO 密码就是它；改了之后所有已有池账号登录失败 |
 | SAML 签名证书与私钥 | SSO | 沿用则 GitHub 侧证书不用改 |
 | SCIM token、Copilot 席位 PAT | SSO | 企业级凭据，沿用 |
