@@ -10,7 +10,7 @@
 //                           替换 REPLACE_*（ACR、Key Vault、Workload Identity、内网 IP、来源网段）并写入企业变量；
 //   <out>/mysql-bootstrap/  引用 deploy/azure/k8s/mysql-bootstrap，替换同样的 Azure 值。
 // 生成的文件是 JSON（YAML 的子集），避免手写 YAML 转义。
-import { X509Certificate } from 'node:crypto';
+import { createHash, X509Certificate } from 'node:crypto';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -466,6 +466,24 @@ export function renderOverlay(env, outDir, options = {}) {
       });
     }
     if (enterpriseClasses.proxy.length + enterpriseClasses.sso.length > 0) resources.push('enterprise-secret-provider-classes.yaml');
+  }
+  // 这些 ConfigMap 没有内容哈希后缀，内容变化（例如打开公网开关后的 CONSOLE_PUBLIC_BASE_URL）不会让 Pod 重启，
+  // 环境变量就一直是旧值。把每个服务读取的渲染值的哈希写进 Pod 模板注解，值变化时 kubectl apply 即滚动更新该服务。
+  const configData = Object.fromEntries(patches.filter((p) => p.kind === 'ConfigMap').map((p) => [p.metadata.name, p.data]));
+  const SERVICE_CONFIG_MAPS = {
+    proxy: ['ghcp-common', 'ghcp-enterprise', 'ghcp-proxy-config'],
+    sso: ['ghcp-common', 'ghcp-enterprise', 'ghcp-sso-config'],
+    login: ['ghcp-common', 'ghcp-enterprise', 'ghcp-login-config'],
+    console: ['ghcp-common', 'ghcp-console-config'],
+  };
+  for (const [service, names] of Object.entries(SERVICE_CONFIG_MAPS)) {
+    const hash = createHash('sha256').update(JSON.stringify(names.map((name) => [name, configData[name] ?? null]))).digest('hex').slice(0, 16);
+    patches.push({
+      apiVersion: 'apps/v1',
+      kind: 'Deployment',
+      metadata: { name: `ghcp-${service}` },
+      spec: { template: { metadata: { annotations: { 'ghcp.azure/config-hash': hash } } } },
+    });
   }
   if (publicSsoHost && appGwPrivateIp) {
     // Login 的 Chromium 不依赖 VNet 的 DNS 配置也能经 App GW 私网前端访问对外的 SSO 主机名。

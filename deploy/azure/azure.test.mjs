@@ -440,6 +440,28 @@ test('renderer: a published Proxy gets its internal load balancer, reachable onl
   }
 });
 
+test('renderer: a changed rendered value rolls only the services that read it (config-hash annotation)', { skip: skipKubectl }, () => {
+  const hashes = (overrides) => {
+    const { outDir, result } = renderInto(azdEnvironment(overrides));
+    try {
+      assert.deepEqual(result.errors, []);
+      writeOverlay(result, outDir);
+      const { objects } = kustomize(path.join(outDir, 'app'));
+      return Object.fromEntries(['proxy', 'sso', 'login', 'console'].map((service) => [service,
+        named(objects, 'Deployment', `ghcp-${service}`).spec.template.metadata.annotations['ghcp.azure/config-hash']]));
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  };
+  const before = hashes({});
+  assert.ok(Object.values(before).every((hash) => /^[0-9a-f]{16}$/.test(hash)));
+  assert.deepEqual(hashes({}), before, 'rendering is deterministic');
+  // Opening the Console publicly changes CONSOLE_PUBLIC_BASE_URL, which only Console reads.
+  const after = hashes({ GHCP_PUBLIC_CONSOLE_HOST: 'console.example.com', APPGW_PRIVATE_IP: '10.40.5.10' });
+  assert.notEqual(after.console, before.console);
+  assert.deepEqual([after.proxy, after.sso, after.login], [before.proxy, before.sso, before.login]);
+});
+
 test('renderer: refuses approval with missing values, secrets in ConfigMaps and open Proxy ranges', () => {
   const missing = renderOverlay(azdEnvironment({ GHCP_ENTERPRISE_SLUG: '', GHCP_CONFIG_APPROVED: 'true' }), path.join(os.tmpdir(), 'unused'));
   assert.ok(missing.errors.some((e) => /GHCP_CONFIG_APPROVED=true but these values are missing: GHCP_ENTERPRISE_SLUG/.test(e)));

@@ -308,6 +308,7 @@ SSO 的 Pod 在 `ghcp-scim-token` 等机密写入之前停在 `ContainerCreating
    ```
 
    `ghcp-proxy-api-key` 轮换需要同时更新 LiteLLM；`ghcp-mysql-url` 轮换需要先改 MySQL 账号密码（重跑账号初始化 Job：删除两个 `ghcp-mysql-*` 机密后 `azd hooks run postprovision`）。
+7. **改配置**：改 azd 环境中的值（例如公网开关、`GHCP_PROXY_CONFIG_OVERRIDES`）后 `azd provision` 或 `azd hooks run postprovision`。渲染脚本把每个服务读取的 ConfigMap 值的哈希写进 Pod 模板注解 `ghcp.azure/config-hash`，所以只有值变化的服务滚动更新（例如打开 Console 公网访问只重启 Console，使新的 `CONSOLE_PUBLIC_BASE_URL` 生效）；其余服务不受影响。
 
 ## 7. 公网访问开关
 
