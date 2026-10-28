@@ -137,6 +137,7 @@ X-User-Identity: sha256:<鉴权确认的64位小写hex hash>
 | Proxy → Copilot | `POOL_INFERENCE_TIMEOUT_SECONDS` 最大 600（可选；不进入指纹） | 推理请求上限 |
 | App GW 后端 `requestTimeout` | SSO 60 秒、Console 120 秒、**LiteLLM / Proxy 900 秒** | 覆盖 600 秒推理 + LiteLLM 自身开销 |
 | App GW 公网 IP TCP 空闲超时 | 15 分钟（参数 `GHCP_APPGW_IDLE_TIMEOUT_MINUTES`，4–30） | 非流式请求在完成前没有任何字节；默认 4 分钟会切断 |
+| 内部负载均衡（AKS `LoadBalancer` Service）TCP 空闲超时 | Proxy 内部负载均衡 15 分钟（注解 `service.beta.kubernetes.io/azure-load-balancer-tcp-idle-timeout: "15"`，`components/azure-proxy-ilb`）；**LiteLLM 的内部负载均衡由 LiteLLM 部署管理，需要加同样的注解** | Azure 负载均衡规则默认 4 分钟并发送 TCP RST。实测：没有这个注解时，经 App GW 的 300 秒非流式请求在 268 秒被重置，App GW 返回 502（SSE 不受影响，流中持续有数据） |
 | App GW HTTP/2 | **关闭** | App GW v2 前端的 HTTP/2 连接空闲超时固定 180 秒、不可配置（App GW FAQ） |
 | App GW 私网前端 | TCP 空闲超时固定 5 分钟、不可配置（App GW FAQ） | VNet 内的长时间非流式调用应直接用 LiteLLM 自己的内部负载均衡，不经 App GW 私网前端 |
 | App GW 响应缓冲 | 关闭（`enableResponseBuffering: false`） | SSE 逐块转发；WAF_v2 的请求缓冲无法关闭（WAF 需要完整请求） |

@@ -330,7 +330,7 @@ azd provision
 | `litellmAllowedSourceCidrs` | LiteLLM 单独的来源列表 |
 | `ssoAllowAnySource` / `litellmAllowAnySource` | 显式同意对任意来源开放 |
 | `hostNames` / `certificateNames` | 对外主机名；Key Vault 中的证书名（默认 `ghcp-public-tls`） |
-| `litellmBackend` | `{ address, port, probePath }`，LiteLLM 的内部负载均衡 |
+| `litellmBackend` | `{ address, port, probePath }`，LiteLLM 的内部负载均衡。该 Service 需要注解 `service.beta.kubernetes.io/azure-load-balancer-tcp-idle-timeout: "15"`：Azure 负载均衡默认 4 分钟空闲即重置连接，会截断长时间没有输出的非流式请求（设计文档第 7 节；Proxy 的内部负载均衡已设置） |
 | `litellmAllowedPathPrefixes` | LiteLLM 放行的路径前缀 |
 | `wafMode` | `Prevention`（默认）/ `Detection` |
 | `splitHorizonDns` | 默认 `true`：VNet 内把对外主机名解析到 App GW 私网前端 |

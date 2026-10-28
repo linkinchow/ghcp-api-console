@@ -251,6 +251,10 @@ test('internal load balancers: SSO and Console private only, fixed IPs, source r
       assert.match(annotations['service.beta.kubernetes.io/azure-load-balancer-internal-subnet'], /^REPLACE_/);
       assert.equal(service.spec.externalTrafficPolicy, 'Local');
       assert.ok(service.spec.loadBalancerSourceRanges.length > 0, 'source ranges are mandatory');
+      // Non-streaming inference is silent for up to 600 s; the Azure default (4 minutes) resets it.
+      if (service.metadata.name === 'ghcp-proxy-ilb') {
+        assert.equal(annotations['service.beta.kubernetes.io/azure-load-balancer-tcp-idle-timeout'], '15');
+      }
     }
   }
   assert.ok(!byKind(rendered('azure-aks').objects, 'Ingress').length, 'no Ingress: App Gateway (deploy/azure) is the only public entry');
