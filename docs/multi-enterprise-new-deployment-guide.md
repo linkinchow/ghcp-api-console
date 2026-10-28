@@ -3,10 +3,9 @@
 本指南适用于**全新部署**多企业版 `multi-f43f27e-amd64-r3`，以最常见的情况为例：客户只有**一个** GitHub 企业（一个 slug）。第 10 节说明以后如何再添加企业。
 
 - 已有单企业版 r4 部署要升级，请看 [多企业版升级指南](multi-enterprise-upgrade-guide.md)，不要按本文操作原数据。
-- 本文只写部署和首次开池。日常 Console 操作（每日巡检、调整 cap、Drain、处理异常成员、查用户租约等）见《管理员手册》。
+- 本文只写部署和首次开池。日常 Console 操作（每日巡检、调整 cap、Drain、处理异常成员、查用户租约等）见[《管理员手册》](admin-manual/README.md)。
 - 文中的主机名、slug、域名、令牌都是占位值（`contoso`、`fabrikam`、`example.com`），请替换为实际值；实际值不要写进仓库、工单或截图。
 
-<!-- TODO(coordinator): 《管理员手册》在 docs/admin-manual 分支（docs/admin-manual/README.md），合入 main 后把本文中的“《管理员手册》”改为链接。 -->
 
 整体流程：
 
