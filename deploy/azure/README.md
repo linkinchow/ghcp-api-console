@@ -22,6 +22,8 @@ deploy/azure/
 │                                subnet-role-assignment、acr、key-vault、key-vault-secret、mysql、waf-policy、app-gateway
 ├── hooks/                       PowerShell 7：preprovision、postprovision、deploy-app、predown、Set-GhcpSecret、common
 ├── scripts/render-overlay.mjs   按 azd 环境生成本环境的私有 overlay（.generated/<环境>/，不入库）
+├── scripts/enterprise-registry.mjs  多企业 registry 的 Key Vault / 挂载约定与校验（第 8.6 节）
+├── enterprise-registry.azure.example.json  按本部署约定写的 registry 示例（两个新增企业）
 ├── k8s/mysql-bootstrap/         MySQL 账号初始化 Job（用 Proxy 镜像，无额外镜像）
 ├── images.json                  四个镜像的 Docker Hub digest（与 base 一致，测试校验）
 ├── public-access-design.md      公网访问开关的设计
@@ -178,6 +180,7 @@ done
 | `GHCP_LITELLM_NAMESPACE` / `GHCP_LITELLM_POD_LABEL` | NetworkPolicy 中放行访问 Proxy 的 LiteLLM（同集群时）；标签默认 `app=litellm`（LiteLLM AKS 模板） |
 | `GHCP_PROXY_ILB` / `GHCP_PROXY_ILB_ALLOWED_CIDRS` | 启用 Proxy 内部负载均衡（LiteLLM 在另一个集群）；来源只能是 LiteLLM 节点子网 |
 | `GHCP_ALLOW_AZD_DOWN` | 允许 `azd down`（第 8.5 节） |
+| `GHCP_ENTERPRISE_REGISTRY_FILE` | 多企业：运维维护的 registry JSON 文件路径（绝对路径，或相对 `deploy/azure`；放在私有位置，不入库）。为空 = 只有 `default`（第 8.6 节） |
 
 ### 3.6 公网访问开关
 
@@ -249,6 +252,7 @@ azd provision
 | `ghcp-copilot-seat-pat` | `ghcp-sso/GITHUB_COPILOT_SEAT_PAT` | **运维写入** | SSO |
 | `ghcp-saml-idp-cert` / `ghcp-saml-idp-key` | `ghcp-sso-saml/idp-cert.pem`、`idp-key.pem` | **运维写入**（自己维护的 SAML 签名证书与私钥） | SSO |
 | `ghcp-public-tls`（或 `certificateNames` 中的名字） | — | **运维写入**（公网模式） | App GW |
+| `ghcp-ent-<id>-*` | 文件 `/run/secrets/<id>/*` | registry 中其他企业的机密（第 8.6 节） | SSO（`sso.*`）、Proxy（Models token） |
 
 - 生成类机密只在内存中生成，经 ARM 控制面（`az resource create --subscription ...`）写入，不出现在 azd 环境、日志或仓库中；重复执行不会轮换已有值。
 - 控制面写入不受 Key Vault 网络规则限制，所以私有的 vault 也能在 VNet 外写入；读取值（数据面）只能在 VNet 内或经 `GHCP_KEY_VAULT_ALLOWED_IP_RANGES`。
@@ -311,9 +315,9 @@ SSO 的 Pod 在 `ghcp-scim-token` 等机密写入之前停在 `ContainerCreating
 
 ```bash
 # 先把证书写入 Key Vault（第 5.2 节），再：
-azd env set GHCP_PUBLIC_ACCESS '{"sso":true,"console":true,"litellm":false,"allowedSourceCidrs":["203.0.113.0/24"],"hostNames":{"sso":"sso.example.com","console":"console.example.com"}}'
+azd env set GHCP_PUBLIC_ACCESS '{"sso":false,"console":true,"litellm":false,"allowedSourceCidrs":["203.0.113.0/24"],"hostNames":{"console":"console.example.com"}}'
 azd provision
-# 输出 APPGW_PUBLIC_IP：在公网 DNS 中把两个主机名指向它；SSO 地址变化后同步 GitHub SAML 设置
+# 输出 APPGW_PUBLIC_IP：在公网 DNS 中把 Console 主机名指向它。SSO 通常不需要对外（设计文档第 2.1 节）；确需开放时 SSO 地址变化后同步 GitHub SAML 设置
 ```
 
 | 键 | 说明 |
@@ -369,6 +373,52 @@ Container Insights（`ContainerLogV2`）、AKS / MySQL 指标、App GW 访问与
 ### 8.5 删除
 
 `azd down` 会删除资源组及其中的 MySQL 和数据盘，predown hook 默认拒绝；确认已备份后 `azd env set GHCP_ALLOW_AZD_DOWN true`。复用 VNet / AKS 的环境永远拒绝（见第 9 节）。Key Vault 开启了清除保护，删除后在保留期内同名 vault 不能重建。
+
+### 8.6 多企业：新增、轮换、移除
+
+`default` 企业始终由环境变量定义，机密名不变（第 5.1 节）。其他企业写在运维维护的 registry 文件中（格式见 [registry 配置参考](../../docs/multi-enterprise-registry.md)，本部署的示例见 [`enterprise-registry.azure.example.json`](enterprise-registry.azure.example.json)），用 `GHCP_ENTERPRISE_REGISTRY_FILE` 指向它。registry 本身不含机密，可以放在客户的私有仓库中。
+
+**依据代码确认的事实**（`src/packages/shared/src/enterprise/`）：
+
+| registry 字段 | 读取的服务 | 容器内文件（本部署约定） | Key Vault 机密 | 必需 | 来源 |
+| --- | --- | --- | --- | --- | --- |
+| `sso.signingCert` | SSO | `/run/secrets/<id>/idp-cert.pem` | `ghcp-ent-<id>-saml-idp-cert` | 是 | 运维（该企业**独立**的 SAML 证书） |
+| `sso.signingKey` | SSO | `/run/secrets/<id>/idp-key.pem` | `ghcp-ent-<id>-saml-idp-key` | 是 | 运维 |
+| `sso.sessionSecret` | SSO | `/run/secrets/<id>/session-secret` | `ghcp-ent-<id>-session-secret` | 是 | postprovision 生成 |
+| `sso.scimToken` | SSO | `/run/secrets/<id>/scim-token` | `ghcp-ent-<id>-scim-token` | 是 | 运维 |
+| `sso.seatPat` | SSO | `/run/secrets/<id>/seat-pat` | `ghcp-ent-<id>-copilot-seat-pat` | 是 | 运维 |
+| `sso.defaultUserPassword` | SSO | `/run/secrets/<id>/default-user-password` | `ghcp-ent-<id>-sso-default-user-password` | 是（账号池要求 ≥16 字符） | postprovision 生成 |
+| `modelsAdmin.copilotToken` | Proxy | `/run/secrets/<id>/models-admin-copilot-token` | `ghcp-ent-<id>-models-admin-copilot-token` | 否 | 运维 |
+
+- 这是 registry 中全部 7 个机密字段（`registryFields.ts`）；SSO 读 `sso.*`（`sso/src/enterprises.ts`），Proxy 只读 `modelsAdmin.copilotToken`（`proxy/src/enterprises.ts`），**Login 不读任何机密**。`{"file"}` 必须是绝对路径（`secrets.ts`）。
+- 企业 ID 规则 `^[a-z][a-z0-9-]{0,30}[a-z0-9]$`（`scope.ts`），也满足 Key Vault 机密名规则（字母数字和短横线，≤127）；最长的名字约 70 个字符。
+- 本部署只接受 `{"file": "/run/secrets/<id>/<文件名>"}` 形式的引用：每个企业的机密不经过环境变量，也不允许指向别的企业的目录。registry 中不能写 `default`。
+- 渲染结果：registry 作为 ConfigMap（名字带内容哈希）只读挂载到 Proxy、SSO、Login 的 `/etc/ghcp-registry/enterprise-registry.json`，三者的 ConfigMap 中设置 `ENTERPRISE_REGISTRY_FILE`；SSO 为每个企业挂载一个 SecretProviderClass（`ghcp-sso-ent-<id>`，只含 `sso.*` 的 6 个文件），Proxy 只为配置了 Models token 的企业挂载 `ghcp-proxy-ent-<id>`；Login、Console 不挂载任何企业机密。
+
+**部署前的检查**（渲染脚本与 hook，失败即停止）：未知字段；ID 不合规或重复；registry 中出现 `default`；缺少必需的机密引用；`{"env"}` 引用或路径不符合约定；github.com 企业缺少 `github.shortcode` 或 `github.slug`；GHE.com 企业缺少 `github.slug`、设置了 shortcode、`apiBaseUrl` / `copilotApiBaseUrl` 不在同一个 `<子域>.ghe.com` 下；缺少 `pool.accountDomain`，或 slug / `accountDomain` 与其他企业（含 `default`）重复；各企业 `initialMaxAccounts` 之和超过 10000；`login.ssoLoginUrl` 与 `SSO_PUBLIC_BASE_URL` 不一致（建议省略，Login 按 `<SSO_PUBLIC_BASE_URL>/enterprises/<id>/login` 推导）。`deploy-app.ps1` 还会确认 registry 引用的每个 Key Vault 机密都已存在。
+
+**新增一个企业**（作为单独的变更进行；不需要数据库迁移）：
+
+1. GitHub 侧准备该企业的 slug（github.com 还有 shortcode）、SCIM token、席位 PAT，可选 Models 管理员 token；为它生成**独立的** SAML 签名证书和私钥。
+2. 写入 Key Vault：
+
+   ```powershell
+   pwsh ./hooks/Set-GhcpSecret.ps1 -Enterprise <id> -Kind scim-token -Prompt
+   pwsh ./hooks/Set-GhcpSecret.ps1 -Enterprise <id> -Kind copilot-seat-pat -Prompt
+   pwsh ./hooks/Set-GhcpSecret.ps1 -Enterprise <id> -Kind saml-idp-cert -File <证书 PEM>
+   pwsh ./hooks/Set-GhcpSecret.ps1 -Enterprise <id> -Kind saml-idp-key -File <私钥 PEM>
+   pwsh ./hooks/Set-GhcpSecret.ps1 -Enterprise <id> -Kind models-admin-copilot-token -Prompt   # 可选
+   ```
+
+   `session-secret` 与 `sso-default-user-password` 由下一步的 postprovision 自动生成。
+3. 在 registry 文件中追加该企业（从示例复制，`id`、`slug`、`shortcode`、`pool.accountDomain` 有数据后不能修改），首次使用时 `azd env set GHCP_ENTERPRISE_REGISTRY_FILE <路径>`。
+4. 重新渲染并部署：`azd hooks run postprovision`（生成缺少的机密、检查、渲染、`kubectl apply`）。registry 的 ConfigMap 名字随内容变化，Proxy（逐个替换）、SSO、Login（`Recreate`）因此**滚动重启**——服务不支持热加载 registry。如需手工重启：`kubectl --kubeconfig .kube/<集群>.config --context <上下文> -n ghcp rollout restart deployment/ghcp-proxy deployment/ghcp-sso deployment/ghcp-login`。
+5. GitHub 侧该企业的 SAML 设置：Sign on URL `<SSO_PUBLIC_BASE_URL>/enterprises/<id>/sso`，Issuer `<SSO_PUBLIC_BASE_URL>/enterprises/<id>/metadata`，证书为该企业的 `ghcp-ent-<id>-saml-idp-cert`。`default` 的根路径设置不变。
+6. Console **Pool overview**：新企业以 `draft` 出现；处理 Blockers（例如 `sso:enterprise_secret_unconfigured:sso.signingKey`），**Edit cap**，再 **Activate**。按第 6 节小规模观察开户。
+
+**轮换某个企业的机密**：`Set-GhcpSecret.ps1 -Enterprise <id> -Kind <kind> ... -Force`。CSI 驱动约 2 分钟内更新挂载的文件；SSO 对文件机密缓存 60 秒，所以 SCIM token、席位 PAT、session secret、池用户密码无需重启即可生效；**SAML 签名证书与私钥在 SSO 进程内缓存，轮换后需要重启 SSO**（并在 GitHub 中更新证书）；Models token 每次查询都重新读取（`docs/multi-enterprise-registry.md` 第 4 节）。轮换 session secret 会使该企业已有的 SSO 会话失效。
+
+**停用 / 移除**：开通过账号（有池成员、SSO 用户或 Login 任务）的企业**不能**从 registry 删除，否则相关服务以 `enterprise_missing_from_registry` 启动失败；在 Console 中 **Drain**（必要时把 cap 调到最小）。只有从未产生数据的 `draft` 企业可以从 registry 删除，然后 `azd hooks run postprovision`；之后可以删除它的 `ghcp-ent-<id>-*` 机密（Key Vault 开启了软删除 / 清除保护）。
 
 ## 9. 复用已有 VNet / AKS（与 LiteLLM 共存）
 
@@ -451,6 +501,7 @@ az aks update --resource-group <rg> --name <集群> --enable-secret-rotation --s
 | AKS overlay | `node --test deploy/kubernetes/azure-aks.test.mjs` | 通过：github.com、GHE.com、叠加全部组件三种渲染；镜像为 ACR + r3 digest；**每个 Pod 引用的每个 Secret 键都由它自己挂载的 SecretProviderClass 同步**；base 的安全上下文、副本、更新策略、探针与门禁不变；PVC 使用 Retain 的 Azure Disk 类；MySQL CA 恰为两个根证书且指纹匹配；内部负载均衡都是 internal |
 | 渲染脚本 | `azure.test.mjs` | 通过：内网 github.com、公网 GHE.com（+ Proxy 内部负载均衡、DBA 方式、确认）、对外 Proxy（内部负载均衡只放行 App GW 子网）三种环境渲染后 `kubectl kustomize` 成功，除门禁脚本外无 `REPLACE_`；拒绝缺值确认、ConfigMap 中的机密、对全网开放的 Proxy 内部负载均衡 |
 | 公网开关校验 | `azure.test.mjs` | 通过：主机名、CIDR、后端、重复主机名、未知键、类型；`proxy` 必须有 `proxyAllowedSourceCidrs`，宽于 /28 与缺少 mTLS 时警告，CA 证书格式校验；Proxy 的 WAF 策略总带来源与路径允许列表 |
+| 多企业 | `azure-aks.test.mjs`、`azure.test.mjs` | 通过：default（github.com，环境变量）+ 一个 github.com + 一个 GHE.com 企业渲染成功；**registry 中每个机密文件都只由读取它的 Pod 的 SecretProviderClass 挂载**（SSO 12 个、Proxy 1 个、Login / Console 0 个），default 的原有名称不变；registry ConfigMap 与 `ENTERPRISE_REGISTRY_FILE` 接到 Proxy / SSO / Login；字段、机密字段、读取方、ID 规则与源码一致；24 种非法 registry（ID、`default`、缺少机密、`env` 引用、路径、GHE.com 规则、重复、`ssoLoginUrl` 等）被拒绝 |
 | MySQL 账号初始化 | `azure.test.mjs` | 通过：语法；两种方式的授权；密码只作为绑定参数；输入校验 |
 | PowerShell hooks | `azure.test.mjs`（有 pwsh 时） | 语法解析；每条 az 命令都经 `Invoke-Az`（追加 `--subscription`），kubectl 都显式带 kubeconfig |
 | 仓库卫生 | `azure.test.mjs` | 没有订阅 / 租户 / 对象 ID（只有内置角色定义 ID 和全零示例）、公网 IP、真实主机名、本机路径、私钥或令牌 |
@@ -461,6 +512,7 @@ az aks update --resource-group <rg> --name <集群> --enable-secret-rotation --s
 - 没有部署到 Azure，没有运行 `what-if`、`az deployment ... validate` 或任何访问订阅的命令。因此 ARM 层面的校验（SKU / 版本在所选地域是否可用、配额、API 版本支持的属性值、`log_bin_trust_function_creators` 等参数的取值格式、MySQL 8.4 的可用性、ZRS 磁盘与 App GW 的可用区支持、角色分配的传播延迟）都要在客户订阅中首次部署时确认。
 - hooks 没有实际运行（它们调用 az / azd / kubectl 访问 Azure）；只做了语法与约定检查。
 - Key Vault CSI + Workload Identity 同步 Secret、`az acr import` 按 digest 复制、经 ARM 写入私有 Key Vault 的机密、App GW 从私有 Key Vault 读取证书、私有终结点 DNS、内部负载均衡固定 IP 与来源限制、Cilium 下的 NetworkPolicy、MySQL 账号初始化 Job 对真实 Azure MySQL 的连接，都只按官方文档设计，未在 Azure 上运行。
+- 多企业：Secrets Store CSI 把同一个 Pod 的多个 SecretProviderClass 卷挂到 `/run/secrets/<id>`（根文件系统只读）、registry 变化触发的滚动重启、新企业在真实 SSO / Login 上的就绪，都未在集群上运行。
 - WAF 托管规则对 SSO / Console 实际请求的误报情况未测（建议首次以 `Detection` 观察）；SSE 与 600 秒请求经 App GW 的端到端行为未测。
 - 应用本身的行为沿用 `deploy/kubernetes` 在 kind 上的验证（Kubernetes README 第 9 节），本目录没有新增运行时验证。
 

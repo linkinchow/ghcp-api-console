@@ -47,9 +47,15 @@ if (-not (Test-KeyVaultSecret 'ghcp-mysql-url')) {
   Write-Host '  ghcp-mysql-url exists, kept'
 }
 
+# registry 中其他企业的 session secret 与池用户 SSO 密码同样由部署生成（每个企业独立）。
+foreach ($secret in (Get-EnterpriseSecrets | Where-Object { $_.generated })) {
+  Initialize-GeneratedSecret $secret.name 32 | Out-Null
+}
+
 # ---- 3. 运维提供的机密 ----
 $operatorSecrets = @('ghcp-scim-token', 'ghcp-copilot-seat-pat', 'ghcp-saml-idp-cert', 'ghcp-saml-idp-key')
 if (Test-EnvTrue 'GHCP_PUBLIC_ACCESS_ENABLED') { $operatorSecrets += 'ghcp-public-tls (or the certificateNames in GHCP_PUBLIC_ACCESS)' }
+$operatorSecrets += @(Get-EnterpriseSecrets | Where-Object { -not $_.generated } | ForEach-Object { $_.name })
 $missing = @($operatorSecrets | Where-Object { $_ -match ' ' -or -not (Test-KeyVaultSecret $_) })
 if ($missing.Count) {
   Write-Warning ("Key Vault still needs these operator-provided secrets: " + ($missing -join ', ') +

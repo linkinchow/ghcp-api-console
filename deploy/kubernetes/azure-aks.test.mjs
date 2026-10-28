@@ -267,3 +267,128 @@ test('components stay declared as Kustomize components and the overlay reuses th
   assert.doesNotMatch(overlay, /\.\.\/\.\.\/base/, 'the overlay goes through github-com, it does not fork the base');
   assert.ok(readFileSync(path.join(root, 'deploy/kubernetes/README.md'), 'utf8').includes('azure-aks'), 'README mentions the AKS overlay');
 });
+
+// ---------------------------------------------------------------------------
+// Multi-enterprise: a registry with default (github.com, from the environment) + one github.com + one GHE.com enterprise,
+// rendered by deploy/azure/scripts/render-overlay.mjs.
+// ---------------------------------------------------------------------------
+const READERS = { 'sso.signingCert': 'sso', 'sso.signingKey': 'sso', 'sso.sessionSecret': 'sso', 'sso.scimToken': 'sso',
+  'sso.seatPat': 'sso', 'sso.defaultUserPassword': 'sso', 'modelsAdmin.copilotToken': 'proxy' };
+const KEY_VAULT_SUFFIX = { 'sso.signingCert': 'saml-idp-cert', 'sso.signingKey': 'saml-idp-key', 'sso.sessionSecret': 'session-secret',
+  'sso.scimToken': 'scim-token', 'sso.seatPat': 'copilot-seat-pat', 'sso.defaultUserPassword': 'sso-default-user-password',
+  'modelsAdmin.copilotToken': 'models-admin-copilot-token' };
+
+function secretRefs(registry) {
+  const refs = [];
+  for (const enterprise of registry.enterprises) {
+    for (const [section, values] of Object.entries(enterprise)) {
+      if (typeof values !== 'object' || values === null) continue;
+      for (const [key, value] of Object.entries(values)) {
+        if (value && typeof value === 'object' && 'file' in value) refs.push({ id: enterprise.id, field: `${section}.${key}`, path: value.file });
+      }
+    }
+  }
+  return refs;
+}
+
+let multiEnterpriseRender;
+async function renderMultiEnterprise() {
+  if (multiEnterpriseRender) return multiEnterpriseRender;
+  const { renderOverlay, writeOverlay } = await import('../azure/scripts/render-overlay.mjs');
+  const registry = JSON.parse(readFileSync(path.join(root, 'deploy/azure/enterprise-registry.azure.example.json'), 'utf8'));
+  const outDir = path.join(root, 'deploy/azure/.generated', `.test-${randomUUID()}`);
+  const result = renderOverlay({
+    AZURE_ENV_NAME: 'unittest', GHCP_GITHUB_HOSTING: 'github.com', GHCP_NAMESPACE: 'ghcp',
+    AZURE_CONTAINER_REGISTRY_ENDPOINT: 'acrunittest000000.azurecr.io', AZURE_KEY_VAULT_NAME: 'kvunittest000000',
+    AZURE_TENANT_ID: '00000000-0000-0000-0000-000000000000', GHCP_WORKLOAD_CLIENT_ID: '00000000-0000-0000-0000-000000000001',
+    GHCP_PROXY_REPLICAS: '2', GHCP_DISK_SKU: 'Premium_ZRS', GHCP_ILB_SUBNET_NAME: 'snet-ghcp-ilb', GHCP_SSO_ILB_IP: '10.40.4.68',
+    GHCP_CONSOLE_ILB_IP: '10.40.4.69', VNET_ADDRESS_PREFIXES: '10.40.0.0/16', AKS_SUBNET_PREFIX: '10.40.0.0/22',
+    PE_SUBNET_PREFIX: '10.40.4.0/26', APPGW_SUBNET_PREFIX: '10.40.5.0/24', POD_CIDR: '10.244.0.0/16',
+    MYSQL_FQDN: 'mysql-unittest.mysql.database.azure.com', MYSQL_ADMIN_LOGIN: 'ghcpadmin', GHCP_NETWORK_POLICY_ENGINE: 'cilium',
+    GHCP_ENTERPRISE_SLUG: 'contoso', GHCP_ENTERPRISE_SHORTCODE: 'ctso', GHCP_POOL_ACCOUNT_EMAIL_DOMAIN: 'pool.contoso.example.com',
+    GHCP_POOL_WARMUP_MODEL: 'example-model',
+  }, outDir, { registry });
+  assert.deepEqual(result.errors, []);
+  try {
+    writeOverlay(result, outDir);
+    multiEnterpriseRender = { registry, result, ...render(path.join(outDir, 'app')) };
+    return multiEnterpriseRender;
+  } finally {
+    rmSync(outDir, { recursive: true, force: true });
+  }
+}
+
+test('multi-enterprise: every registry secret file is mounted from Key Vault into the pod that reads it, and no other pod', async () => {
+  const { registry, objects, result } = await renderMultiEnterprise();
+  assert.deepEqual(registry.enterprises.map((e) => e.id), ['tailspin', 'fabrikam-ghe']);
+  assert.ok(registry.enterprises.some((e) => e.github.baseUrl.endsWith('.ghe.com')));
+  assert.ok(registry.enterprises.some((e) => e.github.baseUrl === 'https://github.com'));
+  const refs = secretRefs(registry);
+  assert.equal(refs.length, 13, '6 SSO secrets per enterprise + one Models admin token');
+  const spcs = new Map(byKind(objects, 'SecretProviderClass').map((s) => [s.metadata.name, s]));
+  // What each pod can see: { mount directory, file name, Key Vault object }.
+  const view = {};
+  for (const service of SERVICES) {
+    const spec = podSpec(objects, service);
+    const main = spec.containers.find((c) => c.name === service);
+    view[service] = [];
+    for (const volume of spec.volumes.filter((v) => v.csi)) {
+      const mount = main.volumeMounts.find((m) => m.name === volume.name);
+      assert.ok(mount?.readOnly, `${service}: ${volume.name} mounted read-only`);
+      const spc = spcs.get(volume.csi.volumeAttributes.secretProviderClass);
+      assert.ok(spc, `${service}: ${volume.csi.volumeAttributes.secretProviderClass} exists`);
+      assert.equal(spc.spec.parameters.clientID, '00000000-0000-0000-0000-000000000001');
+      assert.equal(spc.spec.parameters.keyvaultName, 'kvunittest000000');
+      for (const block of spc.spec.parameters.objects.split('- |').slice(1)) {
+        const objectName = /objectName: (\S+)/.exec(block)[1];
+        const file = /objectAlias: (\S+)/.exec(block)?.[1] ?? objectName;
+        view[service].push({ dir: mount.mountPath, file, objectName });
+      }
+    }
+  }
+  for (const ref of refs) {
+    const reader = READERS[ref.field];
+    assert.ok(reader, `${ref.field} has a known reader`);
+    const expected = { dir: path.posix.dirname(ref.path), file: path.posix.basename(ref.path), objectName: `ghcp-ent-${ref.id}-${KEY_VAULT_SUFFIX[ref.field]}` };
+    assert.equal(expected.dir, `/run/secrets/${ref.id}`);
+    for (const service of SERVICES) {
+      const hits = view[service].filter((v) => v.objectName === expected.objectName || (v.dir === expected.dir && v.file === expected.file));
+      if (service === reader) assert.deepEqual(hits, [expected], `${ref.id}.${ref.field} reaches ${service}`);
+      else assert.deepEqual(hits, [], `${ref.id}.${ref.field} must not reach ${service}`);
+    }
+  }
+  // Pods get nothing beyond what the registry references (plus their own default-enterprise class).
+  const enterpriseFiles = (service) => view[service].filter((v) => v.dir.startsWith('/run/secrets/'));
+  assert.equal(enterpriseFiles('sso').length, 12);
+  assert.equal(enterpriseFiles('proxy').length, 1);
+  assert.equal(enterpriseFiles('login').length, 0, 'Login reads no secret');
+  assert.equal(enterpriseFiles('console').length, 0);
+  assert.equal(result.enterpriseSecrets.length, 13);
+  // The default enterprise keeps its original classes and Key Vault names.
+  for (const service of SERVICES) {
+    assert.ok(podSpec(objects, service).volumes.some((v) => v.csi?.volumeAttributes.secretProviderClass === `ghcp-${service}-kv`));
+  }
+  assert.ok(view.sso.some((v) => v.objectName === 'ghcp-scim-token' && v.dir === '/mnt/secrets-store'), 'default keeps ghcp-scim-token');
+});
+
+test('multi-enterprise: the registry ConfigMap is mounted into Proxy, SSO and Login with ENTERPRISE_REGISTRY_FILE', async () => {
+  const { registry, objects } = await renderMultiEnterprise();
+  const maps = byKind(objects, 'ConfigMap').filter((c) => c.metadata.name.startsWith('ghcp-enterprise-registry-'));
+  assert.equal(maps.length, 1, 'generated with a content hash: a registry change rolls the three Deployments');
+  assert.deepEqual(JSON.parse(maps[0].data['enterprise-registry.json']), registry);
+  assert.doesNotMatch(JSON.stringify(maps[0].data), /BEGIN|"env"/, 'file references only, no values');
+  for (const service of ['proxy', 'sso', 'login']) {
+    const spec = podSpec(objects, service);
+    const main = spec.containers.find((c) => c.name === service);
+    const values = Object.fromEntries((main.envFrom ?? []).flatMap((s) => Object.entries(named(objects, 'ConfigMap', s.configMapRef.name)?.data ?? {})));
+    assert.equal(values.ENTERPRISE_REGISTRY_FILE, '/etc/ghcp-registry/enterprise-registry.json', `${service}: ENTERPRISE_REGISTRY_FILE`);
+    const volume = spec.volumes.find((v) => v.configMap?.name === maps[0].metadata.name);
+    assert.ok(volume, `${service}: registry volume`);
+    assert.deepEqual(volume.configMap.items, [{ key: 'enterprise-registry.json', path: 'enterprise-registry.json' }]);
+    const mount = main.volumeMounts.find((m) => m.name === volume.name);
+    assert.deepEqual([mount.mountPath, mount.readOnly], ['/etc/ghcp-registry', true]);
+  }
+  const consoleSpec = podSpec(objects, 'console');
+  assert.ok(!consoleSpec.volumes.some((v) => v.configMap?.name?.startsWith('ghcp-enterprise-registry')), 'Console does not load the registry');
+  assert.equal(byKind(objects, 'Secret').length, 0);
+});

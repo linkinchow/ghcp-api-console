@@ -11,9 +11,18 @@
 //   <out>/mysql-bootstrap/  引用 deploy/azure/k8s/mysql-bootstrap，替换同样的 Azure 值。
 // 生成的文件是 JSON（YAML 的子集），避免手写 YAML 转义。
 import { X509Certificate } from 'node:crypto';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import {
+  enterpriseSecretDir,
+  enterpriseSecretProviderClasses,
+  REGISTRY_FILE_NAME,
+  REGISTRY_FILE_PATH,
+  REGISTRY_MOUNT_DIR,
+  validateEnterpriseRegistry,
+} from './enterprise-registry.mjs';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 export const azureDir = path.resolve(scriptDir, '..');
@@ -265,7 +274,20 @@ function networkPolicies(ctx) {
  * Renders both overlays for one environment. `env` is the azd environment (process.env in the hooks).
  * Returns { files: {relativePath: content}, summary, errors, warnings, pending, approved }.
  */
-export function renderOverlay(env, outDir) {
+/** The operator registry: options.registry (tests), else the JSON file named by GHCP_ENTERPRISE_REGISTRY_FILE. */
+function loadRegistryInput(env, options, problems) {
+  if (options.registry !== undefined) return options.registry;
+  const file = env.GHCP_ENTERPRISE_REGISTRY_FILE;
+  if (!file) return undefined;
+  try {
+    return JSON.parse(readFileSync(path.resolve(file), 'utf8'));
+  } catch (error) {
+    problems.errors.push(`GHCP_ENTERPRISE_REGISTRY_FILE could not be read as JSON: ${error.message}`);
+    return undefined;
+  }
+}
+
+export function renderOverlay(env, outDir, options = {}) {
   const problems = { errors: [], warnings: [], pending: [] };
   const hosting = requireValue(env, 'GHCP_GITHUB_HOSTING', problems, (v) => ['github.com', 'ghe.com'].includes(v));
   const namespace = requireValue(env, 'GHCP_NAMESPACE', problems, (v) => /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/.test(v));
@@ -348,6 +370,25 @@ export function renderOverlay(env, outDir) {
     }
   }
 
+  // ---- 多企业 registry（可选）：default 仍由环境变量定义，文件只列新增企业 ----
+  const registryInput = loadRegistryInput(env, options, problems);
+  const multiEnterprise = registryInput !== undefined;
+  let enterprises = [];
+  if (multiEnterprise) {
+    const checked = validateEnterpriseRegistry(registryInput, {
+      defaultBaseUrl: hosting === 'ghe.com' ? enterprise.GITHUB_BASE_URL : 'https://github.com',
+      defaultSlug: env.GHCP_ENTERPRISE_SLUG,
+      defaultAccountDomain: env.GHCP_POOL_ACCOUNT_EMAIL_DOMAIN,
+      defaultMaxAccounts: Number(proxyConfig.POOL_MAX_ACCOUNTS ?? 100),
+      ssoPublicBaseUrl,
+    });
+    for (const error of checked.errors) problems.errors.push(`enterprise registry: ${error}`);
+    for (const warning of checked.warnings) problems.warnings.push(`enterprise registry: ${warning}`);
+    enterprises = checked.enterprises;
+    proxyConfig.ENTERPRISE_REGISTRY_FILE = REGISTRY_FILE_PATH;
+    sso.ENTERPRISE_REGISTRY_FILE = REGISTRY_FILE_PATH;
+  }
+
   const approvedRequested = env.GHCP_CONFIG_APPROVED === 'true';
   const approved = approvedRequested && problems.pending.length === 0 && problems.errors.length === 0;
   if (approvedRequested && problems.pending.length) {
@@ -401,6 +442,31 @@ export function renderOverlay(env, outDir) {
     ...SPC_NAMES.map(spcPatch),
   ];
   if (proxyIlb) patches.push(ilbPatch('ghcp-proxy-ilb', proxyIlbIp, proxyIlbSources));
+  // registry 以 ConfigMap 只读挂载到 Proxy、SSO、Login（kustomize 生成带内容哈希的名字：registry 变化即滚动重启三者）；
+  // 每个企业的机密按读取方挂载：SSO 只拿 sso.*，Proxy 只拿 modelsAdmin.copilotToken，Login 不拿任何机密。
+  const enterpriseClasses = { proxy: [], sso: [] };
+  if (multiEnterprise) {
+    patches.push({ apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'ghcp-login-config' }, data: { ENTERPRISE_REGISTRY_FILE: REGISTRY_FILE_PATH } });
+    const azure = { keyVault, tenantId, clientId };
+    for (const service of ['proxy', 'sso']) enterpriseClasses[service] = enterpriseSecretProviderClasses(enterprises, service, azure);
+    for (const service of ['proxy', 'sso', 'login']) {
+      const classes = enterpriseClasses[service] ?? [];
+      const volumes = [{ name: 'enterprise-registry', configMap: { name: 'ghcp-enterprise-registry', items: [{ key: REGISTRY_FILE_NAME, path: REGISTRY_FILE_NAME }] } },
+        ...classes.map((spc) => ({
+          name: `ent-${spc.metadata.labels['ghcp-enterprise']}`,
+          csi: { driver: 'secrets-store.csi.k8s.io', readOnly: true, volumeAttributes: { secretProviderClass: spc.metadata.name } },
+        }))];
+      const mounts = [{ name: 'enterprise-registry', mountPath: REGISTRY_MOUNT_DIR, readOnly: true },
+        ...classes.map((spc) => ({ name: `ent-${spc.metadata.labels['ghcp-enterprise']}`, mountPath: enterpriseSecretDir(spc.metadata.labels['ghcp-enterprise']), readOnly: true }))];
+      patches.push({
+        apiVersion: 'apps/v1',
+        kind: 'Deployment',
+        metadata: { name: `ghcp-${service}` },
+        spec: { template: { spec: { volumes, containers: [{ name: service, volumeMounts: mounts }] } } },
+      });
+    }
+    if (enterpriseClasses.proxy.length + enterpriseClasses.sso.length > 0) resources.push('enterprise-secret-provider-classes.yaml');
+  }
   if (publicSsoHost && appGwPrivateIp) {
     // Login 的 Chromium 不依赖 VNet 的 DNS 配置也能经 App GW 私网前端访问对外的 SSO 主机名。
     patches.push({
@@ -436,6 +502,16 @@ export function renderOverlay(env, outDir) {
         { op: 'replace', path: '/spec/ingress/0/from/0/podSelector', value: { matchLabels: { [labelKey]: labelValue ?? '' } } },
       ]),
     });
+  }
+  if (multiEnterprise) {
+    kustomization.configMapGenerator = [{
+      name: 'ghcp-enterprise-registry',
+      files: [REGISTRY_FILE_NAME],
+      options: { labels: { 'app.kubernetes.io/part-of': 'ghcp' } },
+    }];
+    files[`app/${REGISTRY_FILE_NAME}`] = `${JSON.stringify(registryInput, null, 2)}\n`;
+    const classes = [...enterpriseClasses.sso, ...enterpriseClasses.proxy];
+    if (classes.length) files['app/enterprise-secret-provider-classes.yaml'] = header + classes.map((c) => JSON.stringify(c, null, 2)).join('\n---\n') + '\n';
   }
   files['app/kustomization.yaml'] = header + json(kustomization);
   patches.forEach((patch, i) => { files[`app/patch-${String(i + 1).padStart(2, '0')}.yaml`] = header + json(patch); });
@@ -499,8 +575,18 @@ export function renderOverlay(env, outDir) {
     mysql: { host: mysqlFqdn, database: mysqlDatabase, mode: mysqlMode },
     networkPolicy: enableNetworkPolicy,
     loadBalancerSourceRanges: { sso: ssoSources, console: consoleSources, proxy: proxyIlbSources },
+    enterprises: multiEnterprise ? enterprises.map((e) => ({
+      id: e.id,
+      githubBaseUrl: e.baseUrl,
+      slug: e.slug,
+      githubSaml: { signOnUrl: `${ssoPublicBaseUrl}/enterprises/${e.id}/sso`, issuer: `${ssoPublicBaseUrl}/enterprises/${e.id}/metadata` },
+      keyVaultSecrets: e.secrets.map((s) => s.name),
+    })) : '(registry not used: default only)',
   };
-  return { files, summary, errors: problems.errors, warnings: problems.warnings, pending: problems.pending, approved };
+  const enterpriseSecrets = enterprises.flatMap((e) => e.secrets.map((s) => ({
+    name: s.name, enterprise: e.id, field: s.field, service: s.service, required: s.required, generated: s.generated,
+  })));
+  return { files, summary, errors: problems.errors, warnings: problems.warnings, pending: problems.pending, approved, enterpriseSecrets };
 }
 
 export function writeOverlay(result, outDir) {
@@ -527,6 +613,15 @@ function main(argv) {
     for (const error of errors) console.error(`[public-access] error: ${error}`);
     return errors.length ? 1 : 0;
   }
+  if (command === 'enterprise-secrets') {
+    // Key Vault 机密清单（JSON），供 hooks 检查与生成；不写文件。
+    const result = renderOverlay(process.env, path.join(azureDir, '.generated', 'unused'));
+    const registryErrors = result.errors.filter((e) => e.startsWith('enterprise registry'));
+    for (const error of registryErrors) console.error(`[render] error: ${error}`);
+    if (registryErrors.length) return 1;
+    console.log(JSON.stringify(result.enterpriseSecrets));
+    return 0;
+  }
   if (command === 'render') {
     const envName = process.env.AZURE_ENV_NAME;
     if (!envName || !/^[A-Za-z0-9-]+$/.test(envName)) {
@@ -549,7 +644,7 @@ function main(argv) {
     }
     return 0;
   }
-  console.error('usage: render-overlay.mjs render [--out <dir>] [--require-approved] | validate-public-access');
+  console.error('usage: render-overlay.mjs render [--out <dir>] [--require-approved] | validate-public-access | enterprise-secrets');
   return 2;
 }
 

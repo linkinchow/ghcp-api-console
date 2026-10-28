@@ -576,3 +576,115 @@ test('repository hygiene: no tenant data, local paths, real host names or genera
   assert.ok(!existsSync(path.join(directory, '.generated')) || readdirSync(path.join(directory, '.generated')).every((d) => d.startsWith('.test-')),
     'generated overlays are never part of the tree');
 });
+
+// ---------------------------------------------------------------------------
+// Multi-enterprise registry: conventions match the product code; invalid registries fail before deploy.
+// ---------------------------------------------------------------------------
+const registryModule = () => import('./scripts/enterprise-registry.mjs');
+const exampleRegistry = () => JSON.parse(readFileSync(path.join(directory, 'enterprise-registry.azure.example.json'), 'utf8'));
+const registryContext = { defaultBaseUrl: 'https://github.com', defaultSlug: 'contoso', defaultAccountDomain: 'pool.contoso.example.com',
+  defaultMaxAccounts: 100, ssoPublicBaseUrl: 'http://10.40.4.68:7001' };
+
+test('registry conventions follow the product code: fields, secret fields, readers, ID rule', async () => {
+  const { ENTERPRISE_SECRETS, REGISTRY_TEXT_FIELDS, LOGIN_SELECTOR_KEYS, enterpriseSecretName } = await registryModule();
+  const shared = path.join(root, 'src/packages/shared/src/enterprise');
+  const fieldsSource = readFileSync(path.join(shared, 'registryFields.ts'), 'utf8');
+  const kinds = [...fieldsSource.slice(fieldsSource.indexOf('const FIELD_KINDS'), fieldsSource.indexOf(']);', fieldsSource.indexOf('const FIELD_KINDS')))
+    .matchAll(/\['([a-zA-Z.]+)', '(\w+)'\]/g)].map((m) => [m[1], m[2]]);
+  assert.deepEqual(kinds.filter(([, kind]) => kind !== 'secret').map(([field]) => field).sort(), [...REGISTRY_TEXT_FIELDS].sort());
+  const ssoSecretKeys = /SSO_SECRET_KEYS = \[([^\]]+)\]/.exec(fieldsSource)[1].match(/'(\w+)'/g).map((k) => `sso.${k.slice(1, -1)}`);
+  const secretFields = [...ssoSecretKeys, ...kinds.filter(([, kind]) => kind === 'secret').map(([field]) => field)];
+  assert.deepEqual(ENTERPRISE_SECRETS.map((s) => s.field).sort(), secretFields.sort(), 'every secret field of the registry has a convention');
+  const selectorKeys = /LOGIN_SELECTOR_KEYS = \[([^\]]+)\]/.exec(fieldsSource)[1].match(/'(\w+)'/g).map((k) => k.slice(1, -1));
+  assert.deepEqual([...LOGIN_SELECTOR_KEYS], selectorKeys);
+  // Readers: SSO reads sso.* (ssoSecret), Proxy reads modelsAdmin.copilotToken (modelsAdminToken), Login reads none.
+  assert.match(readFileSync(path.join(root, 'src/sso/src/enterprises.ts'), 'utf8'), /enterprise\.profile\.sso\[field\];\s+if \(!ref\) return undefined;\s+return readSecret/);
+  assert.match(readFileSync(path.join(root, 'src/proxy/src/enterprises.ts'), 'utf8'), /modelsAdmin\?\.copilotToken[\s\S]{0,200}readSecret\(ref/);
+  assert.doesNotMatch(readFileSync(path.join(root, 'src/login/src/enterprises.ts'), 'utf8'), /readSecret/);
+  for (const secret of ENTERPRISE_SECRETS) assert.equal(secret.service, secret.field.startsWith('sso.') ? 'sso' : 'proxy', secret.field);
+  // {file} must be absolute (secrets.ts); IDs follow scope.ts; the longest ID still gives a valid Key Vault name.
+  assert.match(readFileSync(path.join(shared, 'secrets.ts'), 'utf8'), /if \(!isAbsolute\(path\)\)/);
+  assert.match(readFileSync(path.join(shared, 'scope.ts'), 'utf8'), /ENTERPRISE_ID_PATTERN = \/\^\[a-z\]\[a-z0-9-\]\{0,30\}\[a-z0-9\]\$\//);
+  const longest = `a${'b'.repeat(30)}c`;
+  for (const secret of ENTERPRISE_SECRETS) assert.match(enterpriseSecretName(longest, secret), /^[A-Za-z0-9-]{1,127}$/);
+  // The example follows the shared docs' path convention and passes validation.
+  const { validateEnterpriseRegistry } = await registryModule();
+  const checked = validateEnterpriseRegistry(exampleRegistry(), registryContext);
+  assert.deepEqual(checked.errors, []);
+  assert.deepEqual(checked.enterprises.map((e) => [e.id, e.isGheCom, e.secrets.length]), [['tailspin', false, 6], ['fabrikam-ghe', true, 7]]);
+});
+
+test('registry validation fails fast on IDs, missing or non-conventional secrets and GHE.com rules', async () => {
+  const { validateEnterpriseRegistry } = await registryModule();
+  const mutate = (change) => {
+    const registry = exampleRegistry();
+    change(registry.enterprises[0], registry.enterprises[1], registry);
+    return validateEnterpriseRegistry(registry, registryContext).errors;
+  };
+  const cases = [
+    [(a) => { a.id = 'Tailspin'; }, /enterprises\[0\]\.id must match/],
+    [(a) => { a.id = `t${'x'.repeat(32)}`; }, /enterprises\[0\]\.id must match/],
+    [(a) => { a.id = 'bad_id'; }, /enterprises\[0\]\.id must match/],
+    [(a) => { a.id = 'default'; }, /default must not be in the registry/],
+    [(a, b) => { b.id = 'tailspin'; }, /duplicate enterprise id/],
+    [(a) => { delete a.sso.scimToken; }, /tailspin\.sso\.scimToken is required: \{"file": "\/run\/secrets\/tailspin\/scim-token"\}/],
+    [(a) => { delete a.sso.seatPat; }, /tailspin\.sso\.seatPat is required/],
+    [(a) => { delete a.sso.signingKey; }, /tailspin\.sso\.signingKey is required/],
+    [(a) => { a.sso.scimToken = { env: 'SCIM_TOKEN' }; }, /\{"env": \.\.\.\} is not supported/],
+    [(a) => { a.sso.scimToken = { file: '/run/secrets/other/scim-token' }; }, /must reference \/run\/secrets\/tailspin\/scim-token \(Key Vault secret ghcp-ent-tailspin-scim-token\)/],
+    [(a) => { a.sso.scimToken = { file: 'scim-token' }; }, /must reference \/run\/secrets\/tailspin\/scim-token/],
+    [(a, b) => { b.modelsAdmin.copilotToken = { file: '/run/secrets/fabrikam-ghe/token' }; }, /fabrikam-ghe\.modelsAdmin\.copilotToken must reference/],
+    [(a) => { a.sso.unknownSecret = { file: '/run/secrets/tailspin/x' }; }, /tailspin\.sso\.unknownSecret is not a known registry field/],
+    [(a) => { delete a.github.shortcode; }, /tailspin\.github\.shortcode is required on github\.com/],
+    [(a, b) => { b.github.shortcode = 'fab'; }, /fabrikam-ghe\.github\.shortcode must be empty on GHE\.com/],
+    [(a, b) => { delete b.github.slug; }, /fabrikam-ghe\.github\.slug is required \(the enterprise slug; SSO and Login need it\)/],
+    [(a, b) => { b.github.apiBaseUrl = 'https://api.other.ghe.com'; }, /fabrikam-ghe\.github\.apiBaseUrl must be under the same fabrikam\.ghe\.com/],
+    [(a) => { a.github.baseUrl = 'https://github.example.com'; }, /tailspin\.github\.baseUrl is required/],
+    [(a) => { a.pool.accountDomain = 'pool.contoso.example.com'; }, /tailspin\.pool\.accountDomain duplicates default\.pool\.accountDomain/],
+    [(a) => { a.github.slug = 'contoso'; }, /tailspin\.github\.slug duplicates default\.github\.slug/],
+    [(a) => { delete a.pool.accountDomain; }, /tailspin\.pool\.accountDomain is required/],
+    [(a) => { a.login = { ssoLoginUrl: 'http://sso:7001/enterprises/tailspin/login' }; }, /tailspin\.login\.ssoLoginUrl must be http:\/\/10\.40\.4\.68:7001\/enterprises\/tailspin\/login/],
+    [(a, b, r) => { r.extra = true; }, /registry\.extra is not a known registry field/],
+    [(a, b, r) => { r.enterprises = []; }, /registry\.enterprises must list 1 to 31/],
+  ];
+  for (const [change, pattern] of cases) {
+    const errors = mutate(change);
+    assert.ok(errors.some((e) => pattern.test(e)), `${pattern} → ${errors.join('; ')}`);
+  }
+  // A correct override of ssoLoginUrl and an optional Models token omitted are accepted.
+  assert.deepEqual(mutate((a) => { a.login = { ssoLoginUrl: 'http://10.40.4.68:7001/enterprises/tailspin/login' }; }), []);
+  assert.deepEqual(mutate((a, b) => { delete b.modelsAdmin; }), []);
+});
+
+test('renderer: a broken registry blocks rendering and approval; the CLI lists the Key Vault secrets', { skip: skipKubectl }, () => {
+  const registry = exampleRegistry();
+  delete registry.enterprises[1].sso.seatPat;
+  const broken = renderOverlay(azdEnvironment({ GHCP_CONFIG_APPROVED: 'true' }), path.join(os.tmpdir(), 'unused'), { registry });
+  assert.ok(broken.errors.some((e) => /^enterprise registry: fabrikam-ghe\.sso\.seatPat is required/.test(e)));
+  assert.equal(broken.approved, false);
+  const missingFile = renderOverlay(azdEnvironment({ GHCP_ENTERPRISE_REGISTRY_FILE: path.join(os.tmpdir(), `missing-${randomUUID()}.json`) }), path.join(os.tmpdir(), 'unused'));
+  assert.ok(missingFile.errors.some((e) => /GHCP_ENTERPRISE_REGISTRY_FILE could not be read/.test(e)));
+  const cli = exec(process.execPath, [path.join(directory, 'scripts/render-overlay.mjs'), 'enterprise-secrets'],
+    { env: { ...process.env, ...azdEnvironment({ GHCP_ENTERPRISE_REGISTRY_FILE: path.join(directory, 'enterprise-registry.azure.example.json') }) } });
+  assert.equal(cli.status, 0, cli.stderr);
+  const secrets = JSON.parse(cli.stdout);
+  assert.equal(secrets.length, 13);
+  assert.deepEqual(secrets.filter((s) => s.generated).map((s) => s.name).sort(), ['ghcp-ent-fabrikam-ghe-session-secret',
+    'ghcp-ent-fabrikam-ghe-sso-default-user-password', 'ghcp-ent-tailspin-session-secret', 'ghcp-ent-tailspin-sso-default-user-password']);
+  assert.ok(secrets.every((s) => /^ghcp-ent-(tailspin|fabrikam-ghe)-[a-z-]+$/.test(s.name)));
+  const none = exec(process.execPath, [path.join(directory, 'scripts/render-overlay.mjs'), 'enterprise-secrets'], { env: { ...process.env, ...azdEnvironment() } });
+  assert.equal(none.stdout.trim(), '[]', 'without a registry: default only');
+  // Hooks: generated per-enterprise secrets, presence check before deploy, per-enterprise names in Set-GhcpSecret.
+  const hooks = (name) => readFileSync(path.join(directory, 'hooks', name), 'utf8');
+  assert.match(hooks('postprovision.ps1'), /Get-EnterpriseSecrets \| Where-Object \{ \$_\.generated \}/);
+  assert.match(hooks('deploy-app.ps1'), /Assert-EnterpriseSecretsPresent/);
+  assert.match(hooks('Set-GhcpSecret.ps1'), /\$Name = "ghcp-ent-\$Enterprise-\$Kind"/);
+});
+
+test('Set-GhcpSecret -Kind values are exactly the Key Vault suffixes of the convention', async () => {
+  const { ENTERPRISE_SECRETS } = await registryModule();
+  const source = readFileSync(path.join(directory, 'hooks/Set-GhcpSecret.ps1'), 'utf8');
+  const kinds = /\[ValidateSet\(([^)]+)\)\]\s*\[string\] \$Kind/.exec(source)[1].match(/'([a-z-]+)'/g).map((k) => k.slice(1, -1));
+  assert.deepEqual(kinds.sort(), ENTERPRISE_SECRETS.map((s) => s.suffix).sort());
+  assert.match(source, /ValidatePattern\('\^\[a-z\]\[a-z0-9-\]\{0,30\}\[a-z0-9\]\$'\)\]\[string\] \$Enterprise/);
+});

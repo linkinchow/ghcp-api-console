@@ -8,7 +8,7 @@
 
 | 端点 | 能否对外 | 方式 | 默认来源限制 |
 | --- | --- | --- | --- |
-| SSO 的 SAML 页面 | 可以（`publicAccess.sso`） | App GW WAF_v2 → SSO 内部负载均衡 | 只放行 `allowedSourceCidrs` + VNet；`ssoAllowAnySource: true` 才对任意来源开放 |
+| SSO 的 SAML 页面 | **通常不需要对外**（第 2.1 节）；`publicAccess.sso` 只用于少见情况：公司网络 / VPN 之外的人必须经本 IdP 登录 EMU 企业 | App GW WAF_v2 → SSO 内部负载均衡 | 只放行 `allowedSourceCidrs` + VNet；`ssoAllowAnySource: true` 才对任意来源开放 |
 | Console | 可以（`publicAccess.console`），仅管理员 | 同上 | 只放行 `allowedSourceCidrs` + VNet；**没有**“任意来源”选项 |
 | LiteLLM | 可以（`publicAccess.litellm`） | App GW WAF_v2 → LiteLLM 内部负载均衡；只放行推理路径 | 只放行 `litellmAllowedSourceCidrs`（或 `allowedSourceCidrs`）+ VNet；`litellmAllowAnySource: true` 才放开 |
 | Proxy | **默认不开放，也不推荐**；`publicAccess.proxy`（默认 `false`）只用于 LiteLLM 在另一个网络、且无法用 Private Link / VNet 对等 / VPN 互联的情况 | App GW WAF_v2 → Proxy 内部负载均衡；只放行公开的推理路径；建议 App GW mutual TLS | **必须**给出 `proxyAllowedSourceCidrs`（只填 LiteLLM 出口 IP）；没有“任意来源”选项 |
@@ -19,11 +19,27 @@
 
 | 端点 | 谁访问 | 说明 |
 | --- | --- | --- |
-| SSO `/sso`、`/metadata`、`/login`、`/logout`（`default` 企业在根路径，其他企业在 `/enterprises/<id>/...`） | Login Pod 内的无头 Chromium（总是在 VNet 内）；管理员的浏览器（配置和测试 GitHub SAML、首个管理员登录） | GitHub 服务端从不连接 SSO：SAML 全部经浏览器中转（`guidance/network-deployment.md` 第 1 节）。`SAMLResponse` 由浏览器 POST 给 GitHub，不是 POST 给 SSO，所以 SSO 的 WAF 只会看到 HTTP-Redirect 绑定的 `GET /sso?SAMLRequest=...&RelayState=...` 和登录表单 `POST /login`。账号池中的账号由 Login 自动登录，最终用户不登录 SSO。因此“对外”主要服务于不在 VNet / VPN 内的管理员，默认仍按来源限制。 |
+| SSO `/sso`、`/metadata`、`/login`、`/logout`（`default` 企业在根路径，其他企业在 `/enterprises/<id>/...`） | Login Pod 内的无头 Chromium（集群内）；内网 / VPN 中管理员的浏览器 | 见第 2.1 节。SSO 的 WAF 只会看到 `GET /sso?SAMLRequest=...&RelayState=...`、登录表单 `POST /login` 和 `/metadata`。 |
 | SSO `/api/...`、`/internal/...` | Proxy、Console、Login（集群内 Service） | 内部管理接口（`INTERNAL_API_TOKEN`），永远不经 App GW：WAF 先按路径允许列表拦截，再显式拦截这两个前缀。 |
 | Console | 管理员 | 初始化前第一个打开 Console 的人可以创建管理员，所以**先用 `kubectl port-forward` 初始化，再开放**（README 第 6 节）。只允许管理网段。 |
 | Proxy | LiteLLM（服务端调用） | 见第 4 节，不对外。 |
 | LiteLLM | 开发者工具、内部应用 | 用 LiteLLM virtual key 认证，身份 Hook 由 key hash 生成 `X-User-Identity`。 |
+
+### 2.1 SSO 通常不需要公网（已按代码核对）
+
+账号池模式下，SAML 登录由 Login Pod 内的无头 Chromium 完成：
+
+1. Login 打开 GitHub 的设备授权 / 登录页（`login/src/auth/HeadlessPlaywrightAuthStrategy.ts`）；GitHub 识别出 EMU 账号后，把**这个集群内的浏览器**重定向到 IdP 的 Sign on URL（`GET <SSO_PUBLIC_BASE_URL>/sso?SAMLRequest=...`，HTTP-Redirect 绑定）。
+2. 浏览器在 SSO 的登录页（`<SSO_PUBLIC_BASE_URL>/login`，即 Login 的 `SSO_URL`；Login 只在允许的登录 URL 上填写密码）提交池用户的密码。
+3. SSO 返回一个自动提交的表单，把 `SAMLResponse` 经同一个浏览器 **POST 到 GitHub 的 ACS**（`sso/src/routes/samlRoutes.ts` 中 `<form method="post" action="${acsUrl}">`，HTTP-POST 绑定）。
+
+因此：
+
+- **GitHub 服务端从不连接 SSO**（没有服务器到服务器的 SAML 调用）；SCIM 是 SSO **出站**调用 GitHub API（`sso/src/scim/scimClient.ts`，`SCIM_BASE_URL` → `api.github.com` 或 `api.<子域>.ghe.com`），经 NAT 出口；
+- SAML 元数据与签名证书是**在 GitHub 的 SAML 设置中粘贴**的（Sign on URL、Issuer、公钥证书），GitHub 不会来抓取 `/metadata`；
+- SSO 只需要被两类浏览器访问到：**Login Pod**（`SSO_PUBLIC_BASE_URL` 在集群内可解析：内部负载均衡 IP、内网 DNS 或 `hostAliases`）；以及**内网 / VPN 中管理员的浏览器**——配置或测试 GitHub SAML 时，或某个 EMU 用户（例如设置企业用的首个管理员）在 GitHub 网页上登录时，GitHub 会把这个人的浏览器重定向到 SSO。
+
+`SSO_PUBLIC_BASE_URL` 名字里虽然有 PUBLIC，要求只是这两类浏览器都能访问且同源（`guidance/network-deployment.md` 第 1、2 节）。纯集群内地址（`http://ghcp-sso.<namespace>.svc.cluster.local:7001`）Login 能用，但管理员的浏览器打不开，所以默认用 SSO 的内部负载均衡地址。**`publicAccess.sso` 只用于少见情况**：公司网络 / VPN 之外的人必须经本 IdP 登录 EMU 企业（例如没有 VPN 的外部管理员）。与代码核对时没有发现与上述描述不一致之处；补充一点：除 `/sso`、`/login` 外，管理员浏览器也会访问 `/logout`，其他企业的路径在 `/enterprises/<id>/` 下，这些都已在 WAF 路径允许列表中。
 
 ## 3. 方案比较
 
@@ -159,15 +175,17 @@ X-User-Identity: sha256:<鉴权确认的64位小写hex hash>
 
 ```json
 {
-  "sso": true,
+  "sso": false,
   "console": true,
   "litellm": false,
   "allowedSourceCidrs": ["203.0.113.0/24"],
-  "hostNames": { "sso": "sso.example.com", "console": "console.example.com" },
-  "certificateNames": { "sso": "ghcp-public-tls", "console": "ghcp-public-tls" },
+  "hostNames": { "console": "console.example.com" },
+  "certificateNames": { "console": "ghcp-public-tls" },
   "wafMode": "Prevention"
 }
 ```
+
+SSO 确需对外时（第 2.1 节的少见情况）再加 `"sso": true` 与 `"hostNames": { "sso": "sso.example.com" }`。
 
 LiteLLM 另需 `"litellm": true`、`"hostNames": { "litellm": "llm.example.com" }`、`"litellmBackend": { "address": "<LiteLLM 内部负载均衡 IP>", "port": 4000 }`，可选 `litellmAllowedSourceCidrs`、`litellmAllowedPathPrefixes`、`litellmAllowAnySource`。
 

@@ -3,7 +3,7 @@
 @export()
 @description('公网访问开关。默认全部 false = 仅内网；任一为 true 时创建 Application Gateway WAF_v2（公网 IP + 私网前端），后端始终是内网地址。')
 type publicAccessConfig = {
-  @description('SSO 的 SAML 页面（/sso、/metadata、/login、/logout 及 /enterprises/<id>/...）经 App GW 对外。/api、/internal 始终被 WAF 拦截。')
+  @description('SSO 的 SAML 页面（/sso、/metadata、/login、/logout 及 /enterprises/<id>/...）经 App GW 对外。通常不需要：只有 Login Pod 和内网 / VPN 中管理员的浏览器访问 SSO（public-access-design.md 第 2.1 节）。/api、/internal 始终被 WAF 拦截。')
   sso: bool
 
   @description('Console 管理界面经 App GW 对外。只放行 allowedSourceCidrs（以及 VNet 内部），不支持对全网开放。')

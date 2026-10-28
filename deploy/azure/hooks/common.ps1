@@ -156,6 +156,24 @@ function Invoke-Renderer {
   return $LASTEXITCODE
 }
 
+# registry（GHCP_ENTERPRISE_REGISTRY_FILE）中每个企业引用的 Key Vault 机密：[{ name, enterprise, field, service, required, generated }]。
+# 没有 registry 时为空。registry 不符合约定时抛出（错误由渲染脚本打印）。
+function Get-EnterpriseSecrets {
+  if ([string]::IsNullOrWhiteSpace($env:GHCP_ENTERPRISE_REGISTRY_FILE)) { return @() }
+  $output = & node (Join-Path $script:AzureDir 'scripts/render-overlay.mjs') enterprise-secrets
+  if ($LASTEXITCODE -ne 0) { throw 'The enterprise registry is invalid (see the errors above).' }
+  return @($output | ConvertFrom-Json)
+}
+
+# 部署前检查：registry 引用的每个机密都必须已在 Key Vault 中（缺少时 SSO 对该企业报阻塞项，Pod 停在 CSI 挂载）。
+function Assert-EnterpriseSecretsPresent {
+  $missing = @(Get-EnterpriseSecrets | Where-Object { -not (Test-KeyVaultSecret $_.name) } | ForEach-Object { "$($_.name) ($($_.enterprise).$($_.field))" })
+  if ($missing.Count) {
+    throw ("Key Vault is missing secrets referenced by the enterprise registry: " + ($missing -join ', ') +
+      ". Write them with hooks/Set-GhcpSecret.ps1 -Enterprise <id> -Kind <kind> (README section 8.6).")
+  }
+}
+
 function Get-GeneratedDir {
   return Join-Path $script:AzureDir ".generated/$(Get-RequiredEnv 'AZURE_ENV_NAME')"
 }

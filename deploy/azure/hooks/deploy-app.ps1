@@ -35,6 +35,9 @@ if ($LASTEXITCODE -ne 0) { throw 'kubectl kustomize failed.' }
 $leftovers = @($rendered | Select-String 'REPLACE_' | Where-Object { $_.Line -notmatch "includes\(''REPLACE_''\)|REPLACE_(INGRESS|INTERNAL_INGRESS|LITELLM)_" })
 if ($leftovers.Count) { throw "Placeholders left in the rendered manifests:`n$($leftovers.Line -join "`n")" }
 
+# 多企业：registry 引用的每个 Key Vault 机密都必须已存在，否则不部署。
+Assert-EnterpriseSecretsPresent
+
 Connect-Aks
 $namespace = Get-RequiredEnv 'GHCP_NAMESPACE'
 Initialize-Namespace $namespace
@@ -52,4 +55,7 @@ Write-Host 'Next steps (deploy/azure/README.md section 6):'
 Write-Host "  1. Initialize the Console admin first, from this machine only: kubectl --kubeconfig $($script:Kube.Kubeconfig) --context $($script:Kube.Context) -n $namespace port-forward svc/ghcp-console 7004:7004"
 Write-Host "  2. GitHub SAML: Sign on URL $ssoBase/sso, Issuer $ssoBase/metadata, certificate = Key Vault secret ghcp-saml-idp-cert"
 Write-Host '  3. Keep Ready idle target at 0 until SAML / SCIM / seats are verified; then open the pool gradually.'
+foreach ($id in @(Get-EnterpriseSecrets | ForEach-Object { $_.enterprise } | Select-Object -Unique)) {
+  Write-Host "  Enterprise ${id}: GitHub SAML Sign on URL $ssoBase/enterprises/$id/sso, Issuer $ssoBase/enterprises/$id/metadata; it starts as draft: check Blockers, Edit cap, then Activate in Console."
+}
 if ($env:APPGW_PUBLIC_IP) { Write-Host "  4. Public DNS: point the published host names at $($env:APPGW_PUBLIC_IP) (Application Gateway)." }

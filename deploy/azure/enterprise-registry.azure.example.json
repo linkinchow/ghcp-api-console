@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "enterprises": [
+    {
+      "id": "tailspin",
+      "displayName": "Tailspin (github.com)",
+      "github": {
+        "baseUrl": "https://github.com",
+        "slug": "tailspin",
+        "shortcode": "tsp"
+      },
+      "sso": {
+        "signingCert": { "file": "/run/secrets/tailspin/idp-cert.pem" },
+        "signingKey": { "file": "/run/secrets/tailspin/idp-key.pem" },
+        "sessionSecret": { "file": "/run/secrets/tailspin/session-secret" },
+        "scimToken": { "file": "/run/secrets/tailspin/scim-token" },
+        "seatPat": { "file": "/run/secrets/tailspin/seat-pat" },
+        "defaultUserPassword": { "file": "/run/secrets/tailspin/default-user-password" }
+      },
+      "pool": {
+        "accountDomain": "pool.tailspin.example.com",
+        "initialMaxAccounts": 10
+      }
+    },
+    {
+      "id": "fabrikam-ghe",
+      "displayName": "Fabrikam (GHE.com)",
+      "github": {
+        "baseUrl": "https://fabrikam.ghe.com",
+        "slug": "fabrikam"
+      },
+      "sso": {
+        "emailDomain": "fabrikam.example.com",
+        "signingCert": { "file": "/run/secrets/fabrikam-ghe/idp-cert.pem" },
+        "signingKey": { "file": "/run/secrets/fabrikam-ghe/idp-key.pem" },
+        "sessionSecret": { "file": "/run/secrets/fabrikam-ghe/session-secret" },
+        "scimToken": { "file": "/run/secrets/fabrikam-ghe/scim-token" },
+        "seatPat": { "file": "/run/secrets/fabrikam-ghe/seat-pat" },
+        "defaultUserPassword": { "file": "/run/secrets/fabrikam-ghe/default-user-password" }
+      },
+      "login": {
+        "ssoProvider": "custom"
+      },
+      "pool": {
+        "accountDomain": "pool.fabrikam.example.com",
+        "initialMaxAccounts": 20
+      },
+      "modelsAdmin": {
+        "githubLogin": "fabrikam-admin",
+        "copilotToken": { "file": "/run/secrets/fabrikam-ghe/models-admin-copilot-token" }
+      }
+    }
+  ]
+}
