@@ -335,7 +335,7 @@ azd provision
 | `wafMode` | `Prevention`（默认）/ `Detection` |
 | `splitHorizonDns` | 默认 `true`：VNet 内把对外主机名解析到 App GW 私网前端 |
 
-**关闭**：把端点设为 `false` 后 `azd provision` 会移除对应监听器（关闭 Proxy 时 postprovision 同时删除 Proxy 的内部负载均衡及其 NetworkPolicy，除非设置了 `GHCP_PROXY_ILB`）；三个都关闭后，增量部署**不会删除**已有的 App GW、公网 IP 与 WAF 策略，需要手工删除：
+**关闭**：把端点设为 `false` 后 `azd provision` 会移除对应监听器（关闭 Proxy 时 postprovision 同时删除 Proxy 的内部负载均衡及其 NetworkPolicy，除非设置了 `GHCP_PROXY_ILB`）。该端点的 split-horizon 私有 DNS 区域（与主机名同名）不会自动删除，VNet 内该主机名仍解析到 App GW 私网前端（无监听器，返回 404）；需要时先删除区域的 VNet 链接再删除区域。三个都关闭后，增量部署**不会删除**已有的 App GW、公网 IP 与 WAF 策略，需要手工删除：
 
 ```bash
 RG=<资源组>; ENV=<环境名>
@@ -521,6 +521,7 @@ az aks update --resource-group <rg> --name <集群> --enable-secret-rotation --s
 | 滚动更新 | 持续负载下滚动替换两个 Proxy：长连接 1389/1389、新连接 1364/1364，零失败 |
 | 配置变化 | 改 azd 值后只有读取该值的服务滚动更新（`ghcp.azure/config-hash`，第 6 节） |
 | 公网开关 | App GW WAF_v2（公网 + 私网前端），Key Vault 中的通配符证书（TLS 1.3，两个前端都通过系统信任链校验），split-horizon DNS（每个对外主机名一个私有区域）。Console 经 App GW 打开与登录，跨站写入 403。Proxy 只放行推理路径：`/healthz`、`/api/*`、`/internal/*` 在 WAF 层 403；推理 JSON / SSE 正常 |
+| 关闭 Proxy 对外 | `proxy: false` 后 `azd provision`：只剩 Console 的监听器，Proxy 主机名在 App GW 上 404，Console 不受影响；Proxy 内部负载均衡与 NetworkPolicy 被删除 |
 | 来源限制 | 允许列表之外的来源（AKS 的 NAT 出口、互联网扫描）对两个对外主机名均为 403；未配置的主机名 404 |
 | 长请求（经 App GW，`POOL_INFERENCE_TIMEOUT_SECONDS=600`） | SSE 300 秒与 550 秒：200，最大分块间隔 0.25 秒（响应不缓冲）。非流式 300 秒无输出：200（修复内部负载均衡空闲超时之后，见下表）。**非流式 550 秒无输出：Proxy 在 300 秒返回 502**——Proxy 用 Node 内置 fetch 调上游，其默认响应头超时为 300 秒，上游 300 秒内不发响应头时请求失败，与 App GW 无关（产品问题，见第 13 节） |
 
