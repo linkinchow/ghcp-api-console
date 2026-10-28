@@ -1,6 +1,6 @@
-# 迁移指南：单企业版 r4 → 新环境中的多企业版
+# 迁移指南：单企业版 → 新环境中的多企业版
 
-本指南适用于：现有**单企业版 r4**（多个 Proxy 副本 + MySQL），要迁移到**另一套新环境**里的**多企业版**（同样是多个 Proxy 副本 + MySQL），并在迁移后继续添加更多企业（多 slug）。
+本指南适用于：现有**单企业版**（r4，或更早的 MySQL 账号池版本，见第 1.2 节；多个 Proxy 副本 + MySQL），要迁移到**另一套新环境**里的**多企业版**（同样是多个 Proxy 副本 + MySQL），并在迁移后继续添加更多企业（多 slug）。
 
 - 原环境不升级、不改动：数据**复制**到新环境，在新环境里完成 r4 → 多企业版的迁移。这与[多企业版升级指南](multi-enterprise-upgrade-guide.md)（原地升级）的数据迁移是同一过程，只是发生在一份数据副本上；那份指南里的配置变化、行为变化、DBA 脚本说明同样适用。
 - 迁移后，原企业成为新环境的 `default` 企业：池账号、席位、SSO 用户、调用方租约（caller key hash 与账号的绑定）全部保留，用户无感知。其他企业在迁移验证通过后再添加（第 9 节）。
@@ -16,10 +16,38 @@
 
 ## 1. 前提
 
-- **原环境必须是单企业版 r4**（镜像 tag `single-slug-164cade-amd64-r4`；以四个工作负载实际使用的镜像 tag 或 digest 为准）。更早的版本先按 [r4 升级指南](user-pool-release-upgrade-guide.md) 升到 r4 并验证。
 - 新环境使用当前多企业版镜像（digest 见[发布验证记录](multi-enterprise-release-validation.md)最新一节），四个组件同一版本。
 - 需要一个维护窗口：从停原环境到新环境验证通过，期间经 LiteLLM 到 GHCP 的请求不可用（其他模型后端不受影响）。时长主要取决于 MySQL 导出、导入和迁移，请先用一份数据副本演练（第 11 节）。
 - **新旧两套任何时候都不能同时运行**，否则两套 SSO / Proxy 会同时修改 GitHub 上的用户和席位。
+- 原环境的 Proxy 副本数不限：多副本 + MySQL 的 r4 正是资格测试覆盖的形态（两个 Proxy 副本）。
+
+### 1.1 确认原环境的版本
+
+经过验证的路径是**单企业版 r4 → 多企业版**。先确认原环境是哪个版本：
+
+| 方法 | 能看出什么 |
+| --- | --- |
+| Pod 实际运行的镜像（命令见表下） | 与 Docker Hub 上 r4 的 digest 比对（`linkinchow/ghcp-proxy` 上唯一的单企业版 tag 是 `single-slug-164cade-amd64-r4`） |
+| 镜像标签 `org.opencontainers.image.revision` | 用 `deploy/user-pool-mysql-customer/build-images.mjs` 构建的镜像带有源码提交（40 位 SHA，tag 本身也是这个 SHA）；同目录的 `build-manifest.json` 也记录了提交与镜像 ID。手工 `docker build` 的镜像没有这个标签 |
+| 运行形态 | 早于 r4 的镜像以 npm 启动（`WORKDIR /app`，Rancher 模板里有 `command: [node, src/proxy/dist/index.js]`）；r4 及以后以 Tini 为 PID 1，镜像内没有 npm |
+| 环境变量 | 有 `LOGIN_SSO_PROVIDER` → 早于 r4；有 `MYSQL_AUTO_MIGRATE`、`SHUTDOWN_TIMEOUT_MS` → r4 |
+| SSO / Login 的 SQLite | `sso_users` 有 `copilot_seat_pending_cancellation_date` 列、Login 有 `login_task_attempts` 表 → 至少运行过 r4 |
+
+查看 Pod 实际运行的镜像（显式指定原集群的 context 与 namespace）：
+
+```bash
+kubectl --context <原集群 context> -n <namespace> get pods -o custom-columns=POD:.metadata.name,IMAGE:.status.containerStatuses[*].imageID
+```
+
+`/healthz` 和 MySQL 的 `schema_migrations` 无法区分 r4 与更早的账号池版本（r4 及以前 `/healthz` 只有 `status`、`service`；`schema_migrations` 从 MySQL 账号池首个版本到 r4 都是同样 3 条记录）。
+
+### 1.2 原环境早于 r4 时
+
+- **MySQL 账号池版本**（源码提交 `2bc12b3`，2026-09-15 及以后，包括用 `build-images.mjs` 交付的版本）：Proxy 的 MySQL 表结构从那时到 r4 基本没有变化，r4 会自动处理两种旧形状（统计表补列、token 列排序规则）。**在新环境里多走一步**：第 4 节恢复数据后，先用 **r4** 镜像启动一次（账号池在备份前已暂停，暂停状态保存在数据库里，r4 启动后不会开户），确认 `/readyz` 正常、Console 数据完整，再按第 5 节换成多企业版。SSO / Login 的 SQLite 由 r4 在启动时自动补列，只进不退。
+  - 这样做的原因：经过资格测试的是“r4 之前的基线 → r4”和“r4 → 多企业版”这两段；直接从更早的版本跳到多企业版在代码上大概率可行，但没有验证过，不推荐。
+  - r4 的配置变化见 [r4 升级指南](user-pool-release-upgrade-guide.md)第 4 节（例如删除 `LOGIN_SSO_PROVIDER`；Proxy 不要再覆盖启动命令）。影响账号池配置指纹的 Proxy 环境变量保持不变（第 2.1 节）。
+- **未提交源码构建的内部测试镜像**（例如 2026-09-14 前后的 `production-fix`、`check` 等 tag）：没有对应的提交，表结构无法从 git 核对。先把备份恢复到一个隔离的临时库，与 r4 的 `scripts/proxy-mysql-initial.sql` 建出的结构比对；结构不同时 r4 会以 `Unsupported MySQL schema` 拒绝启动，需要单独评估。
+- **PostgreSQL / Redis 的旧版**（迁移到本 fork 之前的 Azure AKS 部署）：**没有迁移路径**，仓库中也没有 PostgreSQL → MySQL 的数据工具。只能在新环境全新部署（同一 GitHub 企业时注意第 0 节所说的孤儿账号与席位问题），或另行开发数据导出工具。
 
 ## 2. 准备新环境（不要启动应用）
 
@@ -48,7 +76,7 @@
 
 ## 3. 停止原环境并备份
 
-1. **暂停账号池**：在原环境（r4）Console 的 **User pool** 页暂停预热，等进行中的登录任务结束（Login Tasks 页没有运行中的任务）。
+1. **暂停账号池**：在原环境 Console 的 **User pool** 页暂停预热，等进行中的登录任务结束（Login Tasks 页没有运行中的任务）。
 2. **停止全部四个服务**，所有 Proxy 副本都要停（Kubernetes / Rancher 缩到 0，确认旧 Pod 全部退出）。
 3. **备份**（与升级指南第 4 节相同）：
 
