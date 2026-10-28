@@ -77,6 +77,18 @@ var names = {
 var natInOurRg = createNatGateway && empty(existingNatGatewayId) && !reuse.aks
 var natGatewayId = !empty(existingNatGatewayId) ? existingNatGatewayId : (natInOurRg ? natGateway.id : '')
 
+// 订阅注册了 EnableApplicationGatewayNetworkIsolation（私有部署，已 GA）时，App GW 子网必须委派给
+// Microsoft.Network/applicationGateways，否则创建失败（ApplicationGatewayNetworkIsolationRequiresSubnetDelegation）；
+// 未注册时委派同样有效，所以始终设置。
+var appGwDelegations = [
+  {
+    name: 'appgw'
+    properties: {
+      serviceName: 'Microsoft.Network/applicationGateways'
+    }
+  }
+]
+
 // App GW v2 子网的必需入站规则：GatewayManager 65200-65535（平台管理）与 AzureLoadBalancer（健康探测）。
 var appGwNsgRules = concat([
   {
@@ -255,6 +267,7 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = if (createVnet) {
           networkSecurityGroup: {
             id: nsgAppGw.id
           }
+          delegations: appGwDelegations
         }
       }
     ]
@@ -321,6 +334,7 @@ module byoAppGwSubnet 'subnet.bicep' = if (!createVnet && !reuse.appGateway) {
     addressPrefix: subnetPrefixes.appGateway
     nsgName: 'nsg-${namePrefix}-appgw'
     nsgRules: appGwNsgRules
+    delegations: appGwDelegations
     tags: tags
   }
   dependsOn: [

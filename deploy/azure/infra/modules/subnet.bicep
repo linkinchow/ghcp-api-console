@@ -8,6 +8,7 @@ param addressPrefix string
 param nsgName string
 param nsgRules array = []
 param natGatewayId string = ''
+param delegations array = []
 
 @allowed([
   'Enabled'
@@ -42,6 +43,7 @@ resource subnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = {
     natGateway: empty(natGatewayId) ? null : {
       id: natGatewayId
     }
+    delegations: delegations
   }
 }
 

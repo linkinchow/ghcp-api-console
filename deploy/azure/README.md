@@ -53,7 +53,7 @@ Log Analytics ◄── Container Insights、AKS / MySQL / App GW 诊断；（�
 
 | 资源 | 说明 |
 | --- | --- |
-| VNet、子网、NSG | 四个子网（第 3.2 节网段）；NSG 只为占住绑定（企业治理策略会给无 NSG 子网绑定空 NSG）；App GW 子网有 v2 必需的 GatewayManager 规则 |
+| VNet、子网、NSG | 四个子网（第 3.2 节网段）；NSG 只为占住绑定（企业治理策略会给无 NSG 子网绑定空 NSG）；App GW 子网有 v2 必需的 GatewayManager 规则，并委派给 `Microsoft.Network/applicationGateways`（第 9 节） |
 | NAT Gateway | AKS 子网的固定出口 IP（输出 `NAT_EGRESS_IP`），供 GitHub / GHE.com 的 IP 允许列表；空闲超时 15 分钟（覆盖 600 秒推理） |
 | AKS | Azure CNI Overlay（Pod 不占 VNet 地址）、Cilium 数据面与网络策略、OIDC + Workload Identity、Key Vault CSI 插件（轮换开启）、Entra ID + Azure RBAC、system / user 节点池跨可用区、可选私有集群 |
 | MySQL 灵活服务器 | 8.0（可选 8.4）、私有终结点、禁用公网、`require_secure_transport=ON`、utf8mb4、`log_bin_trust_function_creators=ON`、自动扩容存储、备份保留 14 天、默认区域冗余高可用 |
@@ -438,6 +438,7 @@ azd env set GHCP_EXISTING_NAT_GATEWAY_ID <NAT Gateway 资源 ID>
 azd env set GHCP_EXISTING_PRIVATE_DNS_ZONE_IDS '{"acr":"<区域资源 ID>","keyVault":"<区域资源 ID>"}'
 ```
 
+- App GW 子网：模板新建时委派给 `Microsoft.Network/applicationGateways`（订阅注册了 `EnableApplicationGatewayNetworkIsolation` 时 Azure 强制要求，未注册时也无害）。在 `GHCP_EXISTING_SUBNET_NAMES` 中复用已有的 App GW 子网时，由使用方加上这个委派，否则创建 App GW 时报 `ApplicationGatewayNetworkIsolationRequiresSubnetDelegation`。
 - 网段冲突由使用方保证：`GHCP_SERVICE_CIDR` / `GHCP_POD_CIDR` 不得与 VNet、对等网络、LiteLLM 集群的 Service CIDR（LiteLLM 模板默认 `10.31.0.0/16`）重叠。
 - LiteLLM 模板把 CoreDNS 的公网解析转发到外部 DNS，但对 `database.azure.com`、`azurecr.io`、`vaultcore.azure.net` 例外转给 Azure DNS；本部署使用的三个私有区域都落在这些例外中。本部署自己的集群不修改 CoreDNS。
 - 模板会在 VNet 所在的资源组中创建子网、NSG 和角色分配：**这类环境绝不能用 `azd down`**（azd 会按部署涉及的资源组清理）；predown hook 会拒绝。删除时只删本部署的资源组，并手工删除新建的子网 / NSG / 角色分配。
