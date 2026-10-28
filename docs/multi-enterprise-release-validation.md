@@ -182,7 +182,7 @@ r2 时的对照：旧 Pod 有忙碌长连接时要等满 25 秒才强制关闭�
 - 真实 LiteLLM：kind 和镜像级检查中的长连接客户端分别是 Node 的 `http.Agent({ keepAlive: true })` 和原始套接字，行为与 LiteLLM 的连接池相近，但没有用 LiteLLM 本身验证（包括它是否压缩请求体）；仓库的 LiteLLM 示例配置是 `max_retries: 0`。
 - CVE-2026-111181 的缓解只按设计和单元测试验证（压缩请求体在解压之前被 415 拒绝），没有在镜像上做攻击性复现。
 - SSO、Login 没有流式接口，“响应头已发出后在 `finish` 时结束套接字”只在 Proxy（SSE）、Console（CSV 转发）上做了镜像级验证，SSO、Login 由共享代码的单元测试覆盖。
-- `ownerSideEffects` 在 `f43f27e` 上 8 次运行中 1 次 22/22，其余各有 1–2 条计时断言失败（第 7 节）；测试本身的不稳定待单独修正。
+- `ownerSideEffects` 在 `f43f27e` 上 8 次运行中 1 次 22/22，其余各有 1–2 条计时断言失败（第 7 节）；测试本身的不稳定已在之后单独修正（数据库时钟回拨与 5 秒步骤截止，只改测试），见 [ownerSideEffects 确定性修正](user-pool-owner-side-effects-determinism.md)。
 - 资格测试中没有真实 Login 浏览器任务（kind 阶段 A 有真实 Login 的 Chromium 对 mock GHE.com）。
 - `MYSQL_AUTO_MIGRATE=false` + r4 → 多企业 DBA 升级脚本只在集成测试中覆盖；全新部署的其余未覆盖项同 r2 第 3.4 节。
 - 性能、容量与长时间稳定性。
