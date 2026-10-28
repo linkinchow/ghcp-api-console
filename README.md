@@ -68,6 +68,7 @@ SSO / Login / Console → 同一个 Proxy Service
 | 没有现有部署，全新安装（单个或多个企业） | [多企业版新部署指南](./docs/multi-enterprise-new-deployment-guide.md)：使用 `multi-f43f27e-amd64-r3`，从一个企业（`default`）开始，以后按 registry 添加企业 |
 | 单企业部署，升级到单企业版 r4（`single-slug-164cade-amd64-r4`） | [单企业版 r4 升级指南](./docs/user-pool-release-upgrade-guide.md)；SQLite 与 MySQL 均适用 |
 | 单企业版 r4（SQLite 或 MySQL），升级到多企业版（`multi-f43f27e-amd64-r3`） | [多企业版升级指南](./docs/multi-enterprise-upgrade-guide.md)：只支持从 r4 升级；四个组件一次性替换，首次升级需短暂停机；回滚只能恢复备份。升级完成并稳定后，再按 [registry 配置参考](./docs/multi-enterprise-registry.md) 添加企业 |
+| 单企业版 r4 迁移到**另一套新环境**的多企业版（原环境不动） | [迁移指南](./docs/multi-enterprise-migrate-to-new-environment.md)：停原环境 → 备份 → 在新环境恢复并迁移 → 切换 GitHub SAML 与 LiteLLM；原环境保留作回退 |
 | 已使用 SQLite User Pool（`caller-lease`），升级到 MySQL 多副本 | [SQLite User Pool → MySQL 多副本升级指南](./docs/user-pool-mysql-upgrade-guide.md)，保留现有池成员和有效凭据，不重新开户 |
 | 使用普通 `direct` 模式，仅将账号数据库从 SQLite 迁到 MySQL | [direct 模式数据库迁移工具](./upgrade/sqlite-to-mysql/README.md)，不用于迁移 User Pool 表 |
 | 尚未启用 User Pool，希望在单 Proxy／SQLite 部署中启用账号池 | [单副本 User Pool 启用与升级指南](./docs/user-pool-upgrade-guide.md)；原 direct 账号不会自动成为池成员 |

@@ -4,6 +4,8 @@
 
 多企业版是独立的发布线：镜像 tag 以 `multi-` 开头，不复用 `single-slug-*`，不发布 `latest`。单企业版继续单独维护；不需要多个企业的客户可以留在单企业版。
 
+要把 r4 迁移到**另一套新环境**（原环境不动，数据复制过去再迁移），见 [迁移指南：单企业版 r4 → 新环境中的多企业版](multi-enterprise-migrate-to-new-environment.md)。
+
 没有现有部署、要全新安装多企业版时，请看 [多企业版新部署指南](multi-enterprise-new-deployment-guide.md)。
 
 ## 1. 本版本包含什么
