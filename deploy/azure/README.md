@@ -141,7 +141,7 @@ done
 | `GHCP_NETWORK_DATAPLANE` / `GHCP_NETWORK_POLICY` | `cilium` / `cilium` | 网络策略引擎创建后不能更换 |
 | `GHCP_AKS_OUTBOUND_TYPE` | `userAssignedNATGateway` | 走客户防火墙时 `userDefinedRouting` |
 | `GHCP_PRIVATE_CLUSTER` | `false` | 私有集群：hook 必须在 VNet 内（跳板机 / 自托管流水线 / VPN）运行 |
-| `GHCP_API_SERVER_AUTHORIZED_IP_RANGES` | `[]` | 非私有集群时限制 API server 来源（建议填运维出口） |
+| `GHCP_API_SERVER_AUTHORIZED_IP_RANGES` | `[]` | 非私有集群时限制 API server 来源（建议填运维出口）。设置后，本模板创建的 NAT Gateway 出口 IP 会自动加入（节点经它访问 API server）；复用已有 NAT / 防火墙时须自行加入其出口 IP。运维机经 Global Secure Access、企业代理或 VPN 访问时，API server 看到的来源地址不是本机查到的公网出口 IP，须按实际来源配置，否则 `kubectl` 连接被拒 |
 | `GHCP_DISABLE_LOCAL_ACCOUNTS` / `GHCP_AKS_ADMIN_GROUP_OBJECT_IDS` | `false` / `[]` | 集群始终启用 Entra ID + Azure RBAC；禁用本地账户时 hook 需要 kubelogin |
 | `GHCP_GRANT_DEPLOYER_AKS_ADMIN` | `true` | 给执行部署的身份授予 AKS RBAC Cluster Admin（hook 部署应用需要） |
 | `GHCP_UPGRADE_CHANNEL` / `GHCP_NODE_OS_UPGRADE_CHANNEL` | `none` / `None` | 自动升级默认关闭；开启时在周末维护窗口进行。SSO / Login / Console 是单副本，节点排空时各有短暂中断 |
@@ -153,7 +153,7 @@ done
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `GHCP_MYSQL_SKU_TIER` / `GHCP_MYSQL_SKU_NAME` | `GeneralPurpose` / `Standard_D2ads_v5` | Burstable 不支持高可用、CPU 积分耗尽会限速，只用于测试 |
-| `GHCP_MYSQL_VERSION` | `8.0.21` | 或 `8.4`（以地域支持为准） |
+| `GHCP_MYSQL_VERSION` | `8.4` | 默认 8.4（LTS）。`8.0.21`（8.0 系列）在 Azure 的标准支持到 2027-01-31，之后自动进入按 vCore·小时**收费**的 Extended Support；已在 8.0 上的服务器可以原地主版本升级到 8.4。本项目的资格测试一直使用 MySQL 8.4 |
 | `GHCP_MYSQL_HA` | `ZoneRedundant` | `Disabled` / `SameZone` / `ZoneRedundant` |
 | `GHCP_MYSQL_STORAGE_GB` / `GHCP_MYSQL_BACKUP_RETENTION_DAYS` / `GHCP_MYSQL_GEO_BACKUP` | `64` / `14` / `false` | 存储自动扩容；异地备份创建后不能改 |
 | `GHCP_MYSQL_ADMIN_LOGIN` | `ghcpadmin` | 管理员登录名 |

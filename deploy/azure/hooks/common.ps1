@@ -152,7 +152,9 @@ function Initialize-Namespace {
 
 function Invoke-Renderer {
   param([string[]] $Arguments = @('render'))
-  & node (Join-Path $script:AzureDir 'scripts/render-overlay.mjs') @Arguments
+  # Out-Host: otherwise the renderer's stdout joins the function's return value and a successful render
+  # compares as non-zero at the call sites (`(Invoke-Renderer ...) -ne 0`).
+  & node (Join-Path $script:AzureDir 'scripts/render-overlay.mjs') @Arguments | Out-Host
   return $LASTEXITCODE
 }
 

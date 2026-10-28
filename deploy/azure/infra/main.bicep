@@ -199,7 +199,7 @@ param mysqlSkuName string = 'Standard_D2ads_v5'
   '8.0.21'
   '8.4'
 ])
-param mysqlVersion string = '8.0.21'
+param mysqlVersion string = '8.4'
 
 @allowed([
   'Disabled'
@@ -359,6 +359,12 @@ module network 'modules/network.bicep' = {
   }
 }
 
+// With NAT Gateway outbound, AKS adds no egress IP to the API server allowlist (it only does so for load-balancer
+// outbound), so nodes could not reach the API server and the cluster failed to provision. Add this template's NAT
+// IP whenever an allowlist is set; with an existing NAT gateway or firewall the operator must list its egress IPs.
+var effectiveApiServerAuthorizedIpRanges = empty(apiServerAuthorizedIpRanges) ? [] : union(apiServerAuthorizedIpRanges,
+  empty(network.outputs.natEgressIp) ? [] : ['${network.outputs.natEgressIp}/32'])
+
 var dnsZoneLinkName = 'link-${base}'
 
 module acrDnsZone 'modules/private-dns-zone.bicep' = if (empty(existingPrivateDnsZoneIds.?acr ?? '')) {
@@ -445,7 +451,7 @@ module aks 'modules/aks.bicep' = if (!byoAks) {
     networkPolicy: networkPolicy
     outboundType: aksOutboundType
     privateCluster: privateCluster
-    apiServerAuthorizedIpRanges: apiServerAuthorizedIpRanges
+    apiServerAuthorizedIpRanges: effectiveApiServerAuthorizedIpRanges
     disableLocalAccounts: disableLocalAccounts
     adminGroupObjectIds: aksAdminGroupObjectIds
     upgradeChannel: upgradeChannel

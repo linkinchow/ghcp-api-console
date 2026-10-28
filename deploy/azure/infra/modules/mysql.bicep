@@ -27,7 +27,7 @@ param skuName string = 'Standard_D2ads_v5'
   '8.0.21'
   '8.4'
 ])
-param version string = '8.0.21'
+param version string = '8.4'
 
 @description('高可用：Disabled、SameZone、ZoneRedundant（需要地域支持可用区；Burstable 不支持）。')
 @allowed([

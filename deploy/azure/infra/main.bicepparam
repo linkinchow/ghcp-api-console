@@ -58,7 +58,7 @@ param diskSkuName = readEnvironmentVariable('GHCP_DISK_SKU_NAME', '')
 // ---- MySQL ----
 param mysqlSkuTier = readEnvironmentVariable('GHCP_MYSQL_SKU_TIER', 'GeneralPurpose')
 param mysqlSkuName = readEnvironmentVariable('GHCP_MYSQL_SKU_NAME', 'Standard_D2ads_v5')
-param mysqlVersion = readEnvironmentVariable('GHCP_MYSQL_VERSION', '8.0.21')
+param mysqlVersion = readEnvironmentVariable('GHCP_MYSQL_VERSION', '8.4')
 param mysqlHighAvailability = readEnvironmentVariable('GHCP_MYSQL_HA', 'ZoneRedundant')
 param mysqlStorageSizeGB = int(readEnvironmentVariable('GHCP_MYSQL_STORAGE_GB', '64'))
 param mysqlBackupRetentionDays = int(readEnvironmentVariable('GHCP_MYSQL_BACKUP_RETENTION_DAYS', '14'))
