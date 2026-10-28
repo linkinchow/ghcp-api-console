@@ -375,6 +375,11 @@ test('renderer: internal-only github.com environment renders and fills every Azu
     assert.equal(named(bootstrap, 'SecretProviderClass', 'ghcp-mysql-bootstrap-kv').spec.parameters.keyvaultName, 'kvunittest000000');
     assert.ok(named(bootstrap, 'ConfigMap', 'ghcp-mysql-ca').data['ca.pem'].includes('BEGIN CERTIFICATE'));
     assert.ok(named(bootstrap, 'ConfigMap', 'ghcp-mysql-bootstrap-script').data['bootstrap.cjs'].includes('mysql2/promise'));
+    // Re-running postprovision after the app (and its default deny) is deployed needs this egress to MySQL.
+    const bootstrapEgress = named(bootstrap, 'NetworkPolicy', 'ghcp-azure-mysql-bootstrap').spec;
+    assert.equal(job.spec.template.metadata.labels['app.kubernetes.io/name'], 'ghcp-mysql-bootstrap');
+    assert.deepEqual(bootstrapEgress.podSelector.matchLabels, { 'app.kubernetes.io/name': 'ghcp-mysql-bootstrap' });
+    assert.deepEqual(bootstrapEgress.egress, [{ to: [{ ipBlock: { cidr: '10.40.4.0/26' } }], ports: [{ protocol: 'TCP', port: 3306 }] }]);
     assert.ok(bootstrap.every((o) => o.kind === 'StorageClass' || o.metadata.namespace === 'ghcp'));
   } finally {
     rmSync(outDir, { recursive: true, force: true });

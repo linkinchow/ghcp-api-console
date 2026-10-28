@@ -547,6 +547,22 @@ export function renderOverlay(env, outDir, options = {}) {
   });
   files['mysql-bootstrap/patch-spc.yaml'] = header + json(spcPatch('ghcp-mysql-bootstrap-kv'));
   files['mysql-bootstrap/patch-sa.yaml'] = header + json(patches.find((p) => p.kind === 'ServiceAccount'));
+  if (enableNetworkPolicy) {
+    // The Job carries app.kubernetes.io/part-of=ghcp, so once the app is deployed the namespace's default deny
+    // also blocks it; without this, every later postprovision (new enterprise, public access) times out on MySQL.
+    bootstrap.resources.push('network-policy.yaml');
+    files['mysql-bootstrap/kustomization.yaml'] = header + json(bootstrap);
+    files['mysql-bootstrap/network-policy.yaml'] = header + json({
+      apiVersion: 'networking.k8s.io/v1',
+      kind: 'NetworkPolicy',
+      metadata: { name: 'ghcp-azure-mysql-bootstrap' },
+      spec: {
+        podSelector: { matchLabels: { 'app.kubernetes.io/name': 'ghcp-mysql-bootstrap' } },
+        policyTypes: ['Egress'],
+        egress: [{ to: [{ ipBlock: { cidr: peSubnet } }], ports: [{ protocol: 'TCP', port: 3306 }] }],
+      },
+    });
+  }
 
   const summary = {
     environment: env.AZURE_ENV_NAME || '',
