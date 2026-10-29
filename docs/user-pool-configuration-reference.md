@@ -49,6 +49,7 @@
 - 600秒上限是本项目保守边界，不是外部技术硬限制或已验证最佳值。
 - 调大参数同时影响后台预配/HTTP等待和占用截止时间，不能只把它当作浏览器或模型流的独立选项。
 - 对已上线MySQL，推荐兼容版Proxy使用独立 `POOL_INFERENCE_TIMEOUT_SECONDS=600`，旧 `POOL_REQUEST_TIMEOUT_SECONDS` 保留原值，不改指纹或停库。该能力包含在本次源码提交，Proxy回归及Azure真实新旧共库Messages长流、MySQL专项验证通过；客户需从该版本构建新镜像，旧镜像不支持。详见[600秒生产操作手册](user-pool-request-timeout-change-plan.md)。
+- 非流式推理在上游返回响应头之前没有任何输出。修复前的 Proxy 用 Node 内置 fetch 的默认传输限制（响应头 300 秒、两个数据块之间 300 秒），上游超过 300 秒才返回响应头时请求以 502 失败，`POOL_INFERENCE_TIMEOUT_SECONDS` 再大也只到 300 秒；流式请求不受影响。修复后 Proxy 对上游推理使用独立的传输限制（660 秒，高于两个时限参数的上限 600 秒），实际时限只由本参数决定（[验证报告](user-pool-inference-timeout-validation.md)“非流式 300 秒上限”一节）。
 - 现有 MySQL 池改旧参数值会遇到指纹不匹配。当前维护工具只支持 `PREWARM_CONCURRENCY` 和 `POOL_LOGIN_MAX_PENDING`，不支持该旧超时；不得手工改指纹或清 owner/hold 强行通过。
 - 即使未来支持调整，LiteLLM、SDK、前置代理和进程关闭时限仍可能更短，必须一并核对。
 

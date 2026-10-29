@@ -2,11 +2,17 @@ import assert from 'node:assert/strict';
 import { getEventListeners } from 'node:events';
 import { setImmediate as nextTurn } from 'node:timers/promises';
 import test from 'node:test';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { Agent } from 'undici';
 import {
   clearModelsCache,
+  createUpstreamDispatcher,
+  executePreparedCopilotRequest,
   forwardCopilotRequest,
   listModels,
   resolveCopilotModel,
+  UPSTREAM_TRANSPORT_TIMEOUT_MS,
   validateCopilotOauthToken,
 } from './copilotClient.js';
 import { config } from '../config.js';
@@ -485,3 +491,63 @@ function jsonResponse(value: unknown): Response {
     headers: { 'Content-Type': 'application/json' },
   });
 }
+
+/** A local upstream that sends its response headers only after `delayMs`. */
+async function slowUpstream(delayMs: number): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = createServer((req, res) => {
+    req.resume();
+    const timer = setTimeout(() => res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true}'), delayMs);
+    res.once('close', () => clearTimeout(timer));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}/v1/messages`,
+    close: () => new Promise((resolve) => { server.closeAllConnections(); server.close(() => resolve()); }),
+  };
+}
+
+test('upstream inference uses its own dispatcher whose transport limits sit above every request budget', async () => {
+  // POOL_INFERENCE_TIMEOUT_SECONDS and POOL_REQUEST_TIMEOUT_SECONDS are at most 600 s; undici's default is 300 s.
+  assert.ok(UPSTREAM_TRANSPORT_TIMEOUT_MS > 600_000);
+  const originalFetch = globalThis.fetch;
+  let dispatcher: unknown;
+  globalThis.fetch = async (_input, init) => {
+    dispatcher = (init as { dispatcher?: unknown } | undefined)?.dispatcher;
+    return jsonResponse({ id: 'response' });
+  };
+  try {
+    await executePreparedCopilotRequest({ url: 'https://api.githubcopilot.com/v1/messages', method: 'POST', headers: {}, body: '{}' });
+    assert.ok(dispatcher instanceof Agent);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('the dispatcher, not the fixed undici default, decides how long the global fetch waits for response headers', async () => {
+  const upstream = await slowUpstream(1500);
+  try {
+    await assert.rejects(
+      fetch(upstream.url, { method: 'POST', body: '{}', dispatcher: createUpstreamDispatcher(500) }),
+      (err: Error & { cause?: { code?: string } }) => err.cause?.code === 'UND_ERR_HEADERS_TIMEOUT',
+    );
+    const response = await fetch(upstream.url, { method: 'POST', body: '{}', dispatcher: createUpstreamDispatcher(5000) });
+    assert.deepEqual(await response.json(), { ok: true });
+  } finally {
+    await upstream.close();
+  }
+});
+
+// Real-time check of the production limits (about 5 minutes): GHCP_SLOW_TRANSPORT_TEST=1 npm test -w src/proxy
+test('a non-streaming upstream that answers after 310 s still succeeds', { skip: process.env.GHCP_SLOW_TRANSPORT_TEST !== '1', timeout: 400_000 }, async () => {
+  const upstream = await slowUpstream(310_000);
+  try {
+    const started = Date.now();
+    const response = await executePreparedCopilotRequest({ url: upstream.url, method: 'POST', headers: {}, body: '{}' },
+      AbortSignal.timeout(600_000));
+    assert.equal(response.status, 200);
+    assert.ok(Date.now() - started >= 310_000);
+  } finally {
+    await upstream.close();
+  }
+});
