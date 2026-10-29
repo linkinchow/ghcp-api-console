@@ -16,7 +16,7 @@
 
 ## 1. 前提
 
-- 新环境使用当前多企业版镜像（digest 见[发布验证记录](multi-enterprise-release-validation.md)最新一节），四个组件同一版本。
+- 新环境使用当前多企业版镜像（digest 见[发布验证记录](multi-enterprise-release-validation.md)最新一节），四个组件同一版本。至少用 r4（`multi-ea1a29e-amd64-r4`）：r3 及更早的多企业版、单企业版 r4 及更早版本中，上游超过 300 秒才返回响应头的非流式请求都会以 502 失败（第 2.1 节 `POOL_INFERENCE_TIMEOUT_SECONDS` 一行）。
 - 需要一个维护窗口：从停原环境到新环境验证通过，期间经 LiteLLM 到 GHCP 的请求不可用（其他模型后端不受影响）。时长主要取决于 MySQL 导出、导入和迁移，请先用一份数据副本演练（第 11 节）。
 - **新旧两套任何时候都不能同时运行**，否则两套 SSO / Proxy 会同时修改 GitHub 上的用户和席位。
 - 原环境的 Proxy 副本数不限：多副本 + MySQL 的 r4 正是资格测试覆盖的形态（两个 Proxy 副本）。
@@ -70,7 +70,7 @@ kubectl --context <原集群 context> -n <namespace> get pods -o custom-columns=
 | `POOL_ACCOUNT_EMAIL_DOMAIN` | Proxy | 企业身份的一部分 |
 | 账号池的其他 Proxy 参数（`POOL_WARMUP_MODEL`、`PROVISIONAL_LEASE_TTL_SECONDS`、`PREWARM_CONCURRENCY`、`PREWARM_POLL_SECONDS`、`POOL_LOGIN_MAX_PENDING`、`POOL_EXHAUSTED_RETRY_AFTER_SECONDS`、`POOL_REQUEST_TIMEOUT_SECONDS` 等） | Proxy | 它们写进 MySQL 中的账号池配置指纹；与原值不同时 Proxy 以 `Pool configuration differs between Proxy replicas` 拒绝启动。最稳妥：**原样复制原 Proxy 的全部非机密环境变量**。idle 目标、cap、租约时长不在指纹中，它们本来就保存在数据库里 |
 | `POOL_REQUEST_TIMEOUT_SECONDS`（默认 120） | Proxy | 账号池上游请求时限，**属于账号池配置指纹**：与原值不同时 Proxy 拒绝启动。即使已用下一行把推理时限调大，这个值也保持原样 |
-| `POOL_INFERENCE_TIMEOUT_SECONDS`（原环境设置过时，例如 600） | Proxy | 三条推理路径（`/v1/messages`、`/chat/completions`、`/responses`）的单独总时限（`bf38374` 起提供），**不在指纹中**。原环境设置过就必须带到新环境，否则长请求又会在 `POOL_REQUEST_TIMEOUT_SECONDS` 处被截断；原环境没有设置则不设 |
+| `POOL_INFERENCE_TIMEOUT_SECONDS`（原环境设置过时，例如 600） | Proxy | 三条推理路径（`/v1/messages`、`/chat/completions`、`/responses`）的单独总时限（`bf38374` 起提供），**不在指纹中**。原环境设置过就必须带到新环境，否则长请求又会在 `POOL_REQUEST_TIMEOUT_SECONDS` 处被截断；原环境没有设置则不设。**行为变化**：原环境（`bf38374`、单企业版 r4 等）中，上游超过 300 秒才返回响应头的**非流式**请求实际在约 300 秒失败（Node 内置 fetch 的默认响应头超时），设成 600 也不起作用；多企业版 r4 起按本参数执行。迁移后这类请求可以真正运行到设定的时限，LiteLLM 与业务客户端的超时要覆盖它（[推理超时验证报告](user-pool-inference-timeout-validation.md)“非流式 300 秒上限”一节）。流式请求不受影响 |
 | `GITHUB_API_BASE_URL`（SSO 上设置过非默认值时，例如 GHE.com 或代理地址） | Proxy（多企业版阶段） | 多企业版 Proxy 在 Login 回传 token 时调用 `<API 地址>/user` 核对账号身份。原 Proxy 没有这个变量时，换成多企业版时给 Proxy 加上与 SSO 相同的值（升级指南第 6 节），否则补号全部失败。不在指纹中 |
 | `SSO_DEFAULT_USER_PASSWORD` | SSO | 每个池账号的 SSO 密码就是它；改了之后所有已有池账号登录失败 |
 | SAML 签名证书与私钥 | SSO | 沿用则 GitHub 侧证书不用改 |
@@ -250,7 +250,7 @@ CHECKSUM TABLE proxy_accounts, user_pool_accounts, user_pool_leases, user_pool_s
 | 停机与备份 | 暂停预热、停止全部服务（旧 SSO/Login/Console 停止时退出码为 1，数据留在 `-wal`）。`mysqldump` 按第 3 节；库级账号导出出现 PROCESS 提示，与管理员导出的文件逐字相同 |
 | 恢复（第 4 节） | 非 SUPER 导入账号：先遇到 `ERROR 1419`（binlog），开启 `log_bin_trust_function_creators` 后遇到 `ERROR 1227`（DEFINER）；去掉 `DEFINER` 后导入成功（约 5 秒），五张关键表 `CHECKSUM TABLE` 与原库相同。文件不改属主时 SSO `SQLITE_READONLY`、Console 接口 500 但 `/healthz` 200；`chown -R 1000:1000` 后正常 |
 | r4 中转 | r4 在原数据上启动（Proxy 先 1 个，再 2 个）：数据库快照（表、行数、租约、设置、指纹、迁移记录）**与导入后完全相同**，3 条 `schema_migrations`；SSO/Login 的 SQLite 补上 r4 的列与表；Console 数据完整。停止后用库级管理员加 `--no-tablespaces` 再备份一次 |
-| 多企业版 r3 | Proxy 先 1 个、再扩到 2 个：`schema_migrations` 共 11 条（含 `enterprise-v1/01`–`08`）；`default` 为 `active`，cap 等于原 `max_accounts`，库存 7；四个服务 `/healthz` 返回 `releaseLine: "multi"`；3 个已有调用方经两个 Proxy 都落在原账号；新调用方分到空闲账号；取消暂停后经 mock 补号成功（走按企业作用域的 Login 任务与回调）；推理请求在数据库中的 hold 截止时间约 600 秒、启动日志 `Pool request budgets` 为 `inferenceTimeoutMs: 600000`，说明 `POOL_INFERENCE_TIMEOUT_SECONDS` 仍然生效。之后改用 DBA 方式最小权限、`MYSQL_AUTO_MIGRATE=false` 重启两个 Proxy，正常 |
+| 多企业版 r3（演练时的当前版本；r4 只改了 Proxy 发往上游的请求时限和 qs，没有数据库、配置或接口变化，结果同样适用） | Proxy 先 1 个、再扩到 2 个：`schema_migrations` 共 11 条（含 `enterprise-v1/01`–`08`）；`default` 为 `active`，cap 等于原 `max_accounts`，库存 7；四个服务 `/healthz` 返回 `releaseLine: "multi"`；3 个已有调用方经两个 Proxy 都落在原账号；新调用方分到空闲账号；取消暂停后经 mock 补号成功（走按企业作用域的 Login 任务与回调）；推理请求在数据库中的 hold 截止时间约 600 秒、启动日志 `Pool request budgets` 为 `inferenceTimeoutMs: 600000`，说明 `POOL_INFERENCE_TIMEOUT_SECONDS` 仍然生效。之后改用 DBA 方式最小权限、`MYSQL_AUTO_MIGRATE=false` 重启两个 Proxy，正常 |
 | 指纹检查 | 只把一个 Proxy 的 `POOL_REQUEST_TIMEOUT_SECONDS` 改为 90：该副本以 `Pool configuration differs between Proxy replicas` 拒绝启动；改回 120 后正常 |
 | 直接跳转（仅供参考） | 在同一份备份的另一份副本上不经 r4、直接启动多企业版：迁移成功，MySQL 结构（`mysqldump --no-data`）与经 r4 中转的结果逐字相同，数据快照相同；SQLite 结构仅列名引号写法不同；路由、Console 正常。这只是一个样本（`bf38374` 的结构与 r4 相同），**推荐做法仍是第 1.2 节的 r4 中转** |
 | 回退（第 10 节） | 停止新环境后原样启动原环境：原库 `CHECKSUM TABLE` 未变，Console、两个 Proxy、已有调用方的路由都与迁移前相同。取消暂停后出现第 10 节所述的 SCIM 409 与 `failed` 账号 |
