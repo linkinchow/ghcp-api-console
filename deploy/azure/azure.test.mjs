@@ -349,7 +349,7 @@ test('renderer: internal-only github.com environment renders and fills every Azu
     assert.equal(named(objects, 'ConfigMap', 'ghcp-console-config').data.CONSOLE_PUBLIC_BASE_URL, '');
     assert.equal(named(objects, 'Deployment', 'ghcp-proxy').spec.replicas, 3);
     for (const container of named(objects, 'Deployment', 'ghcp-proxy').spec.template.spec.containers) {
-      assert.match(container.image, /^acrunittest000000\.azurecr\.io\/ghcp\/ghcp-proxy@sha256:14ed9384/);
+      assert.match(container.image, /^acrunittest000000\.azurecr\.io\/ghcp\/ghcp-proxy@sha256:98c4c720/);
     }
     for (const spc of objects.filter((o) => o.kind === 'SecretProviderClass')) {
       assert.equal(spc.spec.parameters.keyvaultName, 'kvunittest000000');
@@ -368,7 +368,7 @@ test('renderer: internal-only github.com environment renders and fills every Azu
 
     const bootstrap = kustomize(path.join(outDir, 'mysql-bootstrap')).objects;
     const job = named(bootstrap, 'Job', 'ghcp-mysql-bootstrap');
-    assert.match(job.spec.template.spec.containers[0].image, /^acrunittest000000\.azurecr\.io\/ghcp\/ghcp-proxy@sha256:14ed9384/);
+    assert.match(job.spec.template.spec.containers[0].image, /^acrunittest000000\.azurecr\.io\/ghcp\/ghcp-proxy@sha256:98c4c720/);
     assert.equal(job.spec.template.spec.serviceAccountName, 'ghcp-workload');
     assert.deepEqual(job.spec.template.spec.containers[0].args, ['node', '/opt/bootstrap/bootstrap.cjs']);
     assert.equal(named(bootstrap, 'ConfigMap', 'ghcp-mysql-bootstrap-config').data.MYSQL_HOST, 'mysql-unittest.mysql.database.azure.com');

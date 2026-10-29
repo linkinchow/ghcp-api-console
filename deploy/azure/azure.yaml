@@ -1,4 +1,4 @@
-# GHCP Proxy 多企业版（multi-f43f27e-amd64-r3）的 Azure 部署。说明见 README.md。
+# GHCP Proxy 多企业版（multi-ea1a29e-amd64-r4）的 Azure 部署。说明见 README.md。
 #
 # azd 只负责环境管理与基础设施（infra/main.bicep + main.bicepparam）。没有 azd service：
 # 应用由 hooks/deploy-app.ps1 用 kubectl 部署，使用本项目自己的 kubeconfig（.kube/，不入库），

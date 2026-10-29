@@ -1,6 +1,6 @@
 # 公网访问开关：设计与取舍
 
-适用：GHCP Proxy 多企业版 `multi-f43f27e-amd64-r3` 的 Azure 部署（本目录）。实现：`infra/main.bicep` 的 `publicAccess` 参数、`infra/modules/app-gateway.bicep`、`infra/modules/waf-policy.bicep`，以及渲染脚本对 `SSO_PUBLIC_BASE_URL` / `CONSOLE_PUBLIC_BASE_URL` 的处理。
+适用：GHCP Proxy 多企业版 `multi-ea1a29e-amd64-r4` 的 Azure 部署（本目录）。实现：`infra/main.bicep` 的 `publicAccess` 参数、`infra/modules/app-gateway.bicep`、`infra/modules/waf-policy.bicep`，以及渲染脚本对 `SSO_PUBLIC_BASE_URL` / `CONSOLE_PUBLIC_BASE_URL` 的处理。
 
 **默认仍然是仅内网**：`publicAccess` 的四个端点开关（`sso`、`console`、`litellm`、`proxy`）都是 `false`，不创建 Application Gateway、公网 IP 和 WAF 策略。
 

@@ -34,4 +34,4 @@ configMapGenerator:
 images:
   - name: ghcp-proxy
     newName: docker.io/linkinchow/ghcp-proxy
-    digest: sha256:14ed9384f57a95c5cb4c1a5bd34d10d722d89d4e8ba9b3b49fcd6e32e41ad5f3
+    digest: sha256:98c4c720db3189d53536885cfd1e521954f3b2989333e27784d6387edad63dec

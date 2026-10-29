@@ -1,6 +1,6 @@
-# Azure 部署（azd + Bicep）：GHCP Proxy 多企业版 multi-f43f27e-amd64-r3
+# Azure 部署（azd + Bicep）：GHCP Proxy 多企业版 multi-ea1a29e-amd64-r4
 
-本目录把多企业版 `multi-f43f27e-amd64-r3`（Proxy、SSO、Login、Console 四个服务）部署到 Azure：AKS + Azure Database for MySQL 灵活服务器 + ACR + Key Vault + Log Analytics，可选 Application Gateway WAF_v2 公网入口。应用清单复用 [`deploy/kubernetes/`](../kubernetes/README.md) 的 base 与 overlay，只在其上叠加 `components/azure-aks`，不复制、不修改 base。
+本目录把多企业版 `multi-ea1a29e-amd64-r4`（Proxy、SSO、Login、Console 四个服务）部署到 Azure：AKS + Azure Database for MySQL 灵活服务器 + ACR + Key Vault + Log Analytics，可选 Application Gateway WAF_v2 公网入口。应用清单复用 [`deploy/kubernetes/`](../kubernetes/README.md) 的 base 与 overlay，只在其上叠加 `components/azure-aks`，不复制、不修改 base。
 
 - 新部署的业务配置（变量含义、GitHub 侧 SAML / SCIM / 席位、开池、LiteLLM 接入、验收清单）仍以 [多企业版新部署指南](../../docs/multi-enterprise-new-deployment-guide.md) 和 [Kubernetes README](../kubernetes/README.md) 为准，本文只写 Azure 相关部分。
 - 公网访问开关的设计与取舍见 [public-access-design.md](public-access-design.md)。
@@ -215,7 +215,7 @@ azd provision
 1. **preprovision**：检查工具；确认 `AZURE_SUBSCRIPTION_ID` 已显式设置；校验 `GHCP_PUBLIC_ACCESS`；生成 MySQL 管理员密码（写入本机 azd 环境）。
 2. **Bicep**：创建第 1 节的资源（约 20–40 分钟，MySQL 区域冗余高可用与 AKS 最慢）。
 3. **postprovision**：
-   - `az acr import --subscription ...` 把四个镜像按 digest 复制到 ACR 的 `ghcp/<服务>:multi-f43f27e-amd64-r3`（服务端复制）；
+   - `az acr import --subscription ...` 把四个镜像按 digest 复制到 ACR 的 `ghcp/<服务>:multi-ea1a29e-amd64-r4`（服务端复制）；
    - 在 Key Vault 中生成缺少的机密（第 5.1 节；已存在的不动）；
    - 列出还需要运维写入的机密；
    - 渲染本环境的 overlay，连接集群（凭据写入 `deploy/azure/.kube/<集群>.config`，所有 kubectl 调用显式带 `--kubeconfig` 与 `--context`，**不读写 `~/.kube/config`**），运行 MySQL 账号初始化 Job；
@@ -500,7 +500,7 @@ az aks update --resource-group <rg> --name <集群> --enable-secret-rotation --s
 | --- | --- | --- |
 | Bicep 编译与 lint | `node --test deploy/azure/azure.test.mjs`（内部调用 Bicep CLI 0.44.1 的 `build`、`lint`、`build-params`） | 通过：编译无警告；按 `bicepconfig.json` 的严格规则（机密参数、输出不含机密等为 error）lint 无诊断；参数文件在默认值和公网开关样例下都能生成 |
 | 模板结构 | 同上（检查编译后的 ARM JSON） | 通过：公网相关资源都带条件、默认关闭；MySQL 禁用公网、TLS、utf8mb4、触发器参数、私有终结点 `mysqlServer`；Key Vault RBAC + 默认拒绝；ACR Premium 无管理员账户；AKS Overlay + OIDC + Workload Identity + CSI 轮换；App GW WAF_v2、HTTP/2 关闭、响应缓冲关闭、TLS 策略、HTTPS 监听器、删除 `X-User-Identity`；WAF DRS 2.1 + Bot 1.1；没有 PostgreSQL / Redis；输出不含机密 |
-| AKS overlay | `node --test deploy/kubernetes/azure-aks.test.mjs` | 通过：github.com、GHE.com、叠加全部组件三种渲染；镜像为 ACR + r3 digest；**每个 Pod 引用的每个 Secret 键都由它自己挂载的 SecretProviderClass 同步**；base 的安全上下文、副本、更新策略、探针与门禁不变；PVC 使用 Retain 的 Azure Disk 类；MySQL CA 恰为两个根证书且指纹匹配；内部负载均衡都是 internal |
+| AKS overlay | `node --test deploy/kubernetes/azure-aks.test.mjs` | 通过：github.com、GHE.com、叠加全部组件三种渲染；镜像为 ACR + r4 digest；**每个 Pod 引用的每个 Secret 键都由它自己挂载的 SecretProviderClass 同步**；base 的安全上下文、副本、更新策略、探针与门禁不变；PVC 使用 Retain 的 Azure Disk 类；MySQL CA 恰为两个根证书且指纹匹配；内部负载均衡都是 internal |
 | 渲染脚本 | `azure.test.mjs` | 通过：内网 github.com、公网 GHE.com（+ Proxy 内部负载均衡、DBA 方式、确认）、对外 Proxy（内部负载均衡只放行 App GW 子网）三种环境渲染后 `kubectl kustomize` 成功，除门禁脚本外无 `REPLACE_`；拒绝缺值确认、ConfigMap 中的机密、对全网开放的 Proxy 内部负载均衡 |
 | 公网开关校验 | `azure.test.mjs` | 通过：主机名、CIDR、后端、重复主机名、未知键、类型；`proxy` 必须有 `proxyAllowedSourceCidrs`，宽于 /28 与缺少 mTLS 时警告，CA 证书格式校验；Proxy 的 WAF 策略总带来源与路径允许列表 |
 | 多企业 | `azure-aks.test.mjs`、`azure.test.mjs` | 通过：default（github.com，环境变量）+ 一个 github.com + 一个 GHE.com 企业渲染成功；**registry 中每个机密文件都只由读取它的 Pod 的 SecretProviderClass 挂载**（SSO 12 个、Proxy 1 个、Login / Console 0 个），default 的原有名称不变；registry ConfigMap 与 `ENTERPRISE_REGISTRY_FILE` 接到 Proxy / SSO / Login；字段、机密字段、读取方、ID 规则与源码一致；24 种非法 registry（ID、`default`、缺少机密、`env` 引用、路径、GHE.com 规则、重复、`ssoLoginUrl` 等）被拒绝 |

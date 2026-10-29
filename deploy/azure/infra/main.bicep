@@ -1,4 +1,4 @@
-// GHCP Proxy 多企业版（multi-f43f27e-amd64-r3）在 Azure 上的基础设施。
+// GHCP Proxy 多企业版（multi-ea1a29e-amd64-r4）在 Azure 上的基础设施。
 // 部署方式：azd（azure.yaml）+ 本文件（订阅级）；参数见 main.bicepparam，说明见 ../README.md。
 //
 // 资源：VNet / 子网 / NSG / NAT Gateway、AKS（或复用已有 AKS）、Azure Database for MySQL 灵活服务器（私有终结点）、

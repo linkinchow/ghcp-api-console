@@ -16,10 +16,10 @@ const root = path.resolve(directory, '../..');
 const env = { ...process.env, KUBECONFIG: path.join(os.tmpdir(), `ghcp-no-kubeconfig-${randomUUID()}`) };
 
 const DIGESTS = {
-  proxy: 'sha256:14ed9384f57a95c5cb4c1a5bd34d10d722d89d4e8ba9b3b49fcd6e32e41ad5f3',
-  sso: 'sha256:93e5be2c5fd8a9166cd67897c52466b833b9bbb12e2eede9dbe7700204b31214',
-  login: 'sha256:96408b4fc3b0d0cd76083cc4bb8a1dcaf91ffa56152a8f7603caa1cc1a968338',
-  console: 'sha256:6526394ff321ab15a4222423013689eb4959dc465dbec6262aa0a84ae267cc90',
+  proxy: 'sha256:98c4c720db3189d53536885cfd1e521954f3b2989333e27784d6387edad63dec',
+  sso: 'sha256:12d60ca0b55e593bb5163d044b906640f033b9a2e767568dea7fb30ac8a35919',
+  login: 'sha256:4481f51701fc23c8f78b1bbe4e4c6eb41b0fe9fc6b4d5e8ae897f9add1263bec',
+  console: 'sha256:91a02afbbba6913a81ab252213a632508cd68610cf6d73d99543b6e731f12fb8',
 };
 const SERVICES = Object.keys(DIGESTS);
 // Azure Database for MySQL root CAs (Microsoft Learn, TLS how-to, 2026-07-17), SHA-256 cross-checked against two trust stores.
@@ -106,7 +106,7 @@ test('the AKS overlay renders for github.com, GHE.com and with every component',
   assert.equal(named(rendered('azure-aks').objects, 'ConfigMap', 'ghcp-enterprise').data.GITHUB_BASE_URL, '');
 });
 
-test('images come from ACR with the r3 digests unchanged, in init and main containers', () => {
+test('images come from ACR with the r4 digests unchanged, in init and main containers', () => {
   for (const name of ALL) {
     const { objects } = rendered(name);
     for (const service of SERVICES) {
