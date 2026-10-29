@@ -523,7 +523,8 @@ az aks update --resource-group <rg> --name <集群> --enable-secret-rotation --s
 | 公网开关 | App GW WAF_v2（公网 + 私网前端），Key Vault 中的通配符证书（TLS 1.3，两个前端都通过系统信任链校验），split-horizon DNS（每个对外主机名一个私有区域）。Console 经 App GW 打开与登录，跨站写入 403。Proxy 只放行推理路径：`/healthz`、`/api/*`、`/internal/*` 在 WAF 层 403；推理 JSON / SSE 正常 |
 | 关闭 Proxy 对外 | `proxy: false` 后 `azd provision`：只剩 Console 的监听器，Proxy 主机名在 App GW 上 404，Console 不受影响；Proxy 内部负载均衡与 NetworkPolicy 被删除 |
 | 来源限制 | 允许列表之外的来源（AKS 的 NAT 出口、互联网扫描）对两个对外主机名均为 403；未配置的主机名 404 |
-| 长请求（经 App GW，`POOL_INFERENCE_TIMEOUT_SECONDS=600`） | SSE 300 秒与 550 秒：200，最大分块间隔 0.25 秒（响应不缓冲）。非流式 300 秒无输出：200（修复内部负载均衡空闲超时之后，见下表）。**非流式 550 秒无输出：Proxy 在 300 秒返回 502**——Proxy 用 Node 内置 fetch 调上游，其默认响应头超时为 300 秒，上游 300 秒内不发响应头时请求失败，与 App GW 无关（产品问题，见第 13 节） |
+| 长请求（经 App GW，`POOL_INFERENCE_TIMEOUT_SECONDS=600`） | SSE 300 秒与 550 秒：200，最大分块间隔 0.25 秒（响应不缓冲）。非流式 300 秒无输出：200（修复内部负载均衡空闲超时之后，见下表）。**r3 下非流式 550 秒无输出：Proxy 在 300 秒返回 502**——Proxy 用 Node 内置 fetch 调上游，其默认响应头超时为 300 秒，与 App GW 无关；r4 已修复，见下一行 |
+| r4（`multi-ea1a29e-amd64-r4`）复测 | 按 digest 导入 ACR，postprovision 重新渲染，四个服务滚动升级到 r4。550 秒无输出的非流式请求（在 Proxy Pod 内经回环地址发出，上游为 northwind mock）：200，550.2 秒；同时的 SSE 550 秒：200，2203 个分块，最大间隔 0.25 秒；Proxy 日志没有上游失败。此时 Proxy 已不再对外，App GW 路径的 550 秒请求没有重测（300 秒的已在修复内部负载均衡空闲超时后通过） |
 
 **部署中发现并已修复的问题**：
 
@@ -548,7 +549,7 @@ az aks update --resource-group <rg> --name <集群> --enable-secret-rotation --s
 
 ## 13. 已知限制与待确认
 
-- **非流式推理实际最长约 300 秒**（r3 及更早版本的产品行为，与部署方式无关）：Proxy 调上游使用 Node 内置 fetch，默认响应头超时 300 秒；上游超过 300 秒才返回响应头时请求以 502 失败，`POOL_INFERENCE_TIMEOUT_SECONDS` 设到 600 也不能延长。流式请求很快收到响应头，不受此限（实测 550 秒正常）。需要更长的非流式请求时请改用流式，或等待 Proxy 修复。
+- **r3 及更早版本的非流式推理实际最长约 300 秒**（产品行为，与部署方式无关）：Proxy 调上游使用 Node 内置 fetch，默认响应头超时 300 秒，上游超过 300 秒才返回响应头时请求以 502 失败，`POOL_INFERENCE_TIMEOUT_SECONDS` 设到 600 也不能延长。**r4 已修复**（本目录部署 r4；第 12 节复测）。
 - MySQL 管理员密码保存在运维机器的 azd 环境中（第 5.1 节），建议初始化后轮换。
 - 公网开关关闭后不会自动删除 App GW（第 7 节）。
 - `SSO_PUBLIC_BASE_URL` 改变需要同步 GitHub SAML 设置（public-access-design.md 第 8 节）。
