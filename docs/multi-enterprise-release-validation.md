@@ -2,7 +2,7 @@
 
 本文记录多企业版（multi-enterprise / multi-slug SSO）候选镜像的发布前验证结果。设计见 [multi-enterprise-design.md](multi-enterprise-design.md)，升级步骤见 [multi-enterprise-upgrade-guide.md](multi-enterprise-upgrade-guide.md)。r4（`multi-ea1a29e-amd64-r4`）的验证记录在最前，它修复了非流式推理被限制在约 300 秒的问题；r3（`multi-f43f27e-amd64-r3`）受该问题和 qs 的 CVE-2026-110816 影响；r2（`multi-4922a4a-amd64-r2`）受 CVE-2026-111181 影响，已被 r3 取代；此前发布的 r1（`multi-41ecffc-amd64-r1`）记录保留在后半部分。
 
-## r4：multi-ea1a29e-amd64-r4（候选，资格测试通过）
+## r4：multi-ea1a29e-amd64-r4（已发布）
 
 所有验证都只用合成数据、mock 外部服务、本地 MySQL 容器。没有调用真实的 GitHub、GitHub EMU、GHE.com、Copilot 或模型；没有创建真实用户或席位；没有接触真实 SSO 环境。Docker Desktop 只用来验证功能，不评估性能。
 
@@ -174,7 +174,16 @@ Login 中这些条目的可达性：
 
 ### 8. 发布
 
-推送到 Docker Hub 后补充 digest 和发布后核对结果。
+已发布到 Docker Hub（公开仓库，2026-10-29）：
+
+| 组件 | 按 digest 引用 |
+| --- | --- |
+| Proxy | `docker.io/linkinchow/ghcp-proxy@sha256:98c4c720db3189d53536885cfd1e521954f3b2989333e27784d6387edad63dec` |
+| SSO | `docker.io/linkinchow/ghcp-sso@sha256:12d60ca0b55e593bb5163d044b906640f033b9a2e767568dea7fb30ac8a35919` |
+| Login | `docker.io/linkinchow/ghcp-login@sha256:4481f51701fc23c8f78b1bbe4e4c6eb41b0fe9fc6b4d5e8ae897f9add1263bec` |
+| Console | `docker.io/linkinchow/ghcp-console@sha256:91a02afbbba6913a81ab252213a632508cd68610cf6d73d99543b6e731f12fb8` |
+
+发布后核对：每个 manifest 的 config digest 等于第 1 节经资格测试的镜像 ID；按 digest 拉起 Proxy，`/healthz` 返回 `releaseLine: "multi"`，带 `Content-Encoding: gzip` 的请求体返回 415，停止时 `shutdown complete`、退出码 0。
 
 ### 9. `8a5cb9d` 候选（已被 `ea1a29e` 取代，未发布）
 

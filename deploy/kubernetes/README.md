@@ -1,6 +1,6 @@
-# Kubernetes 全新部署：多企业版 multi-f43f27e-amd64-r3
+# Kubernetes 全新部署：多企业版 multi-ea1a29e-amd64-r4
 
-本目录是多企业版 `multi-f43f27e-amd64-r3` 在 Kubernetes 上**全新部署**的清单：四个服务（Proxy、SSO、Login、Console）+ 客户自备的外部 MySQL（例如 Azure Database for MySQL 灵活服务器）。用 Kustomize 组织：`base/` 加一个 overlay，按需叠加 `components/`。
+本目录是多企业版 `multi-ea1a29e-amd64-r4` 在 Kubernetes 上**全新部署**的清单：四个服务（Proxy、SSO、Login、Console）+ 客户自备的外部 MySQL（例如 Azure Database for MySQL 灵活服务器）。用 Kustomize 组织：`base/` 加一个 overlay，按需叠加 `components/`。
 
 - 部署前先读 [多企业版新部署指南](../../docs/multi-enterprise-new-deployment-guide.md)：变量含义（第 4 节）、GitHub 侧 SAML / SCIM / 席位配置（第 6 节）、开池（第 7 节）、LiteLLM（第 8 节）、上线验收清单（第 9 节）。本文只写 Kubernetes 相关的部分。
 - 从单企业版 r4 **升级**不要用本目录，见 [多企业版升级指南](../../docs/multi-enterprise-upgrade-guide.md) 和 [`deploy/user-pool-mysql-customer/`](../user-pool-mysql-customer/README.md)。
@@ -291,7 +291,7 @@ Proxy 只通过 ClusterIP Service 提供服务，不经 Ingress、不对最终�
 
 ### 10.1 Proxy 停止时不让长连接客户端离开（r2 的产品行为，r3 已修复）
 
-**r3（`multi-f43f27e-amd64-r3`，已发布，清单 digest 已指向 r3）已修复**：`src/packages/shared/src/shutdown.ts`（提交 `3d6db1a`，四个服务共用）在排空期间让 SIGTERM 时正忙的 keep-alive 连接在当前响应结束后关闭（响应头尚未发出的加 `Connection: close`，已发出的如 SSE 在响应结束后关闭套接字），空闲连接立即关闭。验证方式：
+**r3（`multi-f43f27e-amd64-r3`，已发布）已修复**（清单 digest 现指向 r4 `multi-ea1a29e-amd64-r4`；r4 只改了 Proxy 发往上游的请求，kind 结果沿用 r3）：`src/packages/shared/src/shutdown.ts`（提交 `3d6db1a`，四个服务共用）在排空期间让 SIGTERM 时正忙的 keep-alive 连接在当前响应结束后关闭（响应头尚未发出的加 `Connection: close`，已发出的如 SSE 在响应结束后关闭套接字），空闲连接立即关闭。验证方式：
 
 - kind（`tests/kubernetes/kind-e2e.mjs`，断言已收紧为零失败）：Proxy 滚动更新期间，复用长连接的客户端 739 个请求、每个请求新建连接的客户端 539 个请求全部 200；四个旧 Proxy Pod 从 SIGTERM 到 `shutdown complete` 用时 4–39 ms，没有 `closing their connections`。
 - 镜像级（`tests/image-release/shutdown-keepalive-check.mjs`，四个镜像各自 `docker stop`，r2 作对照，连续 3 次全部通过）：进行中的请求收到带 `Connection: close` 的完整响应后 0–3 ms 收到 FIN；已开始的 SSE / CSV 流完整结束后 1–16 ms 收到 FIN；空闲连接在 draining 日志后 1–13 ms 关闭；容器 1.2–4.1 秒以退出码 0 退出。r2 在同样条件下连接被继续复用约 24 秒，直到强制关闭。
