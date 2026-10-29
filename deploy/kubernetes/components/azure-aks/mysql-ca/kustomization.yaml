@@ -1,0 +1,13 @@
+# ConfigMap ghcp-mysql-ca（键 ca.pem）：Azure Database for MySQL 的两个根 CA，公开证书。来源与指纹见 README.md。
+# 被 components/azure-aks 与 deploy/azure/k8s/mysql-bootstrap 共同引用。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+configMapGenerator:
+  - name: ghcp-mysql-ca
+    files:
+      - ca.pem=azure-mysql-ca.pem
+    options:
+      disableNameSuffixHash: true
+      labels:
+        app.kubernetes.io/part-of: ghcp

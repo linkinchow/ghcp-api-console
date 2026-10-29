@@ -248,6 +248,8 @@ docker compose -f docker-compose.yml -f docker-compose.user-pool.yml -f docker-c
 
 全新部署使用 [`deploy/kubernetes/`](../deploy/kubernetes/README.md)：Kustomize base 加 overlay，包含**全部四个服务**（Proxy、SSO、Login、Console），外部托管 MySQL（例如 Azure Database for MySQL）。操作步骤（建库、填写 Secret 与 ConfigMap、apply 顺序、首次启动门禁、初始化 Console、开池、LiteLLM 访问、升级与回滚）见其 README；该目录的清单已在本地 kind 集群上用 mock 端到端验证过（README 第 9 节）。
 
+部署到 Azure 时用 [`deploy/azure/`](../deploy/azure/README.md)（azd + Bicep）：创建 AKS、Azure Database for MySQL、ACR、Key Vault 等，在上述 overlay 之上叠加 `components/azure-aks`（Key Vault 机密经 Secrets Store CSI 同步为同名 Secret），默认仅内网，可选 Application Gateway WAF 公网入口（[设计](../deploy/azure/public-access-design.md)）。
+
 | 目录 | 内容 |
 | --- | --- |
 | `base/` | 四个 Deployment、ClusterIP Service、ConfigMap、PVC 和 Proxy 的 PodDisruptionBudget；镜像按第 2.1 节的 digest 引用；Secret 只按名称引用，值不入库（格式见 `secret.example.yaml`） |

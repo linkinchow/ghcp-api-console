@@ -1,0 +1,21 @@
+# AKS（Azure）上的 github.com EMU 企业：overlays/github-com + components/azure-aks。
+# GHE.com 企业把 resources 中的 ../github-com 换成 ../ghe-com，其余不变。
+#
+# 使用 deploy/azure（azd + Bicep）部署时不直接 apply 本目录：渲染脚本 deploy/azure/scripts/render-overlay.mjs
+# 在 deploy/azure/.generated/<环境>/（不入库）生成一个引用 overlays/<github-com|ghe-com> 与本组件的私有 overlay，
+# 按 Bicep 输出替换 REPLACE_*（ACR、Key Vault、Workload Identity、内网 IP），按 azd 环境变量填写企业变量。
+# 本目录是不用 azd 时的模板，也是静态检查（deploy/azure/azure.test.mjs）的渲染对象。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ghcp
+
+resources:
+  - ../github-com
+
+components:
+  - ../../components/azure-aks
+  # 可选（README 第 6 节与 deploy/azure/README.md）：
+  # - ../../components/mysql-dba-schema   # DBA 预建表，MYSQL_AUTO_MIGRATE=false
+  # - ../../components/network-policy     # 需要 AKS 启用网络策略引擎（Bicep 默认 Cilium）
+  # - ../../components/azure-proxy-ilb    # LiteLLM 在另一个 AKS 集群时

@@ -1,0 +1,37 @@
+# MySQL 账号初始化 Job（一次性；postprovision hook 在新建的 MySQL 上执行，可重复执行）。
+# 以管理员账号经 TLS（与 Proxy 相同的 CA）连接，确认库为 utf8mb4，创建 / 更新 Proxy 专用账号并授权：
+# - 方式 A（默认，MYSQL_AUTO_MIGRATE=true）：SELECT、INSERT、UPDATE、DELETE、CREATE、ALTER、INDEX、REFERENCES、TRIGGER；
+# - 方式 B（GHCP_MYSQL_MODE=dba-schema）：只授 DML；DBA 另行执行 scripts/proxy-mysql-initial.sql 并授予 proxy_accounts 上的 TRIGGER。
+# 管理员密码与 Proxy 账号密码从 Key Vault 挂载（mysql-admin-password、ghcp-mysql-proxy-password），不出现在清单或日志中。
+# 不需要额外镜像：使用 Proxy 发布镜像（自带 Node 与 mysql2），digest 与 base 相同。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ghcp
+
+resources:
+  - ../../../kubernetes/components/azure-aks/workload-identity
+  - ../../../kubernetes/components/azure-aks/mysql-ca
+  - job.yaml
+
+configMapGenerator:
+  - name: ghcp-mysql-bootstrap-script
+    files:
+      - bootstrap.cjs
+    options:
+      disableNameSuffixHash: true
+  - name: ghcp-mysql-bootstrap-config
+    literals:
+      - MYSQL_HOST=REPLACE_MYSQL_FQDN
+      - MYSQL_ADMIN_USER=REPLACE_MYSQL_ADMIN_LOGIN
+      - MYSQL_DATABASE=ghcp_proxy
+      - MYSQL_PROXY_USER=ghcp_proxy
+      - MYSQL_PROXY_USER_HOST=%
+      - GHCP_MYSQL_MODE=auto-migrate
+    options:
+      disableNameSuffixHash: true
+
+images:
+  - name: ghcp-proxy
+    newName: docker.io/linkinchow/ghcp-proxy
+    digest: sha256:98c4c720db3189d53536885cfd1e521954f3b2989333e27784d6387edad63dec

@@ -1,0 +1,10 @@
+{
+  "comment": "postprovision hook 按 digest 把这四个镜像复制到 ACR（az acr import）。必须与 deploy/kubernetes/base/kustomization.yaml 和 docs/multi-enterprise-release-validation.md 的 r4 digest 一致（azure.test.mjs 校验）。",
+  "tag": "multi-ea1a29e-amd64-r4",
+  "images": {
+    "ghcp-proxy": "docker.io/linkinchow/ghcp-proxy@sha256:98c4c720db3189d53536885cfd1e521954f3b2989333e27784d6387edad63dec",
+    "ghcp-sso": "docker.io/linkinchow/ghcp-sso@sha256:12d60ca0b55e593bb5163d044b906640f033b9a2e767568dea7fb30ac8a35919",
+    "ghcp-login": "docker.io/linkinchow/ghcp-login@sha256:4481f51701fc23c8f78b1bbe4e4c6eb41b0fe9fc6b4d5e8ae897f9add1263bec",
+    "ghcp-console": "docker.io/linkinchow/ghcp-console@sha256:91a02afbbba6913a81ab252213a632508cd68610cf6d73d99543b6e731f12fb8"
+  }
+}

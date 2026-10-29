@@ -1,0 +1,4 @@
+# azd 环境（含本机生成的 MySQL 管理员密码）、按环境渲染的私有 overlay、集群凭据：都不入库。
+.azure/
+.generated/
+.kube/

@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ghcp-proxy-ilb
+  labels:
+    app.kubernetes.io/name: ghcp-proxy
+    app.kubernetes.io/component: proxy
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    service.beta.kubernetes.io/azure-load-balancer-internal-subnet: REPLACE_ILB_SUBNET_NAME
+    service.beta.kubernetes.io/azure-load-balancer-ipv4: REPLACE_PROXY_ILB_IP
+    # Azure 负载均衡探测 /readyz（会 ping MySQL），与 Pod 的 readinessProbe 一致。
+    service.beta.kubernetes.io/port_3000_health-probe_protocol: http
+    service.beta.kubernetes.io/port_3000_health-probe_request-path: /readyz
+    # Azure 负载均衡规则的 TCP 空闲超时默认 4 分钟（并发送 RST）：非流式推理在等待上游期间连接上没有数据，
+    # 超过 4 分钟就被重置（App GW 返回 502）。15 分钟覆盖 600 秒的 POOL_INFERENCE_TIMEOUT_SECONDS 上限（4–100）。
+    service.beta.kubernetes.io/azure-load-balancer-tcp-idle-timeout: "15"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  # 不需要会话粘滞：调用方租约在 MySQL。
+  sessionAffinity: None
+  selector:
+    app.kubernetes.io/name: ghcp-proxy
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      protocol: TCP
+  loadBalancerSourceRanges:
+    # 只填 LiteLLM 节点子网（externalTrafficPolicy: Local 时看到的是节点地址）。
+    - REPLACE_LITELLM_NODE_SUBNET_CIDR

@@ -1,0 +1,90 @@
+# 四个 Deployment：使用 ServiceAccount ghcp-workload，并挂载各自的 SecretProviderClass。
+# 卷必须被某个容器挂载，kubelet 才会执行 CSI 挂载（同时同步出 Secret）；挂载在 /mnt/secrets-store（只读），
+# 应用本身仍从环境变量 / /certs 读取，不读这个目录。卷在 init 容器之前挂载，所以门禁容器的 secretKeyRef 可用。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ghcp-proxy
+spec:
+  template:
+    spec:
+      serviceAccountName: ghcp-workload
+      containers:
+        - name: proxy
+          volumeMounts:
+            - name: key-vault
+              mountPath: /mnt/secrets-store
+              readOnly: true
+      volumes:
+        - name: key-vault
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: ghcp-proxy-kv
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ghcp-sso
+spec:
+  template:
+    spec:
+      serviceAccountName: ghcp-workload
+      containers:
+        - name: sso
+          volumeMounts:
+            - name: key-vault
+              mountPath: /mnt/secrets-store
+              readOnly: true
+      volumes:
+        - name: key-vault
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: ghcp-sso-kv
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ghcp-login
+spec:
+  template:
+    spec:
+      serviceAccountName: ghcp-workload
+      containers:
+        - name: login
+          volumeMounts:
+            - name: key-vault
+              mountPath: /mnt/secrets-store
+              readOnly: true
+      volumes:
+        - name: key-vault
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: ghcp-login-kv
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ghcp-console
+spec:
+  template:
+    spec:
+      serviceAccountName: ghcp-workload
+      containers:
+        - name: console
+          volumeMounts:
+            - name: key-vault
+              mountPath: /mnt/secrets-store
+              readOnly: true
+      volumes:
+        - name: key-vault
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: ghcp-console-kv

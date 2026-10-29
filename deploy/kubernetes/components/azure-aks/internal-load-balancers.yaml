@@ -1,0 +1,58 @@
+# SSO 与 Console 的 Azure 内部负载均衡（不分配公网 IP）。base 的 ClusterIP Service 不变，这里另加两个 Service。
+#
+# 用途：
+# - 仅内网模式（默认）：管理员从 VPN / 管理网段直接访问；SSO_PUBLIC_BASE_URL 默认为 http://<SSO 内网 IP>:7001，
+#   Login 的 Chromium 也访问这个地址（集群内访问负载均衡 IP 会被直接转发到 Pod）。
+# - 公网模式：作为 Application Gateway 的后端（App GW 子网 → 内网 IP）。后端始终是私有地址。
+#
+# - 固定 IP 来自专用子网（Bicep 的 snet-ilb），由 azure-load-balancer-ipv4 指定，重建 Service 也不变。
+# - externalTrafficPolicy: Local 保留客户端源地址（NetworkPolicy 按源地址放行时需要）。
+# - loadBalancerSourceRanges：AKS 据此生成 NSG 规则；kube-proxy / Cilium 对集群内访问负载均衡 IP 也执行这一限制，
+#   所以 SSO 的范围必须包含 Pod CIDR（Login 的 Chromium）。渲染脚本按 Bicep 输出和 GHCP_INTERNAL_ALLOWED_CIDRS 填写。
+apiVersion: v1
+kind: Service
+metadata:
+  name: ghcp-sso-ilb
+  labels:
+    app.kubernetes.io/name: ghcp-sso
+    app.kubernetes.io/component: sso
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    service.beta.kubernetes.io/azure-load-balancer-internal-subnet: REPLACE_ILB_SUBNET_NAME
+    service.beta.kubernetes.io/azure-load-balancer-ipv4: REPLACE_SSO_ILB_IP
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: ghcp-sso
+  ports:
+    - name: http
+      port: 7001
+      targetPort: http
+      protocol: TCP
+  loadBalancerSourceRanges:
+    - REPLACE_SSO_ALLOWED_CIDR
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ghcp-console-ilb
+  labels:
+    app.kubernetes.io/name: ghcp-console
+    app.kubernetes.io/component: console
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    service.beta.kubernetes.io/azure-load-balancer-internal-subnet: REPLACE_ILB_SUBNET_NAME
+    service.beta.kubernetes.io/azure-load-balancer-ipv4: REPLACE_CONSOLE_ILB_IP
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: ghcp-console
+  ports:
+    - name: http
+      port: 7004
+      targetPort: http
+      protocol: TCP
+  loadBalancerSourceRanges:
+    - REPLACE_CONSOLE_ALLOWED_CIDR
