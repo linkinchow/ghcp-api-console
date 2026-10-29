@@ -24,12 +24,14 @@
 
 | 组件 | 按 digest 引用（linux/amd64） |
 | --- | --- |
-| Proxy | `docker.io/linkinchow/ghcp-proxy@sha256:14ed9384f57a95c5cb4c1a5bd34d10d722d89d4e8ba9b3b49fcd6e32e41ad5f3` |
-| SSO | `docker.io/linkinchow/ghcp-sso@sha256:93e5be2c5fd8a9166cd67897c52466b833b9bbb12e2eede9dbe7700204b31214` |
-| Login | `docker.io/linkinchow/ghcp-login@sha256:96408b4fc3b0d0cd76083cc4bb8a1dcaf91ffa56152a8f7603caa1cc1a968338` |
-| Console | `docker.io/linkinchow/ghcp-console@sha256:6526394ff321ab15a4222423013689eb4959dc465dbec6262aa0a84ae267cc90` |
+| Proxy | `docker.io/linkinchow/ghcp-proxy@sha256:98c4c720db3189d53536885cfd1e521954f3b2989333e27784d6387edad63dec` |
+| SSO | `docker.io/linkinchow/ghcp-sso@sha256:12d60ca0b55e593bb5163d044b906640f033b9a2e767568dea7fb30ac8a35919` |
+| Login | `docker.io/linkinchow/ghcp-login@sha256:4481f51701fc23c8f78b1bbe4e4c6eb41b0fe9fc6b4d5e8ae897f9add1263bec` |
+| Console | `docker.io/linkinchow/ghcp-console@sha256:91a02afbbba6913a81ab252213a632508cd68610cf6d73d99543b6e731f12fb8` |
 
-对应 tag 均为 `multi-f43f27e-amd64-r3`（linux/amd64，2026-10-27 发布，仓库公开，无需登录即可拉取）。源码提交：`f43f27e`（已合入 main）。
+对应 tag 均为 `multi-ea1a29e-amd64-r4`（linux/amd64，2026-10-29 发布，仓库公开，无需登录即可拉取）。源码提交：`ea1a29e`（分支 `release/multi-r4`）。
+
+r4 相对 r3（`multi-f43f27e-amd64-r3`）的变化：① 非流式推理不再被限制在约 300 秒——r3 及更早版本中，上游超过 300 秒才返回响应头时请求以 502 失败，`POOL_INFERENCE_TIMEOUT_SECONDS=600` 也无效（流式请求不受影响），r4 中实际时限只由该参数决定（[推理超时验证报告](user-pool-inference-timeout-validation.md)“非流式 300 秒上限”一节）；② qs 升级到 6.16.1（CVE-2026-110816）。两者之间没有数据库、配置或服务间接口变化，已部署 r3（或 r2、r1）的环境替换四个镜像即可（这条路径没有单独做资格测试；单企业版 r4 → 多企业版 r4 的原地升级已验证）。
 
 r3 相对 r2（`multi-4922a4a-amd64-r2`）的变化：① 停止时让正忙的 keep-alive 连接在当前响应结束后关闭（空闲连接立即关闭），LiteLLM 等复用长连接的客户端在 Proxy 滚动升级时不再被强制断开；② 缓解 body-parser 的 CVE-2026-111181（压缩请求体可使进程崩溃，r2 可达且未缓解）：所有请求体解析都关闭解压，带 `Content-Encoding` 压缩的请求体返回 415 `unsupported_content_encoding`；③ 移除未使用的 multer 依赖。两者之间没有数据库或服务间接口变化，已部署 r2（或 r1）的环境替换四个镜像即可（这条路径没有单独做资格测试；r4→r3 原地升级已验证）。**r2 受上述可达漏洞影响，请尽快升级到 r3。**
 
