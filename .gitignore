@@ -29,6 +29,8 @@ docs/*
 guidance/outline.md
 guidance-draft.md
 tmp.md
+# Scratch work (temporary clones, trial merges, generated artifacts)
+/tmp/
 curl.http
 
 .claude/*
@@ -41,6 +43,7 @@ curl.http
 !docs/multi-enterprise-upgrade-guide.md
 !docs/repo-map.md
 !docs/user-pool-*.md
+!docs/admin-manual/
 **/__pycache__/
 **/*.pyc
 .local-sso/

@@ -90,3 +90,24 @@
 6. **定向 MySQL 与真实时间区分**：3项定向测试已通过，用新代码但旧120秒配置的观察者验证数据库行为；真正的旧镜像共库兼容另由四条实际长流证明。
 
 因此，本轮结论限定为上述隔离环境、镜像构造方式与已列明的实际场景，不代表生产变更、正式发布或所有协议形态的端到端验收。
+
+## 非流式 300 秒上限（2026-10 补充）
+
+**现象**：多企业版 r3 在 Azure 上经 App Gateway 测试，`POOL_INFERENCE_TIMEOUT_SECONDS=600`，mock 上游延迟返回。
+
+| 请求 | 结果 |
+| --- | --- |
+| SSE，持续 300 秒、550 秒 | 200 |
+| 非流式，300 秒无输出 | 200 |
+| 非流式，550 秒无输出 | 300.8 秒时 Proxy 返回 502，日志 `upstream-fetch-failed`（`fetch failed`） |
+
+**原因**：Proxy 调上游用 Node 内置 fetch（undici），没有设置 dispatcher，使用 undici 的默认值：`headersTimeout` 与 `bodyTimeout` 都是 300 秒。上游超过 300 秒才返回响应头时，请求以 `UND_ERR_HEADERS_TIMEOUT` 失败，调用方的 AbortSignal（600 秒）不起作用。本地最小复现：服务端 310 秒后才应答，fetch 在约 305 秒失败。流式请求在开始时就收到响应头，之后持续有数据，所以不受影响。单企业版 r4 及更早的版本使用同一调用方式，同样受影响。
+
+**修复**：`src/proxy/src/copilot/copilotClient.ts` 中的 `executePreparedCopilotRequest`（所有推理请求和开户预热都经过它）使用独立的 undici `Agent` 作为 dispatcher，`headersTimeout` 与 `bodyTimeout` 为 660 秒，高于 `POOL_INFERENCE_TIMEOUT_SECONDS` 与 `POOL_REQUEST_TIMEOUT_SECONDS` 的上限（都是 600 秒）。实际时限仍由原来的 AbortSignal 预算决定，未发响应头时到期的行为不变。`undici` 作为 Proxy 的生产依赖固定为 6.29.1，与运行时 Node 22 内置的 undici 同为 6.x。显式的 dispatcher 不经过全局 dispatcher：现有部署都不使用出站代理（`NODE_USE_ENV_PROXY` / `HTTPS_PROXY`），以后要支持代理时需要在这里一并处理。
+
+**测试**：
+
+- `copilotClient.test.ts`：推理请求使用独立的 dispatcher，且传输限制高于 600 秒；dispatcher（而不是 undici 的固定默认值）决定全局 fetch 等待响应头的时间（500 毫秒超时失败、5 秒超时成功）。
+- 实时测试：`GHCP_SLOW_TRANSPORT_TEST=1` 时，上游 310 秒才返回响应头，请求成功。
+- 发布镜像的运行时（`node:22-bookworm-slim`，Node 22.23，内置 undici 6.28.0）加上 `undici` 6.29.1 的 Agent：500 毫秒限制按时以 `UND_ERR_HEADERS_TIMEOUT` 失败，5 秒限制成功；用正式限制（660 秒）时，上游 310 秒才返回响应头的请求成功。
+- 完整 Proxy 测试：685 项，通过 644，失败 0，跳过 41（按需启用的测试）；全部 workspace 的类型检查通过。用 `deploy/images/Dockerfile.release` 构建的 Proxy 镜像包含 `undici` 6.29.1，并已列入生产依赖清单。

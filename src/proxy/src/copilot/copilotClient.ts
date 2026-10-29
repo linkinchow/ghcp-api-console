@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { Agent } from 'undici';
 import { config } from '../config.js';
 import {
   DiagnosticBodyCapture,
@@ -199,12 +200,25 @@ export function prepareCopilotRequest(
   });
 }
 
+// Node's fetch (undici) fails a request after 300 s without response headers, or 300 s between body chunks. That
+// capped non-streaming inference at 300 s whatever POOL_INFERENCE_TIMEOUT_SECONDS allowed. The caller's AbortSignal
+// carries the real budget (POOL_INFERENCE_TIMEOUT_SECONDS and POOL_REQUEST_TIMEOUT_SECONDS are both at most 600 s);
+// these transport limits only sit above it. Keep undici on the major version bundled with the runtime Node.
+export const UPSTREAM_TRANSPORT_TIMEOUT_MS = 660_000;
+
+export function createUpstreamDispatcher(timeoutMs = UPSTREAM_TRANSPORT_TIMEOUT_MS): Agent {
+  return new Agent({ headersTimeout: timeoutMs, bodyTimeout: timeoutMs });
+}
+
+const upstreamDispatcher = createUpstreamDispatcher();
+
 export function executePreparedCopilotRequest(request: PreparedCopilotRequest, signal?: AbortSignal): Promise<Response> {
   return fetch(request.url, {
     method: request.method,
     headers: request.headers,
     body: request.body,
     signal,
+    dispatcher: upstreamDispatcher,
   });
 }
 

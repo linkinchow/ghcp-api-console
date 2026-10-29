@@ -1,6 +1,214 @@
 # 多企业版发布验证记录
 
-本文记录多企业版（multi-enterprise / multi-slug SSO）候选镜像的发布前验证结果。设计见 [multi-enterprise-design.md](multi-enterprise-design.md)，升级步骤见 [multi-enterprise-upgrade-guide.md](multi-enterprise-upgrade-guide.md)。当前发布为 r3（`multi-f43f27e-amd64-r3`），其验证记录在最前；r2（`multi-4922a4a-amd64-r2`）受 CVE-2026-111181 影响，已被 r3 取代；此前发布的 r1（`multi-41ecffc-amd64-r1`）记录保留在后半部分。
+本文记录多企业版（multi-enterprise / multi-slug SSO）候选镜像的发布前验证结果。设计见 [multi-enterprise-design.md](multi-enterprise-design.md)，升级步骤见 [multi-enterprise-upgrade-guide.md](multi-enterprise-upgrade-guide.md)。r4（`multi-ea1a29e-amd64-r4`）的验证记录在最前，它修复了非流式推理被限制在约 300 秒的问题；r3（`multi-f43f27e-amd64-r3`）受该问题和 qs 的 CVE-2026-110816 影响；r2（`multi-4922a4a-amd64-r2`）受 CVE-2026-111181 影响，已被 r3 取代；此前发布的 r1（`multi-41ecffc-amd64-r1`）记录保留在后半部分。
+
+## r4：multi-ea1a29e-amd64-r4（已发布）
+
+所有验证都只用合成数据、mock 外部服务、本地 MySQL 容器。没有调用真实的 GitHub、GitHub EMU、GHE.com、Copilot 或模型；没有创建真实用户或席位；没有接触真实 SSO 环境。Docker Desktop 只用来验证功能，不评估性能。
+
+### 0. 与 r3 相比的变更
+
+源码从 `f43f27e` 前进到 `ea1a29e`（分支 `release/multi-r4`，基于 `main` 的 `8a5cb9d`）。`f43f27e..8a5cb9d` 之间其余的提交只涉及文档、Kubernetes 清单、`.gitignore` 和测试（`ownerSideEffects` 的确定性修正只改了测试）。运行时的改动有两项：
+
+| 提交 | 改动 | 说明 |
+| --- | --- | --- |
+| `0ea666b` | `src/proxy/src/copilot/copilotClient.ts`：Proxy 发往上游 Copilot 的请求改用独立的 undici `Agent`（`headersTimeout`、`bodyTimeout` 均为 660 秒）；Proxy 新增生产依赖 `undici` 6.29.1 | **非流式推理不再被限制在约 300 秒**，见下方说明 |
+| `ea1a29e` | `package-lock.json`：qs 6.16.0 → 6.16.1 | **修复 CVE-2026-110816**（中危，r3 发布后才公开，r3 同样受影响）。6.16.1 是补丁版本，在 express 5.2.1（`^6.14.0`）和 body-parser 2.3.0（`^6.15.2`）允许的范围内，只改锁文件 |
+
+关于 `0ea666b`：
+- **问题**：r3 及更早版本使用 Node 内置 fetch 的默认超时，响应头和数据块间隔各 300 秒。上游超过 300 秒才返回响应头时，请求以 502 失败；即使设置 `POOL_INFERENCE_TIMEOUT_SECONDS=600` 也没有用。Azure 实测：一个 550 秒内没有输出的非流式请求，在 300.8 秒时失败。
+- **修复**：660 秒高于两个时限参数的上限（600 秒），实际时限仍由原来的预算决定。详见[推理超时验证报告](user-pool-inference-timeout-validation.md)的“非流式 300 秒上限”一节。
+- **为什么是 undici 6.29.1**：运行时 Node 22 内置的 undici 是 6.28.0，所以新依赖也选 6.x。6.28.0 本身落在 `npm audit` 公告范围内（≤6.29.0），因此用 6.29.1。
+
+`8a5cb9d` 曾单独构建为 `multi-8a5cb9d-amd64-r4`，并跑完一轮验证（第 9 节）。扫描发现 qs 的新漏洞后升级了 qs，再从 `ea1a29e` 重新构建。
+
+### 1. 候选镜像
+
+构建方式：
+- **构建上下文**：`git -c core.autocrlf=false archive ea1a29e`。已检查上下文中没有 CRLF 文件；tar 的 SHA-256 为 `45c37383a09106619ce9fb1960c110e9e0b9992147276ee4dba95280a3db2f29`。
+- **Dockerfile 与参数**：`deploy/images/Dockerfile.release`，`RELEASE_LINE=multi`，平台 linux/amd64。
+- **基础镜像**：按 digest 固定为 `node:22-bookworm-slim@sha256:efd0ab57…`，镜像内 Node 为 v22.23.3。
+- **npm 源**：公司批准的源，没有绕过 npm 最短发布期管控。
+- **缓存**：运行层不使用缓存（`--no-cache-filter runtime`）。
+
+| 组件 | 本地标签 | 镜像 ID |
+| --- | --- | --- |
+| Proxy | `ghcp-release-proxy:multi-ea1a29e-amd64-r4` | `sha256:d816492bf62bf3f1251ca6b51717f6cacbbae3d720480462ea6ee5d61e798139` |
+| SSO | `ghcp-release-sso:multi-ea1a29e-amd64-r4` | `sha256:2f93ff7cd567804ecabb908ac1f95ab36c2436480c59f68555e13515a56ec2d3` |
+| Login | `ghcp-release-login:multi-ea1a29e-amd64-r4` | `sha256:7aa3a8ee40ac757988384bbb2664b9f25439fabd19a7107a7a2978f61fbfd577` |
+| Console | `ghcp-release-console:multi-ea1a29e-amd64-r4` | `sha256:229a71f2015d98e22b37ae9c4272874ab7bafa3741b76a59f4d50be38f8ef8e9` |
+
+镜像内容：
+- **label**（四个镜像相同）：`org.opencontainers.image.revision=ea1a29e`、`com.ghcp.release-line=multi`、`org.opencontainers.image.version=multi-ea1a29e-amd64-r4`；ENTRYPOINT 为 Tini。
+- **系统包**：运行层的 `apt-get upgrade` 结果与 r3 相同，升级了 `perl-base`（deb12u3 → deb12u4）和 `tzdata`（2026c → 2026e），没有其他可用更新。
+- **npm 包**：`undici` 6.29.1、qs 6.16.1；`body-parser` 仍为 2.3.0（`inflate: false` 缓解不变）；没有 multer。
+- **`undici` 的位置**：四个服务共用同一个 `node_modules`，所以四个镜像都带有 `undici`，但只有 Proxy 使用它。
+
+### 2. 300 秒上限的镜像级检查（本次新增）
+
+做法：在候选 Proxy 镜像内调用打包后的 `executePreparedCopilotRequest`（位于 `/app/src/proxy/dist`），请求一个本地上游。这个上游 310 秒后才返回响应头，请求的 AbortSignal 预算为 600 秒。
+
+| 镜像 | 结果 |
+| --- | --- |
+| r4 `ea1a29e` | 200，310.0 秒 |
+| r4 `8a5cb9d`（第 9 节） | 200，309.7 秒 |
+| r3 `f43f27e`（对照） | 301.2 秒时失败：`fetch failed`，`UND_ERR_HEADERS_TIMEOUT` |
+
+另外，在发布镜像的运行时（`node:22-bookworm-slim`，内置 undici 6.28.0）上确认，内置 fetch 会采用 `undici` 6.29.1 的 Agent：
+- 把超时设为 500 毫秒时，请求按时以 `UND_ERR_HEADERS_TIMEOUT` 失败；
+- 把超时设为 5 秒时，请求成功。
+
+### 3. 原地升级与全新部署资格测试
+
+测试条件与 r3 相同：
+- 命令为 `qualification-prepare.mjs` + `qualification-run.mjs`；
+- 基线为 `single-slug-164cade-amd64-r4`，数据库为 MySQL 8.4；
+- 合成 IdP 证书，有效期至 2026-11-17；
+- 每次使用全新的项目名和未使用的子网（`10.231.81–93.0/24`）。
+
+结果：各报告都记录了上表的镜像 ID，`planCoverage.complete=true`。全部一次通过，断言数与 r3 相同。
+
+| 模式 | 项目 | 用时 | 断言 | 结果 |
+| --- | --- | --- | --- | --- |
+| `multi-upgrade`（MySQL 8.4 + 双 Proxy） | `ghcp-release-qualification-multi-r4b-m1` | 约 11.5 分钟 | 76 | 通过 |
+| `multi-upgrade-sqlite` | `ghcp-release-qualification-multi-r4b-s1` | 约 1 分钟 | 19 | 通过 |
+| `multi-fresh` | `ghcp-release-qualification-multi-r4b-fm1` | 约 3.4 分钟 | 30 | 通过 |
+| `multi-fresh-dba` | `ghcp-release-qualification-multi-r4b-fd1` | 约 3.6 分钟 | 34 | 通过 |
+| `multi-fresh-sqlite` | `ghcp-release-qualification-multi-r4b-fs1` | 约 1.5 分钟 | 23 | 通过 |
+| `idle-target-cap-check.mjs`（对照 r1） | `ghcp-release-qualification-multi-r4b-idlecap1` | 约 2.3 分钟 | 19 | 通过 |
+| 停止时的长连接（对照 r2），3 次 | `ghcp-release-qualification-r4b-shutdown-1/2/3` | 每次约 3–15 分钟 | 每次 50 | 通过 |
+
+`multi-upgrade` 和第一次停止检查比 `8a5cb9d` 那一轮慢（`multi-upgrade` 11.5 分钟，上一轮 6.8 分钟）。当时主机同时在构建和扫描，负载较高；没有出现失败或重试。
+
+### 4. 单元与集成测试
+
+测试环境的变化：
+- **本机 Node 被升级**：这次发布期间，系统把本机 Node 从 v24 自动升级到了 v26.13.0。依赖是在 v24 下安装的，better-sqlite3 无法在 v26 下加载。
+- **`ea1a29e` 改在 Linux 容器中测试**，用了两个运行时：
+  - 发布运行时 `node:22-bookworm-slim`（Node 22.23.3）；
+  - `node:24-bookworm-slim`（Node 24.22.2）。
+- **MySQL 的位置**：MySQL 8.4 与测试容器共用网络命名空间，因为测试只接受回环地址上的 MySQL。
+- **`8a5cb9d` 的单元测试**是在 v26 升级之前、在本机 Node 24 上跑的。
+
+| 范围 | `ea1a29e` | `8a5cb9d`（本机 Node 24） |
+| --- | --- | --- |
+| 全仓 typecheck | 通过（Node 22） | 通过 |
+| shared / SSO / Login / Console | 147/147、96/96、62/62、36/36（Node 22） | 相同 |
+| Proxy | Node 24：685 条，643 通过、41 跳过、1 失败；Node 22 的情况见下方说明 | 685 条：644 通过、41 跳过、0 失败 |
+| Proxy MySQL 集成（13 个文件，逐个运行） | Node 22 上全部通过，各文件结果见表后 | 运行时本机 Node 已升级为 v26，结果不采用：3 个文件因 better-sqlite3 版本不匹配和一次 OpenSSL 熵源错误失败，其余 10 个文件通过 |
+| 资格测试脚本与 mock | 40/40（Node 22） | 40/40 |
+| 部署脚本 | 未在容器中运行：需要 `kubectl kustomize`，容器内没有；`ea1a29e` 只改了锁文件 | 24/24 |
+
+`ea1a29e` 在 Node 22 上的 Proxy MySQL 集成测试结果：
+
+| 文件 | 结果 |
+| --- | --- |
+| `mysqlStorage` | 2/2 |
+| `mysqlEnterpriseMigrations` | 10/10 |
+| `scheduling` | 2/2 |
+| `ownerSideEffects` | 22/22 |
+| `mysqlStore` | 34/34 |
+| `mysqlRecovery` | 5/5 |
+| `mysqlLifecycle` | 2/2 |
+| `mysqlCallerIsolation` | 3/3 |
+| `mysqlAdmission` | 16/16 |
+| `loginPollingRecovery` | 6/6 |
+| `inferenceTimeout.mysql` | 3/3 |
+| `userPoolCredentialRace` | 10/10 |
+| `userPoolCatalogPressure.mysql` | 2/2 |
+
+失败情况如实记录如下。
+
+**Node 24 上的 1 条失败**：
+- **用例**：`mysqlAdmission.integration.test.ts` 中的“uncertain named-lock release (null) …”。
+- **现象**：期望得到 `pool_exhausted`，实际得到 `MysqlDeadlineError`（5 秒的 MySQL 时限）。失败发生在 Proxy 全量测试并行运行时。
+- **结论**：负载下的计时断言，不是代码问题。同一文件在 Node 24 上单独重跑 3 次，每次都是 8 通过、1 跳过；在 Node 22 的 MySQL 集成运行中为 16/16。
+
+**Node 22 容器中 Proxy 全量单元测试的 4 条失败和 5 条取消**：
+- **`store.test.ts`**：4 条并行 SQLite 用例在 worker 线程中加载不到源码模块（`ERR_MODULE_NOT_FOUND …/migrations.js`）。
+- **`enterpriseReadiness.worker.test.ts`**：5 条被取消（`Promise resolution is still pending …`）。
+- **对照**：在同一个容器环境中，对已发布的 r3 源码 `f43f27e` 运行这两个文件，结果完全相同（`store.test` 38/42，`enterpriseReadiness.worker` 5 条取消）。在 Node 24 上，这两个文件全部通过。
+- **结论**：问题出在这种运行方式（Node 22 + tsx 的 worker 线程），不是 r4 的回归。
+
+### 5. 镜像扫描（Docker Scout）
+
+在同一天、用同一漏洞库，扫描了 r4 `ea1a29e`、`8a5cb9d` 和已发布的 r3（全部级别）：
+
+| 镜像 | r4 `ea1a29e`：Critical / High / 全部 | r3（今天的漏洞库）：全部 |
+| --- | --- | --- |
+| Proxy / SSO / Console | 0 / 9 / 52 | 53 |
+| Login | 0 / 14 / 139 | 140 |
+
+**与 r3 的差别**：只有一处，qs 的 CVE-2026-110816 消失了。新增的 `undici` 6.29.1 没有任何条目。
+
+**仍有修复版本的条目**：只剩 CVE-2026-111181（body-parser 2.3.0，修复版本为 2.4.0）。批准的 npm 源仍只到 2.3.0，`inflate: false` 缓解保持不变（见 r3 第 6 节）。
+
+**其余 High 条目**：都来自 Debian Bookworm 基础系统包，Scout 标注为 `not fixed`。
+
+| 范围 | 条目 | 说明 |
+| --- | --- | --- |
+| 全部镜像 | util-linux（6 条）、perl CVE-2026-82560、zlib CVE-2026-85091 | 与 r3 相同 |
+| Login | expat CVE-2026-115506 | 与 r3 相同 |
+| Login | expat CVE-2026-117610、CVE-2026-118370；libxi CVE-2026-109089、CVE-2026-109090 | r3 发布时尚未公开；用今天的漏洞库扫描 r3 的 Login，同样报告 |
+
+Login 中这些条目的可达性：
+- **expat**：只经 Chromium 的 fontconfig 解析镜像内的本地字体配置（见[单企业发布验证记录](user-pool-image-release-validation.md)第 0.4 节），攻击者无法提供输入。
+- **libxi**：X11 输入扩展库，随 Chromium 的系统依赖安装。Login 以无头模式运行，没有 X 服务器，不可达。
+
+**扫描过程**：第一次扫描 Console 和 Login 时，Docker Desktop 的登录会话失效了（`docker scout` 要求登录），重新运行后成功。
+
+### 6. 失败与重跑汇总
+
+- **构建**：第一次失败是脚本问题：脚本把 Git Bash 风格的路径传给了 docker，3 次重试都卡在准备构建上下文这一步。修正脚本后一次构建成功。
+- **Linux 测试**：
+  - 第一次运行时，Docker 的 DNS 暂时无法解析 `deb.debian.org`，测试没有执行。DNS 恢复后重新运行，结果见第 4 节。
+  - 另外两次是脚本问题：`docker exec -w` 的路径被 Git Bash 改写；MySQL 不在回环地址上，被测试拒绝。都在测试真正开始之前发现并修正。
+- **Scout**：见第 5 节。
+- **资格测试与停止检查**：都一次通过，没有重跑。
+
+### 7. 未验证的范围
+
+- 与 r3 第 11 节相同：真实 GitHub / GHE.com / Copilot、真实 LiteLLM、性能与长时间稳定性等。
+- **kind（Kubernetes）**：没有用 r4 重跑。运行时的改动只涉及 Proxy 发往上游的请求，Kubernetes 清单没有变化，沿用 r3 的 kind 结果。
+- **600 秒以上的推理截止行为**：只由单元测试和原有的 MySQL 测试（`inferenceTimeout.mysql`）覆盖。超过 300 秒的端到端请求，计划在 Azure 测试环境中验证。
+
+### 8. 发布
+
+已发布到 Docker Hub（公开仓库，2026-10-29）：
+
+| 组件 | 按 digest 引用 |
+| --- | --- |
+| Proxy | `docker.io/linkinchow/ghcp-proxy@sha256:98c4c720db3189d53536885cfd1e521954f3b2989333e27784d6387edad63dec` |
+| SSO | `docker.io/linkinchow/ghcp-sso@sha256:12d60ca0b55e593bb5163d044b906640f033b9a2e767568dea7fb30ac8a35919` |
+| Login | `docker.io/linkinchow/ghcp-login@sha256:4481f51701fc23c8f78b1bbe4e4c6eb41b0fe9fc6b4d5e8ae897f9add1263bec` |
+| Console | `docker.io/linkinchow/ghcp-console@sha256:91a02afbbba6913a81ab252213a632508cd68610cf6d73d99543b6e731f12fb8` |
+
+发布后核对：每个 manifest 的 config digest 等于第 1 节经资格测试的镜像 ID；按 digest 拉起 Proxy，`/healthz` 返回 `releaseLine: "multi"`，带 `Content-Encoding: gzip` 的请求体返回 415，停止时 `shutdown complete`、退出码 0。
+
+### 9. `8a5cb9d` 候选（已被 `ea1a29e` 取代，未发布）
+
+镜像 `multi-8a5cb9d-amd64-r4`：
+
+| 组件 | 镜像 ID |
+| --- | --- |
+| Proxy | `sha256:141a2c6fada8…` |
+| SSO | `sha256:2be1cafc2855…` |
+| Login | `sha256:53d884e7a580…` |
+| Console | `sha256:823e6597805d…` |
+
+构建上下文 tar 的 SHA-256 为 `ea134d32dac5…`。
+
+这一轮完整跑过的验证：
+- **单元测试**（本机 Node 24）：typecheck 通过；shared 147/147、Proxy 685 条中 644 通过（41 跳过、0 失败）、SSO 96/96、Login 62/62、Console 36/36、资格测试脚本 40/40、部署脚本 24/24。
+- **资格测试**：`multi-upgrade` 76、`multi-upgrade-sqlite` 19、`multi-fresh` 30、`multi-fresh-dba` 34、`multi-fresh-sqlite` 23、idle-target 19 条断言，全部一次通过（项目 `ghcp-release-qualification-multi-r4-*`，子网 `10.231.61–73.0/24`）。
+- **停止检查**：3 次，每次 50/50。
+- **300 秒镜像级检查**：通过（第 2 节）。
+
+被取代的原因：扫描发现 qs 的 CVE-2026-110816 后，按“有修复就修”升级 qs 并重新构建。这些镜像保留在本地。
+
+证据：构建日志、测试日志、报告和扫描结果都保存在本机（`.claude/multi-r4/`、`.claude/multi-r4b/`、`.claude/release-qualification-run-*`），不入库。
+
+---
 
 ## r3：multi-f43f27e-amd64-r3（已发布）
 
@@ -182,7 +390,7 @@ r2 时的对照：旧 Pod 有忙碌长连接时要等满 25 秒才强制关闭�
 - 真实 LiteLLM：kind 和镜像级检查中的长连接客户端分别是 Node 的 `http.Agent({ keepAlive: true })` 和原始套接字，行为与 LiteLLM 的连接池相近，但没有用 LiteLLM 本身验证（包括它是否压缩请求体）；仓库的 LiteLLM 示例配置是 `max_retries: 0`。
 - CVE-2026-111181 的缓解只按设计和单元测试验证（压缩请求体在解压之前被 415 拒绝），没有在镜像上做攻击性复现。
 - SSO、Login 没有流式接口，“响应头已发出后在 `finish` 时结束套接字”只在 Proxy（SSE）、Console（CSV 转发）上做了镜像级验证，SSO、Login 由共享代码的单元测试覆盖。
-- `ownerSideEffects` 在 `f43f27e` 上 8 次运行中 1 次 22/22，其余各有 1–2 条计时断言失败（第 7 节）；测试本身的不稳定待单独修正。
+- `ownerSideEffects` 在 `f43f27e` 上 8 次运行中 1 次 22/22，其余各有 1–2 条计时断言失败（第 7 节）；测试本身的不稳定已在之后单独修正（数据库时钟回拨与 5 秒步骤截止，只改测试），见 [ownerSideEffects 确定性修正](user-pool-owner-side-effects-determinism.md)。
 - 资格测试中没有真实 Login 浏览器任务（kind 阶段 A 有真实 Login 的 Chromium 对 mock GHE.com）。
 - `MYSQL_AUTO_MIGRATE=false` + r4 → 多企业 DBA 升级脚本只在集成测试中覆盖；全新部署的其余未覆盖项同 r2 第 3.4 节。
 - 性能、容量与长时间稳定性。
