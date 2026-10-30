@@ -15,9 +15,11 @@ function Import-AzdEnvironment {
   $lines = & azd env get-values 2>$null
   if ($LASTEXITCODE -ne 0) { throw 'azd env get-values failed: run from deploy/azure after azd env select <name>.' }
   foreach ($line in $lines) {
-    if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)="(.*)"$') {
+    # Bicep outputs of type int / bool are written without quotes (GHCP_PROXY_REPLICAS=2).
+    if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=(?:"(.*)"|([^"]*))$') {
+      $value = if ($null -ne $Matches[2]) { $Matches[2] -replace '\\"', '"' } else { $Matches[3] }
       if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($Matches[1]))) {
-        [Environment]::SetEnvironmentVariable($Matches[1], ($Matches[2] -replace '\\"', '"'))
+        [Environment]::SetEnvironmentVariable($Matches[1], $value)
       }
     }
   }
