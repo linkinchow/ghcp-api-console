@@ -423,7 +423,7 @@ Container Insights（`ContainerLogV2`）、AKS / MySQL 指标、App GW 访问与
 
 ### 8.7 迁移：从原环境恢复数据
 
-原环境（另一套 Kubernetes / Rancher 和别的 MySQL）迁移到本部署时，总体流程、备份方法和切换步骤见[迁移指南](../../docs/multi-enterprise-migrate-to-new-environment.md)。本节只讲 Azure 这一侧：Azure MySQL 只有私有终结点，SSO / Login 的 SQLite 文件要放进 AKS 的数据盘，所以用 `hooks/Restore-GhcpData.ps1` 在集群里完成恢复。
+原环境（另一套 Kubernetes / Rancher 和别的 MySQL）迁移到本部署时，总体流程、备份方法和切换步骤见[迁移指南](../../docs/multi-enterprise-migrate-to-new-environment.md)，可照着执行的完整清单见[执行手册](../../docs/multi-enterprise-migrate-to-azure.md)。本节只讲 Azure 这一侧：Azure MySQL 只有私有终结点，SSO / Login 的 SQLite 文件要放进 AKS 的数据盘，所以用 `hooks/Restore-GhcpData.ps1` 在集群里完成恢复。
 
 **1. 部署前：配置必须与原环境相同**（不一致时 Proxy 拒绝启动，或已有池账号无法登录；迁移指南第 2.1 节）
 
