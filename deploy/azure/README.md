@@ -20,7 +20,7 @@ deploy/azure/
 │   └── modules/                 network、subnet、private-dns-zone、private-endpoint、log-analytics、aks、aks-existing、
 │                                managed-prometheus、workload-identity、user-assigned-identity、role-assignments、
 │                                subnet-role-assignment、acr、key-vault、key-vault-secret、mysql、waf-policy、app-gateway
-├── hooks/                       PowerShell 7：preprovision、postprovision、deploy-app、predown、Set-GhcpSecret、common
+├── hooks/                       PowerShell 7：preprovision、postprovision、deploy-app、predown、Set-GhcpSecret、Restore-GhcpData、common
 ├── scripts/render-overlay.mjs   按 azd 环境生成本环境的私有 overlay（.generated/<环境>/，不入库）
 ├── scripts/enterprise-registry.mjs  多企业 registry 的 Key Vault / 挂载约定与校验（第 8.6 节）
 ├── enterprise-registry.azure.example.json  按本部署约定写的 registry 示例（两个新增企业）
@@ -421,6 +421,65 @@ Container Insights（`ContainerLogV2`）、AKS / MySQL 指标、App GW 访问与
 
 **停用 / 移除**：开通过账号（有池成员、SSO 用户或 Login 任务）的企业**不能**从 registry 删除，否则相关服务以 `enterprise_missing_from_registry` 启动失败；在 Console 中 **Drain**（必要时把 cap 调到最小）。只有从未产生数据的 `draft` 企业可以从 registry 删除，然后 `azd hooks run postprovision`；之后可以删除它的 `ghcp-ent-<id>-*` 机密（Key Vault 开启了软删除 / 清除保护）。
 
+### 8.7 迁移：从原环境恢复数据
+
+原环境（另一套 Kubernetes / Rancher 和别的 MySQL）迁移到本部署时，总体流程、备份方法和切换步骤见[迁移指南](../../docs/multi-enterprise-migrate-to-new-environment.md)。本节只讲 Azure 这一侧：Azure MySQL 只有私有终结点，SSO / Login 的 SQLite 文件要放进 AKS 的数据盘，所以用 `hooks/Restore-GhcpData.ps1` 在集群里完成恢复。
+
+**1. 部署前：配置必须与原环境相同**（不一致时 Proxy 拒绝启动，或已有池账号无法登录；迁移指南第 2.1 节）
+
+| 原环境 | 本部署 |
+| --- | --- |
+| `ENTERPRISE_SLUG`、`ENTERPRISE_SHORTCODE`（GHE.com 为子域） | `GHCP_ENTERPRISE_SLUG`、`GHCP_ENTERPRISE_SHORTCODE`（`GHCP_GHE_SUBDOMAIN`），`GHCP_GITHUB_HOSTING` |
+| `POOL_ACCOUNT_EMAIL_DOMAIN`、`POOL_WARMUP_MODEL` | `GHCP_POOL_ACCOUNT_EMAIL_DOMAIN`、`GHCP_POOL_WARMUP_MODEL` |
+| 其他进入配置指纹的 Proxy 变量（`PROVISIONAL_LEASE_TTL_SECONDS`、`PREWARM_POLL_SECONDS`、`PREWARM_CONCURRENCY`、`POOL_LOGIN_MAX_PENDING`、`POOL_EXHAUSTED_RETRY_AFTER_SECONDS`、`POOL_REQUEST_TIMEOUT_SECONDS`） | 与 base 默认值（300、5、5、5、30、120）不同的，写进 `GHCP_PROXY_CONFIG_OVERRIDES` |
+| `POOL_INFERENCE_TIMEOUT_SECONDS`（设置过时） | `GHCP_PROXY_CONFIG_OVERRIDES`，例如 `{"POOL_INFERENCE_TIMEOUT_SECONDS":"600"}` |
+| `GITHUB_API_BASE_URL`（经出口网关时） | `GHCP_GITHUB_API_BASE_URL` |
+
+不要设置 `GHCP_CONFIG_APPROVED`：恢复完成之前应用不能启动（空库启动后开池会在 GitHub 上新开账号）。
+
+**2. 写入原环境的机密**（在第一次 `azd provision` 之前；之后写入时加 `-Force`，并且必须在应用启动之前）
+
+```powershell
+pwsh ./hooks/Set-GhcpSecret.ps1 -Name ghcp-sso-default-user-password -Prompt   # 原 SSO_DEFAULT_USER_PASSWORD，必须相同
+pwsh ./hooks/Set-GhcpSecret.ps1 -Name ghcp-saml-idp-cert -File <原 SAML 证书 PEM>   # 沿用则 GitHub 不用换证书
+pwsh ./hooks/Set-GhcpSecret.ps1 -Name ghcp-saml-idp-key -File <原 SAML 私钥 PEM>
+pwsh ./hooks/Set-GhcpSecret.ps1 -Name ghcp-scim-token -Prompt
+pwsh ./hooks/Set-GhcpSecret.ps1 -Name ghcp-copilot-seat-pat -Prompt
+```
+
+`ghcp-sso-default-user-password` 不存在时 postprovision 会随机生成一个，**与原环境不同时，每个已有池账号都无法登录**。`API_KEY`、`INTERNAL_API_TOKEN`、`SESSION_SECRET` 可以使用新生成的值（换 `API_KEY` 时同步 LiteLLM）。
+
+**3. `azd provision`**：创建基础设施并执行 MySQL 账号初始化，应用不启动（停在第 4 步的配置摘要）。
+
+**4. 停止原环境并备份**（迁移指南第 3 节），整理成如下目录：
+
+```text
+<备份目录>/
+├── proxy.sql             mysqldump --single-transaction --routines --triggers --default-character-set=utf8mb4 --set-gtid-purged=OFF --no-tablespaces <库名>
+├── sso/                  SSO 数据卷中的 sso.sqlite、sso.sqlite-wal、sso.sqlite-shm、sso-user-events.log（-wal 中可能是全部数据）
+├── login/                Login 数据卷中的 login.sqlite、login.sqlite-wal、login.sqlite-shm
+└── console/admins.json
+```
+
+**5. 恢复**：
+
+```powershell
+pwsh ./hooks/Restore-GhcpData.ps1 -BackupDir <备份目录>
+```
+
+脚本先校验备份（必须含触发器 `user_pool_credential_fence`），只创建 StorageClass 与 PVC，再启动一个临时 Pod（MySQL 8.4 官方镜像，按 digest 导入 ACR；Key Vault、CA 与 NetworkPolicy 同账号初始化 Job）：
+
+- 备份经 `kubectl cp` 复制到 Pod 后逐个核对 SHA-256（网络中断时重试）；
+- 去掉触发器的 `DEFINER`，以管理员账号经 TLS 导入（库重建为 utf8mb4 / `utf8mb4_0900_ai_ci`），打印表数、关键表行数和触发器；
+- 文件放进 SSO / Login / Console 的数据盘，属主 1000，权限只限属主；
+- 结束后删除临时 Pod。数据只经过运维机和集群。
+
+目标库或数据盘已有数据、或应用正在运行时，脚本不做任何改动并退出；只有确认可以覆盖时才加 `-ReplaceExistingData`（先把应用缩到 0，再清空库和数据盘）。
+
+**6. 启动**：`azd env set GHCP_CONFIG_APPROVED true`，`azd hooks run postprovision`。Proxy 取得迁移锁，把数据迁移为多企业结构并全部归入 `default`，账号池保持备份时的暂停状态。
+
+**7. 验证后再切换**：迁移指南第 7 节（`/healthz` 为 `releaseLine: "multi"`；`schema_migrations` 有 `enterprise-v1/*`；Console 用原管理员登录，`default` 的账号数与租约与原环境相同），然后切换 GitHub SAML 与 LiteLLM（第 6 节），最后取消暂停预热。
+
 ## 9. 复用已有 VNet / AKS（与 LiteLLM 共存）
 
 **复用 VNet**（例如 LiteLLM AKS 模板的 VNet，默认 `10.30.0.0/16`）：
@@ -521,6 +580,7 @@ az aks update --resource-group <rg> --name <集群> --enable-secret-rotation --s
 | 滚动更新 | 持续负载下滚动替换两个 Proxy：长连接 1389/1389、新连接 1364/1364，零失败 |
 | 配置变化 | 改 azd 值后只有读取该值的服务滚动更新（`ghcp.azure/config-hash`，第 6 节） |
 | 公网开关 | App GW WAF_v2（公网 + 私网前端），Key Vault 中的通配符证书（TLS 1.3，两个前端都通过系统信任链校验），split-horizon DNS（每个对外主机名一个私有区域）。Console 经 App GW 打开与登录，跨站写入 403。Proxy 只放行推理路径：`/healthz`、`/api/*`、`/internal/*` 在 WAF 层 403；推理 JSON / SSE 正常 |
+| 迁移恢复（第 8.7 节） | 用本地演练留下的合成备份（`bf38374` 单企业版、MySQL + 双 Proxy，SSO / Login 的数据在 `-wal` 中）：azd 企业身份与机密改为备份的值，`Restore-GhcpData.ps1 -ReplaceExistingData` 导入（TLS 1.3，11 张表、触发器、7 个账号、3 个租约；文件属主 1000、权限只限属主），批准后启动 r4。核对 17/17：四个服务 `releaseLine: multi`；`schema_migrations` 3 条 + `enterprise-v1/*` 8 条；只有 `default` 且为 `active`；3 个调用方仍在原账号上；下一个账号名序号 7（接在已有账号之后，不会与 GitHub 上已有的用户重名）；7 个 SSO 用户；Console 用原管理员登录；预热保持暂停；没有指纹或表结构错误 |
 | 关闭 Proxy 对外 | `proxy: false` 后 `azd provision`：只剩 Console 的监听器，Proxy 主机名在 App GW 上 404，Console 不受影响；Proxy 内部负载均衡与 NetworkPolicy 被删除 |
 | 来源限制 | 允许列表之外的来源（AKS 的 NAT 出口、互联网扫描）对两个对外主机名均为 403；未配置的主机名 404 |
 | 长请求（经 App GW，`POOL_INFERENCE_TIMEOUT_SECONDS=600`） | SSE 300 秒与 550 秒：200，最大分块间隔 0.25 秒（响应不缓冲）。非流式 300 秒无输出：200（修复内部负载均衡空闲超时之后，见下表）。**r3 下非流式 550 秒无输出：Proxy 在 300 秒返回 502**——Proxy 用 Node 内置 fetch 调上游，其默认响应头超时为 300 秒，与 App GW 无关；r4 已修复，见下一行 |
@@ -536,7 +596,10 @@ az aks update --resource-group <rg> --name <集群> --enable-secret-rotation --s
 | 订阅注册了 App GW 网络隔离（`EnableApplicationGatewayNetworkIsolation`） | App GW 创建失败，要求子网委派 | App GW 子网委派给 `Microsoft.Network/applicationGateways`（第 9 节） |
 | 应用部署后再运行 postprovision | MySQL 账号初始化 Job 被命名空间的默认拒绝策略阻断，超时失败（新增企业、打开公网开关都要重跑） | 为该 Job 渲染只放行 MySQL 3306 的 NetworkPolicy |
 | 改 azd 值后 ConfigMap 更新但 Pod 不重启 | 打开 Console 公网访问后 `CONSOLE_PUBLIC_BASE_URL` 不生效 | Pod 模板注解 `ghcp.azure/config-hash`（第 6 节） |
+| 单独运行 hook 脚本时读不到 Bicep 输出的整数 | `GHCP_PROXY_REPLICAS=2` 在 azd 环境中没有引号，`Import-AzdEnvironment` 只认带引号的值，渲染报缺值（`azd hooks run` 不受影响，直接运行 `deploy-app.ps1` 会失败） | 同时接受带引号与不带引号的值 |
 | Proxy 内部负载均衡的 TCP 空闲超时为 Azure 默认 4 分钟 | 经 App GW 的 300 秒非流式请求在 268 秒被重置，App GW 返回 502 | 注解 `azure-load-balancer-tcp-idle-timeout: "15"`；LiteLLM 的内部负载均衡需要同样设置（第 7 节） |
+
+**测试订阅的成本自动化**：每天约 16:00 UTC，一个外部主体停止 AKS、MySQL 与 App GW，并把未挂载的数据盘从 `Premium_ZRS` 改为 `Standard_LRS`；改后的盘不属于任何可用区，再也挂不到可用区中的节点（Pod 停在 `FailedAttachVolume`），只能删除后重建。客户订阅有类似策略时，应把本部署的资源组与 AKS 节点资源组排除在外。
 
 **观察到的其他情况**：运维机经 Global Secure Access 等代理访问时，App GW 与 API server 看到的来源是代理的出口地址，不是本机查询到的公网 IP，允许列表要按实际来源配置（WAF 日志 `ApplicationGatewayFirewallLog` 中可以看到被拒的来源）。App GW 公网 IP 开放后很快会有互联网扫描（日志中为 404 或 403）。Login 的 NetworkPolicy 保留了 base 中 `REPLACE_INGRESS_NAMESPACE` 的占位规则（不匹配任何 namespace，无副作用）。
 
