@@ -60,7 +60,7 @@ kubectl --context <原集群 context> -n <namespace> get pods -o custom-columns=
 
 按新部署指南部署新环境，但**四个服务保持不启动**：副本数为 0，或保持启动门禁（`GHCP_CONFIG_APPROVED` 不是 `true`）。
 
-新环境用本仓库的 Azure 部署（`deploy/azure`，azd + Bicep）时，配置、机密、恢复（MySQL 只能经私有终结点访问，SQLite 文件要放进 AKS 数据盘）和启动按 [deploy/azure README 第 8.7 节](../deploy/azure/README.md) 进行：`hooks/Restore-GhcpData.ps1` 在集群内完成第 4 节的恢复。
+新环境用本仓库的 Azure 部署（`deploy/azure`，azd + Bicep）时，配置、机密、恢复（MySQL 只能经私有终结点访问，SQLite 文件要放进 AKS 数据盘）和启动按 [deploy/azure README 第 8.7 节](../deploy/azure/README.md) 进行：`hooks/Restore-GhcpData.ps1` 在集群内完成第 4 节的恢复。完整的执行清单（需要准备的信息、迁移当天的步骤、验证与回退）见[执行手册：迁移到 Azure 上的多企业版](multi-enterprise-migrate-to-azure.md)。
 
 > **不要用空库先启动新环境。** 账号池一旦启用，就会通过 SCIM 在真实企业中新开账号，与原环境的账号冲突。
 
