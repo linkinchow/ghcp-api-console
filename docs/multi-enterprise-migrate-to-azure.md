@@ -73,7 +73,7 @@ SQLite 是服务内嵌的数据库，整个库就是磁盘上的文件。旧版�
 | Proxy 的域名与 TLS 证书 | PFX（不带密码）或 PEM，写入 Key Vault（README 第 5.2 节），DNS 指向 `APPGW_PUBLIC_IP` |
 | 签发 LiteLLM 客户端证书的 CA | 强烈建议开启双向 TLS。Proxy 用一个共享的 `API_KEY` 校验调用方，然后直接信任 `X-User-Identity`：持有这个 key 的人可以冒用任何身份（[公网访问设计](../deploy/azure/public-access-design.md)第 4 节） |
 | Console 的域名、证书与管理员出口网段 | Console 对外时只放行管理员网段；也可以不对外，经 VPN 访问内部负载均衡 |
-| SSO | 通常不需要对外：池账号的 SAML 登录在集群内 Login 的浏览器中完成 |
+| SSO | 通常不需要对外：池账号的 SAML 登录在集群内 Login 的浏览器中完成；GitHub 接受内网 HTTP 的 Sign on URL（例如 `http://<SSO 内部负载均衡 IP>:7001/sso`）。但修改 SAML 设置时，GitHub 要求先在**配置人自己的浏览器**中通过 “Test SAML configuration” 才能保存，所以切换当天企业 owner 的浏览器必须能访问新 SSO 地址（经 VPN / 管理网段访问内部负载均衡），否则需要临时打开 SSO 公网入口并限制来源（README 第 7 节） |
 
 ### 4.3 GitHub 企业
 
@@ -138,7 +138,7 @@ SQLite 是服务内嵌的数据库，整个库就是磁盘上的文件。旧版�
 | 6 | `pwsh ./hooks/Restore-GhcpData.ps1 -BackupDir <备份目录>`；演练过时加 `-ReplaceExistingData`（README 第 8.7 节） |
 | 7 | `azd env set GHCP_CONFIG_APPROVED true`；`azd hooks run postprovision`。Proxy 把数据迁移为多企业结构，账号池保持暂停 |
 | 8 | 按第 9 节验证，全部通过后再继续 |
-| 9 | GitHub 企业 SAML：Sign on URL 改为 `<新 SSO 地址>/sso`，Issuer 改为 `<新 SSO 地址>/metadata`；沿用原证书时不用改证书 |
+| 9 | GitHub 企业 SAML：Sign on URL 改为 `<新 SSO 地址>/sso`，Issuer 改为 `<新 SSO 地址>/metadata`；沿用原证书时不用改证书。保存前 GitHub 要求 “Test SAML configuration” 通过：在能访问新 SSO 地址的浏览器中，用一个已同步的 SSO 用户完成测试登录（第 4.2 节） |
 | 10 | LiteLLM 指向新 Proxy 并换成新 key；用一个已有调用方的 key 发请求，确认它落在原来的账号上 |
 | 11 | 新 Console → Pool overview：**取消暂停预热**，观察补号。新账号经 SAML 登录成功，说明 GitHub 已指向新 SSO |
 
