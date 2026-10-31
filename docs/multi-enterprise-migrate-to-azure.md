@@ -34,12 +34,14 @@ docker image inspect <镜像> --format '{{index .Config.Labels "org.opencontaine
 
 | 后果 | 原因 |
 | --- | --- |
-| 新环境开出的前 N 个账号（N 是原环境开过的账号数）全部以 SCIM 409 失败，需要人工处理，还占用 cap | 池账号名按固定字典从头取名（`aaliyah.abbott00`、`aaron.abernathy00`……），空库从第一个开始取，与 GitHub 上已有的用户重名 |
-| 删除旧用户也不能解决 | EMU 删除（停用）用户后用户名仍被占用；席位到账期末才释放，期间重复计费 |
+| 新环境开出的前 N 个账号（N 是原环境开过的账号数）**接管** GitHub 上已有的同名老用户，不会报错 | 池账号名按固定字典从头取名（`aaliyah.abbott00`、`aaron.abernathy00`……），空库从第一个开始取。新 SSO 发出的 SCIM 创建请求与原环境当初的完全相同（用户名、externalId、邮箱），GitHub 直接返回已有的用户（2026-10 在一个客户环境中观察到：GitHub 上用户数不变，新 SSO 绑定的 SCIM ID 与原用户相同）。仓库测试用的 mock 对重名返回 409，与真实 GitHub 不同 |
+| 新旧两套指向同一批 GitHub 用户 | 原环境再启动、或之后在 GitHub 上停用、移除这些“老”用户（例如为了退席位），都会影响新环境正在使用的账号 |
 | 所有调用方被重新分配账号 | 调用方与账号的绑定（租约）保存在 MySQL 中 |
-| 已有池账号无法再登录 | SSO 用户（密码哈希、SCIM ID、席位状态）保存在 SSO 的 SQLite 中 |
+| 原环境的 SSO 用户、密码哈希、登录任务记录全部丢失 | 保存在 SSO、Login 的 SQLite 中；新环境的 SSO 会为接管的用户重新建立记录 |
 
 迁移数据后，账号、席位、SSO 用户和租约都保留，下一个新账号接着原来的序号取名。
+
+不迁移数据、并且确定不再使用原环境开过的账号时，可以让新环境从更靠后的序号开始取名，避免接管老用户：新环境首次启动后、开池（调高 idle target）之前，在 Proxy 库中执行 `UPDATE user_pool_settings SET next_ordinal = GREATEST(next_ordinal, 1000) WHERE id = 1`。序号 1000 以后的名字以 `01` 结尾（`aaliyah.abbott01`……），与原环境的 `00` 区分开。这不是产品提供的操作，执行前确认原环境的 `next_ordinal` 小于 1000。
 
 ## 3. 要迁移的数据
 
@@ -50,7 +52,7 @@ docker image inspect <镜像> --format '{{index .Config.Labels "org.opencontaine
 | Login | SQLite 文件 `login.sqlite`、`-wal`、`-shm`，在 Login 的数据卷中 | 自动登录任务记录 |
 | Console | `admins.json`，在 Console 的数据卷中 | Console 管理员账号 |
 
-SQLite 是服务内嵌的数据库，整个库就是磁盘上的文件。旧版本停止时不会把 `-wal` 合并回主文件，**最新数据甚至全部数据可能都在 `-wal` 中**：主文件可能只有 4 KB，三个文件必须一起复制。
+SQLite 是服务内嵌的数据库，整个库就是磁盘上的文件。r4 之前的版本停止时不会把 `-wal` 合并回主文件，**最新数据甚至全部数据可能都在 `-wal` 中**：主文件可能只有 4 KB，三个文件必须一起复制。r4 起服务停止时会合并，`-wal` 可能不存在。复制整个数据卷的内容即可，不必逐个挑文件。
 
 ## 4. 需要准备的信息与权限
 
@@ -134,13 +136,13 @@ SQLite 是服务内嵌的数据库，整个库就是磁盘上的文件。旧版�
 | 2 | 停止原环境的**全部四个服务**，所有 Proxy 副本都要停（Kubernetes 缩到 0，确认旧 Pod 全部退出） |
 | 3 | 备份 MySQL（7.1） |
 | 4 | 复制 SSO / Login / Console 数据卷中的文件（7.2） |
-| 5 | 核对备份：`proxy.sql` 中有 ``TRIGGER `user_pool_credential_fence` ``；`sso/` 中有 `sso.sqlite` 与 `sso.sqlite-wal` |
+| 5 | 核对备份：`proxy.sql` 中有 ``TRIGGER `user_pool_credential_fence` ``；`sso/` 中有 `sso.sqlite`，`login/` 中有 `login.sqlite`，`console/` 中有 `admins.json`。r4 之前的版本通常还有 `sso.sqlite-wal`，必须一起带走（第 3 节） |
 | 6 | `pwsh ./hooks/Restore-GhcpData.ps1 -BackupDir <备份目录>`；演练过时加 `-ReplaceExistingData`（README 第 8.7 节） |
 | 7 | `azd env set GHCP_CONFIG_APPROVED true`；`azd hooks run postprovision`。Proxy 把数据迁移为多企业结构，账号池保持暂停 |
 | 8 | 按第 9 节验证，全部通过后再继续 |
 | 9 | GitHub 企业 SAML：Sign on URL 改为 `<新 SSO 地址>/sso`，Issuer 改为 `<新 SSO 地址>/metadata`；沿用原证书时不用改证书。保存前 GitHub 要求 “Test SAML configuration” 通过：在能访问新 SSO 地址的浏览器中，用一个已同步的 SSO 用户完成测试登录（第 4.2 节） |
 | 10 | LiteLLM 指向新 Proxy 并换成新 key；用一个已有调用方的 key 发请求，确认它落在原来的账号上 |
-| 11 | 新 Console → Pool overview：**取消暂停预热**，观察补号。新账号经 SAML 登录成功，说明 GitHub 已指向新 SSO |
+| 11 | 新 Console → Pool overview：**取消暂停预热**，观察补号。新账号经 SAML 登录成功，说明 GitHub 已指向新 SSO。`default` 企业的 cap 沿用原环境的 `POOL_MAX_ACCOUNTS`（或原 Console 中保存的值）：账号数已经等于 cap 时不会补号，先在企业表中 **Edit cap** 调高 |
 
 ### 7.1 备份 MySQL
 
@@ -176,8 +178,8 @@ docker run --rm --network none -v <项目>_sso-data:/from/sso:ro -v <项目>_log
 ```text
 backup/
 ├── proxy.sql
-├── sso/        sso.sqlite、sso.sqlite-wal、sso.sqlite-shm、sso-user-events.log
-├── login/      login.sqlite、login.sqlite-wal、login.sqlite-shm
+├── sso/        sso.sqlite、sso-user-events.log，以及存在时的 sso.sqlite-wal、sso.sqlite-shm
+├── login/      login.sqlite，以及存在时的 login.sqlite-wal、login.sqlite-shm
 └── console/admins.json
 ```
 
@@ -192,6 +194,8 @@ backup/
 3. 把原环境的四个服务恢复到原来的副本数，在原 Console 中取消暂停预热。
 
 新环境运行期间新开的账号、建立的租约只存在于新库中，原环境不知道它们。所以第 9 节验证通过之前不要取消暂停预热，把这个窗口缩到最小。
+
+新环境已经开过新账号时，回退后原环境一取消暂停，就会按同样的序号去开同名账号，接管新环境开出的那些 GitHub 用户（第 2 节）。回退后先在原环境保持暂停，核对 GitHub 上新环境开出的用户与席位，再决定是否取消暂停。
 
 ## 9. 验证清单
 
@@ -218,4 +222,5 @@ backup/
 | --- | --- |
 | 本地演练（迁移指南第 12 节） | 合成数据，`bf38374` 单企业版（MySQL + 双 Proxy）：停机、备份、恢复、迁移、回退；直接迁移与经 r4 中转的结果逐字相同 |
 | Azure（README 第 12 节） | 同一份合成备份（数据在 `-wal` 中）用 `Restore-GhcpData.ps1` 恢复到 Azure MySQL 8.4 与 AKS 数据盘，启动 r4 后 17 项核对全部通过：迁移记录、账号与租约保留、发号序号接续、SSO 用户、Console 原管理员登录、预热保持暂停。另外验证了 550 秒的非流式请求、App Gateway 公网入口、WAF、来源允许列表与证书 |
-| 未验证 | 真实 GitHub 企业的 SAML 切换与补号（测试中用 mock 代替）；7.2 节的 Kubernetes 备份命令（按原理编写；Compose 的方法在本地演练中使用过）；大数据量下的耗时 |
+| Azure 端到端演练（README 第 12 节） | 原环境：同一 AKS 中单独命名空间里的单企业版 r4（MySQL 8.4 + 双 Proxy，SSO / Login / Console 用数据卷）。按第 7 节逐步执行：暂停、停机、`mysqldump`（应用账号）、**7.2 节的 Kubernetes 临时 Pod 备份命令**、`Restore-GhcpData.ps1`、启动多企业版 r4。切换后 8 项全部通过：四个服务为多企业版；`default` 为 `active`，账号与原环境相同；3 个已有调用方经两个 Proxy 推理仍落在原账号；新调用方分到空闲账号。取消暂停（并调高 cap）后新开 3 个账号，名字接着原序号，经新 SSO 完成 SAML 登录与授权。回退（第 8 节）6 项全部通过：原环境的调用方仍落在原账号，账号不变 |
+| 未验证 | 真实 GitHub 企业的 SAML 切换与补号（测试中用 mock 代替）；r4 之前的版本作为原环境的 Kubernetes 端到端（本地演练覆盖过 `bf38374`）；Rancher；大数据量下的耗时 |
